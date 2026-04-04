@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use amber_manifest::{FrameworkCapabilityName, Manifest, Program, ProvideDecl, SlotDecl};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl,
-    ResourceRef, Scenario, ScenarioExport, SlotRef, StorageResourceParams,
+    BindingEdge, BindingFrom, Component, ComponentId, FrameworkRef, Moniker, ProvideRef,
+    ResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef, StorageResourceParams,
 };
 use serde_json::json;
 
@@ -23,6 +23,7 @@ fn component(id: usize, moniker: &str) -> Component {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     }
 }
@@ -113,9 +114,11 @@ fn component_binding(
 
 fn framework_binding(capability: &str, to_component: usize, to_name: &str) -> BindingEdge {
     BindingEdge {
-        from: BindingFrom::Framework(
-            FrameworkCapabilityName::try_from(capability).expect("framework capability"),
-        ),
+        from: BindingFrom::Framework(FrameworkRef {
+            authority: ComponentId(0),
+            capability: FrameworkCapabilityName::try_from(capability)
+                .expect("framework capability"),
+        }),
         to: slot(to_component, to_name),
         weak: false,
     }
@@ -158,6 +161,7 @@ fn externally_rooted_child_scenario(
     child.slots.insert(slot_name.to_string(), slot_decl);
 
     let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(child)],
         bindings: vec![external_binding(0, slot_name, 1, slot_name, true)],
@@ -309,6 +313,7 @@ fn dce_prunes_unused_transitive_subtree() {
     ];
 
     let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings,
@@ -458,6 +463,7 @@ fn dce_keeps_dependencies_for_program_slots() {
     ];
 
     let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings,
@@ -566,6 +572,7 @@ fn dce_keeps_dependencies_for_repeated_slot_each() {
     let bindings = vec![component_binding(2, "api", 1, "api")];
 
     let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings,
@@ -678,6 +685,7 @@ fn dce_prunes_dependency_when_repeated_slot_each_is_dead() {
     let bindings = vec![component_binding(3, "api", 2, "api")];
 
     let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings,
@@ -772,6 +780,7 @@ fn dce_keeps_program_slots_from_env() {
     let bindings = vec![component_binding(2, "admin", 1, "admin")];
 
     let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings,
@@ -849,6 +858,7 @@ fn dce_keeps_storage_slots_used_by_program_mounts() {
     connect_parent_child(&mut components, 0, 1);
 
     let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
@@ -921,6 +931,7 @@ fn dce_keeps_resource_owner_between_export_and_storage_sink() {
         .insert("http".to_string(), provide_http);
 
     let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
@@ -1025,6 +1036,7 @@ fn dce_keeps_ancestors_without_marking_ancestor_program_live() {
     let bindings = vec![component_binding(2, "up", 0, "up")];
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings,
@@ -1074,6 +1086,7 @@ fn dce_keeps_framework_bound_slots() {
         serde_json::from_value(json!({ "kind": "http" })).expect("capability decl");
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings,
@@ -1093,6 +1106,172 @@ fn dce_keeps_framework_bound_slots() {
             panic!("unexpected external binding slots.{}", slot.name)
         }
     }
+}
+
+#[test]
+fn dce_keeps_child_template_owner_program_without_static_exports() {
+    let mut components = vec![Some(component(0, "/")), Some(component(1, "/orchestrator"))];
+    connect_parent_child(&mut components, 0, 1);
+    component_mut(&mut components, 1).program = Some(lower_fixture_program(
+        1,
+        serde_json::from_value(json!({
+            "image": "orchestrator",
+            "entrypoint": ["orchestrator"]
+        }))
+        .expect("program"),
+    ));
+    component_mut(&mut components, 1).child_templates.insert(
+        "worker".to_string(),
+        amber_scenario::ChildTemplate {
+            frozen: false,
+            manifest: Some("catalog/worker".to_string()),
+            allowed_manifests: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            slot_decls: BTreeMap::new(),
+            visible_exports: None,
+            limits: None,
+            possible_backends: Vec::new(),
+        },
+    );
+
+    let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
+        root: ComponentId(0),
+        components,
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let scenario = dce_only(scenario);
+    let orchestrator = scenario.components[1]
+        .as_ref()
+        .expect("template owner should remain");
+    assert!(
+        orchestrator.program.is_some(),
+        "template owner program must survive DCE even without static exports"
+    );
+    assert!(
+        orchestrator.child_templates.contains_key("worker"),
+        "template owner child templates must survive DCE"
+    );
+}
+
+#[test]
+fn dce_keeps_static_child_subtree_visible_for_future_dynamic_bindings() {
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/provider")),
+        Some(component(2, "/provider/root")),
+    ];
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 1, 2);
+    component_mut(&mut components, 0).child_templates.insert(
+        "worker".to_string(),
+        amber_scenario::ChildTemplate {
+            frozen: false,
+            manifest: Some("catalog/worker".to_string()),
+            allowed_manifests: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            slot_decls: BTreeMap::new(),
+            visible_exports: None,
+            limits: None,
+            possible_backends: Vec::new(),
+        },
+    );
+    component_mut(&mut components, 2).program = Some(lower_fixture_program(
+        2,
+        serde_json::from_value(json!({
+            "image": "provider",
+            "entrypoint": ["provider"]
+        }))
+        .expect("program"),
+    ));
+    component_mut(&mut components, 2).provides.insert(
+        "out".to_string(),
+        serde_json::from_value(json!({ "kind": "http" })).expect("provide decl"),
+    );
+
+    let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
+        root: ComponentId(0),
+        components,
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let scenario = dce_only(scenario);
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.as_str() == "/provider"),
+        "static child realm should survive DCE for future dynamic bindings"
+    );
+    let provider_root = scenario
+        .components
+        .iter()
+        .flatten()
+        .find(|component| component.moniker.as_str() == "/provider/root")
+        .expect("static child program should remain");
+    assert!(
+        provider_root.program.is_some(),
+        "static child program should remain runnable for future dynamic bindings"
+    );
+    assert!(
+        provider_root.provides.contains_key("out"),
+        "static child provides should remain available for future dynamic bindings"
+    );
+}
+
+#[test]
+fn dce_keeps_self_external_root_slot_for_future_dynamic_use() {
+    let slot_decl = manifest_slot("http", false, false);
+    let root_program = serde_json::from_value(json!({
+        "image": "root",
+        "entrypoint": ["root"],
+    }))
+    .expect("program");
+
+    let mut root = component(0, "/");
+    root.program = Some(lower_fixture_program(0, root_program));
+    root.slots.insert("api".to_string(), slot_decl);
+
+    let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: vec![external_binding(0, "api", 0, "api", true)],
+        exports: Vec::new(),
+    };
+
+    let scenario = assert_dce_idempotent(scenario);
+    let root_after = scenario
+        .components
+        .first()
+        .and_then(|component| component.as_ref())
+        .expect("root should remain");
+    assert!(
+        root_after.program.is_some(),
+        "root program must survive when it defines future-dynamic external affordances"
+    );
+    assert!(
+        root_after.slots.contains_key("api"),
+        "future-dynamic root external slot must survive DCE"
+    );
+    assert!(
+        scenario.bindings.iter().any(|binding| matches!(
+            &binding.from,
+            BindingFrom::External(slot)
+                if slot.component == ComponentId(0)
+                    && slot.name == "api"
+                    && binding.to.component == ComponentId(0)
+                    && binding.to.name == "api"
+        )),
+        "future-dynamic root external binding must survive DCE"
+    );
 }
 
 #[test]
@@ -1124,6 +1303,7 @@ fn dce_keeps_live_external_root_slot_when_export_makes_consumer_live() {
     green.provides.insert("a2a".to_string(), green_provide);
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(green)],
         bindings: vec![external_binding(0, "white", 1, "white", true)],
@@ -1182,6 +1362,7 @@ fn dce_keeps_live_external_root_slot_used_in_when_condition() {
     green.provides.insert("a2a".to_string(), green_provide);
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(green)],
         bindings: vec![external_binding(0, "white", 1, "white", true)],
@@ -1243,6 +1424,7 @@ fn dce_keeps_live_external_root_slot_used_in_env_when_condition() {
     green.provides.insert("a2a".to_string(), green_provide);
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(green)],
         bindings: vec![external_binding(0, "white", 1, "white", true)],
@@ -1289,6 +1471,7 @@ fn dce_keeps_externally_rooted_child_program_without_exports() {
     child.slots.insert("api".to_string(), slot_decl);
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(child)],
         bindings: vec![external_binding(0, "api", 1, "api", true)],
@@ -1336,6 +1519,7 @@ fn dce_keeps_externally_rooted_root_program_without_exports() {
     root.slots.insert("api".to_string(), slot_decl);
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: vec![external_binding(0, "api", 0, "api", true)],
@@ -1386,6 +1570,7 @@ fn dce_prunes_unused_external_binding_without_exports() {
     child.slots.insert("api".to_string(), slot_decl);
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(child)],
         bindings: vec![external_binding(0, "api", 1, "api", true)],
@@ -1449,6 +1634,7 @@ fn dce_keeps_internal_dependencies_of_externally_rooted_program_without_exports(
     provider.provides.insert("admin".to_string(), provide_http);
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(consumer), Some(provider)],
         bindings: vec![
@@ -1513,6 +1699,7 @@ fn dce_keeps_externally_rooted_program_when_slot_is_only_used_in_when_without_ex
     child.slots.insert("api".to_string(), slot_decl);
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(child)],
         bindings: vec![external_binding(0, "api", 1, "api", true)],
@@ -1630,6 +1817,7 @@ fn dce_keeps_all_slot_dependencies_for_externally_rooted_program_without_exports
     provider.provides.insert("admin".to_string(), provide_http);
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(consumer), Some(provider)],
         bindings: vec![
@@ -1708,6 +1896,7 @@ fn dce_prunes_dead_incoming_edges_of_live_externally_rooted_program() {
     provider.provides.insert("admin".to_string(), provide_http);
 
     let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(consumer), Some(provider)],
         bindings: vec![

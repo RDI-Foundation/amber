@@ -464,10 +464,12 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
         provides: BTreeMap::from([("http".to_string(), provide_http.clone())]),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),

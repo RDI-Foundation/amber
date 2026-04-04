@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use amber_manifest::{FrameworkCapabilityName, Manifest, ManifestDigest};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl, Scenario,
-    ScenarioExport, SlotRef, StorageResourceParams,
+    BindingEdge, BindingFrom, Component, ComponentId, FrameworkRef, Moniker, ProvideRef,
+    ResourceDecl, Scenario, ScenarioExport, SlotRef, StorageResourceParams,
 };
 
 use super::{render_dot, render_dot_with_exports};
@@ -22,6 +22,7 @@ fn component(id: usize, moniker: &str) -> Component {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     }
 }
@@ -114,6 +115,7 @@ fn dot_renders_clusters_and_edges() {
         components,
         bindings,
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     };
 
     let dot = render_dot(&scenario);
@@ -158,6 +160,7 @@ fn dot_renders_root_program_node() {
         components,
         bindings: Vec::new(),
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     };
 
     let dot = render_dot(&scenario);
@@ -178,9 +181,10 @@ fn dot_renders_root_program_node() {
 fn dot_renders_framework_bindings() {
     let components = vec![Some(component(0, "/")), Some(component(1, "/consumer"))];
     let bindings = vec![BindingEdge {
-        from: BindingFrom::Framework(
-            FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
-        ),
+        from: BindingFrom::Framework(FrameworkRef {
+            authority: ComponentId(0),
+            capability: FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
+        }),
         to: SlotRef {
             component: ComponentId(1),
             name: "control".to_string(),
@@ -193,6 +197,7 @@ fn dot_renders_framework_bindings() {
         components,
         bindings,
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     };
 
     let dot = render_dot(&scenario);
@@ -297,6 +302,7 @@ fn dot_renders_root_exports_as_endpoints() {
                 name: "out".to_string(),
             },
         }],
+        manifest_catalog: BTreeMap::new(),
     };
 
     let dot = render_dot_with_exports(&scenario).expect("dot rendering");
@@ -360,6 +366,7 @@ fn dot_renders_root_exports_from_root_component() {
                 name: "out".to_string(),
             },
         }],
+        manifest_catalog: BTreeMap::new(),
     };
 
     let dot = render_dot_with_exports(&scenario).expect("dot rendering");

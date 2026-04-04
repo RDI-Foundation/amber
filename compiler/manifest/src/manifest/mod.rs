@@ -16,13 +16,17 @@ use serde_with::{MapPreventDuplicates, serde_as};
 use crate::{
     error::Error,
     framework::{framework_capabilities, framework_capability},
-    names::{ChildName, ExportName, ProvideName, ResourceName, SlotName, ensure_name_no_dot},
+    names::{
+        ChildName, ExportName, ProvideName, ResourceName, SlotName, TemplateName,
+        ensure_name_no_dot,
+    },
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
-        Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ComponentDecl,
-        ConfigSchema, EnvironmentDecl, ExportTarget, LocalCapabilityRefKind, LocalComponentRef,
-        ManifestBinding, MountSource, Program, ProvideDecl, RawBinding, RawExportTarget,
-        RawProgram, ResourceDecl, SlotDecl, VmScalarU32,
+        Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind,
+        ChildTemplateAllowedManifests, ChildTemplateDecl, ComponentDecl, ConfigSchema,
+        EnvironmentDecl, ExportTarget, LocalCapabilityRefKind, LocalComponentRef, ManifestBinding,
+        MountSource, Program, ProvideDecl, RawBinding, RawExportTarget, RawProgram, ResourceDecl,
+        SlotDecl, VmScalarU32,
     },
 };
 
@@ -57,6 +61,9 @@ pub struct RawManifest {
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub resources: BTreeMap<String, ResourceDecl>,
+    #[serde_as(as = "MapPreventDuplicates<_, _>")]
+    #[serde(default)]
+    pub child_templates: BTreeMap<String, ChildTemplateDecl>,
     #[serde(default)]
     pub bindings: Vec<RawBinding>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
@@ -220,6 +227,15 @@ fn convert_resources(
         .collect::<Result<BTreeMap<_, _>, Error>>()
 }
 
+fn convert_child_templates(
+    child_templates: BTreeMap<String, ChildTemplateDecl>,
+) -> Result<BTreeMap<TemplateName, ChildTemplateDecl>, Error> {
+    child_templates
+        .into_iter()
+        .map(|(name, decl)| Ok((TemplateName::try_from(name)?, decl)))
+        .collect::<Result<BTreeMap<_, _>, Error>>()
+}
+
 fn validate_resource_decls(resources: &BTreeMap<ResourceName, ResourceDecl>) -> Result<(), Error> {
     for (name, resource) in resources {
         if resource.kind != CapabilityKind::Storage {
@@ -312,6 +328,76 @@ fn validate_no_ambiguous_capability(
             name: name.to_string(),
         });
     }
+    Ok(())
+}
+
+fn validate_child_templates(
+    child_templates: &BTreeMap<TemplateName, ChildTemplateDecl>,
+    slots: &BTreeMap<SlotName, SlotDecl>,
+    _bindings: &[RawBinding],
+) -> Result<(), Error> {
+    let declares_component_slot = slots
+        .values()
+        .any(|slot| slot.decl.kind == CapabilityKind::Component);
+    if !child_templates.is_empty() && !declares_component_slot {
+        return Err(Error::ChildTemplatesRequireComponentSlot);
+    }
+
+    for (template_name, template) in child_templates {
+        match (&template.manifest, &template.allowed_manifests) {
+            (Some(_), None) | (None, Some(_)) => {}
+            (Some(_), Some(_)) => {
+                return Err(Error::InvalidChildTemplate {
+                    template: template_name.to_string(),
+                    message: "exactly one of `manifest` or `allowed_manifests` must be present"
+                        .to_string(),
+                });
+            }
+            (None, None) => {
+                return Err(Error::InvalidChildTemplate {
+                    template: template_name.to_string(),
+                    message: "one of `manifest` or `allowed_manifests` is required".to_string(),
+                });
+            }
+        }
+
+        if let Some(reference) = &template.manifest {
+            validate_manifest_ref(reference)?;
+        }
+
+        if let Some(allowed) = &template.allowed_manifests {
+            match allowed {
+                ChildTemplateAllowedManifests::Refs(refs) => {
+                    if refs.is_empty() {
+                        return Err(Error::InvalidChildTemplate {
+                            template: template_name.to_string(),
+                            message: "`allowed_manifests` must not be empty".to_string(),
+                        });
+                    }
+                    for reference in refs {
+                        validate_manifest_ref(reference)?;
+                    }
+                }
+                ChildTemplateAllowedManifests::Selector(selector) => {
+                    if selector.root.trim().is_empty() {
+                        return Err(Error::InvalidChildTemplate {
+                            template: template_name.to_string(),
+                            message: "`allowed_manifests.root` must not be empty".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        for slot_name in template.bindings.keys() {
+            ensure_name_no_dot(slot_name, "slot")?;
+        }
+
+        for export_name in &template.visible_exports {
+            ensure_name_no_dot(export_name, "export")?;
+        }
+    }
+
     Ok(())
 }
 
@@ -700,6 +786,11 @@ fn validate_mounts(
                             help: framework_capability_help(),
                         });
                     };
+                    if spec.decl.kind == CapabilityKind::Component {
+                        return Err(Error::UnsupportedMountSource {
+                            mount: format!("framework.{capability}"),
+                        });
+                    }
                     require_framework_capability_feature(
                         capability,
                         spec.required_experimental_feature,
@@ -765,6 +856,7 @@ impl RawManifest {
             slots,
             provides,
             resources,
+            child_templates,
             bindings,
             exports,
             metadata,
@@ -787,12 +879,14 @@ impl RawManifest {
         let slots = convert_slots(slots)?;
         let provides = convert_provides(provides)?;
         let resources = convert_resources(resources)?;
+        let child_templates = convert_child_templates(child_templates)?;
 
         validate_environment_extends(&environments)?;
         validate_environment_cycles(&environments)?;
         validate_component_environments(&components, &environments)?;
         validate_no_ambiguous_capability(&slots, &provides)?;
         validate_resource_decls(&resources)?;
+        validate_child_templates(&child_templates, &slots, &bindings)?;
 
         let ctx = ValidateCtx {
             components: &components,
@@ -843,6 +937,7 @@ impl RawManifest {
             slots,
             provides,
             resources,
+            child_templates,
             bindings: bindings_out,
             exports: exports_out,
             metadata,
@@ -865,6 +960,7 @@ pub struct Manifest {
     slots: BTreeMap<SlotName, SlotDecl>,
     provides: BTreeMap<ProvideName, ProvideDecl>,
     resources: BTreeMap<ResourceName, ResourceDecl>,
+    child_templates: BTreeMap<TemplateName, ChildTemplateDecl>,
     bindings: Vec<ManifestBinding>,
     exports: BTreeMap<ExportName, ExportTarget>,
     metadata: Option<Value>,
@@ -912,6 +1008,10 @@ impl Manifest {
         &self.resources
     }
 
+    pub fn child_templates(&self) -> &BTreeMap<TemplateName, ChildTemplateDecl> {
+        &self.child_templates
+    }
+
     pub fn bindings(&self) -> &[ManifestBinding] {
         &self.bindings
     }
@@ -931,6 +1031,7 @@ impl Manifest {
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
+            child_templates: BTreeMap::new(),
             bindings: Vec::new(),
             exports: BTreeMap::new(),
             metadata: None,
@@ -961,6 +1062,7 @@ impl Manifest {
         #[builder(default)] slots: BTreeMap<String, SlotDecl>,
         #[builder(default)] provides: BTreeMap<String, ProvideDecl>,
         #[builder(default)] resources: BTreeMap<String, ResourceDecl>,
+        #[builder(default)] child_templates: BTreeMap<String, ChildTemplateDecl>,
         #[builder(default)] bindings: Vec<RawBinding>,
         #[builder(default)] exports: BTreeMap<String, RawExportTarget>,
         metadata: Option<Value>,
@@ -977,6 +1079,7 @@ impl Manifest {
             slots,
             provides,
             resources,
+            child_templates,
             bindings,
             exports,
             metadata,
@@ -1021,6 +1124,12 @@ impl From<&Manifest> for RawManifest {
 
         let resources = manifest
             .resources
+            .iter()
+            .map(|(name, decl)| (name.to_string(), decl.clone()))
+            .collect();
+
+        let child_templates = manifest
+            .child_templates
             .iter()
             .map(|(name, decl)| (name.to_string(), decl.clone()))
             .collect();
@@ -1103,6 +1212,7 @@ impl From<&Manifest> for RawManifest {
             slots,
             provides,
             resources,
+            child_templates,
             bindings,
             exports,
             metadata: manifest.metadata.clone(),

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use amber_manifest::CapabilityKind;
+use amber_mesh::{MeshProtocol, router_export_route_id};
 use amber_scenario::Scenario;
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +29,8 @@ pub struct RouterMetadata {
     pub mesh_port: u16,
     pub control_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_socket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_socket_volume: Option<String>,
@@ -39,6 +42,8 @@ pub struct ExportMetadata {
     pub provide: String,
     pub protocol: String,
     pub router_mesh_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,6 +80,14 @@ pub fn collect_exports_metadata(
     collect_exports(scenario, mesh_plan)
         .into_iter()
         .map(|(name, export)| {
+            let route_protocol = match export.protocol {
+                amber_manifest::NetworkProtocol::Http | amber_manifest::NetworkProtocol::Https => {
+                    MeshProtocol::Http
+                }
+                amber_manifest::NetworkProtocol::Tcp => MeshProtocol::Tcp,
+                other => panic!("unsupported mesh export protocol in proxy metadata: {other}"),
+            };
+            let route_id = router_export_route_id(&name, route_protocol);
             (
                 name,
                 ExportMetadata {
@@ -82,6 +95,7 @@ pub fn collect_exports_metadata(
                     provide: export.provide,
                     protocol: export.protocol.to_string(),
                     router_mesh_port,
+                    route_id: Some(route_id),
                 },
             )
         })

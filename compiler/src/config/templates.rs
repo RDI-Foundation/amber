@@ -160,6 +160,7 @@ mod tests {
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
+            child_templates: BTreeMap::new(),
             children: children.into_iter().map(ComponentId).collect(),
         }
     }

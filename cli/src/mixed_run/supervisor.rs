@@ -135,7 +135,12 @@ pub(super) fn external_slot_env_for_site(
         };
         env.insert(
             amber_compiler::mesh::external_slot_env_var(&link.external_slot_name),
-            external_slot_url(provider, link, consumer_kind)?,
+            external_slot_url(
+                provider,
+                Path::new(&provider.receipt.artifact_dir),
+                link,
+                consumer_kind,
+            )?,
         );
     }
     Ok(env)
@@ -245,8 +250,18 @@ pub(super) fn build_supervisor_plan(
             None
         },
         observability_endpoint: input.observability_endpoint.map(ToOwned::to_owned),
+        framework_ccs_plan_path: input
+            .framework_ccs_plan_path
+            .map(|path| path.display().to_string()),
+        site_actuator_plan_path: input
+            .site_actuator_plan_path
+            .map(|path| path.display().to_string()),
         launch_env,
     })
+}
+
+pub(super) fn write_site_actuator_plan(path: &Path, plan: &SiteActuatorPlan) -> Result<()> {
+    write_json(path, plan)
 }
 
 pub(super) fn spawn_site_supervisor(site_state_root: &Path) -> Result<SupervisorChild> {
@@ -338,7 +353,7 @@ pub(super) fn site_ready_timeout(site_plan: &RunSitePlan) -> Duration {
     }
 }
 
-pub(super) fn site_ready_timeout_for_kind(kind: SiteKind) -> Duration {
+pub(crate) fn site_ready_timeout_for_kind(kind: SiteKind) -> Duration {
     match kind {
         SiteKind::Kubernetes => KUBERNETES_WORKLOAD_READY_TIMEOUT + KUBERNETES_SITE_READY_BUFFER,
         SiteKind::Direct | SiteKind::Compose | SiteKind::Vm => Duration::from_secs(120),
@@ -389,6 +404,10 @@ pub(super) async fn register_new_site_links(
                 &launched.router_identity.id,
                 &consumer_key,
                 &link.protocol.to_string(),
+                Some(&router_export_route_id(
+                    &link.export_name,
+                    mesh_protocol(link.protocol)?,
+                )),
                 ROUTER_CONTROL_TIMEOUT,
             )
             .await?;
@@ -405,6 +424,10 @@ pub(super) async fn register_new_site_links(
                     peer_id: launched.router_identity.id.clone(),
                     peer_key_b64: consumer_key,
                     protocol: link.protocol.to_string(),
+                    route_id: Some(router_export_route_id(
+                        &link.export_name,
+                        mesh_protocol(link.protocol)?,
+                    )),
                 },
             )?;
             continue;
@@ -439,6 +462,10 @@ pub(super) async fn register_new_site_links(
             &consumer.router_identity.id,
             &consumer_key,
             &link.protocol.to_string(),
+            Some(&router_export_route_id(
+                &link.export_name,
+                mesh_protocol(link.protocol)?,
+            )),
             ROUTER_CONTROL_TIMEOUT,
         )
         .await?;
@@ -455,13 +482,17 @@ pub(super) async fn register_new_site_links(
                 peer_id: consumer.router_identity.id.clone(),
                 peer_key_b64: consumer_key,
                 protocol: link.protocol.to_string(),
+                route_id: Some(router_export_route_id(
+                    &link.export_name,
+                    mesh_protocol(link.protocol)?,
+                )),
             },
         )?;
     }
     Ok(())
 }
 
-pub(super) fn update_desired_links_for_consumer(
+pub(crate) fn update_desired_links_for_consumer(
     site_state_root: &Path,
     slot_name: &str,
     url: &str,
@@ -470,12 +501,7 @@ pub(super) fn update_desired_links_for_consumer(
     let mut state: DesiredLinkState = if path.is_file() {
         read_json(&path, "desired links")?
     } else {
-        DesiredLinkState {
-            schema: DESIRED_LINKS_SCHEMA.to_string(),
-            version: DESIRED_LINKS_VERSION,
-            external_slots: BTreeMap::new(),
-            export_peers: Vec::new(),
-        }
+        empty_desired_link_state()
     };
     state.external_slots.insert(
         amber_compiler::mesh::external_slot_env_var(slot_name),
@@ -484,7 +510,7 @@ pub(super) fn update_desired_links_for_consumer(
     write_json(&path, &state)
 }
 
-pub(super) fn update_desired_links_for_provider(
+pub(crate) fn update_desired_links_for_provider(
     site_state_root: &Path,
     peer: DesiredExportPeer,
 ) -> Result<()> {
@@ -492,17 +518,85 @@ pub(super) fn update_desired_links_for_provider(
     let mut state: DesiredLinkState = if path.is_file() {
         read_json(&path, "desired links")?
     } else {
-        DesiredLinkState {
-            schema: DESIRED_LINKS_SCHEMA.to_string(),
-            version: DESIRED_LINKS_VERSION,
-            external_slots: BTreeMap::new(),
-            export_peers: Vec::new(),
-        }
+        empty_desired_link_state()
     };
     if !state.export_peers.contains(&peer) {
         state.export_peers.push(peer);
     }
     write_json(&path, &state)
+}
+
+pub(crate) fn update_desired_overlay_for_consumer(
+    site_state_root: &Path,
+    overlay_id: &str,
+    overlay: DesiredExternalSlotOverlay,
+) -> Result<()> {
+    let path = desired_links_path(site_state_root);
+    let mut state: DesiredLinkState = if path.is_file() {
+        read_json(&path, "desired links")?
+    } else {
+        empty_desired_link_state()
+    };
+    state
+        .external_slot_overlays
+        .insert(overlay_id.to_string(), overlay);
+    write_json(&path, &state)
+}
+
+pub(crate) fn update_desired_overlay_for_provider(
+    site_state_root: &Path,
+    overlay_id: &str,
+    overlay: DesiredExportPeerOverlay,
+) -> Result<()> {
+    let path = desired_links_path(site_state_root);
+    let mut state: DesiredLinkState = if path.is_file() {
+        read_json(&path, "desired links")?
+    } else {
+        empty_desired_link_state()
+    };
+    state
+        .export_peer_overlays
+        .insert(overlay_id.to_string(), overlay);
+    write_json(&path, &state)
+}
+
+pub(crate) fn clear_desired_overlay_for_consumer(
+    site_state_root: &Path,
+    overlay_id: &str,
+) -> Result<()> {
+    let path = desired_links_path(site_state_root);
+    let mut state: DesiredLinkState = if path.is_file() {
+        read_json(&path, "desired links")?
+    } else {
+        return Ok(());
+    };
+    state.external_slot_overlays.remove(overlay_id);
+    write_json(&path, &state)
+}
+
+pub(crate) fn clear_desired_overlay_for_provider(
+    site_state_root: &Path,
+    overlay_id: &str,
+) -> Result<()> {
+    let path = desired_links_path(site_state_root);
+    let mut state: DesiredLinkState = if path.is_file() {
+        read_json(&path, "desired links")?
+    } else {
+        return Ok(());
+    };
+    state.export_peer_overlays.remove(overlay_id);
+    write_json(&path, &state)
+}
+
+fn empty_desired_link_state() -> DesiredLinkState {
+    DesiredLinkState {
+        schema: DESIRED_LINKS_SCHEMA.to_string(),
+        version: DESIRED_LINKS_VERSION,
+        external_slots: BTreeMap::new(),
+        export_peers: Vec::new(),
+        external_slot_overlays: BTreeMap::new(),
+        export_peer_overlays: BTreeMap::new(),
+    }
 }
 
 pub(super) fn launched_site_from_state(
@@ -557,7 +651,7 @@ pub(super) fn launched_site_from_state(
     })
 }
 
-pub(super) fn launched_site_from_receipt(
+pub(crate) fn launched_site_from_receipt(
     site_receipt: &SiteReceipt,
     mesh_scope: &str,
 ) -> Result<LaunchedSite> {
@@ -601,6 +695,34 @@ pub(super) async fn ensure_site_running(
 ) -> Result<()> {
     reap_child(&mut runtime.site_process)?;
     reap_child(&mut runtime.port_forward)?;
+    reap_child(&mut runtime.framework_ccs)?;
+    reap_child(&mut runtime.site_actuator)?;
+
+    if runtime.framework_ccs.is_none()
+        && let Some(plan_path) = plan.framework_ccs_plan_path.as_deref()
+    {
+        runtime.framework_ccs = Some(spawn_runtime_process(
+            &PathBuf::from(&plan.site_state_root),
+            "framework-ccs.log",
+            &plan.launch_env,
+            |cmd| {
+                cmd.arg("run-framework-ccs").arg("--plan").arg(plan_path);
+            },
+        )?);
+    }
+
+    if runtime.site_actuator.is_none()
+        && let Some(plan_path) = plan.site_actuator_plan_path.as_deref()
+    {
+        runtime.site_actuator = Some(spawn_runtime_process(
+            &PathBuf::from(&plan.site_state_root),
+            "site-actuator.log",
+            &plan.launch_env,
+            |cmd| {
+                cmd.arg("run-site-actuator").arg("--plan").arg(plan_path);
+            },
+        )?);
+    }
 
     match plan.kind {
         SiteKind::Direct => {
@@ -942,6 +1064,23 @@ pub(super) async fn apply_desired_links(
             return Ok(false);
         }
     }
+    for overlay in desired.external_slot_overlays.values() {
+        if run_until_stop(
+            run_root,
+            stop_requested,
+            register_external_slot_with_retry(
+                endpoint,
+                &overlay.slot_name,
+                &overlay.url,
+                Duration::from_secs(2),
+            ),
+        )
+        .await?
+        .is_none()
+        {
+            return Ok(false);
+        }
+    }
     for peer in &desired.export_peers {
         if run_until_stop(
             run_root,
@@ -952,6 +1091,27 @@ pub(super) async fn apply_desired_links(
                 &peer.peer_id,
                 &peer.peer_key_b64,
                 &peer.protocol,
+                peer.route_id.as_deref(),
+                Duration::from_secs(2),
+            ),
+        )
+        .await?
+        .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    for overlay in desired.export_peer_overlays.values() {
+        if run_until_stop(
+            run_root,
+            stop_requested,
+            register_export_peer_with_retry(
+                endpoint,
+                &overlay.export_name,
+                &overlay.peer_id,
+                &overlay.peer_key_b64,
+                &overlay.protocol,
+                overlay.route_id.as_deref(),
                 Duration::from_secs(2),
             ),
         )
@@ -970,6 +1130,8 @@ pub(super) async fn cleanup_site(
 ) -> Result<()> {
     reap_child(&mut runtime.site_process)?;
     reap_child(&mut runtime.port_forward)?;
+    reap_child(&mut runtime.framework_ccs)?;
+    reap_child(&mut runtime.site_actuator)?;
 
     if let Some(child) = runtime.site_process.as_mut() {
         stop_child(child).await?;
@@ -977,9 +1139,17 @@ pub(super) async fn cleanup_site(
     if let Some(child) = runtime.port_forward.as_mut() {
         stop_child(child).await?;
     }
+    if let Some(child) = runtime.framework_ccs.as_mut() {
+        stop_child(child).await?;
+    }
+    if let Some(child) = runtime.site_actuator.as_mut() {
+        stop_child(child).await?;
+    }
     runtime.site_process = None;
     runtime.site_started = false;
     runtime.port_forward = None;
+    runtime.framework_ccs = None;
+    runtime.site_actuator = None;
 
     match plan.kind {
         SiteKind::Compose => {
@@ -988,6 +1158,7 @@ pub(super) async fn cleanup_site(
                     .envs(plan.launch_env.clone())
                     .arg("down")
                     .arg("-v")
+                    .arg("--remove-orphans")
                     .status()
                     .into_diagnostic()
                     .wrap_err_with(|| format!("failed to stop compose site `{}`", plan.site_id))?;
@@ -1021,6 +1192,7 @@ pub(super) async fn cleanup_site(
         }
         SiteKind::Direct | SiteKind::Vm => {}
     }
+    cleanup_dynamic_site_children(Path::new(&plan.site_state_root), plan.kind)?;
     Ok(())
 }
 
@@ -1226,58 +1398,174 @@ pub(super) fn ensure_kubernetes_namespace(plan: &SiteSupervisorPlan) -> Result<(
 pub(super) fn ensure_kubernetes_workloads_ready(plan: &SiteSupervisorPlan) -> Result<()> {
     let namespace = required_str(plan.kubernetes_namespace.as_deref(), "kubernetes namespace")?;
     let context = plan.context.as_deref();
-    let timeout = format!("{}s", KUBERNETES_WORKLOAD_READY_TIMEOUT.as_secs());
-    let checks = [
-        (
-            "wait for kubernetes jobs",
-            vec![
-                "-n",
-                namespace,
-                "wait",
-                "--for=condition=complete",
-                "--timeout",
-                timeout.as_str(),
-                "job",
-                "--all",
-            ],
+    let expected = kubernetes_expected_workloads(Path::new(&plan.artifact_dir))?;
+    wait_for_named_kubernetes_resources(
+        context,
+        namespace,
+        "job",
+        "condition=complete",
+        &expected.jobs,
+        &format!("wait for kubernetes jobs for site `{}`", plan.site_id),
+    )?;
+    wait_for_named_kubernetes_resources(
+        context,
+        namespace,
+        "deployment",
+        "condition=available",
+        &expected.deployments,
+        &format!(
+            "wait for kubernetes deployments for site `{}`",
+            plan.site_id
         ),
-        (
-            "wait for kubernetes deployments",
-            vec![
-                "-n",
-                namespace,
-                "wait",
-                "--for=condition=available",
-                "--timeout",
-                timeout.as_str(),
-                "deployment",
-                "--all",
-            ],
-        ),
-    ];
+    )?;
+    Ok(())
+}
 
-    for (label, args) in checks {
-        let output = kubectl_command(context)
-            .args(args)
-            .output()
-            .into_diagnostic()
-            .wrap_err_with(|| format!("{label} for site `{}`", plan.site_id))?;
-        if output.status.success() {
+#[derive(Default)]
+pub(super) struct KubernetesArtifactWorkloads {
+    pub(super) jobs: Vec<String>,
+    pub(super) deployments: Vec<String>,
+}
+
+pub(super) fn kubernetes_expected_workloads(
+    artifact_dir: &Path,
+) -> Result<KubernetesArtifactWorkloads> {
+    let mut jobs = BTreeSet::new();
+    let mut deployments = BTreeSet::new();
+    for path in walk_files(artifact_dir)? {
+        if !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("yaml" | "yml")
+        ) {
             continue;
         }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let raw = fs::read_to_string(&path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read kubernetes artifact {}", path.display()))?;
+        for document in serde_yaml::Deserializer::from_str(&raw) {
+            use serde::Deserialize as _;
+
+            let value = serde_yaml::Value::deserialize(document)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to parse kubernetes artifact {}", path.display())
+                })?;
+            let kind = value
+                .get("kind")
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or_default();
+            let name = value
+                .get("metadata")
+                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(|metadata| metadata.get(serde_yaml::Value::String("name".to_string())))
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            match kind {
+                "Job" => {
+                    jobs.insert(name.to_string());
+                }
+                "Deployment" => {
+                    deployments.insert(name.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(KubernetesArtifactWorkloads {
+        jobs: jobs.into_iter().collect(),
+        deployments: deployments.into_iter().collect(),
+    })
+}
+
+fn wait_for_named_kubernetes_resources(
+    context: Option<&str>,
+    namespace: &str,
+    resource_kind: &str,
+    condition: &str,
+    names: &[String],
+    label: &str,
+) -> Result<()> {
+    for name in names {
+        wait_for_named_kubernetes_resource(
+            context,
+            namespace,
+            resource_kind,
+            condition,
+            name,
+            label,
+        )?;
+    }
+    Ok(())
+}
+
+fn wait_for_named_kubernetes_resource(
+    context: Option<&str>,
+    namespace: &str,
+    resource_kind: &str,
+    condition: &str,
+    name: &str,
+    label: &str,
+) -> Result<()> {
+    let resource = format!("{resource_kind}/{name}");
+    let deadline = Instant::now() + KUBERNETES_WORKLOAD_READY_TIMEOUT;
+    loop {
+        let get_output = kubectl_command(context)
+            .args(["-n", namespace, "get", resource.as_str()])
+            .output()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("{label}: query {resource}"))?;
+        if !get_output.status.success() {
+            if Instant::now() >= deadline {
+                let stderr = String::from_utf8_lossy(&get_output.stderr)
+                    .trim()
+                    .to_string();
+                let detail = if stderr.is_empty() {
+                    format!("status {}", get_output.status)
+                } else {
+                    stderr
+                };
+                return Err(miette::miette!("{label} failed: {detail}"));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = format!("{}s", remaining.as_secs().max(1));
+        let wait_output = kubectl_command(context)
+            .args([
+                "-n",
+                namespace,
+                "wait",
+                "--for",
+                condition,
+                "--timeout",
+                timeout.as_str(),
+                resource.as_str(),
+            ])
+            .output()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("{label}: wait for {resource}"))?;
+        if wait_output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&wait_output.stderr)
+            .trim()
+            .to_string();
+        if stderr.contains("not found") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
         let detail = if stderr.is_empty() {
-            format!("status {}", output.status)
+            format!("status {}", wait_output.status)
         } else {
             stderr
         };
-        return Err(miette::miette!(
-            "{label} for site `{}` failed: {detail}",
-            plan.site_id
-        ));
+        return Err(miette::miette!("{label} failed: {detail}"));
     }
-
-    Ok(())
 }
 
 pub(super) fn compose_project_name(run_id: &str, site_id: &str) -> String {
@@ -1464,20 +1752,40 @@ pub(super) async fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
     }
 }
 
-pub(super) async fn resolve_link_external_url(
+pub(crate) async fn resolve_link_external_url(
     provider: &LaunchedSite,
     link: &RunLink,
     consumer_kind: SiteKind,
     run_root: &Path,
     bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
 ) -> Result<String> {
+    resolve_link_external_url_for_output(
+        provider,
+        Path::new(&provider.receipt.artifact_dir),
+        link,
+        consumer_kind,
+        run_root,
+        bridge_proxies,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_link_external_url_for_output(
+    provider: &LaunchedSite,
+    provider_output_dir: &Path,
+    link: &RunLink,
+    consumer_kind: SiteKind,
+    run_root: &Path,
+    bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
+) -> Result<String> {
     if !link_needs_bridge_proxy(provider.receipt.kind, consumer_kind) {
-        return external_slot_url(provider, link, consumer_kind);
+        return external_slot_url(provider, provider_output_dir, link, consumer_kind);
     }
 
     let port = ensure_bridge_proxy(
         run_root,
         provider,
+        provider_output_dir,
         &link.export_name,
         consumer_kind,
         bridge_proxies,
@@ -1486,18 +1794,21 @@ pub(super) async fn resolve_link_external_url(
     bridge_proxy_external_url(port, link.protocol, consumer_kind)
 }
 
-pub(super) fn link_needs_bridge_proxy(_provider_kind: SiteKind, consumer_kind: SiteKind) -> bool {
+pub(super) fn link_needs_bridge_proxy(provider_kind: SiteKind, consumer_kind: SiteKind) -> bool {
     matches!(consumer_kind, SiteKind::Compose | SiteKind::Kubernetes)
+        && provider_kind != SiteKind::Kubernetes
 }
 
 pub(super) async fn ensure_bridge_proxy(
     run_root: &Path,
     provider: &LaunchedSite,
+    provider_output_dir: &Path,
     export_name: &str,
     consumer_kind: SiteKind,
     bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
 ) -> Result<u16> {
     let key = BridgeProxyKey {
+        provider_output_dir: provider_output_dir.display().to_string(),
         export_name: export_name.to_string(),
         consumer_kind,
     };
@@ -1508,7 +1819,7 @@ pub(super) async fn ensure_bridge_proxy(
     }
 
     let listen = bridge_proxy_bind_addr(consumer_kind, reserve_loopback_port()?);
-    let child = spawn_bridge_proxy(run_root, provider, export_name, listen)?;
+    let child = spawn_bridge_proxy(run_root, provider, provider_output_dir, export_name, listen)?;
     wait_for_socket_listener(bridge_proxy_probe_addr(listen)).await?;
     bridge_proxies.insert(
         key,
@@ -1524,6 +1835,7 @@ pub(super) async fn ensure_bridge_proxy(
 pub(super) fn spawn_bridge_proxy(
     run_root: &Path,
     provider: &LaunchedSite,
+    provider_output_dir: &Path,
     export_name: &str,
     listen: SocketAddr,
 ) -> Result<Child> {
@@ -1534,7 +1846,7 @@ pub(super) fn spawn_bridge_proxy(
     let log_path = logs_root.join(format!("{export_name}.log"));
     spawn_detached_child(run_root, &log_path, |cmd| {
         cmd.arg("proxy")
-            .arg(&provider.receipt.artifact_dir)
+            .arg(provider_output_dir)
             .arg("--export")
             .arg(bridge_proxy_export_binding(export_name, listen));
         if provider.receipt.kind == SiteKind::Kubernetes {
@@ -1552,7 +1864,7 @@ pub(super) fn bridge_proxy_export_binding(export_name: &str, listen: SocketAddr)
 }
 
 pub(super) fn bridge_proxy_bind_addr(consumer_kind: SiteKind, port: u16) -> SocketAddr {
-    host_proxy_bind_addr(consumer_needs_host_wide_listener(consumer_kind), port)
+    host_service_bind_addr_for_consumer(consumer_kind, port)
 }
 
 pub(super) fn bridge_proxy_probe_addr(listen: SocketAddr) -> SocketAddr {
@@ -1564,7 +1876,7 @@ pub(super) fn bridge_proxy_external_url(
     protocol: NetworkProtocol,
     consumer_kind: SiteKind,
 ) -> Result<String> {
-    let host = bridge_proxy_host_for_consumer(consumer_kind);
+    let host = host_service_host_for_consumer(consumer_kind);
     Ok(match protocol {
         NetworkProtocol::Http | NetworkProtocol::Https => format!("http://{host}:{port}"),
         NetworkProtocol::Tcp => format!("tcp://{host}:{port}"),
@@ -1576,7 +1888,7 @@ pub(super) fn bridge_proxy_external_url(
     })
 }
 
-pub(super) fn bridge_proxy_host_for_consumer(consumer_kind: SiteKind) -> String {
+pub(crate) fn host_service_host_for_consumer(consumer_kind: SiteKind) -> String {
     match consumer_kind {
         SiteKind::Compose => CONTAINER_HOST_ALIAS.to_string(),
         SiteKind::Direct | SiteKind::Vm | SiteKind::Kubernetes => {
@@ -1587,6 +1899,13 @@ pub(super) fn bridge_proxy_host_for_consumer(consumer_kind: SiteKind) -> String 
 
 pub(super) fn consumer_needs_host_wide_listener(consumer_kind: SiteKind) -> bool {
     matches!(consumer_kind, SiteKind::Compose | SiteKind::Kubernetes)
+}
+
+pub(crate) fn host_service_bind_addr_for_consumer(
+    consumer_kind: SiteKind,
+    port: u16,
+) -> SocketAddr {
+    host_proxy_bind_addr(consumer_needs_host_wide_listener(consumer_kind), port)
 }
 
 pub(super) fn host_proxy_bind_addr(needs_host_wide_listener: bool, port: u16) -> SocketAddr {
@@ -1607,10 +1926,12 @@ pub(super) fn listener_probe_addr(listen: SocketAddr) -> SocketAddr {
 
 pub(super) fn external_slot_url(
     provider: &LaunchedSite,
+    provider_output_dir: &Path,
     link: &RunLink,
     consumer_kind: SiteKind,
 ) -> Result<String> {
     let host = container_host_for_consumer(provider.receipt.kind, consumer_kind);
+    let route_id = provider_export_route_id(provider_output_dir, link)?;
     let mut mesh_url = Url::parse(&format!("mesh://{}:{}", host, provider.router_addr.port()))
         .into_diagnostic()
         .wrap_err("failed to build mesh link url")?;
@@ -1620,12 +1941,23 @@ pub(super) fn external_slot_url(
         .query_pairs_mut()
         .append_pair("peer_id", &provider.router_identity.id)
         .append_pair("peer_key", &peer_key)
-        .append_pair(
-            "route_id",
-            &router_export_route_id(&link.export_name, mesh_protocol(link.protocol)?),
-        )
+        .append_pair("route_id", &route_id)
         .append_pair("capability", &link.export_name);
     Ok(mesh_url.to_string())
+}
+
+fn provider_export_route_id(provider_output_dir: &Path, link: &RunLink) -> Result<String> {
+    if let Some(route_id) = load_output_proxy_metadata(provider_output_dir)?
+        .exports
+        .get(&link.export_name)
+        .and_then(|export| export.route_id.clone())
+    {
+        return Ok(route_id);
+    }
+    Ok(router_export_route_id(
+        &link.export_name,
+        mesh_protocol(link.protocol)?,
+    ))
 }
 
 pub(super) fn container_host_for_consumer(

@@ -9,20 +9,23 @@ mod sites;
 mod provenance;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
 use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
-    ExportName, ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, ProgramConfigUseSite, framework_capability, span_for_json_pointer,
+    ChildTemplateAllowedManifests, ExportName, ExportTarget, InterpolatedPart, InterpolatedString,
+    InterpolationSource, Manifest, ManifestDigest, ProgramConfigUseSite, framework_capability,
+    span_for_json_pointer,
 };
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, ProgramMount, ProvideRef,
+    BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
+    FrameworkRef, ManifestCatalogEntry, ProgramMount, ProvideRef,
     ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
-    StorageResourceParams as ScenarioStorageResourceParams, graph::component_path_for,
+    StorageResourceParams as ScenarioStorageResourceParams, TemplateBinding, TemplateConfigField,
+    graph::component_path_for,
 };
 use jsonschema::Validator;
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -367,6 +370,14 @@ pub enum Error {
         feature: &'static str,
     },
 
+    #[error("invalid child template `{template}` on {component_path}: {message}")]
+    #[diagnostic(code(linker::invalid_child_template))]
+    InvalidChildTemplate {
+        component_path: String,
+        template: String,
+        message: String,
+    },
+
     #[error("dependency cycle detected: {cycle}")]
     #[diagnostic(
         code(linker::dependency_cycle),
@@ -394,17 +405,54 @@ struct ResolvedExport {
     decl: CapabilityDecl,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FrozenChildTemplateContract {
+    config: BTreeMap<String, TemplateConfigField>,
+    bindings: BTreeMap<String, TemplateBinding>,
+    slot_decls: BTreeMap<String, amber_manifest::SlotDecl>,
+    visible_exports: Vec<String>,
+}
+
+type FrozenTemplateBindings = (
+    BTreeMap<String, TemplateBinding>,
+    BTreeMap<String, amber_manifest::SlotDecl>,
+);
+
+struct FrozenTemplateVariantContext<'a> {
+    scenario: &'a Scenario,
+    manifests: &'a [Option<Arc<Manifest>>],
+    link_index: &'a [LinkIndex],
+    authority_realm: ComponentId,
+    template_name: &'a str,
+    manifest_catalog_key: &'a str,
+    template: &'a ChildTemplate,
+    manifest: &'a Manifest,
+}
+
+struct FlattenState<'a> {
+    store: &'a DigestStore,
+    manifest_catalog: &'a mut BTreeMap<String, ManifestCatalogEntry>,
+    out: &'a mut Vec<Option<Component>>,
+    provenance: &'a mut Provenance,
+    link_index: &'a mut Vec<LinkIndex>,
+}
+
 pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Provenance), Error> {
     let mut components = Vec::new();
     let mut link_index = Vec::new();
     let mut provenance = Provenance::default();
+    let mut manifest_catalog = BTreeMap::new();
     let root = flatten(
         &tree.root,
         None,
         "/",
-        &mut components,
-        &mut provenance,
-        &mut link_index,
+        &mut FlattenState {
+            store,
+            manifest_catalog: &mut manifest_catalog,
+            out: &mut components,
+            provenance: &mut provenance,
+            link_index: &mut link_index,
+        },
     );
 
     debug_assert_eq!(components.len(), provenance.components.len());
@@ -528,6 +576,11 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     let root_manifest = manifests[root.0]
         .as_ref()
         .expect("root manifest should exist");
+    let root_has_program = components[root.0]
+        .as_ref()
+        .expect("root component should exist")
+        .program
+        .is_some();
     let root_program_slots = collect_program_slot_uses(
         components[root.0]
             .as_ref()
@@ -543,6 +596,17 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         root_program_slots.clone(),
     );
     let binding_edges = resolve_binding_edges(&mut resolver, &bindings, &mut errors);
+    if root_has_program {
+        for slot_name in root_manifest.slots().keys() {
+            let _ = resolver.resolve_slot(
+                &SlotRef {
+                    component: root,
+                    name: slot_name.to_string(),
+                },
+                &mut errors,
+            );
+        }
+    }
     let external_root_slots = resolver.external_root_slots();
     validate_all_slots_bound(
         &components,
@@ -603,15 +667,16 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
                                     });
                                     None
                                 }
-                                BindingFrom::Framework(name) => {
+                                BindingFrom::Framework(framework) => {
                                     errors.push(Error::InvalidExport {
                                         component_path: describe_component_path(
                                             &component_path_for(&components, root),
                                         ),
                                         name: export_name.to_string(),
                                         message: format!(
-                                            "target resolves to framework.{name}, which cannot be \
-                                             exported"
+                                            "target resolves to framework.{}, which cannot be \
+                                             exported",
+                                            framework.capability
                                         ),
                                         help: "Export a component provide or child export instead."
                                             .to_string(),
@@ -698,22 +763,17 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         }
     }
 
-    if !errors.is_empty() {
-        return Err(Error::Multiple {
-            count: errors.len(),
-            errors,
-        });
-    }
-
     let mut binding_edges = binding_edges;
-    if !root_program_slots.is_empty() {
+    if root_has_program {
         let mut seen = HashSet::new();
         for edge in &binding_edges {
             if edge.to.component == root {
                 seen.insert(edge.to.name.clone());
             }
         }
-        for slot in root_program_slots {
+        let mut external_root_slots = external_root_slots.into_iter().collect::<Vec<_>>();
+        external_root_slots.sort();
+        for slot in external_root_slots {
             if seen.contains(&slot) {
                 continue;
             }
@@ -734,8 +794,17 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         components,
         bindings: binding_edges,
         exports,
+        manifest_catalog,
     };
     scenario.normalize_order();
+    freeze_child_template_contracts(&mut scenario, &manifests, &link_index, &mut errors);
+
+    if !errors.is_empty() {
+        return Err(Error::Multiple {
+            count: errors.len(),
+            errors,
+        });
+    }
 
     if let Some(err) = dependency_cycle_error(&scenario, &bindings, &provenance, store) {
         return Err(err);
@@ -749,11 +818,9 @@ fn flatten(
     node: &ResolvedNode,
     parent: Option<ComponentId>,
     parent_path: &str,
-    out: &mut Vec<Option<Component>>,
-    prov: &mut Provenance,
-    link_index: &mut Vec<LinkIndex>,
+    state: &mut FlattenState<'_>,
 ) -> ComponentId {
-    let id = ComponentId(out.len());
+    let id = ComponentId(state.out.len());
 
     let authored_moniker: Arc<str> = if parent.is_none() {
         Arc::from("/")
@@ -764,8 +831,9 @@ fn flatten(
     };
 
     let moniker = Arc::clone(&authored_moniker).into();
+    let child_templates = lower_child_templates(node, state.store, state.manifest_catalog);
 
-    out.push(Some(Component {
+    state.out.push(Some(Component {
         id,
         parent,
         moniker,
@@ -776,12 +844,13 @@ fn flatten(
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
+        child_templates,
         metadata: None,
         children: Vec::new(),
     }));
-    link_index.push(LinkIndex::default());
+    state.link_index.push(LinkIndex::default());
 
-    prov.components.push(ComponentProvenance {
+    state.provenance.components.push(ComponentProvenance {
         authored_moniker: Arc::clone(&authored_moniker).into(),
         declared_ref: node.declared_ref.clone(),
         resolved_url: node.resolved_url.clone(),
@@ -792,23 +861,592 @@ fn flatten(
     let mut children = Vec::with_capacity(node.children.len());
     let mut child_by_name = BTreeMap::new();
     for (child_name, child_node) in node.children.iter() {
-        let child_id = flatten(
-            child_node,
-            Some(id),
-            authored_moniker.as_ref(),
-            out,
-            prov,
-            link_index,
-        );
+        let child_id = flatten(child_node, Some(id), authored_moniker.as_ref(), state);
         children.push(child_id);
         let child_name =
             ChildName::try_from(child_name.as_str()).expect("child name should be validated");
         child_by_name.insert(child_name, child_id);
     }
 
-    out[id.0].as_mut().expect("component should exist").children = children;
-    link_index[id.0].child_by_name = child_by_name;
+    state.out[id.0]
+        .as_mut()
+        .expect("component should exist")
+        .children = children;
+    state.link_index[id.0].child_by_name = child_by_name;
     id
+}
+
+fn lower_child_templates(
+    node: &ResolvedNode,
+    store: &DigestStore,
+    manifest_catalog: &mut BTreeMap<String, ManifestCatalogEntry>,
+) -> BTreeMap<String, ChildTemplate> {
+    let mut out = BTreeMap::new();
+
+    for (template_name, template) in &node.child_templates {
+        for manifest in &template.manifests {
+            collect_manifest_catalog_entries(&manifest.root, store, manifest_catalog);
+        }
+
+        let manifest_keys = template
+            .manifests
+            .iter()
+            .map(|manifest| catalog_key(&manifest.source_ref))
+            .collect::<Vec<_>>();
+
+        let (manifest, allowed_manifests) = match (
+            template.decl.manifest.as_ref(),
+            template.decl.allowed_manifests.as_ref(),
+        ) {
+            (Some(_), None) => (manifest_keys.first().cloned(), None),
+            (None, Some(ChildTemplateAllowedManifests::Refs(_)))
+            | (None, Some(ChildTemplateAllowedManifests::Selector(_))) => {
+                (None, Some(manifest_keys))
+            }
+            (Some(_), Some(_)) | (None, None) => unreachable!("manifest validation handles this"),
+            (None, Some(_)) => unreachable!("manifest validation handles this"),
+        };
+
+        out.insert(
+            template_name.clone(),
+            ChildTemplate {
+                frozen: false,
+                manifest,
+                allowed_manifests,
+                config: template
+                    .decl
+                    .config
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            TemplateConfigField::Prefilled {
+                                value: value.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                bindings: template
+                    .decl
+                    .bindings
+                    .iter()
+                    .map(|(name, selector)| {
+                        (
+                            name.clone(),
+                            TemplateBinding::Prefilled {
+                                selector: selector.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                slot_decls: BTreeMap::new(),
+                visible_exports: (!template.decl.visible_exports.is_empty())
+                    .then(|| template.decl.visible_exports.clone()),
+                limits: template
+                    .decl
+                    .limits
+                    .as_ref()
+                    .map(|limits| ChildTemplateLimits {
+                        max_live_children: limits.max_live_children,
+                        name_pattern: limits.name_pattern.clone(),
+                    }),
+                possible_backends: template.decl.possible_backends.clone(),
+            },
+        );
+    }
+
+    out
+}
+
+fn freeze_child_template_contracts(
+    scenario: &mut Scenario,
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
+    errors: &mut Vec<Error>,
+) {
+    let component_ids = scenario
+        .components_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    for component_id in component_ids {
+        let Some(component) = scenario.components[component_id.0].as_ref() else {
+            continue;
+        };
+        if component.child_templates.is_empty() {
+            continue;
+        }
+        let templates = component.child_templates.clone();
+        let mut frozen_templates = BTreeMap::new();
+        let error_count = errors.len();
+        for (template_name, template) in &templates {
+            match freeze_child_template_contract(
+                scenario,
+                manifests,
+                link_index,
+                component_id,
+                template_name,
+                template,
+            ) {
+                Ok(template) => {
+                    frozen_templates.insert(template_name.clone(), template);
+                }
+                Err(err) => errors.push(err),
+            }
+        }
+        if errors.len() == error_count {
+            scenario.component_mut(component_id).child_templates = frozen_templates;
+        }
+    }
+}
+
+fn freeze_child_template_contract(
+    scenario: &Scenario,
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
+    authority_realm: ComponentId,
+    template_name: &str,
+    template: &ChildTemplate,
+) -> Result<ChildTemplate, Error> {
+    let manifest_keys = template_manifest_keys(template);
+    let Some((first_key, rest)) = manifest_keys.split_first() else {
+        return Err(invalid_child_template_error(
+            scenario,
+            authority_realm,
+            template_name,
+            "must specify at least one manifest variant",
+        ));
+    };
+    let mut contract = freeze_manifest_template_contract(
+        scenario,
+        manifests,
+        link_index,
+        authority_realm,
+        template_name,
+        template,
+        first_key,
+    )?;
+    for key in rest {
+        let candidate = freeze_manifest_template_contract(
+            scenario,
+            manifests,
+            link_index,
+            authority_realm,
+            template_name,
+            template,
+            key,
+        )?;
+        if candidate != contract {
+            return Err(invalid_child_template_error(
+                scenario,
+                authority_realm,
+                template_name,
+                format!(
+                    "allowed manifests `{first_key}` and `{key}` present different frozen \
+                     template interfaces after applying the template's prefilled config, \
+                     bindings, and visible exports"
+                ),
+            ));
+        }
+    }
+
+    Ok(ChildTemplate {
+        frozen: true,
+        manifest: template.manifest.clone(),
+        allowed_manifests: template.allowed_manifests.clone(),
+        config: std::mem::take(&mut contract.config),
+        bindings: std::mem::take(&mut contract.bindings),
+        slot_decls: std::mem::take(&mut contract.slot_decls),
+        visible_exports: Some(std::mem::take(&mut contract.visible_exports)),
+        limits: template.limits.clone(),
+        possible_backends: template.possible_backends.clone(),
+    })
+}
+
+fn freeze_manifest_template_contract(
+    scenario: &Scenario,
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
+    authority_realm: ComponentId,
+    template_name: &str,
+    template: &ChildTemplate,
+    manifest_catalog_key: &str,
+) -> Result<FrozenChildTemplateContract, Error> {
+    let manifest = scenario
+        .manifest_catalog
+        .get(manifest_catalog_key)
+        .map(|entry| &entry.manifest)
+        .ok_or_else(|| {
+            invalid_child_template_error(
+                scenario,
+                authority_realm,
+                template_name,
+                format!("references missing manifest catalog key `{manifest_catalog_key}`"),
+            )
+        })?;
+
+    let ctx = FrozenTemplateVariantContext {
+        scenario,
+        manifests,
+        link_index,
+        authority_realm,
+        template_name,
+        manifest_catalog_key,
+        template,
+        manifest,
+    };
+
+    let config = freeze_template_config_fields(&ctx)?;
+    let (bindings, slot_decls) = freeze_template_binding_fields(&ctx)?;
+    let visible_exports = freeze_template_visible_exports(&ctx)?;
+    Ok(FrozenChildTemplateContract {
+        config,
+        bindings,
+        slot_decls,
+        visible_exports,
+    })
+}
+
+fn freeze_template_config_fields(
+    ctx: &FrozenTemplateVariantContext<'_>,
+) -> Result<BTreeMap<String, TemplateConfigField>, Error> {
+    let Some(schema) = ctx.manifest.config_schema() else {
+        if let Some(name) = ctx.template.config.keys().next() {
+            return Err(invalid_child_template_error(
+                ctx.scenario,
+                ctx.authority_realm,
+                ctx.template_name,
+                format!(
+                    "prefills config field `{name}`, but manifest `{}` does not declare config",
+                    ctx.manifest_catalog_key
+                ),
+            ));
+        }
+        return Ok(BTreeMap::new());
+    };
+
+    let properties = schema
+        .0
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .collect::<BTreeMap<_, _>>();
+    for name in ctx.template.config.keys() {
+        if !properties.contains_key(name) {
+            return Err(invalid_child_template_error(
+                ctx.scenario,
+                ctx.authority_realm,
+                ctx.template_name,
+                format!(
+                    "prefills config field `{name}`, but manifest `{}` does not declare it",
+                    ctx.manifest_catalog_key
+                ),
+            ));
+        }
+    }
+
+    let required = schema
+        .0
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<BTreeSet<_>>();
+    Ok(properties
+        .keys()
+        .map(|name| {
+            let field = ctx
+                .template
+                .config
+                .get(*name)
+                .map(|field| match field {
+                    TemplateConfigField::Prefilled { value } => TemplateConfigField::Prefilled {
+                        value: value.clone(),
+                    },
+                    TemplateConfigField::Open { .. } => {
+                        unreachable!("unfrozen child templates do not store open config fields")
+                    }
+                })
+                .unwrap_or(TemplateConfigField::Open {
+                    required: required.contains(name.as_str()),
+                });
+            ((*name).clone(), field)
+        })
+        .collect())
+}
+
+fn freeze_template_binding_fields(
+    ctx: &FrozenTemplateVariantContext<'_>,
+) -> Result<FrozenTemplateBindings, Error> {
+    for slot_name in ctx.template.bindings.keys() {
+        if !ctx.manifest.slots().contains_key(slot_name.as_str()) {
+            return Err(invalid_child_template_error(
+                ctx.scenario,
+                ctx.authority_realm,
+                ctx.template_name,
+                format!(
+                    "prefills binding `{slot_name}`, but manifest `{}` does not declare that slot",
+                    ctx.manifest_catalog_key
+                ),
+            ));
+        }
+    }
+
+    let mut bindings = BTreeMap::new();
+    let mut slot_decls = BTreeMap::new();
+    for (slot_name, slot_decl) in ctx.manifest.slots() {
+        if let Some(binding) = ctx.template.bindings.get(slot_name.as_str()) {
+            let selector = match binding {
+                TemplateBinding::Prefilled { selector } => selector,
+                TemplateBinding::Open { .. } => {
+                    unreachable!("unfrozen child templates do not store open bindings")
+                }
+            };
+            let source_decl = template_binding_selector_decl(
+                ctx.scenario,
+                ctx.manifests,
+                ctx.link_index,
+                ctx.authority_realm,
+                selector,
+            )
+            .map_err(|message| {
+                invalid_child_template_error(
+                    ctx.scenario,
+                    ctx.authority_realm,
+                    ctx.template_name,
+                    message,
+                )
+            })?;
+            if source_decl.kind != slot_decl.decl.kind
+                || source_decl.profile != slot_decl.decl.profile
+            {
+                return Err(invalid_child_template_error(
+                    ctx.scenario,
+                    ctx.authority_realm,
+                    ctx.template_name,
+                    format!(
+                        "prefilled binding `{slot_name}` resolves `{selector}` as \
+                         `{source_decl}`, but manifest `{}` expects `{}`",
+                        ctx.manifest_catalog_key, slot_decl.decl
+                    ),
+                ));
+            }
+            bindings.insert(
+                slot_name.to_string(),
+                TemplateBinding::Prefilled {
+                    selector: selector.clone(),
+                },
+            );
+        } else {
+            bindings.insert(
+                slot_name.to_string(),
+                TemplateBinding::Open {
+                    optional: slot_decl.optional,
+                },
+            );
+        }
+        slot_decls.insert(slot_name.to_string(), slot_decl.clone());
+    }
+    Ok((bindings, slot_decls))
+}
+
+fn freeze_template_visible_exports(
+    ctx: &FrozenTemplateVariantContext<'_>,
+) -> Result<Vec<String>, Error> {
+    if let Some(visible_exports) = ctx.template.visible_exports.as_ref() {
+        for export_name in visible_exports {
+            if !ctx.manifest.exports().contains_key(export_name.as_str()) {
+                return Err(invalid_child_template_error(
+                    ctx.scenario,
+                    ctx.authority_realm,
+                    ctx.template_name,
+                    format!(
+                        "exposes export `{export_name}`, but manifest `{}` does not declare it",
+                        ctx.manifest_catalog_key
+                    ),
+                ));
+            }
+        }
+        return Ok(visible_exports.clone());
+    }
+    Ok(ctx
+        .manifest
+        .exports()
+        .keys()
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn template_binding_selector_decl(
+    scenario: &Scenario,
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
+    authority_realm: ComponentId,
+    selector: &amber_manifest::RealmSelector,
+) -> std::result::Result<CapabilityDecl, String> {
+    let selector = selector.as_str();
+    if let Some(slot_name) = selector.strip_prefix("slots.") {
+        let component = scenario.component(authority_realm);
+        let slot = component.slots.get(slot_name).ok_or_else(|| {
+            format!(
+                "prefilled selector `{selector}` references unknown authority slot `{slot_name}`"
+            )
+        })?;
+        return Ok(slot.decl.clone());
+    }
+    if let Some(provide_name) = selector.strip_prefix("provides.") {
+        return scenario
+            .component(authority_realm)
+            .provides
+            .get(provide_name)
+            .map(|provide| provide.decl.clone())
+            .ok_or_else(|| {
+                format!(
+                    "prefilled selector `{selector}` references unknown authority provide \
+                     `{provide_name}`"
+                )
+            });
+    }
+    if let Some(resource_name) = selector.strip_prefix("resources.") {
+        return scenario
+            .component(authority_realm)
+            .resources
+            .get(resource_name)
+            .map(|resource| CapabilityDecl::builder().kind(resource.kind).build())
+            .ok_or_else(|| {
+                format!(
+                    "prefilled selector `{selector}` references unknown authority resource \
+                     `{resource_name}`"
+                )
+            });
+    }
+    if let Some(external_name) = selector.strip_prefix("external.") {
+        if authority_realm != scenario.root {
+            return Err(format!(
+                "prefilled selector `{selector}` is only valid in the scenario root authority \
+                 realm"
+            ));
+        }
+        let binding = scenario
+            .bindings
+            .iter()
+            .find(|binding| {
+                matches!(
+                    &binding.from,
+                    BindingFrom::External(slot)
+                        if slot.component == scenario.root && slot.name == external_name
+                )
+            })
+            .ok_or_else(|| {
+                format!(
+                    "prefilled selector `{selector}` references unknown external binding \
+                     `{external_name}`"
+                )
+            })?;
+        let slot = scenario
+            .component(authority_realm)
+            .slots
+            .get(binding.to.name.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "prefilled selector `{selector}` resolves through missing authority slot `{}`",
+                    binding.to.name
+                )
+            })?;
+        return Ok(slot.decl.clone());
+    }
+    if let Some(rest) = selector.strip_prefix("children.") {
+        let Some((child_name, export_name)) = rest.split_once(".exports.") else {
+            return Err(format!(
+                "prefilled selector `{selector}` must use `children.<child>.exports.<export>`"
+            ));
+        };
+        let child_name = ChildName::try_from(child_name).map_err(|_| {
+            format!("prefilled selector `{selector}` references invalid child `{child_name}`")
+        })?;
+        let export_name = ExportName::try_from(export_name).map_err(|_| {
+            format!(
+                "prefilled selector `{selector}` references invalid child export `{export_name}`"
+            )
+        })?;
+        let child_id = link_index[authority_realm.0]
+            .child_by_name
+            .get(&child_name)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "prefilled selector `{selector}` references unknown static child \
+                     `#{child_name}`"
+                )
+            })?;
+        return resolve_export(
+            &scenario.components,
+            manifests,
+            link_index,
+            child_id,
+            &export_name,
+        )
+        .map(|resolved| resolved.decl)
+        .map_err(|err| format!("prefilled selector `{selector}` is invalid: {err}"));
+    }
+
+    Err(format!(
+        "prefilled selector `{selector}` is not supported for child templates"
+    ))
+}
+
+fn invalid_child_template_error(
+    scenario: &Scenario,
+    authority_realm: ComponentId,
+    template_name: &str,
+    message: impl Into<String>,
+) -> Error {
+    Error::InvalidChildTemplate {
+        component_path: component_path_for(&scenario.components, authority_realm),
+        template: template_name.to_string(),
+        message: message.into(),
+    }
+}
+
+fn template_manifest_keys(template: &ChildTemplate) -> Vec<String> {
+    template
+        .manifest
+        .iter()
+        .cloned()
+        .chain(template.allowed_manifests.clone().unwrap_or_default())
+        .collect()
+}
+
+fn collect_manifest_catalog_entries(
+    node: &ResolvedNode,
+    store: &DigestStore,
+    manifest_catalog: &mut BTreeMap<String, ManifestCatalogEntry>,
+) {
+    let key = catalog_key(&node.resolved_url);
+    manifest_catalog.entry(key).or_insert_with(|| {
+        let manifest = store
+            .get(&node.digest)
+            .expect("resolved manifest should exist in digest store");
+        ManifestCatalogEntry {
+            source_ref: node.resolved_url.to_string(),
+            digest: node.digest,
+            manifest: (*manifest).clone(),
+        }
+    });
+
+    for child in node.children.values() {
+        collect_manifest_catalog_entries(child, store, manifest_catalog);
+    }
+    for template in node.child_templates.values() {
+        for manifest in &template.manifests {
+            collect_manifest_catalog_entries(&manifest.root, store, manifest_catalog);
+        }
+    }
+}
+
+fn catalog_key(url: &url::Url) -> String {
+    url.to_string()
 }
 
 fn validate_config_tree(

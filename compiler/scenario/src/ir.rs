@@ -1,19 +1,20 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use amber_manifest::{
-    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, ManifestDigest, ProvideDecl, SlotDecl,
-    framework_capability,
+    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ProvideDecl,
+    RealmSelector, RuntimeBackend, SlotDecl, framework_capability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, Program, ProgramMount, ProvideRef,
-    ResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
+    FrameworkRef, ManifestCatalogEntry, Moniker, Program, ProgramMount, ProvideRef, ResourceDecl,
+    ResourceRef, Scenario, ScenarioExport, SlotRef, TemplateBinding, TemplateConfigField,
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
-pub const SCENARIO_IR_VERSION: u32 = 4;
+pub const SCENARIO_IR_VERSION: u32 = 5;
 const MIN_SCENARIO_IR_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,10 +25,14 @@ pub struct ScenarioIr {
     pub components: Vec<ComponentIr>,
     pub bindings: Vec<BindingIr>,
     pub exports: Vec<ExportIr>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub manifest_catalog: BTreeMap<String, ManifestCatalogEntryIr>,
 }
 
 impl From<&Scenario> for ScenarioIr {
     fn from(scenario: &Scenario) -> Self {
+        assert_persistable_child_templates(scenario);
         let components = scenario
             .components_iter()
             .map(|(id, component)| ComponentIr::from_component(id, component))
@@ -42,6 +47,11 @@ impl From<&Scenario> for ScenarioIr {
             components,
             bindings,
             exports,
+            manifest_catalog: scenario
+                .manifest_catalog
+                .iter()
+                .map(|(key, entry)| (key.clone(), ManifestCatalogEntryIr::from(entry)))
+                .collect(),
         }
     }
 }
@@ -70,6 +80,7 @@ impl TryFrom<ScenarioIr> for Scenario {
             .chain(std::iter::once(ir.root))
             .max()
             .expect("root id should be present");
+        let mut component_irs = vec![None; max_id + 1];
         let mut components = vec![None; max_id + 1];
 
         for component in ir.components {
@@ -83,9 +94,42 @@ impl TryFrom<ScenarioIr> for Scenario {
             for name in component.provides.keys() {
                 ensure_name_no_dot(name)?;
             }
+            for name in component.exports.keys() {
+                ensure_name_no_dot(name)?;
+            }
             for name in component.resources.keys() {
                 ensure_name_no_dot(name)?;
             }
+            for name in component.child_templates.keys() {
+                ensure_name_no_dot(name)?;
+            }
+            for (name, template) in &component.child_templates {
+                match (&template.manifest, &template.allowed_manifests) {
+                    (Some(_), None) | (None, Some(_)) => {}
+                    (Some(_), Some(_)) => {
+                        return Err(invalid_scenario(format!(
+                            "child template `{name}` must not specify both `manifest` and \
+                             `allowed_manifests`"
+                        )));
+                    }
+                    (None, None) => {
+                        return Err(invalid_scenario(format!(
+                            "child template `{name}` must specify one of `manifest` or \
+                             `allowed_manifests`"
+                        )));
+                    }
+                }
+                if template
+                    .allowed_manifests
+                    .as_ref()
+                    .is_some_and(|allowed| allowed.is_empty())
+                {
+                    return Err(invalid_scenario(format!(
+                        "child template `{name}` must not have an empty `allowed_manifests` list"
+                    )));
+                }
+            }
+            component_irs[id] = Some(component.clone());
             components[id] = Some(component.into_component());
         }
 
@@ -104,6 +148,8 @@ impl TryFrom<ScenarioIr> for Scenario {
             }
         }
 
+        validate_component_exports(&component_irs, &components)?;
+
         for binding in &ir.bindings {
             if let Some(name) = binding.name.as_deref() {
                 ensure_name_no_dot(name)?;
@@ -116,8 +162,14 @@ impl TryFrom<ScenarioIr> for Scenario {
                 BindingFromIr::Resource { resource, .. } => {
                     ensure_name_no_dot(resource)?;
                 }
-                BindingFromIr::Framework { capability } => {
+                BindingFromIr::Framework {
+                    capability,
+                    authority_realm,
+                } => {
                     ensure_name_no_dot(capability)?;
+                    ensure_component(&components, *authority_realm, || {
+                        format!("framework authority realm for {}", binding.to.slot)
+                    })?;
                 }
                 BindingFromIr::External { slot } => {
                     ensure_name_no_dot(&slot.slot)?;
@@ -172,6 +224,11 @@ impl TryFrom<ScenarioIr> for Scenario {
                 .map(BindingIr::into_binding)
                 .collect::<Result<Vec<_>, _>>()?,
             exports: ir.exports.into_iter().map(ExportIr::into_export).collect(),
+            manifest_catalog: ir
+                .manifest_catalog
+                .into_iter()
+                .map(|(key, entry)| (key, entry.into_entry()))
+                .collect(),
         };
         validate_scenario(&scenario)?;
         scenario.normalize_order();
@@ -201,7 +258,13 @@ pub struct ComponentIr {
     pub provides: BTreeMap<String, ProvideDecl>,
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub exports: BTreeMap<String, ComponentExportTargetIr>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub resources: BTreeMap<String, ResourceDecl>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub child_templates: BTreeMap<String, ChildTemplateIr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
 }
@@ -220,7 +283,13 @@ impl ComponentIr {
             program: component.program.clone(),
             slots: component.slots.clone(),
             provides: component.provides.clone(),
+            exports: BTreeMap::new(),
             resources: component.resources.clone(),
+            child_templates: component
+                .child_templates
+                .iter()
+                .map(|(name, template)| (name.clone(), ChildTemplateIr::from(template)))
+                .collect(),
             metadata: component.metadata.clone(),
         }
     }
@@ -237,8 +306,217 @@ impl ComponentIr {
             slots: self.slots,
             provides: self.provides,
             resources: self.resources,
+            child_templates: self
+                .child_templates
+                .into_iter()
+                .map(|(name, template)| (name, template.into_template()))
+                .collect(),
             metadata: self.metadata,
             children: self.children.into_iter().map(ComponentId).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case")]
+pub enum ComponentExportTargetIr {
+    SelfProvide { provide: String },
+    SelfSlot { slot: String },
+    ChildExport { child: String, export: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChildTemplateIr {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_false")]
+    pub frozen: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_manifests: Option<Vec<String>>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, TemplateConfigFieldIr>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, TemplateBindingIr>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub slot_decls: BTreeMap<String, SlotDecl>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible_exports: Option<Vec<String>>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ChildTemplateLimitsIr>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub possible_backends: Vec<RuntimeBackend>,
+}
+
+impl From<&ChildTemplate> for ChildTemplateIr {
+    fn from(template: &ChildTemplate) -> Self {
+        Self {
+            frozen: template.frozen,
+            manifest: template.manifest.clone(),
+            allowed_manifests: template.allowed_manifests.clone(),
+            config: template
+                .config
+                .iter()
+                .map(|(name, field)| (name.clone(), TemplateConfigFieldIr::from(field)))
+                .collect(),
+            bindings: template
+                .bindings
+                .iter()
+                .map(|(name, field)| (name.clone(), TemplateBindingIr::from(field)))
+                .collect(),
+            slot_decls: template.slot_decls.clone(),
+            visible_exports: template.visible_exports.clone(),
+            limits: template.limits.as_ref().map(ChildTemplateLimitsIr::from),
+            possible_backends: template.possible_backends.clone(),
+        }
+    }
+}
+
+impl ChildTemplateIr {
+    fn into_template(self) -> ChildTemplate {
+        ChildTemplate {
+            frozen: self.frozen,
+            manifest: self.manifest,
+            allowed_manifests: self.allowed_manifests,
+            config: self
+                .config
+                .into_iter()
+                .map(|(name, field)| (name, field.into_field()))
+                .collect(),
+            bindings: self
+                .bindings
+                .into_iter()
+                .map(|(name, field)| (name, field.into_field()))
+                .collect(),
+            slot_decls: self.slot_decls,
+            visible_exports: self.visible_exports,
+            limits: self.limits.map(ChildTemplateLimitsIr::into_limits),
+            possible_backends: self.possible_backends,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TemplateConfigFieldIr {
+    Prefilled { value: Value },
+    Open { required: bool },
+}
+
+impl From<&TemplateConfigField> for TemplateConfigFieldIr {
+    fn from(field: &TemplateConfigField) -> Self {
+        match field {
+            TemplateConfigField::Prefilled { value } => Self::Prefilled {
+                value: value.clone(),
+            },
+            TemplateConfigField::Open { required } => Self::Open {
+                required: *required,
+            },
+        }
+    }
+}
+
+impl TemplateConfigFieldIr {
+    fn into_field(self) -> TemplateConfigField {
+        match self {
+            Self::Prefilled { value } => TemplateConfigField::Prefilled { value },
+            Self::Open { required } => TemplateConfigField::Open { required },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TemplateBindingIr {
+    Prefilled { selector: RealmSelector },
+    Open { optional: bool },
+}
+
+impl From<&TemplateBinding> for TemplateBindingIr {
+    fn from(field: &TemplateBinding) -> Self {
+        match field {
+            TemplateBinding::Prefilled { selector } => Self::Prefilled {
+                selector: selector.clone(),
+            },
+            TemplateBinding::Open { optional } => Self::Open {
+                optional: *optional,
+            },
+        }
+    }
+}
+
+impl TemplateBindingIr {
+    fn into_field(self) -> TemplateBinding {
+        match self {
+            Self::Prefilled { selector } => TemplateBinding::Prefilled { selector },
+            Self::Open { optional } => TemplateBinding::Open { optional },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChildTemplateLimitsIr {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_live_children: Option<u32>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_pattern: Option<String>,
+}
+
+impl From<&ChildTemplateLimits> for ChildTemplateLimitsIr {
+    fn from(limits: &ChildTemplateLimits) -> Self {
+        Self {
+            max_live_children: limits.max_live_children,
+            name_pattern: limits.name_pattern.clone(),
+        }
+    }
+}
+
+impl ChildTemplateLimitsIr {
+    fn into_limits(self) -> ChildTemplateLimits {
+        ChildTemplateLimits {
+            max_live_children: self.max_live_children,
+            name_pattern: self.name_pattern,
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ManifestCatalogEntryIr {
+    pub source_ref: String,
+    pub digest: ManifestDigest,
+    pub manifest: Manifest,
+}
+
+impl From<&ManifestCatalogEntry> for ManifestCatalogEntryIr {
+    fn from(entry: &ManifestCatalogEntry) -> Self {
+        Self {
+            source_ref: entry.source_ref.clone(),
+            digest: entry.digest,
+            manifest: entry.manifest.clone(),
+        }
+    }
+}
+
+impl ManifestCatalogEntryIr {
+    fn into_entry(self) -> ManifestCatalogEntry {
+        ManifestCatalogEntry {
+            source_ref: self.source_ref,
+            digest: self.digest,
+            manifest: self.manifest,
         }
     }
 }
@@ -246,10 +524,21 @@ impl ComponentIr {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BindingFromIr {
-    Component { component: usize, provide: String },
-    Resource { component: usize, resource: String },
-    Framework { capability: String },
-    External { slot: SlotRefIr },
+    Component {
+        component: usize,
+        provide: String,
+    },
+    Resource {
+        component: usize,
+        resource: String,
+    },
+    Framework {
+        capability: String,
+        authority_realm: usize,
+    },
+    External {
+        slot: SlotRefIr,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -294,8 +583,9 @@ impl From<&BindingFrom> for BindingFromIr {
                 component: resource.component.0,
                 resource: resource.name.clone(),
             },
-            BindingFrom::Framework(name) => Self::Framework {
-                capability: name.to_string(),
+            BindingFrom::Framework(framework) => Self::Framework {
+                capability: framework.capability.to_string(),
+                authority_realm: framework.authority.0,
             },
             BindingFrom::External(slot) => Self::External {
                 slot: SlotRefIr::from(slot),
@@ -320,14 +610,20 @@ impl BindingFromIr {
                 component: ComponentId(component),
                 name: resource,
             })),
-            BindingFromIr::Framework { capability } => {
+            BindingFromIr::Framework {
+                capability,
+                authority_realm,
+            } => {
                 let name =
                     FrameworkCapabilityName::try_from(capability.as_str()).map_err(|_| {
                         ScenarioIrError::InvalidName {
                             name: capability.clone(),
                         }
                     })?;
-                Ok(BindingFrom::Framework(name))
+                Ok(BindingFrom::Framework(FrameworkRef {
+                    authority: ComponentId(authority_realm),
+                    capability: name,
+                }))
             }
             BindingFromIr::External { slot } => Ok(BindingFrom::External(slot.into_slot_ref())),
         }
@@ -554,7 +850,128 @@ fn validate_scenario(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     validate_bindings(scenario)?;
     validate_mounted_storage_slots(scenario)?;
     validate_exports(scenario)?;
+    validate_child_templates(scenario)?;
     Ok(())
+}
+
+fn validate_component_exports(
+    component_irs: &[Option<ComponentIr>],
+    components: &[Option<Component>],
+) -> Result<(), ScenarioIrError> {
+    for component in component_irs.iter().flatten() {
+        for export_name in component.exports.keys() {
+            let mut visited = Vec::new();
+            validate_component_export_target(
+                component_irs,
+                components,
+                ComponentId(component.id),
+                export_name,
+                &mut visited,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_component_export_target(
+    component_irs: &[Option<ComponentIr>],
+    components: &[Option<Component>],
+    component_id: ComponentId,
+    export_name: &str,
+    visited: &mut Vec<(usize, String)>,
+) -> Result<(), ScenarioIrError> {
+    let visit_key = (component_id.0, export_name.to_string());
+    if visited.contains(&visit_key) {
+        return Err(invalid_scenario(format!(
+            "component export cycle detected while validating component {} export `{export_name}`",
+            component_id.0
+        )));
+    }
+    visited.push(visit_key.clone());
+
+    let result = validate_component_export_target_inner(
+        component_irs,
+        components,
+        component_id,
+        export_name,
+        visited,
+    );
+    visited.pop();
+    result
+}
+
+fn validate_component_export_target_inner(
+    component_irs: &[Option<ComponentIr>],
+    components: &[Option<Component>],
+    component_id: ComponentId,
+    export_name: &str,
+    visited: &mut Vec<(usize, String)>,
+) -> Result<(), ScenarioIrError> {
+    let context = || {
+        format!(
+            "component export `{export_name}` on component {}",
+            component_id.0
+        )
+    };
+    let component_ir = component_irs
+        .get(component_id.0)
+        .and_then(|component| component.as_ref())
+        .ok_or_else(|| invalid_scenario(context()))?;
+    let target = component_ir
+        .exports
+        .get(export_name)
+        .ok_or_else(|| invalid_scenario(context()))?;
+
+    match target {
+        ComponentExportTargetIr::SelfProvide { provide } => {
+            let _ = ensure_provide(components, component_id, provide, context)?;
+        }
+        ComponentExportTargetIr::SelfSlot { slot } => {
+            let _ = ensure_slot(components, component_id, slot, context)?;
+        }
+        ComponentExportTargetIr::ChildExport { child, export } => {
+            let parent_moniker = component_ir.moniker.as_str();
+            let child_id = component_ir
+                .children
+                .iter()
+                .copied()
+                .find(|child_id| {
+                    component_irs
+                        .get(*child_id)
+                        .and_then(|component| component.as_ref())
+                        .and_then(|component| {
+                            child_alias(parent_moniker, component.moniker.as_str())
+                        })
+                        == Some(child.as_str())
+                })
+                .ok_or_else(|| {
+                    invalid_scenario(format!("{} references missing child `{child}`", context()))
+                })?;
+            validate_component_export_target(
+                component_irs,
+                components,
+                ComponentId(child_id),
+                export,
+                visited,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn child_alias<'a>(parent_moniker: &str, child_moniker: &'a str) -> Option<&'a str> {
+    if child_moniker == "/" {
+        return None;
+    }
+    let remainder = if parent_moniker == "/" {
+        child_moniker.strip_prefix('/')?
+    } else {
+        child_moniker
+            .strip_prefix(parent_moniker)?
+            .strip_prefix('/')?
+    };
+    remainder.split('/').find(|segment| !segment.is_empty())
 }
 
 fn validate_component_tree(scenario: &Scenario) -> Result<(), ScenarioIrError> {
@@ -585,6 +1002,9 @@ fn validate_component_tree(scenario: &Scenario) -> Result<(), ScenarioIrError> {
             ensure_name_no_dot(name)?;
         }
         for name in component.provides.keys() {
+            ensure_name_no_dot(name)?;
+        }
+        for name in component.child_templates.keys() {
             ensure_name_no_dot(name)?;
         }
 
@@ -673,6 +1093,240 @@ fn validate_component_tree(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     Ok(())
 }
 
+fn validate_child_templates(scenario: &Scenario) -> Result<(), ScenarioIrError> {
+    for component in scenario.components.iter().flatten() {
+        for (name, template) in &component.child_templates {
+            match (&template.manifest, &template.allowed_manifests) {
+                (Some(_), None) | (None, Some(_)) => {}
+                (Some(_), Some(_)) => {
+                    return Err(invalid_scenario(format!(
+                        "component {} child template `{name}` specifies both `manifest` and \
+                         `allowed_manifests`",
+                        component.moniker.as_str()
+                    )));
+                }
+                (None, None) => {
+                    return Err(invalid_scenario(format!(
+                        "component {} child template `{name}` must specify one of `manifest` or \
+                         `allowed_manifests`",
+                        component.moniker.as_str()
+                    )));
+                }
+            }
+
+            if let Some(key) = &template.manifest
+                && !scenario.manifest_catalog.contains_key(key)
+            {
+                return Err(invalid_scenario(format!(
+                    "component {} child template `{name}` references missing manifest catalog key \
+                     `{key}`",
+                    component.moniker.as_str()
+                )));
+            }
+
+            if let Some(keys) = &template.allowed_manifests {
+                if keys.is_empty() {
+                    return Err(invalid_scenario(format!(
+                        "component {} child template `{name}` has an empty `allowed_manifests` \
+                         list",
+                        component.moniker.as_str()
+                    )));
+                }
+                for key in keys {
+                    if !scenario.manifest_catalog.contains_key(key) {
+                        return Err(invalid_scenario(format!(
+                            "component {} child template `{name}` references missing manifest \
+                             catalog key `{key}`",
+                            component.moniker.as_str()
+                        )));
+                    }
+                }
+            }
+            if !template.frozen {
+                return Err(invalid_scenario(format!(
+                    "component {} child template `{name}` must use a frozen child template \
+                     contract in ScenarioIr; recompile with the current compiler",
+                    component.moniker.as_str()
+                )));
+            }
+            validate_frozen_child_template_contract(scenario, component, name, template)?;
+        }
+    }
+
+    for (key, entry) in &scenario.manifest_catalog {
+        if entry.digest != entry.manifest.digest() {
+            return Err(invalid_scenario(format!(
+                "manifest catalog entry `{key}` digest {} does not match manifest digest {}",
+                entry.digest,
+                entry.manifest.digest()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn assert_persistable_child_templates(scenario: &Scenario) {
+    for component in scenario.components.iter().flatten() {
+        for (template_name, template) in &component.child_templates {
+            assert!(
+                template.frozen,
+                "component {} child template `{template_name}` must be frozen before serializing \
+                 ScenarioIr",
+                component.moniker.as_str()
+            );
+        }
+    }
+}
+
+fn validate_frozen_child_template_contract(
+    scenario: &Scenario,
+    component: &Component,
+    template_name: &str,
+    template: &ChildTemplate,
+) -> Result<(), ScenarioIrError> {
+    let binding_names = template.bindings.keys().collect::<BTreeSet<_>>();
+    let slot_decl_names = template.slot_decls.keys().collect::<BTreeSet<_>>();
+    if binding_names != slot_decl_names {
+        return Err(invalid_scenario(format!(
+            "component {} child template `{template_name}` has mismatched frozen binding and slot \
+             declaration sets",
+            component.moniker.as_str()
+        )));
+    }
+
+    let manifest_keys = template
+        .manifest
+        .iter()
+        .cloned()
+        .chain(template.allowed_manifests.clone().unwrap_or_default())
+        .collect::<Vec<_>>();
+    for key in manifest_keys {
+        let manifest = &scenario
+            .manifest_catalog
+            .get(&key)
+            .expect("validated manifest catalog key should exist")
+            .manifest;
+        validate_frozen_child_template_manifest(
+            component,
+            template_name,
+            template,
+            manifest,
+            &key,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_frozen_child_template_manifest(
+    component: &Component,
+    template_name: &str,
+    template: &ChildTemplate,
+    manifest: &Manifest,
+    manifest_catalog_key: &str,
+) -> Result<(), ScenarioIrError> {
+    let properties = manifest
+        .config_schema()
+        .and_then(|schema| schema.0.get("properties"))
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .collect::<BTreeMap<_, _>>();
+    let required = manifest
+        .config_schema()
+        .and_then(|schema| schema.0.get("required"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<BTreeSet<_>>();
+    for (name, field) in &template.config {
+        if !properties.contains_key(name) {
+            return Err(invalid_scenario(format!(
+                "component {} child template `{template_name}` frozen config references missing \
+                 field `{name}` in manifest `{manifest_catalog_key}`",
+                component.moniker.as_str()
+            )));
+        }
+        if let TemplateConfigField::Open {
+            required: open_required,
+        } = field
+            && *open_required != required.contains(name.as_str())
+        {
+            return Err(invalid_scenario(format!(
+                "component {} child template `{template_name}` frozen config field `{name}` does \
+                 not match manifest `{manifest_catalog_key}` requiredness",
+                component.moniker.as_str()
+            )));
+        }
+    }
+    for name in properties.keys() {
+        if !template.config.contains_key(name.as_str()) {
+            return Err(invalid_scenario(format!(
+                "component {} child template `{template_name}` omits config field `{name}` from \
+                 frozen contract for manifest `{manifest_catalog_key}`",
+                component.moniker.as_str()
+            )));
+        }
+    }
+
+    for (name, binding) in &template.bindings {
+        let slot = manifest.slots().get(name.as_str()).ok_or_else(|| {
+            invalid_scenario(format!(
+                "component {} child template `{template_name}` frozen binding references missing \
+                 slot `{name}` in manifest `{manifest_catalog_key}`",
+                component.moniker.as_str()
+            ))
+        })?;
+        let frozen_slot = template.slot_decls.get(name.as_str()).ok_or_else(|| {
+            invalid_scenario(format!(
+                "component {} child template `{template_name}` is missing frozen slot declaration \
+                 `{name}`",
+                component.moniker.as_str()
+            ))
+        })?;
+        if frozen_slot != slot {
+            return Err(invalid_scenario(format!(
+                "component {} child template `{template_name}` frozen slot declaration `{name}` \
+                 does not match manifest `{manifest_catalog_key}`",
+                component.moniker.as_str()
+            )));
+        }
+        if let TemplateBinding::Open { optional } = binding
+            && *optional != slot.optional
+        {
+            return Err(invalid_scenario(format!(
+                "component {} child template `{template_name}` frozen binding `{name}` does not \
+                 match manifest `{manifest_catalog_key}` optionality",
+                component.moniker.as_str()
+            )));
+        }
+    }
+    for name in manifest.slots().keys() {
+        if !template.bindings.contains_key(name.as_str()) {
+            return Err(invalid_scenario(format!(
+                "component {} child template `{template_name}` omits slot `{name}` from frozen \
+                 contract for manifest `{manifest_catalog_key}`",
+                component.moniker.as_str()
+            )));
+        }
+    }
+
+    if let Some(visible_exports) = template.visible_exports.as_ref() {
+        for export_name in visible_exports {
+            if !manifest.exports().contains_key(export_name.as_str()) {
+                return Err(invalid_scenario(format!(
+                    "component {} child template `{template_name}` exposes missing export \
+                     `{export_name}` from manifest `{manifest_catalog_key}`",
+                    component.moniker.as_str()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_bindings(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     for binding in &scenario.bindings {
         ensure_name_no_dot(&binding.to.name)?;
@@ -734,14 +1388,15 @@ fn validate_bindings(scenario: &Scenario) -> Result<(), ScenarioIrError> {
                     CapabilityDecl::builder().kind(resource_decl.kind).build(),
                 )
             }
-            BindingFrom::Framework(name) => {
-                let spec = framework_capability(name.as_str()).ok_or_else(|| {
+            BindingFrom::Framework(framework) => {
+                let capability = framework.capability.as_str();
+                let spec = framework_capability(capability).ok_or_else(|| {
                     invalid_scenario(format!(
                         "binding into {target_label} references unknown framework capability \
-                         `framework.{name}`"
+                         `framework.{capability}`"
                     ))
                 })?;
-                (format!("framework.{name}"), spec.decl.clone())
+                (format!("framework.{capability}"), spec.decl.clone())
             }
             BindingFrom::External(slot) => {
                 ensure_name_no_dot(&slot.name)?;
@@ -874,7 +1529,7 @@ fn describe_binding_source(
             .as_str(),
             resource.name
         )),
-        BindingFrom::Framework(name) => Ok(format!("framework.{name}")),
+        BindingFrom::Framework(framework) => Ok(format!("framework.{}", framework.capability)),
         BindingFrom::External(slot) => Ok(format!(
             "external {}.{}",
             component_ref(&scenario.components, slot.component, || {
@@ -927,13 +1582,17 @@ fn validate_exports(scenario: &Scenario) -> Result<(), ScenarioIrError> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use amber_manifest::{FrameworkCapabilityName, ManifestDigest};
+    use amber_manifest::{FrameworkCapabilityName, ManifestDigest, RuntimeBackend};
     use serde_json::json;
 
-    use super::{SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr, ScenarioIrError};
+    use super::{
+        ChildTemplateIr, ComponentExportTargetIr, ComponentIr, ManifestCatalogEntryIr,
+        SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr, ScenarioIrError,
+    };
     use crate::{
-        BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
-        ScenarioExport, SlotRef,
+        BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
+        FrameworkRef, ManifestCatalogEntry, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
+        TemplateBinding, TemplateConfigField,
     };
 
     fn slot_decl(kind: &str) -> amber_manifest::SlotDecl {
@@ -955,6 +1614,7 @@ mod tests {
                 provides: BTreeMap::new(),
                 resources: BTreeMap::new(),
                 metadata: None,
+                child_templates: BTreeMap::new(),
                 children: vec![ComponentId(1)],
             }),
             Some(Component {
@@ -996,6 +1656,7 @@ mod tests {
                 )]),
                 resources: BTreeMap::new(),
                 metadata: None,
+                child_templates: BTreeMap::new(),
                 children: Vec::new(),
             }),
         ];
@@ -1025,6 +1686,7 @@ mod tests {
                     name: "api".to_string(),
                 },
             }],
+            manifest_catalog: BTreeMap::new(),
         };
         scenario.normalize_order();
 
@@ -1194,6 +1856,7 @@ mod tests {
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
+            child_templates: BTreeMap::new(),
             children: Vec::new(),
         })];
 
@@ -1201,7 +1864,10 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings: vec![BindingEdge {
-                from: BindingFrom::Framework(FrameworkCapabilityName::try_from("docker").unwrap()),
+                from: BindingFrom::Framework(FrameworkRef {
+                    authority: ComponentId(0),
+                    capability: FrameworkCapabilityName::try_from("docker").unwrap(),
+                }),
                 to: SlotRef {
                     component: ComponentId(0),
                     name: "docker".to_string(),
@@ -1209,6 +1875,7 @@ mod tests {
                 weak: false,
             }],
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
         scenario.normalize_order();
 
@@ -1239,6 +1906,361 @@ mod tests {
     }
 
     #[test]
+    fn scenario_ir_roundtrips_child_templates_and_manifest_catalog() {
+        let catalog_manifest: amber_manifest::Manifest = r#"
+            {
+              manifest_version: "0.1.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  mode: { type: "string" },
+                },
+              },
+              slots: {
+                realm: { kind: "component" },
+              },
+              exports: {
+                api: "slots.realm",
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let catalog_key = "file:///templates/worker.json5".to_string();
+
+        let components = vec![Some(Component {
+            id: ComponentId(0),
+            parent: None,
+            moniker: Moniker::from("/".to_string()),
+            digest: ManifestDigest::new([0u8; 32]),
+            config: None,
+            config_schema: None,
+            program: None,
+            slots: BTreeMap::from([("realm".to_string(), slot_decl("component"))]),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            child_templates: BTreeMap::from([(
+                "worker".to_string(),
+                ChildTemplate {
+                    frozen: true,
+                    manifest: Some(catalog_key.clone()),
+                    allowed_manifests: None,
+                    config: BTreeMap::from([(
+                        "mode".to_string(),
+                        TemplateConfigField::Prefilled {
+                            value: json!("batch"),
+                        },
+                    )]),
+                    bindings: BTreeMap::from([(
+                        "realm".to_string(),
+                        TemplateBinding::Prefilled {
+                            selector: "slots.realm".parse().unwrap(),
+                        },
+                    )]),
+                    slot_decls: BTreeMap::from([("realm".to_string(), slot_decl("component"))]),
+                    visible_exports: Some(vec!["api".to_string()]),
+                    limits: Some(ChildTemplateLimits {
+                        max_live_children: Some(4),
+                        name_pattern: Some("job-[0-9]+".to_string()),
+                    }),
+                    possible_backends: vec![RuntimeBackend::Direct],
+                },
+            )]),
+            children: Vec::new(),
+        })];
+
+        let mut scenario = Scenario {
+            root: ComponentId(0),
+            components,
+            bindings: Vec::new(),
+            exports: Vec::new(),
+            manifest_catalog: BTreeMap::from([(
+                catalog_key.clone(),
+                ManifestCatalogEntry {
+                    source_ref: catalog_key.clone(),
+                    digest: catalog_manifest.digest(),
+                    manifest: catalog_manifest.clone(),
+                },
+            )]),
+        };
+        scenario.normalize_order();
+
+        let ir = ScenarioIr::from(&scenario);
+        let roundtripped: Scenario = ir.try_into().expect("deserialize scenario IR");
+        assert_eq!(roundtripped, scenario);
+        assert_eq!(
+            roundtripped
+                .component(ComponentId(0))
+                .child_templates
+                .get("worker")
+                .and_then(|template| template.manifest.as_ref()),
+            Some(&catalog_key)
+        );
+        assert_eq!(
+            roundtripped.manifest_catalog.get(&catalog_key),
+            scenario.manifest_catalog.get(&catalog_key)
+        );
+    }
+
+    #[test]
+    fn scenario_ir_rejects_unfrozen_child_template_contracts() {
+        let alpha: amber_manifest::Manifest = r#"
+            {
+              manifest_version: "0.1.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  alpha_only: { type: "string" }
+                }
+              },
+              slots: {
+                realm: { kind: "component" }
+              },
+              provides: {
+                api: { kind: "http", endpoint: "http" }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["alpha"],
+                network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+              },
+              exports: {
+                api: "provides.api"
+              },
+            }
+        "#
+        .parse()
+        .expect("alpha manifest");
+        let beta: amber_manifest::Manifest = r#"
+            {
+              manifest_version: "0.1.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  beta_only: { type: "integer" }
+                }
+              },
+              slots: {
+                db: { kind: "http" }
+              },
+              provides: {
+                api: { kind: "http", endpoint: "http" }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["beta"],
+                network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+              },
+              exports: {
+                api: "provides.api"
+              },
+            }
+        "#
+        .parse()
+        .expect("beta manifest");
+        let alpha_key = "file:///templates/alpha.json5".to_string();
+        let beta_key = "file:///templates/beta.json5".to_string();
+
+        let err = Scenario::try_from(ScenarioIr {
+            schema: SCENARIO_IR_SCHEMA.to_string(),
+            version: SCENARIO_IR_VERSION,
+            root: 0,
+            components: vec![ComponentIr {
+                id: 0,
+                moniker: "/".to_string(),
+                parent: None,
+                children: Vec::new(),
+                resolved_url: None,
+                digest: ManifestDigest::new([0u8; 32]),
+                config: None,
+                config_schema: None,
+                program: None,
+                slots: BTreeMap::from([("realm".to_string(), slot_decl("component"))]),
+                provides: BTreeMap::new(),
+                exports: BTreeMap::new(),
+                resources: BTreeMap::new(),
+                child_templates: BTreeMap::from([(
+                    "worker".to_string(),
+                    ChildTemplateIr {
+                        frozen: false,
+                        manifest: None,
+                        allowed_manifests: Some(vec![alpha_key.clone(), beta_key.clone()]),
+                        config: BTreeMap::new(),
+                        bindings: BTreeMap::new(),
+                        slot_decls: BTreeMap::new(),
+                        visible_exports: None,
+                        limits: None,
+                        possible_backends: Vec::new(),
+                    },
+                )]),
+                metadata: None,
+            }],
+            bindings: Vec::new(),
+            exports: Vec::new(),
+            manifest_catalog: BTreeMap::from([
+                (
+                    alpha_key.clone(),
+                    ManifestCatalogEntryIr {
+                        source_ref: alpha_key.clone(),
+                        digest: alpha.digest(),
+                        manifest: alpha,
+                    },
+                ),
+                (
+                    beta_key.clone(),
+                    ManifestCatalogEntryIr {
+                        source_ref: beta_key.clone(),
+                        digest: beta.digest(),
+                        manifest: beta,
+                    },
+                ),
+            ]),
+        })
+        .expect_err("unfrozen child template contracts should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("must use a frozen child template contract"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn scenario_ir_deserializes_component_exports() {
+        let ir = serde_json::from_value::<ScenarioIr>(json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [1],
+                    "digest": ManifestDigest::new([0u8; 32]),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {},
+                    "exports": {
+                        "api": {
+                            "target": "child_export",
+                            "child": "worker",
+                            "export": "api"
+                        }
+                    },
+                    "resources": {},
+                    "child_templates": {},
+                    "metadata": null
+                },
+                {
+                    "id": 1,
+                    "moniker": "/worker",
+                    "parent": 0,
+                    "children": [],
+                    "digest": ManifestDigest::new([1u8; 32]),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {
+                        "api": {
+                            "kind": "http"
+                        }
+                    },
+                    "exports": {
+                        "api": {
+                            "target": "self_provide",
+                            "provide": "api"
+                        }
+                    },
+                    "resources": {},
+                    "child_templates": {},
+                    "metadata": null
+                }
+            ],
+            "bindings": [],
+            "exports": [],
+            "manifest_catalog": {}
+        }))
+        .expect("scenario IR should decode");
+        assert_eq!(
+            ir.components[0].exports.get("api"),
+            Some(&ComponentExportTargetIr::ChildExport {
+                child: "worker".to_string(),
+                export: "api".to_string(),
+            })
+        );
+        let scenario: Scenario = ir.try_into().expect("scenario should validate");
+        assert_eq!(scenario.root, ComponentId(0));
+    }
+
+    #[test]
+    fn scenario_ir_validates_child_export_aliases_through_nested_child_roots() {
+        let ir = serde_json::from_value::<ScenarioIr>(json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [1],
+                    "digest": ManifestDigest::new([0u8; 32]),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {},
+                    "exports": {
+                        "vm_http": {
+                            "target": "child_export",
+                            "child": "vm_helper",
+                            "export": "http"
+                        }
+                    },
+                    "resources": {},
+                    "child_templates": {},
+                    "metadata": null
+                },
+                {
+                    "id": 1,
+                    "moniker": "/vm_helper/root",
+                    "parent": 0,
+                    "children": [],
+                    "digest": ManifestDigest::new([1u8; 32]),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {
+                        "http": {
+                            "kind": "http"
+                        }
+                    },
+                    "exports": {
+                        "http": {
+                            "target": "self_provide",
+                            "provide": "http"
+                        }
+                    },
+                    "resources": {},
+                    "child_templates": {},
+                    "metadata": null
+                }
+            ],
+            "bindings": [],
+            "exports": [],
+            "manifest_catalog": {}
+        }))
+        .expect("scenario IR should decode");
+
+        let scenario: Scenario = ir
+            .try_into()
+            .expect("nested child-root export should validate");
+        assert_eq!(scenario.root, ComponentId(0));
+    }
+
+    #[test]
     fn scenario_ir_rejects_framework_capability_with_dot() {
         let payload = json!({
             "schema": SCENARIO_IR_SCHEMA,
@@ -1259,7 +2281,11 @@ mod tests {
             ],
             "bindings": [
                 {
-                    "from": { "kind": "framework", "capability": "bad.name" },
+                    "from": {
+                        "kind": "framework",
+                        "capability": "bad.name",
+                        "authority_realm": 0
+                    },
                     "to": { "component": 0, "slot": "docker" },
                     "weak": false
                 }

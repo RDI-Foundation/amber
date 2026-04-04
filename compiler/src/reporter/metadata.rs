@@ -66,6 +66,7 @@ mod tests {
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
+            child_templates: BTreeMap::new(),
             children: Vec::new(),
         }
     }
@@ -102,6 +103,7 @@ mod tests {
             components,
             bindings: Vec::new(),
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
 
         let rendered = render_metadata(&scenario).unwrap();

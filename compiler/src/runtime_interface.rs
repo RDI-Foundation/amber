@@ -233,6 +233,7 @@ mod tests {
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
+            child_templates: BTreeMap::new(),
             children: Vec::new(),
         }
     }
@@ -311,6 +312,7 @@ mod tests {
             components: vec![Some(root)],
             bindings: Vec::new(),
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
 
         let slots = collect_external_slots(&scenario, ["api", "api"]);
@@ -339,6 +341,7 @@ mod tests {
             components: vec![Some(root), Some(child)],
             bindings: Vec::new(),
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
         let mesh_plan = MeshPlan::new(
             vec![ComponentId(1)],

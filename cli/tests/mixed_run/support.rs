@@ -127,6 +127,8 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 "#;
 
+pub(crate) const TEST_APP_IMAGE: &str = "python:3.13-alpine";
+
 pub(crate) fn outputs_root() -> PathBuf {
     cli_test_outputs_root(&workspace_root())
 }
@@ -211,7 +213,7 @@ pub(crate) fn docker_host_ip() -> String {
             .arg("host.docker.internal:host-gateway");
     }
     let output = cmd
-        .arg("python:3.13-alpine")
+        .arg(TEST_APP_IMAGE)
         .arg("python3")
         .arg("-c")
         .arg("import socket; print(socket.gethostbyname('host.docker.internal'))")
@@ -224,6 +226,24 @@ pub(crate) fn docker_host_ip() -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+pub(crate) fn ensure_local_image(tag: &str) {
+    let inspect = Command::new("docker")
+        .arg("image")
+        .arg("inspect")
+        .arg(tag)
+        .status()
+        .unwrap_or_else(|err| panic!("failed to inspect docker image {tag}: {err}"));
+    if inspect.success() {
+        return;
+    }
+    let status = Command::new("docker")
+        .arg("pull")
+        .arg(tag)
+        .status()
+        .unwrap_or_else(|err| panic!("failed to pull docker image {tag}: {err}"));
+    assert!(status.success(), "docker pull failed for {tag}");
 }
 
 pub(crate) fn docker_host_http_url(port: u16) -> String {
@@ -246,10 +266,39 @@ pub(crate) fn read_json(path: &Path) -> Value {
 }
 
 pub(crate) fn http_get(port: u16, path: &str) -> Option<(u16, String)> {
-    let output = Command::new("curl")
+    http_request_with_timeout("GET", port, path, None, Duration::from_secs(5))
+}
+
+pub(crate) fn http_get_with_timeout(
+    port: u16,
+    path: &str,
+    timeout: Duration,
+) -> Option<(u16, String)> {
+    http_request_with_timeout("GET", port, path, None, timeout)
+}
+
+pub(crate) fn http_request_with_timeout(
+    method: &str,
+    port: u16,
+    path: &str,
+    body: Option<&str>,
+    timeout: Duration,
+) -> Option<(u16, String)> {
+    let mut command = Command::new("curl");
+    command
         .arg("-sS")
         .arg("--max-time")
-        .arg("5")
+        .arg(format!("{:.3}", timeout.as_secs_f64()))
+        .arg("-X")
+        .arg(method);
+    if let Some(body) = body {
+        command
+            .arg("-H")
+            .arg("content-type: application/json")
+            .arg("--data")
+            .arg(body);
+    }
+    let output = command
         .arg("-o")
         .arg("-")
         .arg("-w")
@@ -331,14 +380,7 @@ pub(crate) fn wait_for_single_run_root(storage_root: &Path, timeout: Duration) -
     let runs_dir = storage_root.join("runs");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let mut runs = fs::read_dir(&runs_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.is_dir())
-            .collect::<Vec<_>>();
-        runs.sort();
+        let mut runs = collect_run_roots(storage_root);
         if runs.len() == 1 {
             return runs.pop().expect("single run should exist");
         }
@@ -348,6 +390,18 @@ pub(crate) fn wait_for_single_run_root(storage_root: &Path, timeout: Duration) -
         "timed out waiting for single run root under {}",
         runs_dir.display()
     );
+}
+
+fn collect_run_roots(storage_root: &Path) -> Vec<PathBuf> {
+    let mut runs = fs::read_dir(storage_root.join("runs"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    runs.sort();
+    runs
 }
 
 pub(crate) fn wait_for_state_pid_change(
@@ -609,6 +663,7 @@ pub(crate) fn ensure_internal_images() {
     static READY: OnceLock<()> = OnceLock::new();
     READY.get_or_init(|| {
         let root = workspace_root();
+        ensure_local_image(TEST_APP_IMAGE);
         ensure_docker_image(
             AMBER_ROUTER.reference,
             &root.join("docker/amber-router/Dockerfile"),
@@ -655,6 +710,7 @@ pub(crate) fn ensure_kind_internal_images(kind_cluster: &KindCluster) {
     load_kind_image(&name, AMBER_ROUTER.reference);
     load_kind_image(&name, AMBER_PROVISIONER.reference);
     load_kind_image(&name, AMBER_HELPER.reference);
+    load_kind_image(&name, TEST_APP_IMAGE);
     loaded
         .lock()
         .expect("kind image-load guard should lock")
@@ -808,15 +864,22 @@ pub(crate) fn run_manifest_with_args_and_env(
         .envs(extra_env.iter().copied())
         .output()
         .expect("failed to run amber run");
-    let run_root = wait_for_single_run_root(storage_root, Duration::from_secs(60));
     assert!(
         output.status.success(),
-        "amber run failed\nstdout:\n{}\nstderr:\n{}\nrun root: {}{}",
+        "amber run failed\nstdout:\n{}\nstderr:\n{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
-        run_root.display(),
-        run_debug_context(&run_root),
+        collect_run_roots(storage_root)
+            .into_iter()
+            .next()
+            .map(|run_root| format!(
+                "\nrun root: {}{}",
+                run_root.display(),
+                run_debug_context(&run_root)
+            ))
+            .unwrap_or_default(),
     );
+    let run_root = wait_for_single_run_root(storage_root, Duration::from_secs(60));
     let run_id = parse_run_id(&output.stdout);
     let expected_run_root = storage_root.join("runs").join(&run_id);
     assert_eq!(run_root, expected_run_root);
@@ -1024,7 +1087,7 @@ pub(crate) fn write_image_component(
             "manifest_version": "0.3.0",
             "slots": upstreams.iter().map(|(alias, _)| ((*alias).to_string(), json!({"kind": "http"}))).collect::<serde_json::Map<_, _>>(),
             "program": {
-                "image": "python:3.13-alpine",
+                "image": TEST_APP_IMAGE,
                 "entrypoint": ["python3", "-u", "-c", { "file": "./app.py" }],
                 "env": env,
                 "network": {
@@ -1175,13 +1238,13 @@ runcmd:
 }
 
 pub(crate) struct VmComponentSpec<'a> {
-    file_name: &'a str,
-    cloud_init_name: &'a str,
-    name: &'a str,
-    listen_port: u16,
-    base_image: &'a Path,
-    upstreams: &'a [(&'a str, &'a str)],
-    adversarial_host_url: Option<&'a str>,
+    pub(crate) file_name: &'a str,
+    pub(crate) cloud_init_name: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) listen_port: u16,
+    pub(crate) base_image: &'a Path,
+    pub(crate) upstreams: &'a [(&'a str, &'a str)],
+    pub(crate) adversarial_host_url: Option<&'a str>,
 }
 
 pub(crate) fn write_vm_component(root: &Path, spec: VmComponentSpec<'_>) {

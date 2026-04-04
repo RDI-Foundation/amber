@@ -50,12 +50,17 @@ pub struct ServiceAccount {
 }
 
 impl ServiceAccount {
-    pub fn new(name: impl Into<String>, _namespace: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        _namespace: impl Into<String>,
+        labels: BTreeMap<String, String>,
+    ) -> Self {
         Self {
             api_version: "v1",
             kind: "ServiceAccount",
             metadata: ObjectMeta {
                 name: name.into(),
+                labels,
                 ..Default::default()
             },
         }
@@ -87,6 +92,7 @@ impl Role {
     pub fn new(
         name: impl Into<String>,
         _namespace: impl Into<String>,
+        labels: BTreeMap<String, String>,
         rules: Vec<PolicyRule>,
     ) -> Self {
         Self {
@@ -94,6 +100,7 @@ impl Role {
             kind: "Role",
             metadata: ObjectMeta {
                 name: name.into(),
+                labels,
                 ..Default::default()
             },
             rules,
@@ -132,6 +139,7 @@ impl RoleBinding {
     pub fn new(
         name: impl Into<String>,
         _namespace: impl Into<String>,
+        labels: BTreeMap<String, String>,
         subject: Subject,
         role_ref: RoleRef,
     ) -> Self {
@@ -140,6 +148,7 @@ impl RoleBinding {
             kind: "RoleBinding",
             metadata: ObjectMeta {
                 name: name.into(),
+                labels,
                 ..Default::default()
             },
             subjects: vec![subject],

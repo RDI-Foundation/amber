@@ -297,20 +297,36 @@ pub(super) async fn proxy_noise_to_noise(
     Ok(())
 }
 
+pub(super) struct ExternalProxyRequest {
+    pub(super) route_id: Option<Arc<str>>,
+    pub(super) peer_id: Option<Arc<str>>,
+    pub(super) labels: HttpExchangeLabels,
+    pub(super) target: ExternalTarget,
+    pub(super) client: Arc<HttpClient>,
+    pub(super) config: Arc<MeshConfig>,
+    pub(super) external_overrides: ExternalOverrides,
+    pub(super) vetted_external_addrs: VettedExternalAddrs,
+}
+
 pub(super) async fn proxy_noise_to_external(
     session: &mut NoiseSession,
-    labels: HttpExchangeLabels,
-    target: ExternalTarget,
-    client: Arc<HttpClient>,
-    config: Arc<MeshConfig>,
-    external_overrides: ExternalOverrides,
-    vetted_external_addrs: VettedExternalAddrs,
+    request: ExternalProxyRequest,
 ) -> Result<(), RouterError> {
     let (local, remote) = duplex(64 * 1024);
     let mut noise_session = session.clone();
 
     let bridge = tokio::spawn(async move { proxy_noise_to_plain(&mut noise_session, local).await });
 
+    let ExternalProxyRequest {
+        route_id,
+        peer_id,
+        labels,
+        target,
+        client,
+        config,
+        external_overrides,
+        vetted_external_addrs,
+    } = request;
     let state = HttpProxyState {
         client: (*client).clone(),
         target,
@@ -319,6 +335,8 @@ pub(super) async fn proxy_noise_to_external(
         external_overrides,
         vetted_external_addrs,
         mesh_upstream: Arc::new(Mutex::new(None)),
+        route_id,
+        peer_id,
     };
 
     let service = service_fn(move |req: Request<Incoming>| {
@@ -352,6 +370,7 @@ pub(super) async fn proxy_noise_to_external_tcp(
 pub(super) async fn proxy_noise_to_local_http(
     session: &mut NoiseSession,
     route_id: Arc<str>,
+    peer_id: Arc<str>,
     port: u16,
     client: Arc<HttpClient>,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
@@ -369,6 +388,7 @@ pub(super) async fn proxy_noise_to_local_http(
         base_url,
         plugins,
         route_id,
+        peer_id,
         labels,
     };
 
@@ -493,8 +513,14 @@ pub(super) struct TrustBundle {
 }
 
 struct TrustState {
-    noise_by_id: HashMap<String, [u8; 32]>,
+    noise_by_id: HashMap<String, TrustPeerRegistration>,
     id_by_noise: HashMap<[u8; 32], String>,
+}
+
+struct TrustPeerRegistration {
+    noise: [u8; 32],
+    static_peer: bool,
+    dynamic_refs: usize,
 }
 
 impl TrustBundle {
@@ -503,7 +529,7 @@ impl TrustBundle {
         let mut id_by_noise = HashMap::new();
 
         for peer in &config.peers {
-            insert_peer(peer, &mut noise_by_id, &mut id_by_noise)?;
+            insert_static_peer(peer, &mut noise_by_id, &mut id_by_noise)?;
         }
 
         Ok(Self {
@@ -516,7 +542,7 @@ impl TrustBundle {
 
     async fn noise_key(&self, id: &str) -> Option<[u8; 32]> {
         let inner = self.inner.read().await;
-        inner.noise_by_id.get(id).copied()
+        inner.noise_by_id.get(id).map(|entry| entry.noise)
     }
 
     async fn id_for_noise_key(&self, key: &[u8; 32]) -> Option<String> {
@@ -527,8 +553,9 @@ impl TrustBundle {
     pub(super) async fn insert_peer(&self, peer: &MeshPeer) -> Result<(), RouterError> {
         let noise = ed25519_public_to_x25519(peer.public_key)?;
         let mut inner = self.inner.write().await;
-        if let Some(existing) = inner.noise_by_id.get(&peer.id).copied() {
-            if existing == noise {
+        if let Some(existing) = inner.noise_by_id.get_mut(&peer.id) {
+            if existing.noise == noise {
+                existing.dynamic_refs += 1;
                 return Ok(());
             }
             return Err(RouterError::Auth(format!(
@@ -544,19 +571,56 @@ impl TrustBundle {
                 existing_id
             )));
         }
-        inner.noise_by_id.insert(peer.id.clone(), noise);
+        inner.noise_by_id.insert(
+            peer.id.clone(),
+            TrustPeerRegistration {
+                noise,
+                static_peer: false,
+                dynamic_refs: 1,
+            },
+        );
         inner.id_by_noise.insert(noise, peer.id.clone());
+        Ok(())
+    }
+
+    pub(super) async fn remove_peer(&self, peer: &MeshPeer) -> Result<(), RouterError> {
+        let noise = ed25519_public_to_x25519(peer.public_key)?;
+        let mut inner = self.inner.write().await;
+        let Some(existing) = inner.noise_by_id.get_mut(&peer.id) else {
+            return Ok(());
+        };
+        if existing.noise != noise {
+            return Err(RouterError::Auth(format!(
+                "peer {} already registered with a different key",
+                peer.id
+            )));
+        }
+        if existing.dynamic_refs == 0 {
+            return Ok(());
+        }
+        existing.dynamic_refs -= 1;
+        if existing.dynamic_refs == 0 && !existing.static_peer {
+            inner.noise_by_id.remove(&peer.id);
+            inner.id_by_noise.remove(&noise);
+        }
         Ok(())
     }
 }
 
-fn insert_peer(
+fn insert_static_peer(
     peer: &MeshPeer,
-    noise_by_id: &mut HashMap<String, [u8; 32]>,
+    noise_by_id: &mut HashMap<String, TrustPeerRegistration>,
     id_by_noise: &mut HashMap<[u8; 32], String>,
 ) -> Result<(), RouterError> {
     let noise = ed25519_public_to_x25519(peer.public_key)?;
-    noise_by_id.insert(peer.id.clone(), noise);
+    noise_by_id.insert(
+        peer.id.clone(),
+        TrustPeerRegistration {
+            noise,
+            static_peer: true,
+            dynamic_refs: 0,
+        },
+    );
     id_by_noise.insert(noise, peer.id.clone());
     Ok(())
 }

@@ -180,6 +180,14 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
     let mut log_tasks = Vec::new();
     let mut component_sidecar_pid_by_id = HashMap::new();
     let mut control_socket_paths = None;
+    let existing_peer_ports_by_id = read_existing_peer_ports(
+        args.existing_peer_ports.as_deref(),
+        "direct existing peer ports",
+    )?;
+    let existing_peer_identities_by_id = read_existing_peer_identities(
+        args.existing_peer_identities.as_deref(),
+        "direct existing peer identities",
+    )?;
 
     let supervision = async {
         let mut sandbox = DirectSandbox::detect(&runtime_root);
@@ -195,13 +203,33 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 "direct runtime requires `slirp4netns` on Linux for isolated component networking"
             )
         })?;
-        let runtime_state = materialize_direct_runtime(
-            &plan_root,
+        let runtime_state = if args.skip_router || !existing_peer_ports_by_id.is_empty() {
+            materialize_direct_runtime_with_existing(
+                &plan_root,
+                &runtime_root,
+                &direct_plan,
+                &mesh_plan,
+                args.router_mesh_port,
+                DirectExistingMeshState {
+                    reuse_existing: args.runtime_root.is_some() && runtime_state_path.is_file(),
+                    peer_ports_by_id: &existing_peer_ports_by_id,
+                    peer_identities_by_id: &existing_peer_identities_by_id,
+                },
+            )?
+        } else {
+            materialize_direct_runtime(
+                &plan_root,
+                &runtime_root,
+                &direct_plan,
+                &mesh_plan,
+                args.router_mesh_port,
+                args.runtime_root.is_some() && runtime_state_path.is_file(),
+            )?
+        };
+        project_existing_direct_peer_identities(
             &runtime_root,
             &direct_plan,
-            &mesh_plan,
-            args.router_mesh_port,
-            args.runtime_root.is_some() && runtime_state_path.is_file(),
+            &existing_peer_identities_by_id,
         )?;
         #[cfg(target_os = "linux")]
         let mesh_network =
@@ -210,7 +238,9 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
         configure_direct_mesh_network(&runtime_root, &runtime_state, &direct_plan)?;
 
         let router_binary = resolve_runtime_binary("amber-router")?;
-        if let Some(router) = direct_plan.router.as_ref() {
+        if !args.skip_router
+            && let Some(router) = direct_plan.router.as_ref()
+        {
             let paths = DirectControlSocketPaths {
                 artifact_link: resolve_direct_artifact_path(
                     &plan_root,
@@ -497,6 +527,115 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
     }
 }
 
+fn read_existing_peer_ports(
+    path: Option<&Path>,
+    description: &str,
+) -> Result<BTreeMap<String, u16>> {
+    let Some(path) = path else {
+        return Ok(BTreeMap::new());
+    };
+    let raw = fs::read_to_string(path)
+        .map_err(|err| miette::miette!("failed to read {description} {}: {err}", path.display()))?;
+    serde_json::from_str(&raw)
+        .map_err(|err| miette::miette!("invalid {description} {}: {err}", path.display()))
+}
+
+pub(crate) fn read_existing_peer_identities(
+    path: Option<&Path>,
+    description: &str,
+) -> Result<BTreeMap<String, MeshIdentityPublic>> {
+    let Some(path) = path else {
+        return Ok(BTreeMap::new());
+    };
+    let raw = fs::read_to_string(path)
+        .map_err(|err| miette::miette!("failed to read {description} {}: {err}", path.display()))?;
+    let identities: BTreeMap<String, MeshIdentityPublic> = serde_json::from_str(&raw)
+        .map_err(|err| miette::miette!("invalid {description} {}: {err}", path.display()))?;
+    for (peer_id, identity) in &identities {
+        if identity.id != *peer_id {
+            return Err(miette::miette!(
+                "{description} entry `{peer_id}` does not match embedded identity id `{}`",
+                identity.id
+            ));
+        }
+    }
+    Ok(identities)
+}
+
+pub(crate) fn project_existing_direct_peer_identities(
+    runtime_root: &Path,
+    direct_plan: &DirectPlan,
+    existing_peer_identities_by_id: &BTreeMap<String, MeshIdentityPublic>,
+) -> Result<()> {
+    if existing_peer_identities_by_id.is_empty() {
+        return Ok(());
+    }
+    for component in &direct_plan.components {
+        project_existing_peer_identities_into_mesh_config(
+            &runtime_root.join(&component.sidecar.mesh_config_path),
+            existing_peer_identities_by_id,
+        )?;
+    }
+    if let Some(router) = direct_plan.router.as_ref() {
+        project_existing_peer_identities_into_mesh_config(
+            &runtime_root.join(&router.mesh_config_path),
+            existing_peer_identities_by_id,
+        )?;
+    } else {
+        project_existing_peer_identities_into_mesh_config(
+            &runtime_root.join("mesh/router").join(MESH_CONFIG_FILENAME),
+            existing_peer_identities_by_id,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn project_existing_peer_identities_into_mesh_config(
+    path: &Path,
+    existing_peer_identities_by_id: &BTreeMap<String, MeshIdentityPublic>,
+) -> Result<()> {
+    if existing_peer_identities_by_id.is_empty() || !path.is_file() {
+        return Ok(());
+    }
+
+    let mut config = read_mesh_config_public(path)?;
+    let canonical_mesh_scope = existing_peer_identities_by_id
+        .values()
+        .find_map(|identity| identity.mesh_scope.clone());
+    let mut changed = false;
+
+    if let Some(identity) = existing_peer_identities_by_id.get(&config.identity.id) {
+        if config.identity.public_key != identity.public_key
+            || config.identity.mesh_scope != identity.mesh_scope
+        {
+            config.identity.public_key = identity.public_key;
+            config.identity.mesh_scope = identity.mesh_scope.clone();
+            changed = true;
+        }
+    } else if let Some(mesh_scope) = canonical_mesh_scope.as_ref()
+        && config.identity.mesh_scope.as_deref() != Some(mesh_scope.as_str())
+    {
+        config.identity.mesh_scope = Some(mesh_scope.clone());
+        changed = true;
+    }
+
+    for peer in &mut config.peers {
+        let Some(identity) = existing_peer_identities_by_id.get(&peer.id) else {
+            continue;
+        };
+        if peer.public_key == identity.public_key {
+            continue;
+        }
+        peer.public_key = identity.public_key;
+        changed = true;
+    }
+
+    if changed {
+        write_mesh_config_public(path, &config)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_direct_artifact_path(plan_root: &Path, path: &str) -> PathBuf {
     let path = Path::new(path);
     if path.is_absolute() {
@@ -650,16 +789,48 @@ pub(crate) fn assign_direct_runtime_ports(
     direct_plan: &DirectPlan,
     fixed_router_mesh_port: Option<u16>,
 ) -> Result<DirectRuntimeState> {
+    assign_direct_runtime_ports_with_existing(
+        runtime_root,
+        direct_plan,
+        fixed_router_mesh_port,
+        &BTreeMap::new(),
+    )
+}
+
+pub(crate) fn assign_direct_runtime_ports_with_existing(
+    runtime_root: &Path,
+    direct_plan: &DirectPlan,
+    fixed_router_mesh_port: Option<u16>,
+    existing_peer_ports_by_id: &BTreeMap<String, u16>,
+) -> Result<DirectRuntimeState> {
     let mut state = DirectRuntimeState::default();
     let mut reserved = BTreeSet::new();
     let mut mesh_port_by_peer_id = HashMap::<String, u16>::new();
     let mut component_configs = Vec::new();
 
+    for (peer_id, port) in existing_peer_ports_by_id {
+        if !reserved.insert(*port) {
+            return Err(miette::miette!(
+                "runtime port {} was requested twice in one direct runtime",
+                port
+            ));
+        }
+        mesh_port_by_peer_id.insert(peer_id.clone(), *port);
+    }
+
     for component in &direct_plan.components {
         let path = runtime_root.join(&component.sidecar.mesh_config_path);
         let mut config = read_mesh_config_public(path.as_path())?;
         let mesh_port = allocate_direct_runtime_port(&mut reserved, None)?;
-        mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
+        if mesh_port_by_peer_id
+            .insert(config.identity.id.clone(), mesh_port)
+            .is_some()
+        {
+            return Err(miette::miette!(
+                "mesh peer id {} was registered twice in one direct runtime",
+                config.identity.id
+            ));
+        }
         config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
 
         let mut slot_route_ports: BTreeMap<String, Vec<(u16, u16)>> = BTreeMap::new();
@@ -712,7 +883,16 @@ pub(crate) fn assign_direct_runtime_ports(
         let path = runtime_root.join(&router.mesh_config_path);
         let mut config = read_mesh_config_public(path.as_path())?;
         let mesh_port = allocate_direct_runtime_port(&mut reserved, fixed_router_mesh_port)?;
-        mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
+        if let Some(existing) = mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port)
+            && existing != mesh_port
+        {
+            return Err(miette::miette!(
+                "mesh peer id {} was registered with conflicting ports {} and {}",
+                config.identity.id,
+                existing,
+                mesh_port
+            ));
+        }
         config.mesh_listen = SocketAddr::new(
             cross_site_router_mesh_bind_ip(config.mesh_listen.ip(), fixed_router_mesh_port),
             mesh_port,
@@ -834,7 +1014,8 @@ pub(crate) fn write_direct_runtime_state(
                 parent.display()
             )
         })?;
-    let json = serde_json::to_string_pretty(state)
+    let state = merged_direct_runtime_state_for_write(&path, state);
+    let json = serde_json::to_string_pretty(&state)
         .map_err(|err| miette::miette!("failed to serialize direct runtime state: {err}"))?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
         .into_diagnostic()
@@ -867,6 +1048,20 @@ pub(crate) fn write_direct_runtime_state(
     Ok(())
 }
 
+fn merged_direct_runtime_state_for_write(
+    path: &Path,
+    state: &DirectRuntimeState,
+) -> DirectRuntimeState {
+    let mut merged = state.clone();
+    if merged.router_mesh_port.is_none()
+        && let Ok(existing) = read_direct_runtime_state(path)
+        && existing.router_mesh_port.is_some()
+    {
+        merged.router_mesh_port = existing.router_mesh_port;
+    }
+    merged
+}
+
 pub(crate) fn read_direct_runtime_state(path: &Path) -> Result<DirectRuntimeState> {
     let raw = fs::read_to_string(path).map_err(|err| {
         miette::miette!(
@@ -886,16 +1081,60 @@ pub(crate) fn materialize_direct_runtime(
     fixed_router_mesh_port: Option<u16>,
     reuse_existing: bool,
 ) -> Result<DirectRuntimeState> {
+    let empty_peer_ports = BTreeMap::new();
+    let empty_peer_identities = BTreeMap::new();
+    materialize_direct_runtime_with_existing(
+        plan_root,
+        runtime_root,
+        direct_plan,
+        mesh_plan,
+        fixed_router_mesh_port,
+        DirectExistingMeshState {
+            reuse_existing,
+            peer_ports_by_id: &empty_peer_ports,
+            peer_identities_by_id: &empty_peer_identities,
+        },
+    )
+}
+
+pub(crate) struct DirectExistingMeshState<'a> {
+    pub(crate) reuse_existing: bool,
+    pub(crate) peer_ports_by_id: &'a BTreeMap<String, u16>,
+    pub(crate) peer_identities_by_id: &'a BTreeMap<String, MeshIdentityPublic>,
+}
+
+pub(crate) fn materialize_direct_runtime_with_existing(
+    plan_root: &Path,
+    runtime_root: &Path,
+    direct_plan: &DirectPlan,
+    mesh_plan: &MeshProvisionPlan,
+    fixed_router_mesh_port: Option<u16>,
+    existing: DirectExistingMeshState<'_>,
+) -> Result<DirectRuntimeState> {
     let runtime_state_path = direct_runtime_state_path(plan_root);
-    if reuse_existing && runtime_state_path.is_file() {
+    if existing.reuse_existing && runtime_state_path.is_file() {
         return read_direct_runtime_state(&runtime_state_path);
     }
     if runtime_state_path.exists() {
         let _ = fs::remove_file(&runtime_state_path);
     }
-    provision_mesh_filesystem(mesh_plan, runtime_root)?;
-    let runtime_state =
-        assign_direct_runtime_ports(runtime_root, direct_plan, fixed_router_mesh_port)?;
+    let existing_mesh_peer_identities =
+        required_existing_mesh_peer_identities(mesh_plan, existing.peer_identities_by_id)?;
+    provision_mesh_filesystem_with_peer_identities(
+        mesh_plan,
+        runtime_root,
+        &existing_mesh_peer_identities,
+    )?;
+    let runtime_state = if existing.peer_ports_by_id.is_empty() {
+        assign_direct_runtime_ports(runtime_root, direct_plan, fixed_router_mesh_port)?
+    } else {
+        assign_direct_runtime_ports_with_existing(
+            runtime_root,
+            direct_plan,
+            fixed_router_mesh_port,
+            existing.peer_ports_by_id,
+        )?
+    };
     write_direct_runtime_state(plan_root, &runtime_state)?;
     Ok(runtime_state)
 }

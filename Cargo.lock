@@ -111,6 +111,7 @@ dependencies = [
  "amber-router",
  "amber-scenario",
  "amber-template",
+ "axum",
  "base64",
  "clap",
  "dotenvy",
@@ -118,10 +119,13 @@ dependencies = [
  "jsonschema",
  "libc",
  "miette",
+ "regex",
+ "reqwest 0.13.2",
  "rpassword",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "similar",
  "strip-ansi-escapes",
  "tempfile",
@@ -147,6 +151,7 @@ dependencies = [
  "base64",
  "dashmap",
  "futures",
+ "glob",
  "jsonptr",
  "jsonschema",
  "miette",
@@ -306,6 +311,7 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tracing-error",
  "tracing-opentelemetry",
@@ -1619,6 +1625,12 @@ name = "gimli"
 version = "0.32.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
+
+[[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "h2"

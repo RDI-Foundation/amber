@@ -1,6 +1,7 @@
 mod command_support;
 mod direct_runtime;
 mod docs;
+mod framework_component;
 mod mixed_run;
 mod run_inputs;
 mod run_logs;
@@ -372,6 +373,12 @@ enum Command {
     RunVmInit(RunVmInitArgs),
     #[command(hide = true, name = "run-site-supervisor")]
     RunSiteSupervisor(RunSiteSupervisorArgs),
+    #[command(hide = true, name = "run-site-actuator")]
+    RunSiteActuator(RunSiteActuatorArgs),
+    #[command(hide = true, name = "run-framework-control-state")]
+    RunFrameworkControlState(RunFrameworkControlStateArgs),
+    #[command(hide = true, name = "run-framework-ccs")]
+    RunFrameworkCcs(RunFrameworkCcsArgs),
     #[command(hide = true, name = "run-detached-coordinator")]
     RunDetachedCoordinator(RunDetachedCoordinatorArgs),
     #[command(hide = true, name = "run-observability-sink")]
@@ -541,6 +548,18 @@ struct RunDirectInitArgs {
     /// Fixed router mesh port used by the mixed-site supervisor.
     #[arg(long = "router-mesh-port", value_name = "PORT", hide = true)]
     router_mesh_port: Option<u16>,
+
+    /// JSON file containing preexisting mesh peer ids mapped to fixed mesh ports.
+    #[arg(long = "existing-peer-ports", value_name = "FILE", hide = true)]
+    existing_peer_ports: Option<PathBuf>,
+
+    /// JSON file containing preexisting mesh peer identities keyed by peer id.
+    #[arg(long = "existing-peer-identities", value_name = "FILE", hide = true)]
+    existing_peer_identities: Option<PathBuf>,
+
+    /// Reuse an already-running site router instead of spawning the router from this plan.
+    #[arg(long = "skip-router", hide = true)]
+    skip_router: bool,
 }
 
 #[derive(Args)]
@@ -567,6 +586,18 @@ struct RunVmInitArgs {
     /// Fixed router mesh port used by the mixed-site supervisor.
     #[arg(long = "router-mesh-port", value_name = "PORT", hide = true)]
     router_mesh_port: Option<u16>,
+
+    /// JSON file containing preexisting mesh peer ids mapped to fixed mesh ports.
+    #[arg(long = "existing-peer-ports", value_name = "FILE", hide = true)]
+    existing_peer_ports: Option<PathBuf>,
+
+    /// JSON file containing preexisting mesh peer identities keyed by peer id.
+    #[arg(long = "existing-peer-identities", value_name = "FILE", hide = true)]
+    existing_peer_identities: Option<PathBuf>,
+
+    /// Reuse an already-running site router instead of spawning the router from this plan.
+    #[arg(long = "skip-router", hide = true)]
+    skip_router: bool,
 }
 
 #[derive(Args)]
@@ -590,6 +621,27 @@ struct RunOutsideProxyArgs {
 #[derive(Args)]
 struct RunSiteSupervisorArgs {
     /// Path to a mixed-site supervisor plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+}
+
+#[derive(Args)]
+struct RunSiteActuatorArgs {
+    /// Path to a mixed-site site-actuator plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+}
+
+#[derive(Args)]
+struct RunFrameworkControlStateArgs {
+    /// Path to a framework control-state service plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+}
+
+#[derive(Args)]
+struct RunFrameworkCcsArgs {
+    /// Path to a framework CCS plan JSON file.
     #[arg(long = "plan", value_name = "FILE")]
     plan: PathBuf,
 }
@@ -790,10 +842,20 @@ async fn main() -> Result<()> {
                         args.storage_root,
                         args.runtime_root,
                         args.router_mesh_port,
+                        args.existing_peer_ports,
+                        args.existing_peer_identities,
+                        args.skip_router,
                     )
                     .await
                 }
                 Command::RunSiteSupervisor(args) => mixed_run::run_site_supervisor(args.plan).await,
+                Command::RunSiteActuator(args) => mixed_run::run_site_actuator(args.plan).await,
+                Command::RunFrameworkControlState(args) => {
+                    framework_component::run_framework_control_state(args.plan).await
+                }
+                Command::RunFrameworkCcs(args) => {
+                    framework_component::run_framework_ccs(args.plan).await
+                }
                 Command::RunDetachedCoordinator(args) => run_detached_coordinator(args).await,
                 Command::RunObservabilitySink(args) => {
                     mixed_run::run_observability_sink(args.plan).await
@@ -1206,6 +1268,9 @@ async fn run(args: RunArgs) -> Result<()> {
                         storage_root: args.storage_root,
                         runtime_root: None,
                         router_mesh_port: None,
+                        existing_peer_ports: None,
+                        existing_peer_identities: None,
+                        skip_router: false,
                     })
                     .await
                 })
@@ -1219,7 +1284,16 @@ async fn run(args: RunArgs) -> Result<()> {
                     ));
                 }
                 with_scoped_run_env(&explicit_env, || async {
-                    vm_runtime::run_vm_init(target.plan, args.storage_root, None, None).await
+                    vm_runtime::run_vm_init(
+                        target.plan,
+                        args.storage_root,
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
                 })
                 .await
             }
@@ -1415,6 +1489,9 @@ fn project_env_root_for_run_input(input: &str) -> Result<Option<PathBuf>> {
     let Some(path) = local_input_path(input)? else {
         return Ok(None);
     };
+    if load_compiled_scenario_ir(&path)?.is_some() {
+        return Ok(None);
+    }
     if BundleLoader::from_path(&path)?.is_some() {
         return Ok(None);
     }

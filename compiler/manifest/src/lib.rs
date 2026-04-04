@@ -28,19 +28,21 @@ pub use interpolation::{
 pub use manifest::{ExperimentalFeature, Manifest, RawManifest};
 pub use names::{
     ChildName, ExportName, FrameworkCapabilityName, ProvideName, ResourceName, SlotName,
+    TemplateName,
 };
 pub use refs::{ManifestDigest, ManifestRef, ManifestUrl};
 // Keep this available at crate root for internal helpers (spans/document).
 pub(crate) use schema::binding_target_key_for_binding;
 pub use schema::{
     Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityDecl, CapabilityKind,
-    CapabilityTransport, ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EndpointPort,
-    EnvironmentDecl, ExportTarget, LocalComponentRef, ManifestBinding, MountSource, Network,
-    NetworkProtocol, Program, ProgramCommandKind, ProgramCommon, ProgramConfigUseSite,
+    CapabilityTransport, ChildTemplateAllowedManifests, ChildTemplateDecl, ChildTemplateLimitsDecl,
+    ChildTemplateManifestSelector, ComponentDecl, ComponentRef, ConfigSchema, Endpoint,
+    EndpointPort, EnvironmentDecl, ExportTarget, LocalComponentRef, ManifestBinding, MountSource,
+    Network, NetworkProtocol, Program, ProgramCommandKind, ProgramCommon, ProgramConfigUseSite,
     ProgramImage, ProgramMount, ProgramNetworkRef, ProgramPath, ProgramVmField, ProvideDecl,
     RawBinding, RawExportTarget, RawProgram, RawProgramCommon, RawProgramImage, RawProgramPath,
-    RawProgramVmField, RawVmCloudInit, RawVmProgram, ResourceDecl, SlotDecl, VmCloudInit, VmEgress,
-    VmNetwork, VmProgram, VmScalarU32,
+    RawProgramVmField, RawVmCloudInit, RawVmProgram, RealmSelector, ResourceDecl, RuntimeBackend,
+    SlotDecl, VmCloudInit, VmEgress, VmNetwork, VmProgram, VmScalarU32,
 };
 pub use slot_query::{
     SlotQuery, SlotQueryError, SlotQueryValidation, SlotTarget, parse_slot_query,

@@ -91,6 +91,11 @@ That example shows the default Amber loop:
 - outside services can stay outside the app
 - Amber gives you stable localhost entrypoints for what the app chooses to expose
 
+For dynamic component creation, the supported path is `framework.component`. It gives a component
+authority over its realm through the same capability-routing model as the rest of Amber, instead of
+using backend-specific control surfaces. The smallest example is
+[`examples/framework-component`](examples/framework-component/README.md).
+
 For background runs and persisted logs, `amber run --detach`, `amber ps`, `amber logs`, and
 `amber stop` give you a managed local workflow without requiring generated artifacts.
 
@@ -201,6 +206,11 @@ more control over how the system is launched.
   [`examples/vm-network-storage`](examples/vm-network-storage/README.md) are the best places to
   see explicit reachability and isolation in practice.
 
+- **Dynamic children with `framework.component`**  
+  [`examples/framework-component`](examples/framework-component/README.md) shows the supported
+  create/destroy path for dynamic children. Prefer it over backend-specific experimental control
+  capabilities when you need runtime mutation.
+
 - **Observability by graph edge**  
   [`examples/observability-debug`](examples/observability-debug/README.md) shows logs and telemetry
   in terms of the user-facing connections in the scenario, not just container names.
@@ -264,4 +274,3 @@ amber proxy /tmp/amber-compose \
 
 If you arrive here from a search result and only try one thing, start with
 [`examples/mixed-site`](examples/mixed-site/README.md) and run `amber run .`.
-

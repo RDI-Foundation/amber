@@ -68,6 +68,7 @@ fn docker_smoke_component_reaches_public_internet_by_default() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(1)],
     };
 
@@ -83,6 +84,7 @@ fn docker_smoke_component_reaches_public_internet_by_default() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -91,6 +93,7 @@ fn docker_smoke_component_reaches_public_internet_by_default() {
         components: vec![Some(root), Some(client)],
         bindings: Vec::new(),
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     };
 
     let output = compile_output(scenario);
@@ -334,6 +337,7 @@ fn docker_smoke_component_default_egress_blocks_host_access() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(1)],
     };
 
@@ -349,6 +353,7 @@ fn docker_smoke_component_default_egress_blocks_host_access() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -357,6 +362,7 @@ fn docker_smoke_component_default_egress_blocks_host_access() {
         components: vec![Some(root), Some(client)],
         bindings: Vec::new(),
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     };
 
     let output = compile_output(scenario);
@@ -549,6 +555,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(1)],
     };
 
@@ -564,10 +571,12 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(client)],
         bindings: vec![BindingEdge {
@@ -814,6 +823,7 @@ sleep infinity
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(1), ComponentId(2), ComponentId(3)],
     };
     let agent_a = Component {
@@ -828,6 +838,7 @@ sleep infinity
         provides: BTreeMap::from([("agent".to_string(), provide_a2a.clone())]),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
     let agent_b = Component {
@@ -842,6 +853,7 @@ sleep infinity
         provides: BTreeMap::from([("agent".to_string(), provide_a2a)]),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
     let client_c = Component {
@@ -859,10 +871,12 @@ sleep infinity
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(agent_a), Some(agent_b), Some(client_c)],
         bindings: vec![
@@ -1096,6 +1110,7 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(1), ComponentId(2)],
     };
 
@@ -1111,6 +1126,7 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -1126,10 +1142,12 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![BindingEdge {
@@ -1286,6 +1304,7 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(2), ComponentId(1)],
     };
 
@@ -1304,6 +1323,7 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         ]),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -1322,10 +1342,12 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![

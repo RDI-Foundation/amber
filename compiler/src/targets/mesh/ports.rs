@@ -282,6 +282,7 @@ mod tests {
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
+            child_templates: BTreeMap::new(),
             children: Vec::new(),
         }
     }
@@ -329,6 +330,7 @@ mod tests {
             components: vec![Some(consumer), Some(provider)],
             bindings: Vec::<BindingEdge>::new(),
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
 
         let mesh_plan = MeshPlan::new(
@@ -437,6 +439,7 @@ mod tests {
             components: vec![Some(root), Some(consumer), Some(provider)],
             bindings: Vec::<BindingEdge>::new(),
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
 
         let mesh_plan = MeshPlan::new(
@@ -445,6 +448,7 @@ mod tests {
                 ResolvedBinding::Framework(ResolvedFrameworkBinding {
                     consumer: ComponentId(1),
                     slot: "upstream".to_string(),
+                    authority_realm: ComponentId(0),
                     capability: FrameworkCapabilityName::try_from("docker")
                         .expect("framework capability"),
                 }),

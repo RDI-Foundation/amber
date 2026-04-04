@@ -234,6 +234,7 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
             &outside_identity.id,
             &peer_key,
             &export.protocol,
+            None,
             ROUTER_CONTROL_TIMEOUT,
         )
         .await?;
@@ -322,6 +323,7 @@ pub(super) async fn stop_site_from_receipt(
                     .envs(launch_env)
                     .arg("down")
                     .arg("-v")
+                    .arg("--remove-orphans")
                     .status()
                     .into_diagnostic()
                     .wrap_err_with(|| {
@@ -359,6 +361,7 @@ pub(super) async fn stop_site_from_receipt(
             }
         }
     }
+    cleanup_dynamic_site_children(&run_root.join("state").join(site_id), site.kind)?;
     Ok(())
 }
 

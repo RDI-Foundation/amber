@@ -155,6 +155,24 @@ pub enum Error {
     #[diagnostic(code(manifest::unknown_framework_capability), help("{help}"))]
     UnknownFrameworkCapability { capability: String, help: String },
 
+    #[error("invalid realm selector `{selector}`: {message}")]
+    #[diagnostic(code(manifest::invalid_realm_selector))]
+    InvalidRealmSelector { selector: String, message: String },
+
+    #[error("manifest declares `child_templates` but does not expose a `component` slot")]
+    #[diagnostic(
+        code(manifest::child_templates_require_component_slot),
+        help(
+            "Declare at least one `slots.<name>: {{ kind: \"component\" }}` on the manifest that \
+             owns the child templates."
+        )
+    )]
+    ChildTemplatesRequireComponentSlot,
+
+    #[error("invalid child template `{template}`: {message}")]
+    #[diagnostic(code(manifest::invalid_child_template))]
+    InvalidChildTemplate { template: String, message: String },
+
     #[error(
         "framework capability `framework.{capability}` requires experimental feature `{feature}`"
     )]

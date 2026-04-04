@@ -1364,7 +1364,11 @@ pub(crate) fn resolve_runtime_binary(name: &str) -> Result<String> {
     ))
 }
 
-pub(crate) fn provision_mesh_filesystem(plan: &MeshProvisionPlan, root: &Path) -> Result<()> {
+pub(crate) fn provision_mesh_filesystem_with_peer_identities(
+    plan: &MeshProvisionPlan,
+    root: &Path,
+    existing_peer_identities_by_id: &std::collections::BTreeMap<String, MeshIdentityPublic>,
+) -> Result<()> {
     if plan.version != MESH_PROVISION_PLAN_VERSION {
         return Err(miette::miette!(
             "unsupported mesh provision plan version {}",
@@ -1373,14 +1377,34 @@ pub(crate) fn provision_mesh_filesystem(plan: &MeshProvisionPlan, root: &Path) -
     }
 
     let mut identities: HashMap<String, MeshIdentity> = HashMap::new();
+    for identity in existing_peer_identities_by_id.values() {
+        identities.insert(
+            identity.id.clone(),
+            MeshIdentity {
+                id: identity.id.clone(),
+                public_key: identity.public_key,
+                private_key: [0; 64],
+                mesh_scope: identity.mesh_scope.clone(),
+            },
+        );
+    }
     for target in &plan.targets {
+        if existing_peer_identities_by_id.contains_key(&target.config.identity.id) {
+            return Err(miette::miette!(
+                "mesh provision plan target {} collides with an existing peer identity",
+                target.config.identity.id
+            ));
+        }
         let id = target.config.identity.id.clone();
-        identities.entry(id).or_insert_with(|| {
-            MeshIdentity::generate(
-                target.config.identity.id.clone(),
-                target.config.identity.mesh_scope.clone(),
-            )
-        });
+        let mesh_scope = target.config.identity.mesh_scope.clone();
+        identities
+            .entry(id)
+            .or_insert_with(|| match plan.identity_seed.as_deref() {
+                Some(seed) => {
+                    MeshIdentity::derive(target.config.identity.id.clone(), mesh_scope, seed)
+                }
+                None => MeshIdentity::generate(target.config.identity.id.clone(), mesh_scope),
+            });
     }
 
     for target in &plan.targets {
@@ -1428,6 +1452,40 @@ pub(crate) fn provision_mesh_filesystem(plan: &MeshProvisionPlan, root: &Path) -
     }
 
     Ok(())
+}
+
+pub(crate) fn required_existing_mesh_peer_identities(
+    plan: &MeshProvisionPlan,
+    available_peer_identities_by_id: &std::collections::BTreeMap<String, MeshIdentityPublic>,
+) -> Result<std::collections::BTreeMap<String, MeshIdentityPublic>> {
+    let target_ids = plan
+        .targets
+        .iter()
+        .map(|target| target.config.identity.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let required_peer_ids = plan
+        .targets
+        .iter()
+        .flat_map(|target| target.config.peers.iter())
+        .filter(|peer| !target_ids.contains(peer.id.as_str()))
+        .map(|peer| peer.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    required_peer_ids
+        .into_iter()
+        .map(|peer_id| {
+            let identity = available_peer_identities_by_id
+                .get(peer_id)
+                .cloned()
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "mesh provision plan requires existing peer identity {peer_id}, but it is \
+                         not currently available"
+                    )
+                })?;
+            Ok((peer_id.to_string(), identity))
+        })
+        .collect()
 }
 
 pub(crate) fn output_dir_for_target(root: &Path, target: &MeshProvisionTarget) -> Result<PathBuf> {

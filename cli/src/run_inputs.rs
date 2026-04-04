@@ -109,7 +109,11 @@ pub(crate) fn collect_run_interface(run_plan: &RunPlan) -> Result<RunInterface> 
             merge_root_inputs(&mut root_inputs, parse_env_sample(env_sample)?);
         }
 
-        let metadata = load_site_proxy_metadata(site)?;
+        let metadata = match load_site_proxy_metadata(site) {
+            Ok(metadata) => metadata,
+            Err(_) if site.assigned_components.is_empty() => continue,
+            Err(err) => return Err(err),
+        };
 
         for (name, slot) in metadata.external_slots {
             if is_synthetic_external_slot_name(&name) {
@@ -550,9 +554,12 @@ fn is_synthetic_external_slot_name(name: &str) -> bool {
 mod tests {
     use amber_compiler::{
         mesh::PROXY_METADATA_FILENAME,
-        run_plan::{RunLink, RunPlan, RunSitePlan, SiteDefinition, SiteKind},
+        run_plan::{
+            ActiveSiteCapabilities, PlacementDefaults, RunLink, RunPlan, RunSitePlan,
+            SiteDefinition, SiteKind,
+        },
     };
-    use amber_scenario::ScenarioIr;
+    use amber_scenario::{SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr};
 
     use super::*;
 
@@ -571,6 +578,7 @@ mod tests {
                 components: Vec::new(),
                 bindings: Vec::new(),
                 exports: Vec::new(),
+                manifest_catalog: BTreeMap::new(),
             },
             artifact_files,
         }
@@ -624,8 +632,38 @@ mod tests {
                            config.catalog_token\nAMBER_CONFIG_CATALOG_TOKEN=\n";
         let run_plan = RunPlan {
             schema: "amber.run.plan".to_string(),
-            version: 1,
+            version: 2,
             mesh_scope: "scope".to_string(),
+            base_scenario: ScenarioIr {
+                schema: SCENARIO_IR_SCHEMA.to_string(),
+                version: SCENARIO_IR_VERSION,
+                root: 0,
+                components: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+                manifest_catalog: BTreeMap::new(),
+            },
+            offered_sites: BTreeMap::from([(
+                "direct_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            )]),
+            defaults: PlacementDefaults::default(),
+            initial_active_sites: vec!["direct_local".to_string()],
+            standby_sites: Vec::new(),
+            dynamic_enabled_sites: vec!["direct_local".to_string()],
+            control_only_sites: Vec::new(),
+            active_site_capabilities: BTreeMap::from([(
+                "direct_local".to_string(),
+                ActiveSiteCapabilities {
+                    cross_site_routing: true,
+                    dynamic_workloads: true,
+                    privileged_control: true,
+                },
+            )]),
+            placement_components: BTreeMap::new(),
             assignments: BTreeMap::new(),
             sites: BTreeMap::from([(
                 "direct_local".to_string(),
@@ -698,8 +736,23 @@ mod tests {
     fn collect_run_interface_reads_compose_proxy_metadata_from_compose_yaml() {
         let run_plan: RunPlan = serde_json::from_value(serde_json::json!({
             "schema": "amber.run.plan",
-            "version": 1,
+            "version": 2,
             "mesh_scope": "scope",
+            "offered_sites": {
+                "compose_local": { "kind": "compose" }
+            },
+            "defaults": {},
+            "initial_active_sites": ["compose_local"],
+            "standby_sites": [],
+            "dynamic_enabled_sites": ["compose_local"],
+            "control_only_sites": [],
+            "active_site_capabilities": {
+                "compose_local": {
+                    "cross_site_routing": true,
+                    "dynamic_workloads": true,
+                    "privileged_control": true
+                }
+            },
             "assignments": { "/api": "compose_local" },
             "sites": {
                 "compose_local": {
@@ -755,6 +808,100 @@ mod tests {
             interface.exports,
             vec![ExportSpec {
                 name: "api".to_string(),
+                protocol: "http".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn collect_run_interface_skips_empty_standby_sites_without_proxy_metadata() {
+        let run_plan: RunPlan = serde_json::from_value(serde_json::json!({
+            "schema": "amber.run.plan",
+            "version": 2,
+            "mesh_scope": "scope",
+            "offered_sites": {
+                "compose_local": { "kind": "compose" },
+                "direct_local": { "kind": "direct" }
+            },
+            "defaults": {
+                "path": "direct_local",
+                "image": "compose_local"
+            },
+            "initial_active_sites": ["compose_local", "direct_local"],
+            "standby_sites": ["direct_local"],
+            "dynamic_enabled_sites": ["compose_local", "direct_local"],
+            "control_only_sites": [],
+            "active_site_capabilities": {
+                "compose_local": {
+                    "cross_site_routing": true,
+                    "dynamic_workloads": true,
+                    "privileged_control": true
+                },
+                "direct_local": {
+                    "cross_site_routing": true,
+                    "dynamic_workloads": true,
+                    "privileged_control": true
+                }
+            },
+            "assignments": { "/admin": "compose_local" },
+            "sites": {
+                "compose_local": {
+                    "site": { "kind": "compose" },
+                    "router_identity_id": "/site/compose_local/router",
+                    "assigned_components": ["/admin"],
+                    "scenario_ir": {
+                        "schema": amber_scenario::SCENARIO_IR_SCHEMA,
+                        "version": amber_scenario::SCENARIO_IR_VERSION,
+                        "root": 0,
+                        "components": [],
+                        "bindings": [],
+                        "exports": []
+                    },
+                    "artifact_files": {
+                        "compose.yaml": concat!(
+                            "services:\n",
+                            "  amber-router:\n",
+                            "    image: example/router\n",
+                            "x-amber:\n",
+                            "  version: \"1\"\n",
+                            "  exports:\n",
+                            "    admin_http:\n",
+                            "      component: /admin\n",
+                            "      provide: http\n",
+                            "      protocol: http\n",
+                            "      router_mesh_port: 24000\n"
+                        )
+                    }
+                },
+                "direct_local": {
+                    "site": { "kind": "direct" },
+                    "router_identity_id": "/site/direct_local/router",
+                    "assigned_components": [],
+                    "scenario_ir": {
+                        "schema": amber_scenario::SCENARIO_IR_SCHEMA,
+                        "version": amber_scenario::SCENARIO_IR_VERSION,
+                        "root": 0,
+                        "components": [],
+                        "bindings": [],
+                        "exports": []
+                    },
+                    "artifact_files": {}
+                }
+            },
+            "links": [],
+            "startup_waves": [["compose_local"], ["direct_local"]]
+        }))
+        .expect("run plan should deserialize");
+
+        let interface = collect_run_interface(&run_plan).expect("run interface");
+        assert!(
+            interface.external_slots.is_empty(),
+            "empty standby sites should not invent external slot requirements"
+        );
+        assert_eq!(
+            interface.exports,
+            vec![ExportSpec {
+                name: "admin_http".to_string(),
                 protocol: "http".to_string(),
             }]
         );

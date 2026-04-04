@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use amber_manifest::{Manifest, ManifestRef};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl,
-    ResourceRef, Scenario, ScenarioExport, SlotRef, StorageResourceParams,
+    BindingEdge, BindingFrom, ChildTemplate, Component, ComponentId, Moniker, ProvideRef,
+    ResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef, StorageResourceParams,
 };
 use url::Url;
 
@@ -27,6 +27,7 @@ fn component(id: usize, moniker: &str) -> Component {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     }
 }
@@ -146,6 +147,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
     store.put(child_digest, Arc::new(child_manifest));
 
     let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
@@ -318,6 +320,7 @@ fn flatten_keeps_resource_owners() {
     store.put(child_manifest.digest(), Arc::new(child_manifest));
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
@@ -448,6 +451,7 @@ fn flatten_allows_same_name_siblings() {
     store.put(child_b_digest, Arc::new(child_b_manifest));
 
     let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components,
         bindings: Vec::new(),
@@ -504,4 +508,100 @@ fn flatten_allows_same_name_siblings() {
     assert_eq!(child_monikers, vec!["/child", "/parent/child"]);
     assert!(scenario.components[2].is_none());
     assert_eq!(scenario.components[1].as_ref().unwrap().parent, Some(root));
+}
+
+#[test]
+fn flatten_keeps_realm_significant_template_owner_nodes() {
+    let root_manifest: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          components: { parent: "file:///parent.json5" },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let parent_manifest: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          components: { child: "file:///child.json5" },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let child_manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "child",
+            entrypoint: ["child"],
+          },
+        }
+    "#
+    .parse()
+    .unwrap();
+
+    let store = DigestStore::new();
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/parent")),
+        Some(component(2, "/parent/child")),
+    ];
+    components[0].as_mut().unwrap().digest = root_manifest.digest();
+    components[1].as_mut().unwrap().digest = parent_manifest.digest();
+    components[2].as_mut().unwrap().digest = child_manifest.digest();
+
+    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[2].as_mut().unwrap().parent = Some(ComponentId(1));
+    components[0]
+        .as_mut()
+        .unwrap()
+        .children
+        .push(ComponentId(1));
+    components[1]
+        .as_mut()
+        .unwrap()
+        .children
+        .push(ComponentId(2));
+    components[1].as_mut().unwrap().child_templates.insert(
+        "worker".to_string(),
+        ChildTemplate {
+            frozen: false,
+            manifest: Some("file:///templates/worker.json5".to_string()),
+            allowed_manifests: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            slot_decls: BTreeMap::new(),
+            visible_exports: None,
+            limits: None,
+            possible_backends: Vec::new(),
+        },
+    );
+
+    apply_manifest(components[0].as_mut().unwrap(), &root_manifest);
+    apply_manifest(components[1].as_mut().unwrap(), &parent_manifest);
+    apply_manifest(components[2].as_mut().unwrap(), &child_manifest);
+    store.put(root_manifest.digest(), Arc::new(root_manifest));
+    store.put(parent_manifest.digest(), Arc::new(parent_manifest));
+    store.put(child_manifest.digest(), Arc::new(child_manifest));
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings: Vec::new(),
+        exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
+    };
+
+    let scenario = flatten_routing_only(scenario, &store).unwrap();
+    assert_eq!(scenario.components.iter().flatten().count(), 3);
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.as_str() == "/parent"),
+        "template owners must remain in the logical graph"
+    );
 }

@@ -169,7 +169,7 @@ mod tests {
     use amber_manifest::{FrameworkCapabilityName, ManifestDigest};
 
     use super::*;
-    use crate::{BindingEdge, BindingFrom, Moniker, ProvideRef, SlotRef};
+    use crate::{BindingEdge, BindingFrom, FrameworkRef, Moniker, ProvideRef, SlotRef};
 
     fn component(id: usize, moniker: &str) -> Component {
         Component {
@@ -184,6 +184,7 @@ mod tests {
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
+            child_templates: BTreeMap::new(),
             children: Vec::new(),
         }
     }
@@ -220,6 +221,7 @@ mod tests {
             components,
             bindings,
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
 
         let order = topo_order(&scenario).unwrap();
@@ -273,6 +275,7 @@ mod tests {
             components,
             bindings,
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
 
         let cycle = topo_order(&scenario).unwrap_err().cycle;
@@ -299,9 +302,10 @@ mod tests {
     fn topo_order_ignores_framework_bindings() {
         let components = vec![Some(component(0, "/a")), Some(component(1, "/b"))];
         let bindings = vec![BindingEdge {
-            from: BindingFrom::Framework(
-                FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
-            ),
+            from: BindingFrom::Framework(FrameworkRef {
+                authority: ComponentId(0),
+                capability: FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
+            }),
             to: SlotRef {
                 component: ComponentId(1),
                 name: "needs".to_string(),
@@ -313,6 +317,7 @@ mod tests {
             components,
             bindings,
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
 
         let order = topo_order(&scenario).unwrap();

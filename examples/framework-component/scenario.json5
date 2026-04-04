@@ -1,0 +1,20 @@
+{
+  manifest_version: "0.3.0",
+  slots: {
+    realm: { kind: "component", optional: true },
+  },
+  components: {
+    admin: "./admin.json5",
+  },
+  child_templates: {
+    worker: {
+      manifest: "./worker.json5",
+    },
+  },
+  bindings: [
+    { to: "#admin.ctl", from: "framework.component" },
+  ],
+  exports: {
+    admin_http: "#admin.http",
+  },
+}

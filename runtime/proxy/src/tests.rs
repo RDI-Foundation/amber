@@ -43,6 +43,25 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn assert_port_eventually_releases(addr: SocketAddr, context: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match TcpListener::bind(addr) {
+            Ok(listener) => {
+                drop(listener);
+                return;
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::AddrInUse
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("{context}: {err}"),
+        }
+    }
+}
+
 #[cfg(unix)]
 fn with_fake_compose_runtime<F>(script: &str, test: F)
 where
@@ -185,7 +204,7 @@ fn reserve_export_bindings_hold_reserved_ports_until_drop() {
     );
 
     drop(listeners);
-    TcpListener::bind(actual).expect("dropping the reservation should release the port");
+    assert_port_eventually_releases(actual, "dropping the reservation should release the port");
 }
 
 #[tokio::test]
@@ -246,10 +265,14 @@ async fn reserve_export_bindings_preserve_duplicate_export_listeners() {
     );
 
     drop(listeners);
-    TcpListener::bind(bindings[0].listen)
-        .expect("dropping the converted listeners should release the first port");
-    TcpListener::bind(bindings[1].listen)
-        .expect("dropping the converted listeners should release the second port");
+    assert_port_eventually_releases(
+        bindings[0].listen,
+        "dropping the converted listeners should release the first port",
+    );
+    assert_port_eventually_releases(
+        bindings[1].listen,
+        "dropping the converted listeners should release the second port",
+    );
 }
 
 #[test]
@@ -284,6 +307,17 @@ fn choose_compose_project_name_prefers_env_override() {
     )
     .expect("selection should succeed");
     assert_eq!(selected.as_deref(), Some("from-env"));
+}
+
+#[test]
+fn resolve_compose_project_name_prefers_router_metadata_project() {
+    let selected = resolve_compose_project_name(
+        None,
+        Some("dynamic-stack"),
+        Path::new("/tmp/child/compose.yaml"),
+    )
+    .expect("selection should succeed");
+    assert_eq!(selected.as_deref(), Some("dynamic-stack"));
 }
 
 #[test]
@@ -403,6 +437,7 @@ fn resolve_control_endpoint_uses_short_direct_control_socket_alias() {
             router: Some(amber_compiler::mesh::RouterMetadata {
                 mesh_port: 0,
                 control_port: 0,
+                compose_project: None,
                 control_socket: Some(".amber/router-control.sock".to_string()),
                 control_socket_volume: None,
             }),
@@ -433,6 +468,7 @@ fn resolve_control_endpoint_preserves_nested_compose_volume_socket_path() {
             router: Some(amber_compiler::mesh::RouterMetadata {
                 mesh_port: 24000,
                 control_port: 24100,
+                compose_project: None,
                 control_socket: Some("/site/compose_local/router-control.sock".to_string()),
                 control_socket_volume: Some(
                     "${COMPOSE_PROJECT_NAME:-default}_amber-router-control".to_string(),
@@ -454,6 +490,39 @@ fn resolve_control_endpoint_preserves_nested_compose_volume_socket_path() {
         panic!("expected compose volume socket endpoint");
     };
     assert_eq!(volume, "mixed-stack_amber-router-control");
+    assert_eq!(socket_path, "/site/compose_local/router-control.sock");
+}
+
+#[test]
+fn resolve_control_endpoint_prefers_router_metadata_compose_project() {
+    let target = ProxyTarget {
+        kind: ProxyTargetKind::DockerCompose,
+        metadata: ProxyMetadata {
+            version: PROXY_METADATA_VERSION.to_string(),
+            router: Some(amber_compiler::mesh::RouterMetadata {
+                mesh_port: 24000,
+                control_port: 24100,
+                compose_project: Some("dynamic-stack".to_string()),
+                control_socket: Some("/site/compose_local/router-control.sock".to_string()),
+                control_socket_volume: Some(
+                    "${COMPOSE_PROJECT_NAME:-default}_amber-router-control".to_string(),
+                ),
+            }),
+            ..Default::default()
+        },
+        source: PathBuf::from("/tmp/out/compose.yaml"),
+    };
+
+    let endpoint = resolve_control_endpoint(None, None, &target).expect("endpoint should resolve");
+
+    let ControlEndpoint::VolumeSocket {
+        volume,
+        socket_path,
+    } = endpoint
+    else {
+        panic!("expected compose volume socket endpoint");
+    };
+    assert_eq!(volume, "dynamic-stack_amber-router-control");
     assert_eq!(socket_path, "/site/compose_local/router-control.sock");
 }
 

@@ -3,7 +3,9 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{BindingSource, BindingTarget, Manifest};
+use amber_manifest::{
+    BindingSource, BindingTarget, CapabilityKind, ExportTarget, Manifest, framework_capability,
+};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProgramMount, Scenario, SlotRef,
 };
@@ -108,6 +110,7 @@ fn take_scenario(scenario: &mut Scenario) -> Scenario {
             components: Vec::new(),
             bindings: Vec::new(),
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         },
     )
 }
@@ -307,8 +310,11 @@ fn rewrite_bindings(
 }
 
 fn is_pure_routing(
+    scenario: &Scenario,
     component: &Component,
     manifest: &Manifest,
+    manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
     forward_map: &HashMap<(ComponentId, String), Vec<ForwardEdge>>,
 ) -> bool {
     if component.program.is_some()
@@ -322,6 +328,9 @@ fn is_pure_routing(
         return false;
     }
     if !component.resources.is_empty() {
+        return false;
+    }
+    if is_realm_significant(scenario, component, manifest, manifests, child_index) {
         return false;
     }
     if component.children.is_empty() {
@@ -350,8 +359,148 @@ fn is_pure_routing(
     true
 }
 
+fn is_realm_significant(
+    scenario: &Scenario,
+    component: &Component,
+    manifest: &Manifest,
+    manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
+) -> bool {
+    if !component.child_templates.is_empty() {
+        return true;
+    }
+    if component
+        .slots
+        .values()
+        .any(|slot| slot.decl.kind == CapabilityKind::Component)
+    {
+        return true;
+    }
+    if component
+        .provides
+        .values()
+        .any(|provide| provide.decl.kind == CapabilityKind::Component)
+    {
+        return true;
+    }
+    if manifest.exports().values().any(|target| {
+        export_target_kind(scenario, manifests, child_index, component.id, target)
+            == Some(CapabilityKind::Component)
+    }) {
+        return true;
+    }
+    manifest.bindings().iter().any(|binding| {
+        binding_source_kind(
+            scenario,
+            manifests,
+            child_index,
+            component.id,
+            &binding.binding.from,
+        ) == Some(CapabilityKind::Component)
+            || binding_target_kind(
+                scenario,
+                manifests,
+                child_index,
+                component.id,
+                &binding.target,
+            ) == Some(CapabilityKind::Component)
+    })
+}
+
+fn binding_source_kind(
+    scenario: &Scenario,
+    manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
+    component_id: ComponentId,
+    source: &BindingSource,
+) -> Option<CapabilityKind> {
+    let component = scenario.component(component_id);
+    match source {
+        BindingSource::SelfProvide(name) => component
+            .provides
+            .get(name.as_str())
+            .map(|provide| provide.decl.kind),
+        BindingSource::SelfSlot(name) => component
+            .slots
+            .get(name.as_str())
+            .map(|slot| slot.decl.kind),
+        BindingSource::Resource(_) => None,
+        BindingSource::Framework(name) => {
+            framework_capability(name.as_str()).map(|capability| capability.decl.kind)
+        }
+        BindingSource::ChildExport { child, export } => {
+            let child_id = *child_index[component_id.0].get(child.as_str())?;
+            component_export_kind(scenario, manifests, child_index, child_id, export.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn binding_target_kind(
+    scenario: &Scenario,
+    _manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
+    component_id: ComponentId,
+    target: &BindingTarget,
+) -> Option<CapabilityKind> {
+    let component = scenario.component(component_id);
+    match target {
+        BindingTarget::SelfSlot(name) => component
+            .slots
+            .get(name.as_str())
+            .map(|slot| slot.decl.kind),
+        BindingTarget::ChildSlot { child, slot } => {
+            let child_id = *child_index[component_id.0].get(child.as_str())?;
+            scenario
+                .component(child_id)
+                .slots
+                .get(slot.as_str())
+                .map(|slot| slot.decl.kind)
+        }
+        _ => None,
+    }
+}
+
+fn export_target_kind(
+    scenario: &Scenario,
+    manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
+    component_id: ComponentId,
+    target: &ExportTarget,
+) -> Option<CapabilityKind> {
+    let component = scenario.component(component_id);
+    match target {
+        ExportTarget::SelfProvide(name) => component
+            .provides
+            .get(name.as_str())
+            .map(|provide| provide.decl.kind),
+        ExportTarget::SelfSlot(name) => component
+            .slots
+            .get(name.as_str())
+            .map(|slot| slot.decl.kind),
+        ExportTarget::ChildExport { child, export } => {
+            let child_id = *child_index[component_id.0].get(child.as_str())?;
+            component_export_kind(scenario, manifests, child_index, child_id, export.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn component_export_kind(
+    scenario: &Scenario,
+    manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
+    component_id: ComponentId,
+    export_name: &str,
+) -> Option<CapabilityKind> {
+    let manifest = manifests[component_id.0].as_ref()?;
+    let target = manifest.exports().get(export_name)?;
+    export_target_kind(scenario, manifests, child_index, component_id, target)
+}
+
 fn flatten_pure_routing_with_graph(scenario: Scenario, graph: &BindingGraph) -> Scenario {
     let n = scenario.components.len();
+    let child_index = build_child_index(&scenario.components);
 
     let mut referenced_by_binding = vec![false; n];
     for b in &scenario.bindings {
@@ -381,7 +530,14 @@ fn flatten_pure_routing_with_graph(scenario: Scenario, graph: &BindingGraph) -> 
         if referenced_by_binding[idx] {
             continue;
         }
-        if is_pure_routing(component, manifest, &graph.forward_map) {
+        if is_pure_routing(
+            &scenario,
+            component,
+            manifest,
+            &graph.manifests,
+            &child_index,
+            &graph.forward_map,
+        ) {
             remove[idx] = true;
         }
     }
@@ -432,6 +588,7 @@ fn prune_and_rebuild_scenario(
         mut components,
         bindings,
         exports,
+        manifest_catalog,
     } = scenario;
 
     debug_assert_eq!(removed.len(), components.len());
@@ -500,6 +657,7 @@ fn prune_and_rebuild_scenario(
         components,
         bindings: new_bindings,
         exports,
+        manifest_catalog,
     };
     scenario.normalize_order();
     scenario
@@ -607,6 +765,7 @@ impl<'a> DceSolver<'a> {
             self.mark_provide(export.from.component.0, &export.from.name);
         }
         self.seed_externally_rooted_programs();
+        self.seed_dynamic_control_affordances();
 
         while let Some(item) = self.work.pop_front() {
             match item {
@@ -635,6 +794,47 @@ impl<'a> DceSolver<'a> {
             if self.program_used_slots[binding.to.component.0].contains(binding.to.name.as_str()) {
                 self.mark_program_live(binding.to.component.0);
             }
+        }
+    }
+
+    fn seed_dynamic_control_affordances(&mut self) {
+        for (id, component) in self.scenario.components_iter() {
+            if component.child_templates.is_empty() {
+                continue;
+            }
+            if component.program.is_some() {
+                self.mark_program_live(id.0);
+            }
+            for child in &component.children {
+                self.mark_dynamic_realm_subtree(child.0);
+            }
+        }
+
+        let root = self.scenario.root;
+        if self.scenario.component(root).program.is_none() {
+            return;
+        }
+
+        let mut root_external_slots = BTreeSet::new();
+        for binding in &self.scenario.bindings {
+            let BindingFrom::External(slot) = &binding.from else {
+                continue;
+            };
+            if slot.component == root
+                && binding.to.component == root
+                && slot.name == binding.to.name
+            {
+                root_external_slots.insert(binding.to.name.clone());
+            }
+        }
+
+        if root_external_slots.is_empty() {
+            return;
+        }
+
+        self.mark_program_live(root.0);
+        for slot_name in root_external_slots {
+            self.mark_slot(root.0, &slot_name);
         }
     }
 
@@ -753,6 +953,33 @@ impl<'a> DceSolver<'a> {
             self.mark_resource(component.0, &resource);
         }
     }
+
+    fn mark_dynamic_realm_subtree(&mut self, component: usize) {
+        let mut stack = vec![ComponentId(component)];
+        while let Some(id) = stack.pop() {
+            let component = self.scenario.component(id);
+            let slots = component.slots.keys().cloned().collect::<Vec<_>>();
+            let provides = component.provides.keys().cloned().collect::<Vec<_>>();
+            let resources = component.resources.keys().cloned().collect::<Vec<_>>();
+            let children = component.children.clone();
+            let has_program = component.program.is_some();
+
+            self.mark_component_and_ancestors(id.0);
+            if has_program {
+                self.mark_program_live(id.0);
+            }
+            for slot in slots {
+                self.mark_slot(id.0, &slot);
+            }
+            for provide in provides {
+                self.mark_provide(id.0, &provide);
+            }
+            for resource in resources {
+                self.mark_resource(id.0, &resource);
+            }
+            stack.extend(children);
+        }
+    }
 }
 
 fn dce_with_semantics(scenario: Scenario) -> Scenario {
@@ -762,6 +989,7 @@ fn dce_with_semantics(scenario: Scenario) -> Scenario {
     let keep = compute_keep_set(
         &scenario,
         &results.keep_components,
+        &results.live_programs,
         &results.live_slots,
         &results.live_provides,
         &results.live_resources,
@@ -831,6 +1059,7 @@ fn collect_program_used_resources(component: &amber_scenario::Component) -> Vec<
 fn compute_keep_set(
     scenario: &Scenario,
     keep_components: &[bool],
+    live_programs: &[bool],
     live_slots: &HashSet<CapKey>,
     live_provides: &HashSet<CapKey>,
     live_resources: &HashSet<CapKey>,
@@ -840,6 +1069,9 @@ fn compute_keep_set(
     keep[scenario.root.0] = true;
 
     for (idx, &live) in keep_components.iter().enumerate() {
+        keep[idx] |= live;
+    }
+    for (idx, &live) in live_programs.iter().enumerate() {
         keep[idx] |= live;
     }
     for key in live_slots {
@@ -890,6 +1122,7 @@ mod tests {
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
+            child_templates: BTreeMap::new(),
             children: Vec::new(),
         }
     }
@@ -943,6 +1176,7 @@ mod tests {
                 },
             ],
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
         scenario.normalize_order();
 

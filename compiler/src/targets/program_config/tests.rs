@@ -43,10 +43,12 @@ fn test_scenario() -> Scenario {
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
+            child_templates: BTreeMap::new(),
             children: Vec::new(),
         })],
         bindings: Vec::<BindingEdge>::new(),
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     }
 }
 
@@ -93,6 +95,7 @@ fn component_with_config_and_program(
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     }
 }
@@ -105,6 +108,7 @@ fn scenario_with_child(child: Component) -> Scenario {
         components: vec![Some(root), Some(child)],
         bindings: Vec::<BindingEdge>::new(),
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     }
 }
 
@@ -216,6 +220,7 @@ fn build_mount_specs_defers_slot_mount_templates_for_deferred_runtime_addresses(
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
     let scenario = scenario_with_child(child);
@@ -307,6 +312,7 @@ fn build_mount_specs_defers_repeated_slot_item_mount_templates_for_deferred_runt
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
     let scenario = scenario_with_child(child);
@@ -473,6 +479,7 @@ fn build_endpoint_plan_expands_variadic_config_endpoints() {
     let mut root = root;
     root.children.push(ComponentId(1));
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(child)],
         bindings: Vec::<BindingEdge>::new(),

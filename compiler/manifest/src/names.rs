@@ -90,6 +90,7 @@ macro_rules! name_type {
 }
 
 name_type!(ChildName, "child");
+name_type!(TemplateName, "child template");
 name_type!(SlotName, "slot");
 name_type!(ProvideName, "provide");
 name_type!(ResourceName, "resource");

@@ -284,6 +284,8 @@ struct HttpProxyState {
     external_overrides: ExternalOverrides,
     vetted_external_addrs: VettedExternalAddrs,
     mesh_upstream: Arc<Mutex<Option<MeshHttpUpstream>>>,
+    route_id: Option<Arc<str>>,
+    peer_id: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -292,7 +294,20 @@ struct LocalHttpProxyState {
     base_url: Url,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     route_id: Arc<str>,
+    peer_id: Arc<str>,
     labels: HttpExchangeLabels,
+}
+
+const AMBER_ROUTE_ID_HEADER: &str = "x-amber-route-id";
+const AMBER_PEER_ID_HEADER: &str = "x-amber-peer-id";
+const AMBER_FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
+
+fn framework_component_auth_header_value() -> Option<HeaderValue> {
+    env::var(amber_mesh::FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| HeaderValue::from_str(&value).ok())
 }
 
 #[derive(Clone)]
@@ -692,6 +707,14 @@ type VettedExternalAddrs = Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>;
 type ControlAllowlist = Arc<HashSet<IpAddr>>;
 type DynamicIssuers = Arc<RwLock<HashMap<String, HashSet<String>>>>;
 type InboundRoutes = HashMap<String, InboundRoute>;
+type DynamicRouteOverlays = Arc<RwLock<HashMap<String, DynamicRouteOverlay>>>;
+
+#[derive(Clone, Debug)]
+struct DynamicRouteOverlay {
+    routes: HashMap<String, InboundRoute>,
+    peers: Vec<MeshPeer>,
+    static_issuer_grants: HashMap<String, HashSet<String>>,
+}
 
 type ExternalHttpResolveFuture =
     Pin<Box<dyn Future<Output = io::Result<std::vec::IntoIter<SocketAddr>>> + Send>>;
@@ -930,6 +953,22 @@ async fn proxy_local_http_request(
             request_parts.headers.remove(header::ACCEPT_ENCODING);
         }
         sanitize_request_headers(&mut request_parts.headers, &host_header);
+        request_parts.headers.insert(
+            header::HeaderName::from_static(AMBER_ROUTE_ID_HEADER),
+            HeaderValue::from_str(state.route_id.as_ref())
+                .expect("route id header value should be valid"),
+        );
+        request_parts.headers.insert(
+            header::HeaderName::from_static(AMBER_PEER_ID_HEADER),
+            HeaderValue::from_str(state.peer_id.as_ref())
+                .expect("peer id header value should be valid"),
+        );
+        if let Some(auth_token) = framework_component_auth_header_value() {
+            request_parts.headers.insert(
+                header::HeaderName::from_static(AMBER_FRAMEWORK_AUTH_HEADER),
+                auth_token,
+            );
+        }
         if emit_telemetry {
             inject_trace_context(&span, &mut request_parts.headers);
         }
@@ -1599,6 +1638,26 @@ async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Re
         };
 
         sanitize_request_headers(&mut parts.0.headers, &host_header);
+        if let Some(route_id) = state.route_id.as_ref() {
+            parts.0.headers.insert(
+                header::HeaderName::from_static(AMBER_ROUTE_ID_HEADER),
+                HeaderValue::from_str(route_id.as_ref())
+                    .expect("route id header value should be valid"),
+            );
+        }
+        if let Some(peer_id) = state.peer_id.as_ref() {
+            parts.0.headers.insert(
+                header::HeaderName::from_static(AMBER_PEER_ID_HEADER),
+                HeaderValue::from_str(peer_id.as_ref())
+                    .expect("peer id header value should be valid"),
+            );
+        }
+        if let Some(auth_token) = framework_component_auth_header_value() {
+            parts.0.headers.insert(
+                header::HeaderName::from_static(AMBER_FRAMEWORK_AUTH_HEADER),
+                auth_token,
+            );
+        }
         inject_trace_context(&span, &mut parts.0.headers);
 
         let request_body = capture_box_body(

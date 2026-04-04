@@ -54,6 +54,8 @@ pub(crate) fn build_mesh_provision_plan<Name>(
 
     Ok(MeshProvisionPlan {
         version: MESH_PROVISION_PLAN_VERSION.to_string(),
+        identity_seed: None,
+        existing_peer_identities: Vec::new(),
         targets,
     })
 }

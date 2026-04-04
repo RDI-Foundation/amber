@@ -1133,6 +1133,19 @@ async fn health_monitor_restarts_unhealthy_provider_without_rewiring_consumer() 
     let harness = TestHarness::new(ManagerFileConfig::default()).await;
     let (provider, consumer) = create_bound_provider_and_consumer(&harness).await;
 
+    harness
+        .wait_until(
+            "consumer runtime spec becomes visible",
+            Duration::from_secs(10),
+            || async {
+                harness
+                    .runtime
+                    .last_spec(&consumer.scenario_id)
+                    .await
+                    .is_some()
+            },
+        )
+        .await;
     let initial_consumer_spec = harness
         .runtime
         .last_spec(&consumer.scenario_id)
@@ -1207,7 +1220,17 @@ async fn failed_pause_keeps_consumer_blocking_provider_delete() {
         })
         .await;
 
-    let consumer_detail = harness.scenario_detail(&consumer.scenario_id).await;
+    let consumer_detail = harness
+        .wait_for_scenario_detail(
+            "failed pause persists paused desired state and degraded observed state",
+            &consumer.scenario_id,
+            Duration::from_secs(10),
+            |detail| {
+                detail.desired_state == DesiredState::Paused
+                    && detail.observed_state == ObservedState::Degraded
+            },
+        )
+        .await;
     assert_eq!(consumer_detail.desired_state, DesiredState::Paused);
     assert_eq!(consumer_detail.observed_state, ObservedState::Degraded);
 

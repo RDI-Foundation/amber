@@ -24,9 +24,13 @@ pub(super) async fn resolve_http_external_target(
                 "external slot url missing port",
             ));
         };
-        let addrs = resolve_external_host(host, port)
-            .await
-            .map_err(|err| error_response(StatusCode::BAD_GATEWAY, &err))?;
+        let addrs = resolve_external_host_with_policy(
+            host,
+            port,
+            allows_loopback_external_target(&state.target),
+        )
+        .await
+        .map_err(|err| error_response(StatusCode::BAD_GATEWAY, &err))?;
         pin_vetted_external_host(&state.vetted_external_addrs, host, &addrs).await;
     }
     Ok(resolved)
@@ -76,7 +80,7 @@ pub(super) fn resolve_http_external_target_with_override(
             "external slot url missing host",
         ));
     };
-    validate_external_ip_literal(host)
+    validate_external_ip_literal(host, allows_loopback_external_target(target))
         .map_err(|err| error_response(StatusCode::BAD_GATEWAY, &err))?;
 
     Ok(ResolvedHttpExternalTarget::Http(join_url(&base, uri)))
@@ -100,16 +104,17 @@ pub(super) fn resolve_tcp_target(target: &ExternalTarget) -> Result<(String, u16
     let port = parsed.port().ok_or_else(|| {
         RouterError::InvalidConfig("external tcp target url missing port".to_string())
     })?;
-    validate_external_ip_literal(host).map_err(RouterError::InvalidConfig)?;
+    validate_external_ip_literal(host, allows_loopback_external_target(target))
+        .map_err(RouterError::InvalidConfig)?;
 
     Ok((host.to_string(), port))
 }
 
-fn validate_external_ip_literal(host: &str) -> Result<(), String> {
+fn validate_external_ip_literal(host: &str, allow_loopback: bool) -> Result<(), String> {
     let Ok(ip) = host.parse::<IpAddr>() else {
         return Ok(());
     };
-    if is_disallowed_external_ip(ip) {
+    if !allow_loopback && is_disallowed_external_ip(ip) {
         return Err(format!(
             "external target {host} resolves to a disallowed address: {ip}"
         ));
@@ -121,8 +126,16 @@ pub(super) async fn resolve_external_host(
     host: &str,
     port: u16,
 ) -> Result<Vec<SocketAddr>, String> {
+    resolve_external_host_with_policy(host, port, false).await
+}
+
+pub(super) async fn resolve_external_host_with_policy(
+    host: &str,
+    port: u16,
+    allow_loopback: bool,
+) -> Result<Vec<SocketAddr>, String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_disallowed_external_ip(ip) {
+        if !allow_loopback && is_disallowed_external_ip(ip) {
             return Err(format!(
                 "external target {host} resolves to a disallowed address: {ip}"
             ));
@@ -141,7 +154,7 @@ pub(super) async fn resolve_external_host(
     }
     for addr in &addrs {
         let ip = addr.ip();
-        if is_disallowed_external_ip(ip) {
+        if !allow_loopback && is_disallowed_external_ip(ip) {
             return Err(format!(
                 "external target {host}:{port} resolves to a disallowed address: {ip}"
             ));
@@ -197,6 +210,10 @@ fn is_disallowed_external_ip(ip: IpAddr) -> bool {
             false
         }
     }
+}
+
+fn allows_loopback_external_target(target: &ExternalTarget) -> bool {
+    target.url_env == amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV
 }
 
 pub(super) fn join_url(base: &Url, uri: &Uri) -> Url {

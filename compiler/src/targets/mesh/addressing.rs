@@ -183,19 +183,21 @@ impl Addressing for LocalAddressing<'_> {
         &mut self,
         binding: &ResolvedFrameworkBinding,
     ) -> Result<String, Self::Error> {
-        if binding.capability.as_str() != "docker" {
-            return Err(self.unsupported_framework_error(binding.capability.as_str()));
-        }
-
-        match self.options.docker_binding {
-            DockerFrameworkBindingPolicy::LoopbackTcp => {
+        match binding.capability.as_str() {
+            "component" => {
                 let local_port = self.local_framework_binding_port(binding)?;
-                Ok(format!("tcp://127.0.0.1:{local_port}"))
+                Ok(format!("http://127.0.0.1:{local_port}"))
             }
-            DockerFrameworkBindingPolicy::Unsupported { reason } => Err(MeshError::new(format!(
-                "{} {reason}",
-                self.options.backend_label
-            ))),
+            "docker" => match self.options.docker_binding {
+                DockerFrameworkBindingPolicy::LoopbackTcp => {
+                    let local_port = self.local_framework_binding_port(binding)?;
+                    Ok(format!("tcp://127.0.0.1:{local_port}"))
+                }
+                DockerFrameworkBindingPolicy::Unsupported { reason } => Err(MeshError::new(
+                    format!("{} {reason}", self.options.backend_label),
+                )),
+            },
+            _ => Err(self.unsupported_framework_error(binding.capability.as_str())),
         }
     }
 }
@@ -390,6 +392,7 @@ mod tests {
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
+            child_templates: BTreeMap::new(),
             children: Vec::new(),
         }
     }
@@ -416,6 +419,7 @@ mod tests {
             ],
             bindings: Vec::<BindingEdge>::new(),
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
 
         let mesh_plan = MeshPlan::new(
@@ -519,6 +523,7 @@ mod tests {
             components: vec![Some(root), Some(consumer), Some(provider)],
             bindings: Vec::<BindingEdge>::new(),
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
 
         let mesh_plan = MeshPlan::new(
@@ -527,6 +532,7 @@ mod tests {
                 ResolvedBinding::Framework(ResolvedFrameworkBinding {
                     consumer: ComponentId(1),
                     slot: "upstream".to_string(),
+                    authority_realm: ComponentId(0),
                     capability: FrameworkCapabilityName::try_from("docker")
                         .expect("framework capability"),
                 }),
@@ -583,5 +589,61 @@ mod tests {
                 "http://127.0.0.1:20002",
             ]
         );
+    }
+
+    #[test]
+    fn build_address_plan_maps_framework_component_to_loopback_http() {
+        let mut consumer = component(0, "/consumer", "consumer");
+        consumer.slots.insert(
+            "realm".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "component",
+            }))
+            .expect("slot decl"),
+        );
+
+        let scenario = Scenario {
+            root: ComponentId(0),
+            components: vec![Some(consumer)],
+            bindings: Vec::<BindingEdge>::new(),
+            exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
+        };
+
+        let mesh_plan = MeshPlan::new(
+            vec![ComponentId(0)],
+            vec![ResolvedBinding::Framework(ResolvedFrameworkBinding {
+                consumer: ComponentId(0),
+                slot: "realm".to_string(),
+                authority_realm: ComponentId(0),
+                capability: FrameworkCapabilityName::try_from("component")
+                    .expect("framework capability"),
+            })],
+            Vec::new(),
+            HashMap::new(),
+        );
+
+        let endpoint_plan = build_endpoint_plan(&scenario).expect("endpoint plan");
+        let route_ports = allocate_local_route_ports(&scenario, &endpoint_plan, &mesh_plan)
+            .expect("local route ports");
+        let addressing = LocalAddressing::new(
+            &scenario,
+            &route_ports,
+            LocalAddressingOptions {
+                backend_label: "test",
+                docker_binding: DockerFrameworkBindingPolicy::LoopbackTcp,
+            },
+        );
+        let plan = build_address_plan(&mesh_plan, addressing).expect("address plan");
+
+        let slot_value = plan
+            .slot_values_by_component
+            .get(&ComponentId(0))
+            .and_then(|slots| slots.get("realm"))
+            .expect("slot value");
+        let SlotValue::One(value) = slot_value else {
+            panic!("expected singular slot value, got {slot_value:?}");
+        };
+        assert_eq!(value.url, "http://127.0.0.1:20000");
     }
 }

@@ -2,9 +2,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use amber_manifest::{CapabilityKind, NetworkProtocol};
 use amber_mesh::{
-    HttpRoutePlugin, InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate,
-    MeshPeerTemplate, MeshProtocol, OutboundRoute, component_route_id, router_export_route_id,
-    router_external_route_id,
+    FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV, FRAMEWORK_COMPONENT_CCS_URL_ENV, HttpRoutePlugin,
+    InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate, MeshPeerTemplate,
+    MeshProtocol, OutboundRoute, component_route_id, framework_cap_instance_id,
+    router_export_route_id, router_external_route_id,
 };
 use amber_scenario::{ComponentId, Scenario};
 use base64::Engine as _;
@@ -24,6 +25,7 @@ pub(crate) struct MeshConfigBuildOptions<'a> {
     pub(crate) component_mesh_listen_addr: &'a str,
     pub(crate) router_mesh_listen_addr: &'a str,
     pub(crate) router_control_listen_addr: &'a str,
+    pub(crate) force_router: bool,
 }
 
 pub(crate) fn default_mesh_config_build_options() -> MeshConfigBuildOptions<'static> {
@@ -32,6 +34,7 @@ pub(crate) fn default_mesh_config_build_options() -> MeshConfigBuildOptions<'sta
         component_mesh_listen_addr: "0.0.0.0",
         router_mesh_listen_addr: "0.0.0.0",
         router_control_listen_addr: "0.0.0.0",
+        force_router: false,
     }
 }
 
@@ -132,7 +135,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         options,
     } = input;
 
-    let needs_router = mesh_plan.needs_router();
+    let needs_router = mesh_plan.needs_router() || options.force_router;
     if needs_router && router_ports.is_none() {
         return Err(MeshError::new("router ports missing"));
     }
@@ -331,6 +334,50 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             });
         }
 
+        for binding in mesh_plan.framework_bindings() {
+            if binding.consumer != id || binding.capability.as_str() != "component" {
+                continue;
+            }
+            let listen_port = route_ports.framework_binding_port(binding).ok_or_else(|| {
+                MeshError::new(format!(
+                    "route port missing for {}.{}",
+                    component_label(scenario, id),
+                    binding.slot
+                ))
+            })?;
+            let router_identity = router_identity.as_ref().ok_or_else(|| {
+                MeshError::new("framework.component bindings require router identity")
+            })?;
+            let router_addr = addressing.mesh_addr_for_router()?;
+            let slot_decl = scenario
+                .component(binding.consumer)
+                .slots
+                .get(binding.slot.as_str())
+                .expect("framework binding target slot should exist");
+            let authority_moniker = scenario.component(binding.authority_realm).moniker.as_str();
+            let consumer_moniker = scenario.component(binding.consumer).moniker.as_str();
+            let route_id = framework_cap_instance_id(
+                authority_moniker,
+                consumer_moniker,
+                &binding.consumer.0.to_string(),
+                &binding.slot,
+                binding.capability.as_str(),
+            );
+            outbound.push(OutboundRoute {
+                route_id,
+                slot: binding.slot.clone(),
+                capability_kind: Some(slot_decl.decl.kind.to_string()),
+                capability_profile: slot_decl.decl.profile.clone(),
+                listen_port,
+                listen_addr: None,
+                protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
+                peer_addr: router_addr,
+                peer_id: router_identity.id.clone(),
+                capability: binding.capability.to_string(),
+            });
+        }
+
         let mesh_listen = format!("{}:{mesh_port}", options.component_mesh_listen_addr)
             .parse()
             .expect("mesh listen");
@@ -363,7 +410,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 .map(|binding| binding.external_slot.as_str()),
         );
         for (slot_name, slot) in &external_slots {
-            router_env_passthrough.push(slot.url_env.clone());
+            push_env_passthrough_once(&mut router_env_passthrough, &slot.url_env);
             let mut issuers = BTreeSet::new();
             if let Some(consumers) = external_consumers.get(slot_name) {
                 for consumer in consumers {
@@ -424,6 +471,52 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             });
         }
 
+        let framework_bindings = mesh_plan
+            .framework_bindings()
+            .filter(|binding| binding.capability.as_str() == "component")
+            .collect::<Vec<_>>();
+        if !framework_bindings.is_empty() {
+            push_env_passthrough_once(&mut router_env_passthrough, FRAMEWORK_COMPONENT_CCS_URL_ENV);
+            push_env_passthrough_once(
+                &mut router_env_passthrough,
+                FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV,
+            );
+        }
+        for binding in framework_bindings {
+            let slot_decl = scenario
+                .component(binding.consumer)
+                .slots
+                .get(binding.slot.as_str())
+                .expect("framework binding target slot should exist");
+            let consumer_id = identities_by_component
+                .get(&binding.consumer)
+                .expect("framework binding consumer identity missing")
+                .id
+                .clone();
+            let authority_moniker = scenario.component(binding.authority_realm).moniker.as_str();
+            let consumer_moniker = scenario.component(binding.consumer).moniker.as_str();
+            let route_id = framework_cap_instance_id(
+                authority_moniker,
+                consumer_moniker,
+                &binding.consumer.0.to_string(),
+                &binding.slot,
+                binding.capability.as_str(),
+            );
+            inbound.push(InboundRoute {
+                route_id,
+                capability: binding.capability.to_string(),
+                capability_kind: Some(slot_decl.decl.kind.to_string()),
+                capability_profile: slot_decl.decl.profile.clone(),
+                protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
+                target: InboundTarget::External {
+                    url_env: FRAMEWORK_COMPONENT_CCS_URL_ENV.to_string(),
+                    optional: false,
+                },
+                allowed_issuers: vec![consumer_id],
+            });
+        }
+
         let mesh_listen = format!("{}:{router_mesh_port}", options.router_mesh_listen_addr)
             .parse()
             .expect("mesh listen");
@@ -457,6 +550,15 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         router_config,
         router_env_passthrough,
     })
+}
+
+fn push_env_passthrough_once(router_env_passthrough: &mut Vec<String>, env_var: &str) {
+    if !router_env_passthrough
+        .iter()
+        .any(|existing| existing == env_var)
+    {
+        router_env_passthrough.push(env_var.to_string());
+    }
 }
 
 fn mesh_protocol(protocol: NetworkProtocol) -> Result<MeshProtocol, MeshError> {

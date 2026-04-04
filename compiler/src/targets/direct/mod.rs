@@ -198,10 +198,13 @@ impl Reporter for DirectReporter {
 }
 
 fn render_direct(compiled: &CompiledScenario) -> Result<DirectArtifact, ReporterError> {
-    render_direct_inner(compiled).map_err(|err| ReporterError::new(err.to_string()))
+    emit_direct_artifact(compiled, false).map_err(|err| ReporterError::new(err.to_string()))
 }
 
-fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, MeshError> {
+pub(crate) fn emit_direct_artifact(
+    compiled: &CompiledScenario,
+    force_router: bool,
+) -> Result<DirectArtifact, MeshError> {
     let scenario = compiled.scenario();
     let endpoint_plan = crate::targets::program_config::build_endpoint_plan(scenario)?;
     let mesh_plan = build_mesh_plan(
@@ -228,7 +231,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
     let route_ports = placeholder_local_route_ports(scenario, &endpoint_plan, &mesh_plan);
     let mesh_ports_by_component = placeholder_mesh_ports(program_components);
 
-    let needs_router = mesh_plan.needs_router();
+    let needs_router = mesh_plan.needs_router() || force_router;
     let router_ports = needs_router.then_some(RouterPorts {
         mesh: 0,
         control: 0,
@@ -276,6 +279,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
             component_mesh_listen_addr: "127.0.0.1",
             router_mesh_listen_addr: "127.0.0.1",
             router_control_listen_addr: "127.0.0.1",
+            force_router,
         },
     })?;
 
@@ -295,6 +299,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
     let router_metadata = router_ports.map(|ports| RouterMetadata {
         mesh_port: ports.mesh,
         control_port: 0,
+        compose_project: None,
         control_socket: Some(DIRECT_CONTROL_SOCKET_RELATIVE_PATH.to_string()),
         control_socket_volume: None,
     });
@@ -1031,11 +1036,17 @@ mod tests {
         sync::Arc,
     };
 
-    use amber_manifest::Manifest;
+    use amber_manifest::{Manifest, ManifestRef};
+    use amber_mesh::{FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV, FRAMEWORK_COMPONENT_CCS_URL_ENV};
+    use amber_resolver::Resolver;
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
+    use tempfile::TempDir;
+    use url::Url;
 
     use super::*;
     use crate::{
+        CompileOptions, Compiler, DigestStore,
+        reporter::CompiledScenario,
         slots::{SlotObject, SlotValue},
         targets::storage::{StorageIdentity, StorageMount},
     };
@@ -1054,6 +1065,7 @@ mod tests {
         .expect("manifest");
 
         Scenario {
+            manifest_catalog: BTreeMap::new(),
             root: ComponentId(0),
             components: vec![Some(Component {
                 id: ComponentId(0),
@@ -1071,11 +1083,20 @@ mod tests {
                 provides: BTreeMap::new(),
                 resources: BTreeMap::new(),
                 metadata: None,
+                child_templates: BTreeMap::new(),
                 children: Vec::new(),
             })],
             bindings: Vec::<BindingEdge>::new(),
             exports: Vec::new(),
         }
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        std::fs::write(path, contents).expect("fixture file should write");
+    }
+
+    fn file_url(path: &Path) -> Url {
+        Url::from_file_path(path).expect("fixture path should convert to file url")
     }
 
     #[test]
@@ -1097,6 +1118,92 @@ mod tests {
         assert_eq!(entrypoint[0], "/workspace/app/./bin/server");
         assert_eq!(entrypoint[1], "--port");
         assert_eq!(entrypoint[2], "8080");
+    }
+
+    #[test]
+    fn direct_router_passthrough_includes_framework_ccs_auth() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        let admin_path = dir.path().join("admin.json5");
+
+        write_file(
+            &admin_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                ctl: { kind: "component" }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["admin", "${slots.ctl.url}"],
+                network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+              },
+              provides: { http: { kind: "http", endpoint: "http" } },
+              exports: { http: "provides.http" }
+            }
+            "#,
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r##"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  components: {{
+                    admin: "{admin}"
+                  }},
+                  bindings: [
+                    {{ to: "#admin.ctl", from: "framework.component" }}
+                  ],
+                  exports: {{
+                    admin_http: "#admin.http"
+                  }}
+                }}
+                "##,
+                admin = file_url(&admin_path),
+            ),
+        );
+
+        let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let output = runtime
+            .block_on(compiler.compile(
+                ManifestRef::from_url(file_url(&root_path)),
+                CompileOptions::default(),
+            ))
+            .expect("fixture should compile");
+        let compiled = CompiledScenario::from_compile_output(&output)
+            .expect("fixture should materialize compiled scenario");
+        let artifact = emit_direct_artifact(&compiled, false).expect("direct artifact");
+        let direct_plan: DirectPlan = serde_json::from_str(
+            artifact
+                .files
+                .get(Path::new(DIRECT_PLAN_FILENAME))
+                .expect("direct plan should be emitted"),
+        )
+        .expect("direct plan should deserialize");
+        let router = direct_plan
+            .router
+            .expect("framework.component binding should force a router");
+
+        assert!(
+            router
+                .env_passthrough
+                .iter()
+                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CCS_URL_ENV),
+            "router must receive the framework CCS URL env passthrough",
+        );
+        assert!(
+            router
+                .env_passthrough
+                .iter()
+                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV),
+            "router must receive the framework CCS auth env passthrough",
+        );
     }
 
     #[test]

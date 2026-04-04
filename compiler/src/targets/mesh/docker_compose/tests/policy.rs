@@ -346,6 +346,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(2), ComponentId(3), ComponentId(1)],
     };
 
@@ -361,6 +362,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -376,6 +378,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -391,10 +394,12 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(allowed), Some(denied)],
         bindings: vec![BindingEdge {

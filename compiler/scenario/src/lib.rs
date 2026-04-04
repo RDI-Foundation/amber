@@ -4,7 +4,8 @@ use std::{
 };
 
 use amber_manifest::{
-    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, ManifestDigest, ProvideDecl, SlotDecl,
+    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ProvideDecl,
+    RealmSelector, RuntimeBackend, SlotDecl,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -77,6 +78,7 @@ pub struct Scenario {
     pub components: Vec<Option<Component>>,
     pub bindings: Vec<BindingEdge>,
     pub exports: Vec<ScenarioExport>,
+    pub manifest_catalog: BTreeMap<String, ManifestCatalogEntry>,
 }
 
 impl Scenario {
@@ -187,7 +189,9 @@ impl Scenario {
                 BindingFrom::External(slot) => {
                     let _ = self.component(slot.component);
                 }
-                BindingFrom::Framework(_) => {}
+                BindingFrom::Framework(framework) => {
+                    let _ = self.component(framework.authority);
+                }
             }
             let _ = self.component(binding.to.component);
         }
@@ -233,8 +237,77 @@ pub struct Component {
     /// Optional user-defined metadata from the manifest.
     pub metadata: Option<Value>,
 
+    /// Frozen child-template catalog for dynamic children owned by this component realm.
+    pub child_templates: BTreeMap<String, ChildTemplate>,
+
     /// Containment edges (component tree).
     pub children: Vec<ComponentId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildTemplate {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_false")]
+    pub frozen: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_manifests: Option<Vec<String>>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, TemplateConfigField>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, TemplateBinding>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub slot_decls: BTreeMap<String, SlotDecl>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible_exports: Option<Vec<String>>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ChildTemplateLimits>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub possible_backends: Vec<RuntimeBackend>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TemplateConfigField {
+    Prefilled { value: Value },
+    Open { required: bool },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TemplateBinding {
+    Prefilled { selector: RealmSelector },
+    Open { optional: bool },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildTemplateLimits {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_live_children: Option<u32>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_pattern: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestCatalogEntry {
+    pub source_ref: String,
+    pub digest: ManifestDigest,
+    pub manifest: Manifest,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -269,10 +342,28 @@ pub struct ResourceRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FrameworkRef {
+    pub authority: ComponentId,
+    pub capability: FrameworkCapabilityName,
+}
+
+impl FrameworkRef {
+    pub fn as_str(&self) -> &str {
+        self.capability.as_str()
+    }
+}
+
+impl std::fmt::Display for FrameworkRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.capability.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BindingFrom {
     Component(ProvideRef),
     Resource(ResourceRef),
-    Framework(FrameworkCapabilityName),
+    Framework(FrameworkRef),
     External(SlotRef),
 }
 

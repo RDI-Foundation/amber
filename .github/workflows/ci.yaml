@@ -276,14 +276,74 @@ jobs:
           fi
 
   mixed-site-tests:
-    name: Mixed-Site E2E Tests
+    name: Mixed-Site Live Tests (${{ matrix.shard_name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     needs: docker-build
     if: ${{ always() && (github.event_name != 'pull_request' || needs.docker-build.result == 'success') }}
     permissions:
       contents: read
       packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard_name: mixed-run
+            timeout_minutes: 120
+            needs_direct: true
+            needs_kind: true
+            needs_qemu: true
+            needs_prebuilt_images: true
+            test_filters: |
+              mixed_run_
+          - shard_name: framework-fast
+            timeout_minutes: 15
+            needs_direct: false
+            needs_kind: false
+            needs_qemu: false
+            needs_prebuilt_images: false
+            test_filters: |
+              framework_component_create_to_unoffered_site_fails_deterministically_live
+          - shard_name: framework-direct
+            timeout_minutes: 45
+            needs_direct: true
+            needs_kind: false
+            needs_qemu: false
+            needs_prebuilt_images: false
+            test_filters: |
+              framework_component_direct_create_destroy_live
+              framework_component_open_template_frozen_source_replay_live
+              framework_component_destroy_of_provider_keeps_consumer_live
+          - shard_name: framework-docker
+            timeout_minutes: 60
+            needs_direct: false
+            needs_kind: false
+            needs_qemu: false
+            needs_prebuilt_images: true
+            test_filters: |
+              framework_component_concurrent_create_serialization_live
+              framework_component_root_external_binding_live
+              framework_component_nonweak_publication_barrier_live
+          - shard_name: framework-compose-direct
+            timeout_minutes: 90
+            needs_direct: true
+            needs_kind: false
+            needs_qemu: false
+            needs_prebuilt_images: true
+            test_filters: |
+              framework_component_delegated_realm_cross_site_live
+              framework_component_compose_parent_standby_direct_live
+              framework_component_direct_parent_compose_child_live
+              framework_component_dynamic_children_teardown_with_run_live
+          - shard_name: framework-kind-vm
+            timeout_minutes: 120
+            needs_direct: true
+            needs_kind: true
+            needs_qemu: true
+            needs_prebuilt_images: true
+            test_filters: |
+              framework_component_kind_root_export_live
+              framework_component_cross_backend_matrix_live
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
@@ -293,6 +353,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Configure mixed-site VM image path
+        if: matrix.needs_qemu
         run: |
           set -euo pipefail
           case "$(uname -m)" in
@@ -312,6 +373,7 @@ jobs:
               ;;
           esac
       - name: Relax AppArmor user namespace restrictions when present
+        if: matrix.needs_direct
         run: |
           set -euo pipefail
 
@@ -322,6 +384,7 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - name: Ensure bubblewrap is available and usable
+        if: matrix.needs_direct
         run: |
           set -euo pipefail
           probe_bwrap() {
@@ -370,6 +433,7 @@ jobs:
             exit 1
           fi
       - name: Ensure slirp4netns is available
+        if: matrix.needs_direct
         run: |
           set -euo pipefail
 
@@ -380,11 +444,13 @@ jobs:
 
           slirp4netns --version
       - name: Ensure mixed-site VM runtime packages are available
+        if: matrix.needs_qemu
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y ${AMBER_MIXED_RUN_QEMU_PACKAGES}
       - name: Fetch Ubuntu minimal cloud image
+        if: matrix.needs_qemu
         run: |
           set -euo pipefail
           if [ ! -f "$AMBER_MIXED_RUN_BASE_IMAGE" ]; then
@@ -396,6 +462,7 @@ jobs:
           fi
           qemu-img info "$AMBER_MIXED_RUN_BASE_IMAGE"
       - name: Ensure KinD is available
+        if: matrix.needs_kind
         run: |
           if ! command -v kind >/dev/null 2>&1; then
             curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.22.0/kind-linux-amd64
@@ -403,6 +470,7 @@ jobs:
             sudo mv /tmp/kind /usr/local/bin/kind
           fi
       - name: Ensure kubectl is available
+        if: matrix.needs_kind
         run: |
           if ! command -v kubectl >/dev/null 2>&1; then
             curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
@@ -410,16 +478,17 @@ jobs:
             sudo mv /tmp/kubectl /usr/local/bin/kubectl
           fi
       - name: Create shared KinD cluster
+        if: matrix.needs_kind
         shell: bash
         run: |
           set -euo pipefail
-          cluster_name="amber-mixed-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cluster_name="amber-mixed-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.shard_name }}"
           kubeconfig="${RUNNER_TEMP}/amber-mixed-kind-kubeconfig"
           kind create cluster --name "$cluster_name" --kubeconfig "$kubeconfig" --wait 120s
           echo "AMBER_TEST_KIND_CLUSTER_NAME=${cluster_name}" >> "$GITHUB_ENV"
           echo "AMBER_TEST_KIND_KUBECONFIG=${kubeconfig}" >> "$GITHUB_ENV"
       - name: Compute image registries
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && matrix.needs_prebuilt_images
         id: registry
         shell: bash
         run: |
@@ -435,7 +504,7 @@ jobs:
           echo "CI_IMAGE_REGISTRY=${ci_registry}" >> "$GITHUB_ENV"
           echo "CODE_IMAGE_REGISTRY=${code_registry}" >> "$GITHUB_ENV"
       - name: Compute semver tag metadata
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && matrix.needs_prebuilt_images
         id: version_tags
         shell: bash
         run: |
@@ -447,13 +516,13 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && matrix.needs_prebuilt_images
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Pull and retag images for mixed-site tests
-        if: github.event_name == 'pull_request'
+      - name: Pull and retag images for live test shard
+        if: github.event_name == 'pull_request' && matrix.needs_prebuilt_images
         shell: bash
         run: |
           set -euo pipefail
@@ -473,20 +542,21 @@ jobs:
               docker tag "$src" "amber-helper:e2e"
             fi
           done < <(jq -c '.images[]' <<< "$version_tags_json")
-      - name: Run mixed-site e2e tests (prebuilt images)
-        if: github.event_name == 'pull_request'
-        env:
-          AMBER_TEST_USE_PREBUILT_IMAGES: "1"
+      - name: Run live test shard
+        shell: bash
         run: |
           set -euo pipefail
-          cargo test -p amber-cli --test mixed_run mixed_run_ -- --ignored --nocapture --test-threads=1
-      - name: Run mixed-site e2e tests
-        if: github.event_name != 'pull_request'
-        run: |
-          set -euo pipefail
-          cargo test -p amber-cli --test mixed_run mixed_run_ -- --ignored --nocapture --test-threads=1
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ matrix.needs_prebuilt_images }}" = "true" ]; then
+            export AMBER_TEST_USE_PREBUILT_IMAGES=1
+          fi
+          while IFS= read -r test_filter; do
+            [ -n "$test_filter" ] || continue
+            cargo test -p amber-cli --test mixed_run "$test_filter" -- --ignored --nocapture --test-threads=1
+          done <<'EOF'
+          ${{ matrix.test_filters }}
+          EOF
       - name: Delete shared KinD cluster
-        if: always()
+        if: always() && matrix.needs_kind
         shell: bash
         run: |
           set -euo pipefail

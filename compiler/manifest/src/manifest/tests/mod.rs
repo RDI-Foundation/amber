@@ -3,6 +3,7 @@ use crate::{CapabilityKind, NetworkProtocol};
 
 mod basics;
 mod bindings;
+mod child_templates;
 mod components;
 mod exports;
 mod mounts;

@@ -217,6 +217,11 @@ fn kubernetes_emits_router_for_external_slots() {
         .get(&PathBuf::from("02-rbac/amber-provisioner-role.yaml"))
         .expect("provisioner role");
     let role_doc: serde_yaml::Value = serde_yaml::from_str(role_yaml).expect("parse role yaml");
+    assert_eq!(
+        role_doc["metadata"]["labels"]["app.kubernetes.io/managed-by"].as_str(),
+        Some("amber"),
+        "{role_yaml}"
+    );
     let rules = role_doc["rules"].as_sequence().expect("role rules");
     let has_create_rule = rules.iter().any(|rule| {
         let verbs = rule["verbs"].as_sequence().expect("rule verbs");
