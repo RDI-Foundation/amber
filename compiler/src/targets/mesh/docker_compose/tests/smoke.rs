@@ -68,6 +68,7 @@ fn docker_smoke_component_reaches_public_internet_by_default() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(1)],
     };
 
@@ -83,6 +84,7 @@ fn docker_smoke_component_reaches_public_internet_by_default() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -91,6 +93,7 @@ fn docker_smoke_component_reaches_public_internet_by_default() {
         components: vec![Some(root), Some(client)],
         bindings: Vec::new(),
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     };
 
     let output = compile_output(scenario);
@@ -334,6 +337,7 @@ fn docker_smoke_component_default_egress_blocks_host_access() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(1)],
     };
 
@@ -349,6 +353,7 @@ fn docker_smoke_component_default_egress_blocks_host_access() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -357,6 +362,7 @@ fn docker_smoke_component_default_egress_blocks_host_access() {
         components: vec![Some(root), Some(client)],
         bindings: Vec::new(),
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     };
 
     let output = compile_output(scenario);

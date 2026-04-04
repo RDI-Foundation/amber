@@ -48,6 +48,12 @@ fn port_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn lock_port_tests() -> std::sync::MutexGuard<'static, ()> {
+    port_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn reserve_test_port() -> SocketAddr {
     let listener =
         TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener should bind");
@@ -56,6 +62,25 @@ fn reserve_test_port() -> SocketAddr {
         .expect("listener should report its local address");
     drop(listener);
     addr
+}
+
+fn assert_port_eventually_releases(addr: SocketAddr, context: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match TcpListener::bind(addr) {
+            Ok(listener) => {
+                drop(listener);
+                return;
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::AddrInUse
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("{context}: {err}"),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -181,9 +206,7 @@ fn reserve_mesh_addresses_rewrites_ephemeral_override_port() {
 
 #[test]
 fn reserve_export_bindings_hold_reserved_ports_until_drop() {
-    let _port_guard = port_lock()
-        .lock()
-        .expect("port lock should not be poisoned");
+    let _port_guard = lock_port_tests();
     let requested_port = reserve_test_port();
     let requested = [ExportBinding {
         export: "api".to_string(),
@@ -204,14 +227,12 @@ fn reserve_export_bindings_hold_reserved_ports_until_drop() {
     );
 
     drop(listeners);
-    TcpListener::bind(actual).expect("dropping the reservation should release the port");
+    assert_port_eventually_releases(actual, "dropping the reservation should release the port");
 }
 
 #[tokio::test]
 async fn reserve_export_bindings_preserve_duplicate_export_listeners() {
-    let _port_guard = port_lock()
-        .lock()
-        .expect("port lock should not be poisoned");
+    let _port_guard = lock_port_tests();
     let requested = vec![
         ExportBinding {
             export: "api".to_string(),
@@ -268,10 +289,14 @@ async fn reserve_export_bindings_preserve_duplicate_export_listeners() {
     );
 
     drop(listeners);
-    TcpListener::bind(bindings[0].listen)
-        .expect("dropping the converted listeners should release the first port");
-    TcpListener::bind(bindings[1].listen)
-        .expect("dropping the converted listeners should release the second port");
+    assert_port_eventually_releases(
+        bindings[0].listen,
+        "dropping the converted listeners should release the first port",
+    );
+    assert_port_eventually_releases(
+        bindings[1].listen,
+        "dropping the converted listeners should release the second port",
+    );
 }
 
 #[test]
