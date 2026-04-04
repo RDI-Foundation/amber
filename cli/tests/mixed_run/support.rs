@@ -380,14 +380,7 @@ pub(crate) fn wait_for_single_run_root(storage_root: &Path, timeout: Duration) -
     let runs_dir = storage_root.join("runs");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let mut runs = fs::read_dir(&runs_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.is_dir())
-            .collect::<Vec<_>>();
-        runs.sort();
+        let mut runs = collect_run_roots(storage_root);
         if runs.len() == 1 {
             return runs.pop().expect("single run should exist");
         }
@@ -397,6 +390,18 @@ pub(crate) fn wait_for_single_run_root(storage_root: &Path, timeout: Duration) -
         "timed out waiting for single run root under {}",
         runs_dir.display()
     );
+}
+
+fn collect_run_roots(storage_root: &Path) -> Vec<PathBuf> {
+    let mut runs = fs::read_dir(storage_root.join("runs"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    runs.sort();
+    runs
 }
 
 pub(crate) fn wait_for_state_pid_change(
@@ -859,15 +864,22 @@ pub(crate) fn run_manifest_with_args_and_env(
         .envs(extra_env.iter().copied())
         .output()
         .expect("failed to run amber run");
-    let run_root = wait_for_single_run_root(storage_root, Duration::from_secs(60));
     assert!(
         output.status.success(),
-        "amber run failed\nstdout:\n{}\nstderr:\n{}\nrun root: {}{}",
+        "amber run failed\nstdout:\n{}\nstderr:\n{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
-        run_root.display(),
-        run_debug_context(&run_root),
+        collect_run_roots(storage_root)
+            .into_iter()
+            .next()
+            .map(|run_root| format!(
+                "\nrun root: {}{}",
+                run_root.display(),
+                run_debug_context(&run_root)
+            ))
+            .unwrap_or_default(),
     );
+    let run_root = wait_for_single_run_root(storage_root, Duration::from_secs(60));
     let run_id = parse_run_id(&output.stdout);
     let expected_run_root = storage_root.join("runs").join(&run_id);
     assert_eq!(run_root, expected_run_root);

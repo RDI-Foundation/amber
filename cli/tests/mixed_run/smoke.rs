@@ -2325,6 +2325,9 @@ fn framework_component_delegated_realm_cross_site_live() {
         &manifest,
         &json!({
             "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true }
+            },
             "components": {
                 "parent": "./parent.json5",
                 "provider": "./provider.json5"

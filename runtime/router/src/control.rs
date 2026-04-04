@@ -1105,10 +1105,7 @@ pub(super) async fn register_export_peer(
     dynamic_issuers: &DynamicIssuers,
     router_id: &str,
 ) -> Result<(), String> {
-    let peer_id = payload.peer_id.trim();
-    if peer_id.is_empty() {
-        return Err("peer_id must not be empty".to_string());
-    }
+    let peer_id = validated_control_peer_id(&payload.peer_id, "peer_id")?;
     if peer_id == router_id {
         return Err("peer_id must not be the router identity".to_string());
     }
@@ -1148,10 +1145,7 @@ pub(super) async fn unregister_export_peer(
     dynamic_route_overlays: &DynamicRouteOverlays,
     dynamic_issuers: &DynamicIssuers,
 ) -> Result<(), String> {
-    let peer_id = payload.peer_id.trim();
-    if peer_id.is_empty() {
-        return Err("peer_id must not be empty".to_string());
-    }
+    let peer_id = validated_control_peer_id(&payload.peer_id, "peer_id")?;
     let peer_key = decode_peer_key(&payload.peer_key)?;
     let protocol = control_protocol(payload.protocol.trim())?;
     let overlays = dynamic_route_overlays.read().await;
@@ -1164,12 +1158,11 @@ pub(super) async fn unregister_export_peer(
     )?;
 
     let mut issuers = dynamic_issuers.write().await;
-    let Some(route_issuers) = issuers.get_mut(&route.route_id) else {
+    let Some(route_issuers) = issuers.get(&route.route_id) else {
         return Ok(());
     };
-    route_issuers.remove(peer_id);
-    if route_issuers.is_empty() {
-        issuers.remove(&route.route_id);
+    if !route_issuers.contains(peer_id) {
+        return Ok(());
     }
     trust
         .remove_peer(&MeshPeer {
@@ -1178,6 +1171,15 @@ pub(super) async fn unregister_export_peer(
         })
         .await
         .map_err(|err| format!("invalid peer: {err}"))?;
+    let remove_route = if let Some(route_issuers) = issuers.get_mut(&route.route_id) {
+        route_issuers.remove(peer_id);
+        route_issuers.is_empty()
+    } else {
+        false
+    };
+    if remove_route {
+        issuers.remove(&route.route_id);
+    }
     Ok(())
 }
 
@@ -1279,13 +1281,11 @@ pub(super) async fn apply_route_overlay(
 
     let mut overlay_peers = Vec::with_capacity(payload.peers.len());
     for peer in payload.peers {
+        let peer_id = validated_control_peer_id(&peer.peer_id, "overlay peer_id")?;
         let mesh_peer = MeshPeer {
-            id: peer.peer_id.trim().to_string(),
+            id: peer_id.to_string(),
             public_key: decode_peer_key(&peer.peer_key)?,
         };
-        if mesh_peer.id.is_empty() {
-            return Err("overlay peer_id must not be empty".to_string());
-        }
         overlay_peers.push(mesh_peer);
     }
 
@@ -1407,6 +1407,16 @@ fn effective_inbound_routes<'a>(
             .values()
             .flat_map(|overlay| overlay.routes.values()),
     )
+}
+
+fn validated_control_peer_id<'a>(raw: &'a str, field_name: &str) -> Result<&'a str, String> {
+    let peer_id = raw.trim();
+    if peer_id.is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+    HeaderValue::from_str(peer_id)
+        .map_err(|_| format!("{field_name} must be a valid HTTP header value"))?;
+    Ok(peer_id)
 }
 
 pub(super) fn decode_peer_key(value: &str) -> Result<[u8; 32], String> {

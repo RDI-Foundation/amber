@@ -43,27 +43,6 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn port_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-fn lock_port_tests() -> std::sync::MutexGuard<'static, ()> {
-    port_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn reserve_test_port() -> SocketAddr {
-    let listener =
-        TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener should bind");
-    let addr = listener
-        .local_addr()
-        .expect("listener should report its local address");
-    drop(listener);
-    addr
-}
-
 fn assert_port_eventually_releases(addr: SocketAddr, context: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     loop {
@@ -206,11 +185,9 @@ fn reserve_mesh_addresses_rewrites_ephemeral_override_port() {
 
 #[test]
 fn reserve_export_bindings_hold_reserved_ports_until_drop() {
-    let _port_guard = lock_port_tests();
-    let requested_port = reserve_test_port();
     let requested = [ExportBinding {
         export: "api".to_string(),
-        listen: requested_port,
+        listen: SocketAddr::from(([127, 0, 0, 1], 0)),
     }];
 
     let (bindings, listeners) =
@@ -232,15 +209,14 @@ fn reserve_export_bindings_hold_reserved_ports_until_drop() {
 
 #[tokio::test]
 async fn reserve_export_bindings_preserve_duplicate_export_listeners() {
-    let _port_guard = lock_port_tests();
     let requested = vec![
         ExportBinding {
             export: "api".to_string(),
-            listen: reserve_test_port(),
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         },
         ExportBinding {
             export: "api".to_string(),
-            listen: reserve_test_port(),
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         },
     ];
 
