@@ -8677,8 +8677,7 @@ mod tests {
             .expect_err("framework.component should reject unfrozen template contracts");
         assert_eq!(err.code, ProtocolErrorCode::ControlStateUnavailable);
         assert!(
-            err.message
-                .contains("compiler-frozen child template contracts"),
+            err.message.contains("recompile with the current compiler"),
             "error should direct the operator toward recompilation, got: {}",
             err.message
         );

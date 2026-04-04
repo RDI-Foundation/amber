@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use amber_manifest::{
-    CapabilityDecl, CapabilityKind, ExportTarget, FrameworkCapabilityName, Manifest,
-    ManifestDigest, ProvideDecl, RealmSelector, RuntimeBackend, SlotDecl, framework_capability,
+    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ProvideDecl,
+    RealmSelector, RuntimeBackend, SlotDecl, framework_capability,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
-pub const SCENARIO_IR_VERSION: u32 = 6;
+pub const SCENARIO_IR_VERSION: u32 = 5;
 const MIN_SCENARIO_IR_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,6 +32,7 @@ pub struct ScenarioIr {
 
 impl From<&Scenario> for ScenarioIr {
     fn from(scenario: &Scenario) -> Self {
+        assert_persistable_child_templates(scenario);
         let components = scenario
             .components_iter()
             .map(|(id, component)| ComponentIr::from_component(id, component))
@@ -1140,13 +1141,15 @@ fn validate_child_templates(scenario: &Scenario) -> Result<(), ScenarioIrError> 
                         )));
                     }
                 }
-                if !template.frozen {
-                    validate_allowed_manifest_interfaces(scenario, component, name, keys)?;
-                }
             }
-            if template.frozen {
-                validate_frozen_child_template_contract(scenario, component, name, template)?;
+            if !template.frozen {
+                return Err(invalid_scenario(format!(
+                    "component {} child template `{name}` must use a frozen child template \
+                     contract in ScenarioIr; recompile with the current compiler",
+                    component.moniker.as_str()
+                )));
             }
+            validate_frozen_child_template_contract(scenario, component, name, template)?;
         }
     }
 
@@ -1161,6 +1164,19 @@ fn validate_child_templates(scenario: &Scenario) -> Result<(), ScenarioIrError> 
     }
 
     Ok(())
+}
+
+fn assert_persistable_child_templates(scenario: &Scenario) {
+    for component in scenario.components.iter().flatten() {
+        for (template_name, template) in &component.child_templates {
+            assert!(
+                template.frozen,
+                "component {} child template `{template_name}` must be frozen before serializing \
+                 ScenarioIr",
+                component.moniker.as_str()
+            );
+        }
+    }
 }
 
 fn validate_frozen_child_template_contract(
@@ -1309,68 +1325,6 @@ fn validate_frozen_child_template_manifest(
     }
 
     Ok(())
-}
-
-fn validate_allowed_manifest_interfaces(
-    scenario: &Scenario,
-    component: &Component,
-    template_name: &str,
-    keys: &[String],
-) -> Result<(), ScenarioIrError> {
-    let Some((first_key, rest)) = keys.split_first() else {
-        return Ok(());
-    };
-    let expected = manifest_root_interface(
-        &scenario
-            .manifest_catalog
-            .get(first_key)
-            .expect("validated manifest catalog key should exist")
-            .manifest,
-    )?;
-    for key in rest {
-        let actual = manifest_root_interface(
-            &scenario
-                .manifest_catalog
-                .get(key)
-                .expect("validated manifest catalog key should exist")
-                .manifest,
-        )?;
-        if actual != expected {
-            return Err(invalid_scenario(format!(
-                "component {} child template `{template_name}` has incompatible allowed manifests \
-                 `{first_key}` and `{key}`; open-template interfaces must agree on root config, \
-                 slots, and exports",
-                component.moniker.as_str()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn manifest_root_interface(manifest: &Manifest) -> Result<Value, ScenarioIrError> {
-    let exports = manifest
-        .exports()
-        .iter()
-        .map(|(name, target)| {
-            let encoded = match target {
-                ExportTarget::SelfProvide(provide) => {
-                    json!({ "target": "self_provide", "provide": provide })
-                }
-                ExportTarget::SelfSlot(slot) => json!({ "target": "self_slot", "slot": slot }),
-                ExportTarget::ChildExport { child, export } => {
-                    json!({ "target": "child_export", "child": child, "export": export })
-                }
-                _ => json!({ "target": format!("{target:?}") }),
-            };
-            (name.to_string(), encoded)
-        })
-        .collect::<BTreeMap<_, _>>();
-    serde_json::to_value(json!({
-        "config_schema": manifest.config_schema(),
-        "slots": manifest.slots(),
-        "exports": exports,
-    }))
-    .map_err(|err| invalid_scenario(format!("failed to encode child template interface: {err}")))
 }
 
 fn validate_bindings(scenario: &Scenario) -> Result<(), ScenarioIrError> {
@@ -2050,7 +2004,7 @@ mod tests {
     }
 
     #[test]
-    fn scenario_ir_rejects_open_templates_with_incompatible_allowed_manifest_interfaces() {
+    fn scenario_ir_rejects_unfrozen_child_template_contracts() {
         let alpha: amber_manifest::Manifest = r#"
             {
               manifest_version: "0.1.0",
@@ -2163,10 +2117,11 @@ mod tests {
                 ),
             ]),
         })
-        .expect_err("incompatible open-template interfaces should be rejected");
+        .expect_err("unfrozen child template contracts should be rejected");
 
         assert!(
-            err.to_string().contains("incompatible allowed manifests"),
+            err.to_string()
+                .contains("must use a frozen child template contract"),
             "unexpected error: {err}",
         );
     }
