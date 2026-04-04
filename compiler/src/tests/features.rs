@@ -333,6 +333,9 @@ async fn child_template_selector_expands_into_sorted_frozen_catalog() {
         r#"
         {
           manifest_version: "0.1.0",
+          slots: {
+            realm: { kind: "component" },
+          },
         }
         "#,
     );

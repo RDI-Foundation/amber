@@ -567,10 +567,12 @@ fn flatten_keeps_realm_significant_template_owner_nodes() {
     components[1].as_mut().unwrap().child_templates.insert(
         "worker".to_string(),
         ChildTemplate {
+            frozen: false,
             manifest: Some("file:///templates/worker.json5".to_string()),
             allowed_manifests: None,
             config: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            slot_decls: BTreeMap::new(),
             visible_exports: None,
             limits: None,
             possible_backends: Vec::new(),

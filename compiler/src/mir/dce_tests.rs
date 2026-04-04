@@ -1123,10 +1123,12 @@ fn dce_keeps_child_template_owner_program_without_static_exports() {
     component_mut(&mut components, 1).child_templates.insert(
         "worker".to_string(),
         amber_scenario::ChildTemplate {
+            frozen: false,
             manifest: Some("catalog/worker".to_string()),
             allowed_manifests: None,
             config: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            slot_decls: BTreeMap::new(),
             visible_exports: None,
             limits: None,
             possible_backends: Vec::new(),
@@ -1167,10 +1169,12 @@ fn dce_keeps_static_child_subtree_visible_for_future_dynamic_bindings() {
     component_mut(&mut components, 0).child_templates.insert(
         "worker".to_string(),
         amber_scenario::ChildTemplate {
+            frozen: false,
             manifest: Some("catalog/worker".to_string()),
             allowed_manifests: None,
             config: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            slot_decls: BTreeMap::new(),
             visible_exports: None,
             limits: None,
             possible_backends: Vec::new(),

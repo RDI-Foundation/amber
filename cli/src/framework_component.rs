@@ -139,6 +139,18 @@ pub(crate) struct LiveChildRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PendingCreateRecord {
+    pub(crate) tx_id: u64,
+    pub(crate) child: LiveChildRecord,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PendingDestroyRecord {
+    pub(crate) tx_id: u64,
+    pub(crate) child: LiveChildRecord,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct DynamicSitePlanRecord {
     pub(crate) site_id: String,
     pub(crate) kind: SiteKind,
@@ -267,6 +279,10 @@ pub(crate) struct FrameworkControlState {
     pub(crate) journal: Vec<ControlJournalEntry>,
     #[serde(default)]
     pub(crate) live_children: Vec<LiveChildRecord>,
+    #[serde(default)]
+    pub(crate) pending_creates: Vec<PendingCreateRecord>,
+    #[serde(default)]
+    pub(crate) pending_destroys: Vec<PendingDestroyRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -328,6 +344,8 @@ pub(crate) fn build_control_state(
         capability_instances: BTreeMap::new(),
         journal: Vec::new(),
         live_children: Vec::new(),
+        pending_creates: Vec::new(),
+        pending_destroys: Vec::new(),
     };
     refresh_capability_instances(&mut state)?;
     Ok(state)
@@ -389,6 +407,105 @@ fn persist_control_state_update<T>(
     Ok(result)
 }
 
+#[derive(Clone, Copy)]
+enum ChildRecordLocation {
+    Live(usize),
+    PendingCreate(usize),
+    PendingDestroy(usize),
+}
+
+fn all_child_records(state: &FrameworkControlState) -> impl Iterator<Item = &LiveChildRecord> {
+    state
+        .live_children
+        .iter()
+        .chain(state.pending_creates.iter().map(|record| &record.child))
+        .chain(state.pending_destroys.iter().map(|record| &record.child))
+}
+
+fn visible_child_records(state: &FrameworkControlState) -> impl Iterator<Item = &LiveChildRecord> {
+    state
+        .live_children
+        .iter()
+        .chain(state.pending_destroys.iter().map(|record| &record.child))
+        .filter(|child| child_is_visible(child))
+}
+
+fn child_record_location(
+    state: &FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<ChildRecordLocation, ProtocolErrorResponse> {
+    if let Some(index) = state
+        .live_children
+        .iter()
+        .position(|child| child.child_id == child_id)
+    {
+        return Ok(ChildRecordLocation::Live(index));
+    }
+    if let Some(index) = state
+        .pending_creates
+        .iter()
+        .position(|record| record.child.child_id == child_id)
+    {
+        return Ok(ChildRecordLocation::PendingCreate(index));
+    }
+    if let Some(index) = state
+        .pending_destroys
+        .iter()
+        .position(|record| record.child.child_id == child_id)
+    {
+        return Ok(ChildRecordLocation::PendingDestroy(index));
+    }
+    Err(protocol_error(
+        ProtocolErrorCode::ControlStateUnavailable,
+        &format!("child id {child_id} is missing from authoritative state"),
+    ))
+}
+
+fn child_record_mut(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<&mut LiveChildRecord, ProtocolErrorResponse> {
+    match child_record_location(state, child_id)? {
+        ChildRecordLocation::Live(index) => Ok(&mut state.live_children[index]),
+        ChildRecordLocation::PendingCreate(index) => Ok(&mut state.pending_creates[index].child),
+        ChildRecordLocation::PendingDestroy(index) => Ok(&mut state.pending_destroys[index].child),
+    }
+}
+
+fn child_create_tx_id(
+    state: &FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<u64, ProtocolErrorResponse> {
+    state
+        .pending_creates
+        .iter()
+        .find(|record| record.child.child_id == child_id)
+        .map(|record| record.tx_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("child id {child_id} is missing pending create transaction state"),
+            )
+        })
+}
+
+fn child_destroy_tx_id(
+    state: &FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<u64, ProtocolErrorResponse> {
+    state
+        .pending_destroys
+        .iter()
+        .find(|record| record.child.child_id == child_id)
+        .map(|record| record.tx_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("child id {child_id} is missing pending destroy transaction state"),
+            )
+        })
+}
+
 pub(crate) fn write_control_state_service_plan(
     path: &Path,
     listen_addr: SocketAddr,
@@ -438,15 +555,7 @@ pub(crate) fn authorize_capability_instance<'a>(
     cap_instance_id: &str,
     peer_id: &str,
 ) -> std::result::Result<&'a CapabilityInstanceRecord, ProtocolErrorResponse> {
-    let record = state
-        .capability_instances
-        .get(cap_instance_id)
-        .ok_or_else(|| {
-            protocol_error(
-                ProtocolErrorCode::Unauthorized,
-                "unknown framework capability instance",
-            )
-        })?;
+    let record = capability_instance_record(state, cap_instance_id)?;
     if record.recipient_peer_id != peer_id {
         return Err(protocol_error(
             ProtocolErrorCode::Unauthorized,
@@ -454,6 +563,21 @@ pub(crate) fn authorize_capability_instance<'a>(
         ));
     }
     Ok(record)
+}
+
+fn capability_instance_record<'a>(
+    state: &'a FrameworkControlState,
+    cap_instance_id: &str,
+) -> std::result::Result<&'a CapabilityInstanceRecord, ProtocolErrorResponse> {
+    state
+        .capability_instances
+        .get(cap_instance_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::Unauthorized,
+                "unknown framework capability instance",
+            )
+        })
 }
 
 fn scenario_component_checked(
@@ -512,7 +636,6 @@ pub(crate) fn describe_template(
         .ok_or_else(|| {
             protocol_error(ProtocolErrorCode::UnknownTemplate, "unknown child template")
         })?;
-    let manifest_catalog_key = template_interface_manifest_catalog_key(template)?;
     let manifest = template_manifest_description(&scenario, template)?;
     let bindable_sources = bindable_source_candidates(
         &scenario,
@@ -520,10 +643,8 @@ pub(crate) fn describe_template(
         state,
         ComponentId(authority_realm_id),
     )?;
-    let template_config =
-        template_config_fields_for_manifest(&scenario, template, manifest_catalog_key)?;
-    let template_bindings =
-        template_binding_fields_for_manifest(&scenario, template, manifest_catalog_key)?;
+    let template_config = template_config_fields(template)?;
+    let template_bindings = template_binding_fields(template)?;
 
     let config = template_config
         .iter()
@@ -561,12 +682,7 @@ pub(crate) fn describe_template(
                             candidates: Vec::new(),
                         },
                         TemplateBinding::Open { optional } => {
-                            let slot_decl = root_template_slot_decl_for_manifest(
-                                &scenario,
-                                template,
-                                manifest_catalog_key,
-                                name,
-                            )?;
+                            let slot_decl = root_template_slot_decl(template, name)?;
                             let candidates = bindable_sources
                                 .iter()
                                 .filter(|candidate| !candidate.sources.is_empty())
@@ -598,7 +714,7 @@ pub(crate) fn describe_template(
         config,
         bindings,
         exports: TemplateExportsDescription {
-            visible: visible_exports_for_manifest(template, &scenario, manifest_catalog_key),
+            visible: visible_exports(template)?,
         },
         limits: TemplateLimits {
             max_live_children: template
@@ -614,11 +730,8 @@ pub(crate) fn list_children(
     authority_realm_id: usize,
 ) -> ChildListResponse {
     ChildListResponse {
-        children: state
-            .live_children
-            .iter()
+        children: visible_child_records(state)
             .filter(|child| child.authority_realm_id == authority_realm_id)
-            .filter(|child| child_is_visible(child))
             .map(|child| ChildSummary {
                 name: child.name.clone(),
                 state: child.state,
@@ -635,6 +748,7 @@ pub(crate) fn describe_child(
     let child = state
         .live_children
         .iter()
+        .chain(state.pending_destroys.iter().map(|record| &record.child))
         .find(|child| child.authority_realm_id == authority_realm_id && child.name == child_name)
         .ok_or_else(|| protocol_error(ProtocolErrorCode::UnknownChild, "unknown child"))?;
     Ok(ChildDescribeResponse {
@@ -685,11 +799,7 @@ pub(crate) fn snapshot(
         .retain(|key, _| required_catalog_keys.contains(key));
     normalize_scenario_ir_order(&mut live_scenario_ir);
     let mut assignments = state.placement.assignments.clone();
-    for child in state
-        .live_children
-        .iter()
-        .filter(|child| child_is_visible(child))
-    {
+    for child in visible_child_records(state) {
         assignments.extend(child.assignments.clone());
     }
     Ok(SnapshotResponse {
@@ -760,23 +870,11 @@ async fn prepare_child_record(
         authority_realm,
     )?;
     let selected_manifest_catalog_key = select_manifest_catalog_key(template, request)?;
-    let rendered_config = build_child_config(
-        &live_scenario,
-        template,
-        &selected_manifest_catalog_key,
-        request,
-    )?;
-    let resolved_bindings = resolve_template_bindings(
-        &live_scenario,
-        template,
-        &selected_manifest_catalog_key,
-        request,
-        &bindable_sources,
-    )?;
+    let rendered_config = build_child_config(template, request)?;
+    let resolved_bindings = resolve_template_bindings(template, request, &bindable_sources)?;
     let child_id = allocate_child_id(state);
     let (wrapper_manifest, synthetic_sources) = build_wrapper_manifest(
         state,
-        &live_scenario,
         template,
         &request.name,
         &selected_manifest_catalog_key,
@@ -872,6 +970,28 @@ fn remove_incident_bindings_from_survivors(state: &mut FrameworkControlState, ch
             .bindings
             .retain(|binding| binding.source_child_id != Some(child_id));
     }
+    for pending in &mut state.pending_creates {
+        if pending.child.child_id == child_id {
+            continue;
+        }
+        let Some(fragment) = pending.child.fragment.as_mut() else {
+            continue;
+        };
+        fragment
+            .bindings
+            .retain(|binding| binding.source_child_id != Some(child_id));
+    }
+    for pending in &mut state.pending_destroys {
+        if pending.child.child_id == child_id {
+            continue;
+        }
+        let Some(fragment) = pending.child.fragment.as_mut() else {
+            continue;
+        };
+        fragment
+            .bindings
+            .retain(|binding| binding.source_child_id != Some(child_id));
+    }
 }
 
 #[cfg(test)]
@@ -882,22 +1002,26 @@ async fn create_child(
     state_path: &Path,
 ) -> std::result::Result<CreateChildResponse, ProtocolErrorResponse> {
     let child = prepare_child_record(state, authority_realm_id, &request).await?;
+    let tx_id = allocate_tx_id(state);
     persist_control_state_update(state, state_path, "create_prepared", |state| {
-        state.live_children.push(child.clone());
-        append_journal_entry(state, &child, ChildState::CreateRequested);
-        append_journal_entry(state, &child, ChildState::CreatePrepared);
+        state.pending_creates.push(PendingCreateRecord {
+            tx_id,
+            child: child.clone(),
+        });
+        append_journal_entry(state, tx_id, &child, ChildState::CreateRequested);
+        append_journal_entry(state, tx_id, &child, ChildState::CreatePrepared);
         Ok(())
     })?;
 
     persist_control_state_update(state, state_path, "create_committed_hidden", |state| {
         transition_child_state(state, child.child_id, ChildState::CreateCommittedHidden)?;
-        append_journal_entry(state, &child, ChildState::CreateCommittedHidden);
+        append_journal_entry(state, tx_id, &child, ChildState::CreateCommittedHidden);
         Ok(())
     })?;
 
     persist_control_state_update(state, state_path, "create_live", |state| {
-        transition_child_state(state, child.child_id, ChildState::Live)?;
-        append_journal_entry(state, &child, ChildState::Live);
+        append_journal_entry(state, tx_id, &child, ChildState::Live);
+        move_pending_create_to_live(state, child.child_id)?;
         Ok(())
     })?;
 
@@ -930,25 +1054,24 @@ async fn destroy_child(
     };
     let child_id = state.live_children[child_index].child_id;
     let child = state.live_children[child_index].clone();
+    let tx_id = allocate_tx_id(state);
 
     persist_control_state_update(state, state_path, "destroy_requested", |state| {
-        append_journal_entry(state, &child, ChildState::DestroyRequested);
-        transition_child_state(state, child_id, ChildState::DestroyRequested)?;
+        append_journal_entry(state, tx_id, &child, ChildState::DestroyRequested);
+        move_live_child_to_pending_destroy(state, child_id, tx_id)?;
         Ok(())
     })?;
 
     persist_control_state_update(state, state_path, "destroy_retracted", |state| {
         remove_incident_bindings_from_survivors(state, child_id);
         transition_child_state(state, child_id, ChildState::DestroyRetracted)?;
-        append_journal_entry(state, &child, ChildState::DestroyRetracted);
+        append_journal_entry(state, tx_id, &child, ChildState::DestroyRetracted);
         Ok(())
     })?;
 
     persist_control_state_update(state, state_path, "destroy_committed", |state| {
-        append_journal_entry(state, &child, ChildState::DestroyCommitted);
-        state
-            .live_children
-            .retain(|candidate| candidate.child_id != child_id);
+        append_journal_entry(state, tx_id, &child, ChildState::DestroyCommitted);
+        remove_pending_destroy(state, child_id)?;
         Ok(())
     })?;
     Ok(())
@@ -986,7 +1109,7 @@ fn validate_child_name_available(
     authority_realm_id: usize,
     child_name: &str,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    if state.live_children.iter().any(|child| {
+    if all_child_records(state).any(|child| {
         child.authority_realm_id == authority_realm_id
             && child.name == child_name
             && child.state != ChildState::CreateAborted
@@ -1015,6 +1138,8 @@ fn validate_template_limits(
         let live = state
             .live_children
             .iter()
+            .chain(state.pending_creates.iter().map(|record| &record.child))
+            .chain(state.pending_destroys.iter().map(|record| &record.child))
             .filter(|child| child.authority_realm_id == authority_realm_id)
             .filter(|child| child.template_name.as_deref() == Some(template_name))
             .filter(|child| child_counts_toward_template_limits(child))
@@ -1089,13 +1214,10 @@ fn select_manifest_catalog_key(
 }
 
 fn build_child_config(
-    scenario: &Scenario,
     template: &ChildTemplate,
-    selected_manifest_catalog_key: &str,
     request: &CreateChildRequest,
 ) -> std::result::Result<Option<serde_json::Value>, ProtocolErrorResponse> {
-    let template_config =
-        template_config_fields_for_manifest(scenario, template, selected_manifest_catalog_key)?;
+    let template_config = template_config_fields(template)?;
     for key in request.config.keys() {
         if !template_config.contains_key(key.as_str()) {
             return Err(protocol_error(
@@ -1134,14 +1256,11 @@ fn build_child_config(
 }
 
 fn resolve_template_bindings(
-    scenario: &Scenario,
     template: &ChildTemplate,
-    selected_manifest_catalog_key: &str,
     request: &CreateChildRequest,
     bindable_sources: &[BindableSourceCandidate],
 ) -> std::result::Result<Vec<ResolvedTemplateBinding>, ProtocolErrorResponse> {
-    let template_bindings =
-        template_binding_fields_for_manifest(scenario, template, selected_manifest_catalog_key)?;
+    let template_bindings = template_binding_fields(template)?;
     for key in request.bindings.keys() {
         if !template_bindings.contains_key(key.as_str()) {
             return Err(protocol_error(
@@ -1154,13 +1273,7 @@ fn resolve_template_bindings(
     template_bindings
         .iter()
         .map(|(slot_name, field)| {
-            let slot_decl = root_template_slot_decl_for_manifest(
-                scenario,
-                template,
-                selected_manifest_catalog_key,
-                slot_name,
-            )?
-            .clone();
+            let slot_decl = root_template_slot_decl(template, slot_name)?.clone();
             let candidate = match field {
                 TemplateBinding::Prefilled { selector } => {
                     Some(find_bindable_source(bindable_sources, selector.as_str())?)
@@ -1217,7 +1330,6 @@ fn resolve_template_bindings(
 
 fn build_wrapper_manifest(
     state: &FrameworkControlState,
-    scenario: &Scenario,
     template: &ChildTemplate,
     child_name: &str,
     selected_manifest_catalog_key: &str,
@@ -1314,7 +1426,7 @@ fn build_wrapper_manifest(
         }
     }
 
-    let exports = visible_exports_for_manifest(template, scenario, selected_manifest_catalog_key)
+    let exports = visible_exports(template)?
         .into_iter()
         .map(|export_name| {
             let target = format!("#{child_name}.{export_name}")
@@ -1403,15 +1515,20 @@ fn allocate_child_id(state: &mut FrameworkControlState) -> u64 {
     state.next_child_id
 }
 
+fn allocate_tx_id(state: &mut FrameworkControlState) -> u64 {
+    state.next_tx_id += 1;
+    state.next_tx_id
+}
+
 fn append_journal_entry(
     state: &mut FrameworkControlState,
+    tx_id: u64,
     child: &LiveChildRecord,
     child_state: ChildState,
 ) {
-    state.next_tx_id += 1;
     state.generation += 1;
     state.journal.push(ControlJournalEntry {
-        tx_id: state.next_tx_id,
+        tx_id,
         child_id: child.child_id,
         authority_realm_id: child.authority_realm_id,
         child_name: child.name.clone(),
@@ -1425,17 +1542,105 @@ fn transition_child_state(
     child_id: u64,
     next_state: ChildState,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    let child = state
-        .live_children
-        .iter_mut()
-        .find(|child| child.child_id == child_id)
+    let child = child_record_mut(state, child_id)?;
+    child.state = next_state;
+    Ok(())
+}
+
+fn move_pending_create_to_live(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let index = state
+        .pending_creates
+        .iter()
+        .position(|record| record.child.child_id == child_id)
         .ok_or_else(|| {
             protocol_error(
                 ProtocolErrorCode::ControlStateUnavailable,
-                &format!("child id {child_id} is missing from authoritative state"),
+                &format!("child id {child_id} is missing pending create state"),
             )
         })?;
-    child.state = next_state;
+    let mut record = state.pending_creates.remove(index);
+    record.child.state = ChildState::Live;
+    state.live_children.push(record.child);
+    Ok(())
+}
+
+fn remove_pending_create(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let index = state
+        .pending_creates
+        .iter()
+        .position(|record| record.child.child_id == child_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("child id {child_id} is missing pending create state"),
+            )
+        })?;
+    state.pending_creates.remove(index);
+    Ok(())
+}
+
+fn move_live_child_to_pending_destroy(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+    tx_id: u64,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let index = state
+        .live_children
+        .iter()
+        .position(|child| child.child_id == child_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("child id {child_id} is missing live child state"),
+            )
+        })?;
+    let mut child = state.live_children.remove(index);
+    child.state = ChildState::DestroyRequested;
+    state
+        .pending_destroys
+        .push(PendingDestroyRecord { tx_id, child });
+    Ok(())
+}
+
+fn remove_pending_destroy(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let index = state
+        .pending_destroys
+        .iter()
+        .position(|record| record.child.child_id == child_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("child id {child_id} is missing pending destroy state"),
+            )
+        })?;
+    state.pending_destroys.remove(index);
+    Ok(())
+}
+
+fn remove_child_record(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    match child_record_location(state, child_id)? {
+        ChildRecordLocation::Live(index) => {
+            state.live_children.remove(index);
+        }
+        ChildRecordLocation::PendingCreate(index) => {
+            state.pending_creates.remove(index);
+        }
+        ChildRecordLocation::PendingDestroy(index) => {
+            state.pending_destroys.remove(index);
+        }
+    }
     Ok(())
 }
 
@@ -2050,9 +2255,7 @@ fn refresh_capability_instances(state: &mut FrameworkControlState) -> Result<()>
 fn collect_capability_instances(
     state: &FrameworkControlState,
 ) -> Result<BTreeMap<String, CapabilityInstanceRecord>> {
-    let active_children = state
-        .live_children
-        .iter()
+    let active_children = all_child_records(state)
         .filter(|child| child_state_keeps_capability_instances(child.state))
         .collect::<Vec<_>>();
 
@@ -2229,7 +2432,7 @@ struct BindableSourceCandidate {
 
 fn placement_file_from_state(state: &FrameworkControlState) -> PlacementFile {
     let mut components = state.placement.placement_components.clone();
-    for child in &state.live_children {
+    for child in visible_child_records(state) {
         components.extend(child.assignments.clone());
     }
     PlacementFile {
@@ -2271,11 +2474,7 @@ fn run_plan_activation_from_state(state: &FrameworkControlState) -> RunPlanActiv
 
 fn live_assignment_map(state: &FrameworkControlState) -> BTreeMap<String, String> {
     let mut assignments = state.placement.assignments.clone();
-    for child in state
-        .live_children
-        .iter()
-        .filter(|child| child_is_visible(child))
-    {
+    for child in visible_child_records(state) {
         assignments.extend(child.assignments.clone());
     }
     assignments
@@ -2337,11 +2536,7 @@ fn live_scenario_ir(
         .collect::<BTreeMap<_, _>>();
     let mut bindings = state.base_scenario.bindings.clone();
 
-    for child in state
-        .live_children
-        .iter()
-        .filter(|child| child_is_visible(child))
-    {
+    for child in visible_child_records(state) {
         let Some(fragment) = child.fragment.as_ref() else {
             continue;
         };
@@ -2535,9 +2730,7 @@ fn binding_sort_key(binding: &BindingIr, monikers: &BTreeMap<usize, String>) -> 
 }
 
 fn live_child_component_owner(state: &FrameworkControlState, component_id: usize) -> Option<u64> {
-    state
-        .live_children
-        .iter()
+    all_child_records(state)
         .filter_map(|child| {
             let fragment = child.fragment.as_ref()?;
             fragment
@@ -2629,11 +2822,8 @@ fn bindable_source_candidates(
         authority_realm,
     )?);
 
-    for child in state
-        .live_children
-        .iter()
-        .filter(|child| child.authority_realm_id == authority_realm.0)
-        .filter(|child| child_is_visible(child))
+    for child in
+        visible_child_records(state).filter(|child| child.authority_realm_id == authority_realm.0)
     {
         for (export_name, output) in &child.outputs {
             out.push(BindableSourceCandidate {
@@ -2710,6 +2900,7 @@ fn static_child_export_candidates(
     let dynamic_child_roots = state
         .live_children
         .iter()
+        .chain(state.pending_destroys.iter().map(|record| &record.child))
         .filter(|child| child.authority_realm_id == authority_realm.0)
         .filter(|child| child_is_visible(child))
         .filter_map(|child| {
@@ -3002,134 +3193,59 @@ fn runtime_backend_name(backend: &amber_manifest::RuntimeBackend) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn template_interface_manifest_catalog_key(
+fn frozen_template_contract(
     template: &ChildTemplate,
-) -> std::result::Result<&str, ProtocolErrorResponse> {
-    template
-        .manifest
-        .as_deref()
-        .or_else(|| {
-            template
-                .allowed_manifests
-                .as_ref()
-                .and_then(|keys| keys.first())
-                .map(String::as_str)
-        })
-        .ok_or_else(|| {
-            protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
-                "child template is missing its frozen manifest catalog key",
-            )
-        })
+) -> std::result::Result<&ChildTemplate, ProtocolErrorResponse> {
+    if template.frozen {
+        return Ok(template);
+    }
+    Err(protocol_error(
+        ProtocolErrorCode::ControlStateUnavailable,
+        "framework.component requires compiler-frozen child template contracts; recompile with \
+         the current compiler",
+    ))
 }
 
-fn root_template_manifest_for_key<'a>(
-    scenario: &'a Scenario,
-    manifest_catalog_key: &str,
-) -> std::result::Result<&'a Manifest, ProtocolErrorResponse> {
-    scenario
-        .manifest_catalog
-        .get(manifest_catalog_key)
-        .map(|entry| &entry.manifest)
-        .ok_or_else(|| {
-            protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
-                &format!(
-                    "child template root manifest `{manifest_catalog_key}` is missing from the \
-                     frozen manifest catalog"
-                ),
-            )
-        })
-}
-
-fn template_config_fields_for_manifest(
-    scenario: &Scenario,
+fn template_config_fields(
     template: &ChildTemplate,
-    manifest_catalog_key: &str,
 ) -> std::result::Result<BTreeMap<String, TemplateConfigField>, ProtocolErrorResponse> {
-    let mut fields = template.config.clone();
-    let manifest = root_template_manifest_for_key(scenario, manifest_catalog_key)?;
-    let Some(schema) = manifest.config_schema() else {
-        return Ok(fields);
-    };
-    let required = schema
-        .0
-        .get("required")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .collect::<BTreeSet<_>>();
-    for name in schema
-        .0
-        .get("properties")
-        .and_then(serde_json::Value::as_object)
-        .into_iter()
-        .flat_map(|properties| properties.keys())
-    {
-        fields
-            .entry(name.clone())
-            .or_insert(TemplateConfigField::Open {
-                required: required.contains(name.as_str()),
-            });
-    }
-    Ok(fields)
+    Ok(frozen_template_contract(template)?.config.clone())
 }
 
-fn template_binding_fields_for_manifest(
-    scenario: &Scenario,
+fn template_binding_fields(
     template: &ChildTemplate,
-    manifest_catalog_key: &str,
 ) -> std::result::Result<BTreeMap<String, TemplateBinding>, ProtocolErrorResponse> {
-    let mut fields = template.bindings.clone();
-    let manifest = root_template_manifest_for_key(scenario, manifest_catalog_key)?;
-    for (name, slot) in manifest.slots() {
-        fields
-            .entry(name.to_string())
-            .or_insert(TemplateBinding::Open {
-                optional: slot.optional,
-            });
-    }
-    Ok(fields)
+    Ok(frozen_template_contract(template)?.bindings.clone())
 }
 
-fn root_template_slot_decl_for_manifest<'a>(
-    scenario: &'a Scenario,
-    _template: &'a ChildTemplate,
-    manifest_catalog_key: &str,
+fn root_template_slot_decl<'a>(
+    template: &'a ChildTemplate,
     slot_name: &str,
 ) -> std::result::Result<&'a amber_manifest::SlotDecl, ProtocolErrorResponse> {
-    root_template_manifest_for_key(scenario, manifest_catalog_key)?
-        .slots()
+    frozen_template_contract(template)?
+        .slot_decls
         .get(slot_name)
         .ok_or_else(|| {
             protocol_error(
                 ProtocolErrorCode::ControlStateUnavailable,
-                "child template root slot is missing from the frozen manifest catalog entry",
+                "child template root slot is missing from the frozen child template contract",
             )
         })
 }
 
-fn visible_exports_for_manifest(
+fn visible_exports(
     template: &ChildTemplate,
-    scenario: &Scenario,
-    manifest_catalog_key: &str,
-) -> Vec<String> {
-    if let Some(visible) = template.visible_exports.as_ref() {
-        return visible.clone();
-    }
-    scenario
-        .manifest_catalog
-        .get(manifest_catalog_key)
-        .map(|entry| {
-            entry
-                .manifest
-                .exports()
-                .keys()
-                .map(ToString::to_string)
-                .collect()
+) -> std::result::Result<Vec<String>, ProtocolErrorResponse> {
+    frozen_template_contract(template)?
+        .visible_exports
+        .clone()
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                "child template visible exports are missing from the frozen child template \
+                 contract",
+            )
         })
-        .unwrap_or_default()
 }
 
 fn source_compatible(target: CapabilityDecl, candidate: CapabilityDecl) -> bool {
@@ -3323,13 +3439,13 @@ pub(crate) struct SiteActuatorDestroyRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ControlCreateChildRequest {
-    authority_realm_id: usize,
+    cap_instance_id: String,
     request: CreateChildRequest,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ControlDestroyChildRequest {
-    authority_realm_id: usize,
+    cap_instance_id: String,
 }
 
 #[derive(Debug)]
@@ -3791,9 +3907,7 @@ fn link_still_required(
     removed_child_id: u64,
     link: &RunLink,
 ) -> bool {
-    state
-        .live_children
-        .iter()
+    visible_child_records(state)
         .filter(|candidate| candidate.child_id != removed_child_id)
         .filter(|candidate| child_link_overlays_are_active(candidate))
         .any(|candidate| {
@@ -4091,9 +4205,7 @@ fn cloned_child_record(
     state: &FrameworkControlState,
     child_id: u64,
 ) -> std::result::Result<LiveChildRecord, ProtocolErrorResponse> {
-    state
-        .live_children
-        .iter()
+    all_child_records(state)
         .find(|child| child.child_id == child_id)
         .cloned()
         .ok_or_else(|| {
@@ -4208,9 +4320,10 @@ async fn continue_create_committed_hidden(
     if child.state != ChildState::CreateCommittedHidden {
         return Ok(());
     }
+    let tx_id = child_create_tx_id(&state, child_id)?;
     persist_control_state_update(&mut state, &app.state_path, "create_live", |state| {
-        transition_child_state(state, child_id, ChildState::Live)?;
-        append_journal_entry(state, &child, ChildState::Live);
+        append_journal_entry(state, tx_id, &child, ChildState::Live);
+        move_pending_create_to_live(state, child_id)?;
         Ok(())
     })
 }
@@ -4270,11 +4383,10 @@ async fn continue_destroy_retracted(
     if child.state != ChildState::DestroyRetracted {
         return Ok(());
     }
+    let tx_id = child_destroy_tx_id(&state, child_id)?;
     persist_control_state_update(&mut state, &app.state_path, "destroy_committed", |state| {
-        append_journal_entry(state, &child, ChildState::DestroyCommitted);
-        state
-            .live_children
-            .retain(|candidate| candidate.child_id != child_id);
+        append_journal_entry(state, tx_id, &child, ChildState::DestroyCommitted);
+        remove_pending_destroy(state, child_id)?;
         Ok(())
     })
 }
@@ -4299,10 +4411,11 @@ async fn continue_destroy_requested(
         if child.state != ChildState::DestroyRequested {
             return Ok(());
         }
+        let tx_id = child_destroy_tx_id(&state, child_id)?;
         persist_control_state_update(&mut state, &app.state_path, "destroy_retracted", |state| {
             remove_incident_bindings_from_survivors(state, child_id);
             transition_child_state(state, child_id, ChildState::DestroyRetracted)?;
-            append_journal_entry(state, &child, ChildState::DestroyRetracted);
+            append_journal_entry(state, tx_id, &child, ChildState::DestroyRetracted);
             Ok(())
         })?;
     }
@@ -4319,14 +4432,19 @@ async fn execute_create_child(
     let child = {
         let mut state = app.control_state.lock().await;
         let child = prepare_child_record(&mut state, authority_realm_id, &request).await?;
+        let tx_id = allocate_tx_id(&mut state);
         persist_control_state_update(&mut state, &app.state_path, "create_prepared", |state| {
-            state.live_children.push(child.clone());
-            append_journal_entry(state, &child, ChildState::CreateRequested);
-            append_journal_entry(state, &child, ChildState::CreatePrepared);
+            state.pending_creates.push(PendingCreateRecord {
+                tx_id,
+                child: child.clone(),
+            });
+            append_journal_entry(state, tx_id, &child, ChildState::CreateRequested);
+            append_journal_entry(state, tx_id, &child, ChildState::CreatePrepared);
             Ok(())
         })?;
-        child
+        (tx_id, child)
     };
+    let (tx_id, child) = child;
 
     let mut prepared_sites = Vec::new();
     for site_plan in &child.site_plans {
@@ -4334,19 +4452,18 @@ async fn execute_create_child(
             let rollback_err = rollback_prepared_sites(app, child.child_id, &prepared_sites).await;
             let mut state = app.control_state.lock().await;
             if state
-                .live_children
+                .pending_creates
                 .iter()
-                .any(|candidate| candidate.child_id == child.child_id)
+                .any(|candidate| candidate.child.child_id == child.child_id)
+                && rollback_err.is_ok()
             {
                 persist_control_state_update(
                     &mut state,
                     &app.state_path,
                     "create_aborted",
                     |state| {
-                        append_journal_entry(state, &child, ChildState::CreateAborted);
-                        state
-                            .live_children
-                            .retain(|candidate| candidate.child_id != child.child_id);
+                        append_journal_entry(state, tx_id, &child, ChildState::CreateAborted);
+                        remove_pending_create(state, child.child_id)?;
                         Ok(())
                     },
                 )?;
@@ -4380,7 +4497,7 @@ async fn execute_create_child(
             "create_committed_hidden",
             |state| {
                 transition_child_state(state, child.child_id, ChildState::CreateCommittedHidden)?;
-                append_journal_entry(state, &child, ChildState::CreateCommittedHidden);
+                append_journal_entry(state, tx_id, &child, ChildState::CreateCommittedHidden);
                 Ok(())
             },
         )?;
@@ -4411,6 +4528,7 @@ async fn execute_destroy_child(
         let Some(child) = state
             .live_children
             .iter()
+            .chain(state.pending_destroys.iter().map(|record| &record.child))
             .find(|child| {
                 child.authority_realm_id == authority_realm_id && child.name == child_name
             })
@@ -4420,17 +4538,14 @@ async fn execute_destroy_child(
         };
         match child.state {
             ChildState::Live => {
+                let tx_id = allocate_tx_id(&mut state);
                 persist_control_state_update(
                     &mut state,
                     &app.state_path,
                     "destroy_requested",
                     |state| {
-                        append_journal_entry(state, &child, ChildState::DestroyRequested);
-                        transition_child_state(
-                            state,
-                            child.child_id,
-                            ChildState::DestroyRequested,
-                        )?;
+                        append_journal_entry(state, tx_id, &child, ChildState::DestroyRequested);
+                        move_live_child_to_pending_destroy(state, child.child_id, tx_id)?;
                         Ok(())
                     },
                 )?;
@@ -4459,26 +4574,22 @@ async fn execute_destroy_child(
 async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
     let children = {
         let state = app.control_state.lock().await;
-        state.live_children.clone()
+        all_child_records(&state).cloned().collect::<Vec<_>>()
     };
     for child in children {
         match child.state {
             ChildState::CreateRequested => {
                 let mut state = app.control_state.lock().await;
-                if state
-                    .live_children
-                    .iter()
-                    .any(|candidate| candidate.child_id == child.child_id)
-                {
+                if child_record_location(&state, child.child_id).is_ok() {
+                    let tx_id = child_create_tx_id(&state, child.child_id)
+                        .map_err(|err| miette::miette!(err.message))?;
                     persist_control_state_update(
                         &mut state,
                         &app.state_path,
                         "create_aborted",
                         |state| {
-                            append_journal_entry(state, &child, ChildState::CreateAborted);
-                            state
-                                .live_children
-                                .retain(|candidate| candidate.child_id != child.child_id);
+                            append_journal_entry(state, tx_id, &child, ChildState::CreateAborted);
+                            remove_child_record(state, child.child_id)?;
                             Ok(())
                         },
                     )
@@ -4491,22 +4602,25 @@ async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
                     .iter()
                     .map(|site_plan| site_plan.site_id.clone())
                     .collect::<Vec<_>>();
-                let _ = rollback_prepared_sites(app, child.child_id, &prepared_sites).await;
+                rollback_prepared_sites(app, child.child_id, &prepared_sites)
+                    .await
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to rollback prepared child `{}` during recovery",
+                            child.name
+                        )
+                    })?;
                 let mut state = app.control_state.lock().await;
-                if state
-                    .live_children
-                    .iter()
-                    .any(|candidate| candidate.child_id == child.child_id)
-                {
+                if child_record_location(&state, child.child_id).is_ok() {
+                    let tx_id = child_create_tx_id(&state, child.child_id)
+                        .map_err(|err| miette::miette!(err.message))?;
                     persist_control_state_update(
                         &mut state,
                         &app.state_path,
                         "create_aborted",
                         |state| {
-                            append_journal_entry(state, &child, ChildState::CreateAborted);
-                            state
-                                .live_children
-                                .retain(|candidate| candidate.child_id != child.child_id);
+                            append_journal_entry(state, tx_id, &child, ChildState::CreateAborted);
+                            remove_child_record(state, child.child_id)?;
                             Ok(())
                         },
                     )
@@ -4653,8 +4767,14 @@ async fn control_create_child(
     Json(request): Json<ControlCreateChildRequest>,
 ) -> std::result::Result<Json<CreateChildResponse>, ProtocolApiError> {
     authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
+    let authority_realm_id = {
+        let state = app.control_state.lock().await;
+        capability_instance_record(&state, &request.cap_instance_id)
+            .map_err(ProtocolApiError::from)?
+            .authority_realm_id
+    };
     Ok(Json(
-        execute_create_child(&app, request.authority_realm_id, request.request).await?,
+        execute_create_child(&app, authority_realm_id, request.request).await?,
     ))
 }
 
@@ -4665,7 +4785,13 @@ async fn control_destroy_child(
     Json(request): Json<ControlDestroyChildRequest>,
 ) -> std::result::Result<StatusCode, ProtocolApiError> {
     authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
-    execute_destroy_child(&app, request.authority_realm_id, &child).await?;
+    let authority_realm_id = {
+        let state = app.control_state.lock().await;
+        capability_instance_record(&state, &request.cap_instance_id)
+            .map_err(ProtocolApiError::from)?
+            .authority_realm_id
+    };
+    execute_destroy_child(&app, authority_realm_id, &child).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4705,7 +4831,7 @@ async fn ccs_create_child(
 ) -> std::result::Result<Json<CreateChildResponse>, ProtocolApiError> {
     let (_, record, _) = authorize_request(&app, &headers).await?;
     Ok(Json(
-        forward_create_child(&app, record.authority_realm_id, request).await?,
+        forward_create_child(&app, &record.cap_instance_id, request).await?,
     ))
 }
 
@@ -4736,7 +4862,7 @@ async fn ccs_destroy_child(
     AxumPath(child): AxumPath<String>,
 ) -> std::result::Result<StatusCode, ProtocolApiError> {
     let (_, record, _) = authorize_request(&app, &headers).await?;
-    forward_destroy_child(&app, record.authority_realm_id, &child).await?;
+    forward_destroy_child(&app, &record.cap_instance_id, &child).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4819,7 +4945,7 @@ async fn fetch_control_state(
 
 async fn forward_create_child(
     app: &CcsApp,
-    authority_realm_id: usize,
+    cap_instance_id: &str,
     request: CreateChildRequest,
 ) -> std::result::Result<CreateChildResponse, ProtocolApiError> {
     let url = format!(
@@ -4831,7 +4957,7 @@ async fn forward_create_child(
         .post(&url)
         .header(FRAMEWORK_AUTH_HEADER, app.control_state_auth_token.as_ref())
         .json(&ControlCreateChildRequest {
-            authority_realm_id,
+            cap_instance_id: cap_instance_id.to_string(),
             request,
         })
         .send()
@@ -4846,7 +4972,7 @@ async fn forward_create_child(
 
 async fn forward_destroy_child(
     app: &CcsApp,
-    authority_realm_id: usize,
+    cap_instance_id: &str,
     child: &str,
 ) -> std::result::Result<(), ProtocolApiError> {
     let url = format!(
@@ -4857,7 +4983,9 @@ async fn forward_destroy_child(
         .client
         .post(&url)
         .header(FRAMEWORK_AUTH_HEADER, app.control_state_auth_token.as_ref())
-        .json(&ControlDestroyChildRequest { authority_realm_id })
+        .json(&ControlDestroyChildRequest {
+            cap_instance_id: cap_instance_id.to_string(),
+        })
         .send()
         .await
         .map_err(|err| {
@@ -5536,6 +5664,14 @@ mod tests {
         }
     }
 
+    fn pending_create(tx_id: u64, child: LiveChildRecord) -> PendingCreateRecord {
+        PendingCreateRecord { tx_id, child }
+    }
+
+    fn pending_destroy(tx_id: u64, child: LiveChildRecord) -> PendingDestroyRecord {
+        PendingDestroyRecord { tx_id, child }
+    }
+
     fn test_control_state_app(
         dir: &TempDir,
         state: FrameworkControlState,
@@ -5607,6 +5743,81 @@ mod tests {
                 .route(
                     "/v1/children/{child_id}/prepare",
                     post(|| async { StatusCode::NO_CONTENT }),
+                )
+                .route(
+                    "/v1/children/{child_id}/rollback",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                )
+                .route(
+                    "/v1/children/{child_id}/publish",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                )
+                .route(
+                    "/v1/children/{child_id}/destroy",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                );
+            handles.push(tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("site actuator should serve");
+            }));
+        }
+        handles
+    }
+
+    async fn install_failing_rollback_site_actuator(
+        app: &ControlStateApp,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let offered_sites = {
+            let state = app.control_state.lock().await;
+            state
+                .placement
+                .offered_sites
+                .iter()
+                .map(|(site_id, site)| (site_id.clone(), site.kind))
+                .collect::<Vec<_>>()
+        };
+        let mut handles = Vec::with_capacity(offered_sites.len());
+        for (site_id, site_kind) in offered_sites {
+            let site_state_root = Path::new(&app.state_root).join(&site_id);
+            fs::create_dir_all(&site_state_root).expect("site state root should exist");
+            let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .expect("actuator listener");
+            let listen_addr = listener.local_addr().expect("actuator addr");
+            write_json(
+                &site_state_root.join("site-actuator-plan.json"),
+                &SiteActuatorPlan {
+                    schema: "amber.run.site_actuator_plan".to_string(),
+                    version: 1,
+                    run_id: "test-run".to_string(),
+                    mesh_scope: "test-mesh".to_string(),
+                    run_root: app.run_root.display().to_string(),
+                    site_id: site_id.clone(),
+                    kind: site_kind,
+                    router_identity_id: format!("/site/{site_id}/router"),
+                    artifact_dir: site_state_root.join("artifact").display().to_string(),
+                    site_state_root: site_state_root.display().to_string(),
+                    listen_addr,
+                    storage_root: None,
+                    runtime_root: None,
+                    router_mesh_port: None,
+                    compose_project: None,
+                    kubernetes_namespace: None,
+                    context: None,
+                    observability_endpoint: None,
+                    launch_env: BTreeMap::new(),
+                },
+            )
+            .expect("site actuator plan should write");
+            let app = Router::new()
+                .route(
+                    "/v1/children/{child_id}/prepare",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                )
+                .route(
+                    "/v1/children/{child_id}/rollback",
+                    post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
                 )
                 .route(
                     "/v1/children/{child_id}/publish",
@@ -6843,6 +7054,8 @@ mod tests {
             capability_instances: BTreeMap::new(),
             journal: Vec::new(),
             live_children: vec![first, second],
+            pending_creates: Vec::new(),
+            pending_destroys: Vec::new(),
         };
 
         assert!(
@@ -6972,10 +7185,12 @@ mod tests {
         state.live_children = vec![alpha_child];
 
         let template = ChildTemplate {
+            frozen: false,
             manifest: Some("file:///templates/worker.json5".to_string()),
             allowed_manifests: None,
             config: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            slot_decls: BTreeMap::new(),
             visible_exports: None,
             limits: Some(amber_scenario::ChildTemplateLimits {
                 max_live_children: Some(1),
@@ -7311,43 +7526,46 @@ mod tests {
             install_barrier_destroy_site_actuator(&app).await;
         {
             let mut state = app.control_state.lock().await;
-            state.live_children.push(LiveChildRecord {
-                child_id: 7,
-                authority_realm_id: root_authority,
-                name: "job-compose".to_string(),
-                state: ChildState::DestroyRetracted,
-                template_name: Some("fixture".to_string()),
-                selected_manifest_catalog_key: None,
-                fragment: None,
-                assignments: BTreeMap::new(),
-                site_plans: vec![
-                    DynamicSitePlanRecord {
-                        site_id: "compose_local".to_string(),
-                        kind: SiteKind::Compose,
-                        router_identity_id: "/site/compose_local/router".to_string(),
-                        component_ids: Vec::new(),
-                        assigned_components: Vec::new(),
-                        artifact_files: BTreeMap::new(),
-                        desired_artifact_files: BTreeMap::new(),
-                        proxy_exports: BTreeMap::new(),
-                        routed_inputs: Vec::new(),
-                    },
-                    DynamicSitePlanRecord {
-                        site_id: "direct_local".to_string(),
-                        kind: SiteKind::Direct,
-                        router_identity_id: "/site/direct_local/router".to_string(),
-                        component_ids: Vec::new(),
-                        assigned_components: Vec::new(),
-                        artifact_files: BTreeMap::new(),
-                        desired_artifact_files: BTreeMap::new(),
-                        proxy_exports: BTreeMap::new(),
-                        routed_inputs: Vec::new(),
-                    },
-                ],
-                overlay_ids: Vec::new(),
-                overlays: Vec::new(),
-                outputs: BTreeMap::new(),
-            });
+            state.pending_destroys.push(pending_destroy(
+                1,
+                LiveChildRecord {
+                    child_id: 7,
+                    authority_realm_id: root_authority,
+                    name: "job-compose".to_string(),
+                    state: ChildState::DestroyRetracted,
+                    template_name: Some("fixture".to_string()),
+                    selected_manifest_catalog_key: None,
+                    fragment: None,
+                    assignments: BTreeMap::new(),
+                    site_plans: vec![
+                        DynamicSitePlanRecord {
+                            site_id: "compose_local".to_string(),
+                            kind: SiteKind::Compose,
+                            router_identity_id: "/site/compose_local/router".to_string(),
+                            component_ids: Vec::new(),
+                            assigned_components: Vec::new(),
+                            artifact_files: BTreeMap::new(),
+                            desired_artifact_files: BTreeMap::new(),
+                            proxy_exports: BTreeMap::new(),
+                            routed_inputs: Vec::new(),
+                        },
+                        DynamicSitePlanRecord {
+                            site_id: "direct_local".to_string(),
+                            kind: SiteKind::Direct,
+                            router_identity_id: "/site/direct_local/router".to_string(),
+                            component_ids: Vec::new(),
+                            assigned_components: Vec::new(),
+                            artifact_files: BTreeMap::new(),
+                            desired_artifact_files: BTreeMap::new(),
+                            proxy_exports: BTreeMap::new(),
+                            routed_inputs: Vec::new(),
+                        },
+                    ],
+                    overlay_ids: Vec::new(),
+                    overlays: Vec::new(),
+                    outputs: BTreeMap::new(),
+                },
+            ));
         }
 
         let destroy = tokio::spawn({
@@ -7437,43 +7655,46 @@ mod tests {
             install_barrier_publish_site_actuator(&app).await;
         {
             let mut state = app.control_state.lock().await;
-            state.live_children.push(LiveChildRecord {
-                child_id: 7,
-                authority_realm_id: root_authority,
-                name: "job-compose".to_string(),
-                state: ChildState::CreateCommittedHidden,
-                template_name: Some("fixture".to_string()),
-                selected_manifest_catalog_key: None,
-                fragment: None,
-                assignments: BTreeMap::new(),
-                site_plans: vec![
-                    DynamicSitePlanRecord {
-                        site_id: "compose_local".to_string(),
-                        kind: SiteKind::Compose,
-                        router_identity_id: "/site/compose_local/router".to_string(),
-                        component_ids: Vec::new(),
-                        assigned_components: Vec::new(),
-                        artifact_files: BTreeMap::new(),
-                        desired_artifact_files: BTreeMap::new(),
-                        proxy_exports: BTreeMap::new(),
-                        routed_inputs: Vec::new(),
-                    },
-                    DynamicSitePlanRecord {
-                        site_id: "direct_local".to_string(),
-                        kind: SiteKind::Direct,
-                        router_identity_id: "/site/direct_local/router".to_string(),
-                        component_ids: Vec::new(),
-                        assigned_components: Vec::new(),
-                        artifact_files: BTreeMap::new(),
-                        desired_artifact_files: BTreeMap::new(),
-                        proxy_exports: BTreeMap::new(),
-                        routed_inputs: Vec::new(),
-                    },
-                ],
-                overlay_ids: Vec::new(),
-                overlays: Vec::new(),
-                outputs: BTreeMap::new(),
-            });
+            state.pending_creates.push(pending_create(
+                1,
+                LiveChildRecord {
+                    child_id: 7,
+                    authority_realm_id: root_authority,
+                    name: "job-compose".to_string(),
+                    state: ChildState::CreateCommittedHidden,
+                    template_name: Some("fixture".to_string()),
+                    selected_manifest_catalog_key: None,
+                    fragment: None,
+                    assignments: BTreeMap::new(),
+                    site_plans: vec![
+                        DynamicSitePlanRecord {
+                            site_id: "compose_local".to_string(),
+                            kind: SiteKind::Compose,
+                            router_identity_id: "/site/compose_local/router".to_string(),
+                            component_ids: Vec::new(),
+                            assigned_components: Vec::new(),
+                            artifact_files: BTreeMap::new(),
+                            desired_artifact_files: BTreeMap::new(),
+                            proxy_exports: BTreeMap::new(),
+                            routed_inputs: Vec::new(),
+                        },
+                        DynamicSitePlanRecord {
+                            site_id: "direct_local".to_string(),
+                            kind: SiteKind::Direct,
+                            router_identity_id: "/site/direct_local/router".to_string(),
+                            component_ids: Vec::new(),
+                            assigned_components: Vec::new(),
+                            artifact_files: BTreeMap::new(),
+                            desired_artifact_files: BTreeMap::new(),
+                            proxy_exports: BTreeMap::new(),
+                            routed_inputs: Vec::new(),
+                        },
+                    ],
+                    overlay_ids: Vec::new(),
+                    overlays: Vec::new(),
+                    outputs: BTreeMap::new(),
+                },
+            ));
         }
 
         let publish = tokio::spawn({
@@ -8403,14 +8624,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_destroy_child_resumes_pending_destroy_transactions() {
+        let (dir, mut state, state_path) = compile_empty_control_state().await;
+        let root_authority = state.base_scenario.root;
+        state.pending_destroys.push(pending_destroy(
+            1,
+            empty_live_child(root_authority, "doomed", 1, ChildState::DestroyRequested),
+        ));
+        write_control_state(&state_path, &state).expect("state should write");
+        let app = test_control_state_app(&dir, state, state_path);
+
+        execute_destroy_child(&app, root_authority, "doomed")
+            .await
+            .expect("destroy should resume the pending transaction");
+
+        let recovered = app.control_state.lock().await.clone();
+        assert!(
+            recovered.pending_destroys.is_empty(),
+            "resumed destroy should consume pending destroy state"
+        );
+        let states = recovered
+            .journal
+            .iter()
+            .map(|entry| entry.state)
+            .collect::<Vec<_>>();
+        assert!(
+            states.contains(&ChildState::DestroyRetracted),
+            "resumed destroy should continue the existing transaction"
+        );
+        assert_eq!(states.last().copied(), Some(ChildState::DestroyCommitted));
+    }
+
+    #[tokio::test]
+    async fn describe_template_rejects_unfrozen_template_contracts() {
+        let (_, mut state, _) = compile_exact_template_control_state().await;
+        let root_authority = state.base_scenario.root;
+        let root_component = state
+            .base_scenario
+            .components
+            .iter_mut()
+            .find(|component| component.id == root_authority)
+            .expect("root component should exist");
+        let template = root_component
+            .child_templates
+            .get_mut("worker")
+            .expect("worker template should exist");
+        template.frozen = false;
+        template.visible_exports = None;
+        template.slot_decls.clear();
+
+        let err = describe_template(&state, root_authority, "worker")
+            .expect_err("framework.component should reject unfrozen template contracts");
+        assert_eq!(err.code, ProtocolErrorCode::ControlStateUnavailable);
+        assert!(
+            err.message
+                .contains("compiler-frozen child template contracts"),
+            "error should direct the operator toward recompilation, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
     async fn recover_control_state_aborts_create_requested_children() {
         let (dir, mut state, state_path) = compile_empty_control_state().await;
         let root_authority = state.base_scenario.root;
-        state.live_children.push(empty_live_child(
-            root_authority,
-            "requested",
+        state.pending_creates.push(pending_create(
             1,
-            ChildState::CreateRequested,
+            empty_live_child(root_authority, "requested", 1, ChildState::CreateRequested),
         ));
         write_control_state(&state_path, &state).expect("state should write");
         let app = test_control_state_app(&dir, state, state_path);
@@ -8424,6 +8704,10 @@ mod tests {
             recovered.live_children.is_empty(),
             "create_requested recovery should discard the stale child"
         );
+        assert!(
+            recovered.pending_creates.is_empty(),
+            "create_requested recovery should clear pending create state"
+        );
         assert_eq!(
             recovered.journal.last().map(|entry| entry.state),
             Some(ChildState::CreateAborted)
@@ -8434,11 +8718,9 @@ mod tests {
     async fn recover_control_state_aborts_create_prepared_children() {
         let (dir, mut state, state_path) = compile_empty_control_state().await;
         let root_authority = state.base_scenario.root;
-        state.live_children.push(empty_live_child(
-            root_authority,
-            "prepared",
+        state.pending_creates.push(pending_create(
             1,
-            ChildState::CreatePrepared,
+            empty_live_child(root_authority, "prepared", 1, ChildState::CreatePrepared),
         ));
         write_control_state(&state_path, &state).expect("state should write");
         let app = test_control_state_app(&dir, state, state_path);
@@ -8452,6 +8734,10 @@ mod tests {
             recovered.live_children.is_empty(),
             "create_prepared recovery should remove the child"
         );
+        assert!(
+            recovered.pending_creates.is_empty(),
+            "create_prepared recovery should clear pending create state"
+        );
         assert_eq!(
             recovered.journal.last().map(|entry| entry.state),
             Some(ChildState::CreateAborted)
@@ -8459,14 +8745,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_control_state_surfaces_create_prepared_rollback_failures() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        write_file(
+            &root_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: { path: "/bin/echo", args: ["root"] },
+            }
+            "#,
+        );
+        let placement = PlacementFile {
+            schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+            version: amber_compiler::run_plan::PLACEMENT_VERSION,
+            sites: BTreeMap::from([(
+                "direct_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            )]),
+            defaults: PlacementDefaults {
+                path: Some("direct_local".to_string()),
+                ..PlacementDefaults::default()
+            },
+            components: BTreeMap::new(),
+        };
+        let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+        let state_path = dir.path().join("control-state.json");
+        let root_authority = state.base_scenario.root;
+        let app = test_control_state_app(&dir, state.clone(), state_path.clone());
+        let actuators = install_failing_rollback_site_actuator(&app).await;
+        state.pending_creates.push(pending_create(
+            1,
+            LiveChildRecord {
+                child_id: 1,
+                authority_realm_id: root_authority,
+                name: "prepared".to_string(),
+                state: ChildState::CreatePrepared,
+                template_name: Some("worker".to_string()),
+                selected_manifest_catalog_key: None,
+                fragment: None,
+                assignments: BTreeMap::new(),
+                site_plans: vec![DynamicSitePlanRecord {
+                    site_id: "direct_local".to_string(),
+                    kind: SiteKind::Direct,
+                    router_identity_id: "/site/direct_local/router".to_string(),
+                    component_ids: Vec::new(),
+                    assigned_components: Vec::new(),
+                    artifact_files: BTreeMap::new(),
+                    desired_artifact_files: BTreeMap::new(),
+                    proxy_exports: BTreeMap::new(),
+                    routed_inputs: Vec::new(),
+                }],
+                overlay_ids: Vec::new(),
+                overlays: Vec::new(),
+                outputs: BTreeMap::new(),
+            },
+        ));
+        write_control_state(&state_path, &state).expect("state should write");
+        *app.control_state.lock().await = state;
+
+        let err = recover_control_state(&app)
+            .await
+            .expect_err("recovery should fail when prepared rollback fails");
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to rollback prepared child `prepared`"),
+            "error should identify the blocked transaction, got: {message}"
+        );
+
+        let recovered = app.control_state.lock().await.clone();
+        assert_eq!(
+            recovered.pending_creates.len(),
+            1,
+            "failed recovery must retain the prepared child transaction"
+        );
+        assert!(
+            recovered.journal.is_empty(),
+            "failed rollback must not pretend the child was aborted"
+        );
+        for actuator in actuators {
+            actuator.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn recover_control_state_promotes_create_committed_hidden_children_to_live() {
         let (dir, mut state, state_path) = compile_empty_control_state().await;
         let root_authority = state.base_scenario.root;
-        state.live_children.push(empty_live_child(
-            root_authority,
-            "hidden",
+        state.pending_creates.push(pending_create(
             1,
-            ChildState::CreateCommittedHidden,
+            empty_live_child(
+                root_authority,
+                "hidden",
+                1,
+                ChildState::CreateCommittedHidden,
+            ),
         ));
         write_control_state(&state_path, &state).expect("state should write");
         let app = test_control_state_app(&dir, state, state_path);
@@ -8484,6 +8861,10 @@ mod tests {
                 .map(|child| child.state),
             Some(ChildState::Live)
         );
+        assert!(
+            recovered.pending_creates.is_empty(),
+            "create_committed_hidden recovery should consume pending create state"
+        );
         assert_eq!(
             recovered.journal.last().map(|entry| entry.state),
             Some(ChildState::Live)
@@ -8494,11 +8875,9 @@ mod tests {
     async fn recover_control_state_completes_destroy_requested_children() {
         let (dir, mut state, state_path) = compile_empty_control_state().await;
         let root_authority = state.base_scenario.root;
-        state.live_children.push(empty_live_child(
-            root_authority,
-            "doomed",
+        state.pending_destroys.push(pending_destroy(
             1,
-            ChildState::DestroyRequested,
+            empty_live_child(root_authority, "doomed", 1, ChildState::DestroyRequested),
         ));
         write_control_state(&state_path, &state).expect("state should write");
         let app = test_control_state_app(&dir, state, state_path);
@@ -8511,6 +8890,10 @@ mod tests {
         assert!(
             recovered.live_children.is_empty(),
             "destroy_requested recovery should commit the removal"
+        );
+        assert!(
+            recovered.pending_destroys.is_empty(),
+            "destroy_requested recovery should clear pending destroy state"
         );
         let states = recovered
             .journal
@@ -8528,11 +8911,9 @@ mod tests {
     async fn recover_control_state_completes_destroy_retracted_children() {
         let (dir, mut state, state_path) = compile_empty_control_state().await;
         let root_authority = state.base_scenario.root;
-        state.live_children.push(empty_live_child(
-            root_authority,
-            "retracted",
+        state.pending_destroys.push(pending_destroy(
             1,
-            ChildState::DestroyRetracted,
+            empty_live_child(root_authority, "retracted", 1, ChildState::DestroyRetracted),
         ));
         write_control_state(&state_path, &state).expect("state should write");
         let app = test_control_state_app(&dir, state, state_path);
@@ -8545,6 +8926,10 @@ mod tests {
         assert!(
             recovered.live_children.is_empty(),
             "destroy_retracted recovery should commit the removal"
+        );
+        assert!(
+            recovered.pending_destroys.is_empty(),
+            "destroy_retracted recovery should clear pending destroy state"
         );
         assert_eq!(
             recovered.journal.last().map(|entry| entry.state),
