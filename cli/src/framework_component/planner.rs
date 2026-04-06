@@ -1,0 +1,2582 @@
+async fn prepare_child_record(
+    state: &mut FrameworkControlState,
+    authority_realm_id: usize,
+    request: &CreateChildRequest,
+) -> std::result::Result<LiveChildRecord, ProtocolErrorResponse> {
+    validate_child_name(&request.name)?;
+    let current_live_scenario_ir = live_scenario_ir(state)?;
+    let live_scenario = decode_live_scenario(state)?;
+    let authority_realm = ComponentId(authority_realm_id);
+    let authority_component = live_scenario.component(authority_realm);
+    let template = authority_component
+        .child_templates
+        .get(request.template.as_str())
+        .ok_or_else(|| {
+            protocol_error(ProtocolErrorCode::UnknownTemplate, "unknown child template")
+        })?;
+    validate_child_name_available(state, authority_realm_id, &request.name)?;
+    validate_template_limits(
+        state,
+        authority_realm_id,
+        request.template.as_str(),
+        &request.name,
+        template,
+    )?;
+    let bindable_sources = bindable_source_candidates(
+        &live_scenario,
+        &current_live_scenario_ir,
+        state,
+        authority_realm,
+    )?;
+    let selected_manifest_catalog_key = select_manifest_catalog_key(template, request)?;
+    let rendered_config = build_child_config(template, request)?;
+    let resolved_bindings = resolve_template_bindings(template, request, &bindable_sources)?;
+    let child_id = allocate_child_id(state);
+    let (wrapper_manifest, synthetic_sources) = build_wrapper_manifest(
+        state,
+        template,
+        &request.name,
+        &selected_manifest_catalog_key,
+        rendered_config,
+        &resolved_bindings,
+    )?;
+    let wrapper_url = wrapper_manifest_url(authority_realm_id, child_id);
+    let compiled = compile_frozen_manifest(
+        state,
+        ManifestRef::from_url(wrapper_url.clone()),
+        BTreeMap::from([(wrapper_url.to_string(), wrapper_manifest)]),
+    )
+    .await?;
+    let (fragment, outputs) = extract_live_child_fragment(
+        state,
+        &compiled,
+        &synthetic_sources,
+        authority_component,
+        &request.name,
+        child_id,
+    )?;
+
+    let mut child = LiveChildRecord {
+        child_id,
+        authority_realm_id,
+        name: request.name.clone(),
+        state: ChildState::CreatePrepared,
+        template_name: Some(request.template.clone()),
+        selected_manifest_catalog_key: Some(selected_manifest_catalog_key),
+        fragment: Some(fragment),
+        assignments: BTreeMap::new(),
+        site_plans: Vec::new(),
+        overlay_ids: Vec::new(),
+        overlays: Vec::new(),
+        outputs,
+    };
+
+    let fragment = child.fragment.as_ref().expect("fragment set");
+    let fragment_component_ids = fragment
+        .components
+        .iter()
+        .map(|component| ComponentId(component.id))
+        .collect::<BTreeSet<_>>();
+    let combined_scenario = scenario_with_fragment(&current_live_scenario_ir, fragment)?;
+    let planned = plan_dynamic_fragment(
+        &combined_scenario,
+        &fragment_component_ids,
+        &placement_file_from_state(state),
+        &run_plan_activation_from_state(state),
+        &live_assignment_map(state),
+    )
+    .map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::PlacementUnsatisfied,
+            &format!("child placement could not be satisfied: {err}"),
+        )
+    })?;
+    child.assignments = planned.assignments;
+    child.overlays = dynamic_overlay_records(&planned.incident_links, fragment);
+    let mut live_assignments = live_assignment_map(state);
+    live_assignments.extend(child.assignments.clone());
+    let routed_inputs = dynamic_input_route_records(
+        &combined_scenario,
+        &live_assignments,
+        fragment,
+        &resolved_bindings,
+    );
+    child.site_plans = dynamic_site_plans(
+        &planned.site_plans,
+        &child.assignments,
+        fragment,
+        &child.outputs,
+        &child.overlays,
+        &routed_inputs,
+    )?;
+    child.overlay_ids = child
+        .overlays
+        .iter()
+        .map(|overlay| overlay.overlay_id.clone())
+        .collect();
+    Ok(child)
+}
+
+fn remove_incident_bindings_from_survivors(state: &mut FrameworkControlState, child_id: u64) {
+    for live_child in &mut state.live_children {
+        if live_child.child_id == child_id {
+            continue;
+        }
+        let Some(fragment) = live_child.fragment.as_mut() else {
+            continue;
+        };
+        fragment
+            .bindings
+            .retain(|binding| binding.source_child_id != Some(child_id));
+    }
+    for pending in &mut state.pending_creates {
+        if pending.child.child_id == child_id {
+            continue;
+        }
+        let Some(fragment) = pending.child.fragment.as_mut() else {
+            continue;
+        };
+        fragment
+            .bindings
+            .retain(|binding| binding.source_child_id != Some(child_id));
+    }
+    for pending in &mut state.pending_destroys {
+        if pending.child.child_id == child_id {
+            continue;
+        }
+        let Some(fragment) = pending.child.fragment.as_mut() else {
+            continue;
+        };
+        fragment
+            .bindings
+            .retain(|binding| binding.source_child_id != Some(child_id));
+    }
+}
+
+#[cfg(test)]
+async fn create_child(
+    state: &mut FrameworkControlState,
+    authority_realm_id: usize,
+    request: CreateChildRequest,
+    state_path: &Path,
+) -> std::result::Result<CreateChildResponse, ProtocolErrorResponse> {
+    let child = prepare_child_record(state, authority_realm_id, &request).await?;
+    let tx_id = allocate_tx_id(state);
+    persist_control_state_update(state, state_path, "create_prepared", |state| {
+        state.pending_creates.push(PendingCreateRecord {
+            tx_id,
+            child: child.clone(),
+        });
+        append_journal_entry(state, tx_id, &child, ChildState::CreateRequested);
+        append_journal_entry(state, tx_id, &child, ChildState::CreatePrepared);
+        Ok(())
+    })?;
+
+    persist_control_state_update(state, state_path, "create_committed_hidden", |state| {
+        transition_child_state(state, child.child_id, ChildState::CreateCommittedHidden)?;
+        append_journal_entry(state, tx_id, &child, ChildState::CreateCommittedHidden);
+        Ok(())
+    })?;
+
+    persist_control_state_update(state, state_path, "create_live", |state| {
+        append_journal_entry(state, tx_id, &child, ChildState::Live);
+        move_pending_create_to_live(state, child.child_id)?;
+        Ok(())
+    })?;
+
+    let live_child = state
+        .live_children
+        .iter()
+        .find(|candidate| candidate.child_id == child.child_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                "created child disappeared from control state",
+            )
+        })?;
+    Ok(create_child_response(live_child))
+}
+
+#[cfg(test)]
+async fn destroy_child(
+    state: &mut FrameworkControlState,
+    authority_realm_id: usize,
+    child_name: &str,
+    state_path: &Path,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let Some(child_index) = state.live_children.iter().position(|child| {
+        child.authority_realm_id == authority_realm_id
+            && child.name == child_name
+            && child.state == ChildState::Live
+    }) else {
+        return Ok(());
+    };
+    let child_id = state.live_children[child_index].child_id;
+    let child = state.live_children[child_index].clone();
+    let tx_id = allocate_tx_id(state);
+
+    persist_control_state_update(state, state_path, "destroy_requested", |state| {
+        append_journal_entry(state, tx_id, &child, ChildState::DestroyRequested);
+        move_live_child_to_pending_destroy(state, child_id, tx_id)?;
+        Ok(())
+    })?;
+
+    persist_control_state_update(state, state_path, "destroy_retracted", |state| {
+        remove_incident_bindings_from_survivors(state, child_id);
+        transition_child_state(state, child_id, ChildState::DestroyRetracted)?;
+        append_journal_entry(state, tx_id, &child, ChildState::DestroyRetracted);
+        Ok(())
+    })?;
+
+    persist_control_state_update(state, state_path, "destroy_committed", |state| {
+        append_journal_entry(state, tx_id, &child, ChildState::DestroyCommitted);
+        remove_pending_destroy(state, child_id)?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn child_is_visible(child: &LiveChildRecord) -> bool {
+    matches!(child.state, ChildState::Live | ChildState::DestroyRequested)
+}
+
+fn child_counts_toward_template_limits(child: &LiveChildRecord) -> bool {
+    !matches!(
+        child.state,
+        ChildState::CreateAborted | ChildState::DestroyCommitted
+    )
+}
+
+fn validate_child_name(name: &str) -> std::result::Result<(), ProtocolErrorResponse> {
+    if name.trim().is_empty() {
+        return Err(protocol_error(
+            ProtocolErrorCode::InvalidConfig,
+            "child name must not be empty",
+        ));
+    }
+    if name.contains('.') {
+        return Err(protocol_error(
+            ProtocolErrorCode::InvalidConfig,
+            "child name must not contain `.`",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_child_name_available(
+    state: &FrameworkControlState,
+    authority_realm_id: usize,
+    child_name: &str,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    if all_child_records(state).any(|child| {
+        child.authority_realm_id == authority_realm_id
+            && child.name == child_name
+            && child.state != ChildState::CreateAborted
+            && child.state != ChildState::DestroyCommitted
+    }) {
+        return Err(protocol_error(
+            ProtocolErrorCode::NameConflict,
+            &format!("child `{child_name}` already exists"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_template_limits(
+    state: &FrameworkControlState,
+    authority_realm_id: usize,
+    template_name: &str,
+    child_name: &str,
+    template: &ChildTemplate,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    if let Some(limit) = template
+        .limits
+        .as_ref()
+        .and_then(|limits| limits.max_live_children)
+    {
+        let live = state
+            .live_children
+            .iter()
+            .chain(state.pending_creates.iter().map(|record| &record.child))
+            .chain(state.pending_destroys.iter().map(|record| &record.child))
+            .filter(|child| child.authority_realm_id == authority_realm_id)
+            .filter(|child| child.template_name.as_deref() == Some(template_name))
+            .filter(|child| child_counts_toward_template_limits(child))
+            .count() as u32;
+        if live >= limit {
+            return Err(protocol_error(
+                ProtocolErrorCode::NameConflict,
+                &format!(
+                    "template `{template_name}` already has the maximum of {limit} live children"
+                ),
+            ));
+        }
+    }
+    if let Some(pattern) = template
+        .limits
+        .as_ref()
+        .and_then(|limits| limits.name_pattern.as_deref())
+    {
+        let regex = regex::Regex::new(pattern).map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("invalid child template name_pattern `{pattern}`: {err}"),
+            )
+        })?;
+        if !regex.is_match(child_name) {
+            return Err(protocol_error(
+                ProtocolErrorCode::InvalidConfig,
+                &format!("child name `{child_name}` does not match `{pattern}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn select_manifest_catalog_key(
+    template: &ChildTemplate,
+    request: &CreateChildRequest,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    match (&template.manifest, &template.allowed_manifests) {
+        (Some(key), None) => {
+            if request.manifest.is_some() {
+                return Err(protocol_error(
+                    ProtocolErrorCode::ManifestNotAllowed,
+                    "exact child templates must not specify `manifest` in CreateChild",
+                ));
+            }
+            Ok(key.clone())
+        }
+        (None, Some(allowed)) => {
+            let selected = request.manifest.as_ref().ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ManifestNotAllowed,
+                    "open child templates must specify `manifest.catalog_key` in CreateChild",
+                )
+            })?;
+            if !allowed
+                .iter()
+                .any(|candidate| candidate == &selected.catalog_key)
+            {
+                return Err(protocol_error(
+                    ProtocolErrorCode::ManifestNotAllowed,
+                    &format!(
+                        "manifest catalog key `{}` is not allowed for template `{}`",
+                        selected.catalog_key, request.template
+                    ),
+                ));
+            }
+            Ok(selected.catalog_key.clone())
+        }
+        _ => unreachable!("validated child template shape"),
+    }
+}
+
+fn build_child_config(
+    template: &ChildTemplate,
+    request: &CreateChildRequest,
+) -> std::result::Result<Option<serde_json::Value>, ProtocolErrorResponse> {
+    let template_config = template_config_fields(template)?;
+    for key in request.config.keys() {
+        if !template_config.contains_key(key.as_str()) {
+            return Err(protocol_error(
+                ProtocolErrorCode::InvalidConfig,
+                &format!("unknown child config field `{key}`"),
+            ));
+        }
+    }
+
+    let mut config = serde_json::Map::new();
+    for (name, field) in &template_config {
+        match field {
+            TemplateConfigField::Prefilled { value } => {
+                if request.config.contains_key(name.as_str()) {
+                    return Err(protocol_error(
+                        ProtocolErrorCode::InvalidConfig,
+                        &format!("config field `{name}` is prefilled by the template"),
+                    ));
+                }
+                config.insert(name.clone(), value.clone());
+            }
+            TemplateConfigField::Open { required } => {
+                if let Some(value) = request.config.get(name.as_str()) {
+                    config.insert(name.clone(), value.clone());
+                } else if *required {
+                    return Err(protocol_error(
+                        ProtocolErrorCode::InvalidConfig,
+                        &format!("missing required config field `{name}`"),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok((!config.is_empty()).then_some(serde_json::Value::Object(config)))
+}
+
+fn resolve_template_bindings(
+    template: &ChildTemplate,
+    request: &CreateChildRequest,
+    bindable_sources: &[BindableSourceCandidate],
+) -> std::result::Result<Vec<ResolvedTemplateBinding>, ProtocolErrorResponse> {
+    let template_bindings = template_binding_fields(template)?;
+    for key in request.bindings.keys() {
+        if !template_bindings.contains_key(key.as_str()) {
+            return Err(protocol_error(
+                ProtocolErrorCode::InvalidBinding,
+                &format!("unknown child binding field `{key}`"),
+            ));
+        }
+    }
+
+    template_bindings
+        .iter()
+        .map(|(slot_name, field)| {
+            let slot_decl = root_template_slot_decl(template, slot_name)?.clone();
+            let candidate = match field {
+                TemplateBinding::Prefilled { selector } => {
+                    Some(find_bindable_source(bindable_sources, selector.as_str())?)
+                }
+                TemplateBinding::Open { optional } => {
+                    let Some(input) = request.bindings.get(slot_name.as_str()) else {
+                        if *optional {
+                            return Ok(None);
+                        }
+                        return Err(protocol_error(
+                            ProtocolErrorCode::InvalidBinding,
+                            &format!("missing required binding `{slot_name}`"),
+                        ));
+                    };
+                    let selected = match (&input.selector, &input.handle) {
+                        (Some(selector), None) => find_bindable_source(bindable_sources, selector)?,
+                        (None, Some(handle)) => {
+                            find_bindable_source_by_handle(bindable_sources, handle)?
+                        }
+                        _ => {
+                            return Err(protocol_error(
+                                ProtocolErrorCode::InvalidBinding,
+                                &format!(
+                                    "binding `{slot_name}` must specify exactly one of `selector` \
+                                     or `handle`"
+                                ),
+                            ));
+                        }
+                    };
+                    if !source_compatible(slot_decl.decl.clone(), selected.decl.clone()) {
+                        return Err(protocol_error(
+                            ProtocolErrorCode::BindingTypeMismatch,
+                            &format!(
+                                "binding `{slot_name}` expects `{}` but `{}` provides `{}`",
+                                slot_decl.decl.kind, selected.selector, selected.decl.kind
+                            ),
+                        ));
+                    }
+                    Some(selected)
+                }
+            };
+
+            Ok(candidate.map(|candidate| ResolvedTemplateBinding {
+                slot_name: slot_name.clone(),
+                slot_decl,
+                sources: candidate.sources.clone(),
+                source_child_id: candidate.source_child_id,
+                dynamic_child_output: candidate.dynamic_child_output.clone(),
+            }))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(|bindings| bindings.into_iter().flatten().collect())
+}
+
+fn build_wrapper_manifest(
+    state: &FrameworkControlState,
+    template: &ChildTemplate,
+    child_name: &str,
+    selected_manifest_catalog_key: &str,
+    rendered_config: Option<serde_json::Value>,
+    resolved_bindings: &[ResolvedTemplateBinding],
+) -> std::result::Result<(Manifest, BTreeMap<String, SyntheticSourceRecord>), ProtocolErrorResponse>
+{
+    let entry = state
+        .base_scenario
+        .manifest_catalog
+        .get(selected_manifest_catalog_key)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "frozen manifest catalog entry `{selected_manifest_catalog_key}` is missing"
+                ),
+            )
+        })?;
+    let child_url = url::Url::parse(&entry.source_ref).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "invalid frozen manifest catalog source_ref `{selected_manifest_catalog_key}`: \
+                 {err}"
+            ),
+        )
+    })?;
+
+    let mut slots = BTreeMap::new();
+    let mut bindings = Vec::new();
+    let mut synthetic_sources = BTreeMap::new();
+    let mut next_synthetic = 0usize;
+
+    for binding in resolved_bindings {
+        for source in &binding.sources {
+            let synthetic_name = format!("__amber_src_{next_synthetic}");
+            next_synthetic += 1;
+            let (actual_source, source_child_id) = match &source.from {
+                BindingFrom::Component(provide) => (
+                    BindingFrom::Component(provide.clone()),
+                    binding
+                        .source_child_id
+                        .or_else(|| live_child_component_owner(state, provide.component.0)),
+                ),
+                BindingFrom::Resource(resource) => (
+                    BindingFrom::Resource(resource.clone()),
+                    binding.source_child_id,
+                ),
+                BindingFrom::Framework(framework) => (
+                    BindingFrom::Framework(framework.clone()),
+                    binding.source_child_id,
+                ),
+                BindingFrom::External(slot) => {
+                    (BindingFrom::External(slot.clone()), binding.source_child_id)
+                }
+            };
+            synthetic_sources.insert(
+                synthetic_name.clone(),
+                SyntheticSourceRecord {
+                    slot_name: binding.slot_name.clone(),
+                    actual_source,
+                    source_child_id,
+                    weak: source.weak,
+                },
+            );
+
+            if let BindingFrom::Framework(framework) = &source.from {
+                bindings.push(raw_binding(
+                    &format!("#{child_name}"),
+                    binding.slot_name.clone(),
+                    "framework",
+                    framework.capability.to_string(),
+                    source.weak,
+                )?);
+                continue;
+            }
+
+            slots.insert(
+                synthetic_name.clone(),
+                SlotDecl::builder()
+                    .decl(binding.slot_decl.decl.clone())
+                    .optional(false)
+                    .multiple(false)
+                    .build(),
+            );
+            bindings.push(raw_binding(
+                &format!("#{child_name}"),
+                binding.slot_name.clone(),
+                "slots",
+                synthetic_name,
+                true,
+            )?);
+        }
+    }
+
+    let exports = visible_exports(template)?
+        .into_iter()
+        .map(|export_name| {
+            let target = format!("#{child_name}.{export_name}")
+                .parse::<RawExportTarget>()
+                .map_err(|err| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!("failed to build synthetic export target: {err}"),
+                    )
+                })?;
+            Ok((export_name, target))
+        })
+        .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+
+    let manifest = Manifest::builder()
+        .components(BTreeMap::from([(
+            child_name.to_string(),
+            ComponentDecl::Object(component_ref_from_url(
+                ManifestRef::from_url(child_url),
+                rendered_config,
+            )?),
+        )]))
+        .slots(slots)
+        .bindings(bindings)
+        .exports(exports)
+        .build()
+        .map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("failed to build synthetic wrapper manifest: {err}"),
+            )
+        })?;
+
+    Ok((manifest, synthetic_sources))
+}
+
+fn raw_binding(
+    to: &str,
+    slot: String,
+    from: &str,
+    capability: String,
+    weak: bool,
+) -> std::result::Result<RawBinding, ProtocolErrorResponse> {
+    serde_json::from_value(json!({
+        "to": to,
+        "slot": slot,
+        "from": from,
+        "capability": capability,
+        "weak": weak,
+    }))
+    .map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("failed to build synthetic binding: {err}"),
+        )
+    })
+}
+
+fn component_ref_from_url(
+    manifest: ManifestRef,
+    config: Option<serde_json::Value>,
+) -> std::result::Result<ComponentRef, ProtocolErrorResponse> {
+    let mut value = json!({ "manifest": manifest });
+    if let Some(config) = config
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("config".to_string(), config);
+    }
+    serde_json::from_value(value).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("failed to build synthetic child component ref: {err}"),
+        )
+    })
+}
+
+fn wrapper_manifest_url(authority_realm_id: usize, child_id: u64) -> url::Url {
+    url::Url::parse(&format!(
+        "amber+framework://rendered-child/{authority_realm_id}/{child_id}"
+    ))
+    .expect("synthetic wrapper URL should parse")
+}
+
+fn allocate_child_id(state: &mut FrameworkControlState) -> u64 {
+    state.next_child_id += 1;
+    state.next_child_id
+}
+
+fn allocate_tx_id(state: &mut FrameworkControlState) -> u64 {
+    state.next_tx_id += 1;
+    state.next_tx_id
+}
+
+fn append_journal_entry(
+    state: &mut FrameworkControlState,
+    tx_id: u64,
+    child: &LiveChildRecord,
+    child_state: ChildState,
+) {
+    state.generation += 1;
+    state.journal.push(ControlJournalEntry {
+        tx_id,
+        child_id: child.child_id,
+        authority_realm_id: child.authority_realm_id,
+        child_name: child.name.clone(),
+        state: child_state,
+        generation: state.generation,
+    });
+}
+
+fn transition_child_state(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+    next_state: ChildState,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let child = child_record_mut(state, child_id)?;
+    child.state = next_state;
+    Ok(())
+}
+
+fn move_pending_create_to_live(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let index = state
+        .pending_creates
+        .iter()
+        .position(|record| record.child.child_id == child_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("child id {child_id} is missing pending create state"),
+            )
+        })?;
+    let mut record = state.pending_creates.remove(index);
+    record.child.state = ChildState::Live;
+    state.live_children.push(record.child);
+    Ok(())
+}
+
+fn remove_pending_create(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let index = state
+        .pending_creates
+        .iter()
+        .position(|record| record.child.child_id == child_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("child id {child_id} is missing pending create state"),
+            )
+        })?;
+    state.pending_creates.remove(index);
+    Ok(())
+}
+
+fn move_live_child_to_pending_destroy(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+    tx_id: u64,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let index = state
+        .live_children
+        .iter()
+        .position(|child| child.child_id == child_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("child id {child_id} is missing live child state"),
+            )
+        })?;
+    let mut child = state.live_children.remove(index);
+    child.state = ChildState::DestroyRequested;
+    state
+        .pending_destroys
+        .push(PendingDestroyRecord { tx_id, child });
+    Ok(())
+}
+
+fn remove_pending_destroy(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let index = state
+        .pending_destroys
+        .iter()
+        .position(|record| record.child.child_id == child_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("child id {child_id} is missing pending destroy state"),
+            )
+        })?;
+    state.pending_destroys.remove(index);
+    Ok(())
+}
+
+fn remove_child_record(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    match child_record_location(state, child_id)? {
+        ChildRecordLocation::Live(index) => {
+            state.live_children.remove(index);
+        }
+        ChildRecordLocation::PendingCreate(index) => {
+            state.pending_creates.remove(index);
+        }
+        ChildRecordLocation::PendingDestroy(index) => {
+            state.pending_destroys.remove(index);
+        }
+    }
+    Ok(())
+}
+
+fn dynamic_site_plans(
+    desired_site_plans: &BTreeMap<String, amber_compiler::run_plan::RunSitePlan>,
+    assignments: &BTreeMap<String, String>,
+    fragment: &LiveScenarioFragment,
+    outputs: &BTreeMap<String, OutputHandleRecord>,
+    overlays: &[DynamicOverlayRecord],
+    routed_inputs: &[DynamicInputRouteRecord],
+) -> std::result::Result<Vec<DynamicSitePlanRecord>, ProtocolErrorResponse> {
+    let child_moniker_set = fragment
+        .components
+        .iter()
+        .map(|component| component.moniker.as_str())
+        .collect::<BTreeSet<_>>();
+    let child_monikers = fragment
+        .components
+        .iter()
+        .map(|component| (component.id, component.moniker.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut site_plans = Vec::new();
+    for (site_id, desired_site_plan) in desired_site_plans {
+        let component_ids = desired_site_plan
+            .scenario_ir
+            .components
+            .iter()
+            .filter(|component| child_moniker_set.contains(component.moniker.as_str()))
+            .map(|component| component.id)
+            .collect::<Vec<_>>();
+        if component_ids.is_empty() {
+            continue;
+        }
+        let assigned_components = desired_site_plan
+            .assigned_components
+            .iter()
+            .filter(|moniker| {
+                fragment
+                    .components
+                    .iter()
+                    .any(|component| component.moniker == **moniker)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut proxy_exports = BTreeMap::new();
+        for (name, output) in outputs {
+            let Some((component_id, component_moniker, provide_name)) =
+                output.sources.iter().find_map(|source| {
+                    let BindingFromIr::Component { component, provide } = &source.from else {
+                        return None;
+                    };
+                    let moniker = child_monikers.get(component)?;
+                    (assignments.get(*moniker)? == site_id).then_some((
+                        *component,
+                        *moniker,
+                        provide.as_str(),
+                    ))
+                })
+            else {
+                continue;
+            };
+            let protocol = match output.decl.kind.transport() {
+                CapabilityTransport::Http => "http",
+                CapabilityTransport::NonNetwork => continue,
+                _ => continue,
+            };
+            let export =
+                dynamic_proxy_export_record(fragment, component_id, provide_name, protocol)
+                    .ok_or_else(|| {
+                        protocol_error(
+                            ProtocolErrorCode::ControlStateUnavailable,
+                            &format!(
+                                "dynamic export `{name}` on component `{component_moniker}` could \
+                                 not be resolved to a concrete network endpoint"
+                            ),
+                        )
+                    })?;
+            proxy_exports.insert(name.clone(), export);
+        }
+        for overlay in overlays {
+            let DynamicOverlayAction::ExportPeer { link } = &overlay.action else {
+                continue;
+            };
+            if link.provider_site != *site_id
+                || !child_moniker_set.contains(link.provider_component.as_str())
+            {
+                continue;
+            }
+            if proxy_exports.contains_key(&link.export_name) {
+                continue;
+            }
+            let component = fragment
+                .components
+                .iter()
+                .find(|component| component.moniker == link.provider_component)
+                .ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!(
+                            "dynamic export provider `{}` is missing from the live child fragment",
+                            link.provider_component
+                        ),
+                    )
+                })?;
+            let export = dynamic_proxy_export_record(
+                fragment,
+                component.id,
+                &link.provide,
+                &link.protocol.to_string(),
+            )
+            .ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "dynamic export `{}` on component `{}` could not be resolved to a \
+                         concrete network endpoint",
+                        link.export_name, link.provider_component
+                    ),
+                )
+            })?;
+            proxy_exports.insert(link.export_name.clone(), export);
+        }
+        let artifact_files = if desired_site_plan.site.kind == SiteKind::Kubernetes {
+            project_kubernetes_dynamic_child_artifact_files(
+                &desired_site_plan.artifact_files,
+                &component_ids,
+            )
+            .map_err(|err| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "failed to project kubernetes child artifact for site `{site_id}`: {err}"
+                    ),
+                )
+            })?
+        } else {
+            desired_site_plan.artifact_files.clone()
+        };
+        site_plans.push(DynamicSitePlanRecord {
+            site_id: site_id.clone(),
+            kind: desired_site_plan.site.kind,
+            router_identity_id: desired_site_plan.router_identity_id.clone(),
+            component_ids,
+            assigned_components,
+            artifact_files,
+            desired_artifact_files: desired_site_plan.artifact_files.clone(),
+            proxy_exports,
+            routed_inputs: routed_inputs
+                .iter()
+                .filter(|input| input.component == child_monikers[&fragment.root_component_id])
+                .filter(|input| {
+                    assignments
+                        .get(input.component.as_str())
+                        .is_some_and(|assigned_site| assigned_site == site_id)
+                })
+                .cloned()
+                .collect(),
+        });
+    }
+    Ok(site_plans)
+}
+
+fn dynamic_input_route_records(
+    scenario: &Scenario,
+    assignments: &BTreeMap<String, String>,
+    fragment: &LiveScenarioFragment,
+    resolved_bindings: &[ResolvedTemplateBinding],
+) -> Vec<DynamicInputRouteRecord> {
+    let Some(root_component) = fragment
+        .components
+        .iter()
+        .find(|component| component.id == fragment.root_component_id)
+    else {
+        return Vec::new();
+    };
+    let Some(child_site) = assignments.get(root_component.moniker.as_str()) else {
+        return Vec::new();
+    };
+    let fragment_components = fragment
+        .components
+        .iter()
+        .map(|component| component.moniker.as_str())
+        .collect::<BTreeSet<_>>();
+    resolved_bindings
+        .iter()
+        .filter_map(|binding| {
+            let component_source = binding.dynamic_child_output.clone().or_else(|| {
+                let ResolvedBindingSource {
+                    from: BindingFrom::Component(ProvideRef { component, name }),
+                    ..
+                } = binding.sources.first()?.clone()
+                else {
+                    return None;
+                };
+                if binding.sources.len() != 1 {
+                    return None;
+                }
+                let provider_component = scenario.component(component).moniker.to_string();
+                let protocol = match binding.slot_decl.decl.kind.transport() {
+                    CapabilityTransport::Http => "http",
+                    CapabilityTransport::NonNetwork => return None,
+                    _ => return None,
+                };
+                Some(DynamicChildOutputSource {
+                    provider_component,
+                    provide: name,
+                    protocol: protocol.to_string(),
+                    capability_kind: binding.slot_decl.decl.kind.to_string(),
+                    capability_profile: binding.slot_decl.decl.profile.clone(),
+                })
+            })?;
+            let provider_site = assignments.get(component_source.provider_component.as_str())?;
+            if fragment_components.contains(component_source.provider_component.as_str()) {
+                return None;
+            }
+            (provider_site == child_site).then(|| DynamicInputRouteRecord {
+                component: root_component.moniker.clone(),
+                slot: binding.slot_name.clone(),
+                provider_component: component_source.provider_component,
+                protocol: component_source.protocol,
+                capability_kind: component_source.capability_kind,
+                capability_profile: component_source.capability_profile,
+                target: DynamicInputRouteTarget::ComponentProvide {
+                    provide: component_source.provide,
+                },
+            })
+        })
+        .collect()
+}
+
+fn dynamic_proxy_export_record(
+    fragment: &LiveScenarioFragment,
+    component_id: usize,
+    provide_name: &str,
+    protocol: &str,
+) -> Option<DynamicProxyExportRecord> {
+    let component = fragment
+        .components
+        .iter()
+        .find(|component| component.id == component_id)?;
+    let network = component.program.as_ref()?.network()?;
+    let protocol = protocol.parse::<NetworkProtocol>().ok()?;
+    let resolve_provide = |name: &str| {
+        let provide = component.provides.get(name)?;
+        let endpoint_name = provide.endpoint.as_deref()?;
+        let endpoint = network
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.name == endpoint_name)?;
+        Some((provide, endpoint))
+    };
+    let (provide_name, provide, endpoint) =
+        if let Some((provide, endpoint)) = resolve_provide(provide_name) {
+            (provide_name.to_string(), provide, endpoint)
+        } else {
+            let mut candidates = component
+                .provides
+                .iter()
+                .filter_map(|(name, provide)| {
+                    let endpoint_name = provide.endpoint.as_deref()?;
+                    let endpoint = network
+                        .endpoints
+                        .iter()
+                        .find(|endpoint| endpoint.name == endpoint_name)?;
+                    (endpoint.protocol == protocol).then_some((name.clone(), provide, endpoint))
+                })
+                .collect::<Vec<_>>();
+            if candidates.len() != 1 {
+                return None;
+            }
+            let (name, provide, endpoint) = candidates.pop()?;
+            (name, provide, endpoint)
+        };
+    Some(DynamicProxyExportRecord {
+        component_id,
+        component: component.moniker.clone(),
+        provide: provide_name,
+        protocol: protocol.to_string(),
+        capability_kind: provide.decl.kind.to_string(),
+        capability_profile: provide.decl.profile.clone(),
+        target_port: endpoint.port,
+    })
+}
+
+fn dynamic_overlay_records(
+    links: &[RunLink],
+    fragment: &LiveScenarioFragment,
+) -> Vec<DynamicOverlayRecord> {
+    let child_monikers = fragment
+        .components
+        .iter()
+        .map(|component| component.moniker.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut overlays = Vec::new();
+    for link in links {
+        let consumer_in_child = child_monikers.contains(link.consumer_component.as_str());
+        let provider_in_child = child_monikers.contains(link.provider_component.as_str());
+        if consumer_in_child || provider_in_child {
+            overlays.push(DynamicOverlayRecord {
+                overlay_id: format!(
+                    "child:{}:consumer:{}:{}",
+                    fragment.root_component_id, link.consumer_site, link.external_slot_name
+                ),
+                site_id: link.consumer_site.clone(),
+                action: DynamicOverlayAction::ExternalSlot { link: link.clone() },
+            });
+        }
+        if consumer_in_child || provider_in_child {
+            overlays.push(DynamicOverlayRecord {
+                overlay_id: format!(
+                    "child:{}:provider:{}:{}",
+                    fragment.root_component_id, link.provider_site, link.export_name
+                ),
+                site_id: link.provider_site.clone(),
+                action: DynamicOverlayAction::ExportPeer { link: link.clone() },
+            });
+        }
+    }
+    overlays
+}
+
+fn create_child_response(child: &LiveChildRecord) -> CreateChildResponse {
+    CreateChildResponse {
+        child: ChildHandle {
+            name: child.name.clone(),
+            selector: format!("children.{}", child.name),
+        },
+        outputs: child
+            .outputs
+            .iter()
+            .map(|(name, output)| {
+                (
+                    name.clone(),
+                    amber_mesh::component_protocol::OutputHandle {
+                        selector: output.selector.clone(),
+                        handle: output.handle.clone(),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+fn extract_live_child_fragment(
+    state: &mut FrameworkControlState,
+    compiled: &CompiledScenario,
+    synthetic_sources: &BTreeMap<String, SyntheticSourceRecord>,
+    authority_component: &Component,
+    child_name: &str,
+    child_id: u64,
+) -> std::result::Result<
+    (LiveScenarioFragment, BTreeMap<String, OutputHandleRecord>),
+    ProtocolErrorResponse,
+> {
+    let wrapper_root = compiled.scenario_ir().root;
+    let old_child_root = compiled
+        .scenario()
+        .component(ComponentId(wrapper_root))
+        .children
+        .first()
+        .copied()
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                "synthetic wrapper compiled without a child root",
+            )
+        })?
+        .0;
+    let mut id_map = BTreeMap::new();
+    for component in &compiled.scenario_ir().components {
+        if component.id == wrapper_root {
+            continue;
+        }
+        id_map.insert(component.id, state.next_component_id);
+        state.next_component_id += 1;
+    }
+
+    let mut components = compiled
+        .scenario_ir()
+        .components
+        .iter()
+        .filter(|component| component.id != wrapper_root)
+        .map(|component| {
+            let mut component = component.clone();
+            component.id = *id_map
+                .get(&component.id)
+                .expect("component ids should be allocated");
+            component.parent = match component.parent {
+                Some(parent) if parent == wrapper_root => Some(authority_component.id.0),
+                Some(parent) => Some(
+                    *id_map
+                        .get(&parent)
+                        .expect("internal child parent should be remapped"),
+                ),
+                None => None,
+            };
+            component.children = component
+                .children
+                .iter()
+                .map(|child| {
+                    *id_map
+                        .get(child)
+                        .expect("internal child edges should be remapped")
+                })
+                .collect();
+            component.moniker =
+                joined_moniker(authority_component.moniker.as_str(), &component.moniker);
+            component
+        })
+        .collect::<Vec<_>>();
+    components.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut bindings = Vec::new();
+    for binding in &compiled.scenario_ir().bindings {
+        if binding.to.component == wrapper_root {
+            continue;
+        }
+        let mut rewritten = binding.clone();
+        rewritten.to.component = *id_map
+            .get(&binding.to.component)
+            .expect("binding target should be remapped");
+        let source_child_id = match &mut rewritten.from {
+            BindingFromIr::Component { component, provide } if *component == wrapper_root => {
+                let synthetic = synthetic_sources.get(provide).ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!("missing synthetic source mapping for `{provide}`"),
+                    )
+                })?;
+                rewritten.from = BindingFromIr::from(&synthetic.actual_source);
+                rewritten.weak = synthetic.weak;
+                synthetic.source_child_id
+            }
+            BindingFromIr::Resource {
+                component,
+                resource,
+            } if *component == wrapper_root => {
+                let synthetic = synthetic_sources.get(resource).ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!("missing synthetic source mapping for `{resource}`"),
+                    )
+                })?;
+                rewritten.from = BindingFromIr::from(&synthetic.actual_source);
+                rewritten.weak = synthetic.weak;
+                synthetic.source_child_id
+            }
+            BindingFromIr::External { slot } if slot.component == wrapper_root => {
+                let synthetic = synthetic_sources.get(&slot.slot).ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!("missing synthetic source mapping for `{}`", slot.slot),
+                    )
+                })?;
+                rewritten.from = BindingFromIr::from(&synthetic.actual_source);
+                rewritten.weak = synthetic.weak;
+                synthetic.source_child_id
+            }
+            BindingFromIr::Framework {
+                authority_realm, ..
+            } if *authority_realm == wrapper_root => {
+                let Some(synthetic) = synthetic_sources.values().find(|source| {
+                    source.slot_name == binding.to.slot
+                        && matches!(source.actual_source, BindingFrom::Framework(_))
+                }) else {
+                    return Err(protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!(
+                            "missing framework synthetic source mapping for slot `{}`",
+                            binding.to.slot
+                        ),
+                    ));
+                };
+                rewritten.from = BindingFromIr::from(&synthetic.actual_source);
+                rewritten.weak = synthetic.weak;
+                synthetic.source_child_id
+            }
+            BindingFromIr::Framework {
+                authority_realm, ..
+            } => {
+                if let Some(remapped) = id_map.get(authority_realm) {
+                    *authority_realm = *remapped;
+                }
+                None
+            }
+            BindingFromIr::Component { component, .. } => {
+                *component = *id_map
+                    .get(component)
+                    .expect("internal binding source should be remapped");
+                None
+            }
+            BindingFromIr::Resource { component, .. } => {
+                *component = *id_map
+                    .get(component)
+                    .expect("internal binding resource source should be remapped");
+                None
+            }
+            BindingFromIr::External { .. } => None,
+        };
+        bindings.push(LiveFragmentBindingRecord {
+            binding: rewritten,
+            source_child_id,
+        });
+    }
+
+    let mut outputs = BTreeMap::new();
+    for export in &compiled.scenario_ir().exports {
+        let sources = if export.from.component == wrapper_root {
+            let synthetic = synthetic_sources.get(&export.from.provide).ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "missing synthetic mapping for exported source `{}`",
+                        export.from.provide
+                    ),
+                )
+            })?;
+            vec![live_binding_source_record(&synthetic.actual_source, false)]
+        } else {
+            let actual_component_id = *id_map.get(&export.from.component).ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    "export source component is missing from child id map",
+                )
+            })?;
+            vec![LiveBindingSourceRecord {
+                from: BindingFromIr::Component {
+                    component: actual_component_id,
+                    provide: export.from.provide.clone(),
+                },
+                weak: false,
+            }]
+        };
+        outputs.insert(
+            export.name.clone(),
+            OutputHandleRecord {
+                selector: format!("children.{child_name}.exports.{}", export.name),
+                handle: Some(format!("h_{child_id}_{}", export.name)),
+                decl: export.capability.clone(),
+                sources,
+            },
+        );
+    }
+
+    Ok((
+        LiveScenarioFragment {
+            root_component_id: *id_map
+                .get(&old_child_root)
+                .expect("child root id should be remapped"),
+            components,
+            bindings,
+        },
+        outputs,
+    ))
+}
+
+async fn compile_frozen_manifest(
+    state: &FrameworkControlState,
+    root: ManifestRef,
+    extra_manifests: BTreeMap<String, Manifest>,
+) -> std::result::Result<CompiledScenario, ProtocolErrorResponse> {
+    let backend = Arc::new(FrozenCatalogBackend {
+        entries: Arc::new(state.base_scenario.manifest_catalog.clone()),
+        extra_manifests: Arc::new(extra_manifests),
+    });
+    let compiler = Compiler::new(
+        Resolver::new().with_remote(RemoteResolver::new(
+            frozen_catalog_schemes(state.base_scenario.manifest_catalog.values())
+                .into_iter()
+                .chain(["amber+framework".to_string()]),
+            backend,
+        )),
+        DigestStore::default(),
+    );
+    let output = compiler
+        .compile(root, CompileOptions::default())
+        .await
+        .map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("failed to compile frozen manifest: {err:?}"),
+            )
+        })?;
+    CompiledScenario::from_compile_output(&output).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("failed to materialize compiled scenario: {err}"),
+        )
+    })
+}
+
+fn joined_moniker(parent: &str, child: &str) -> String {
+    if parent == "/" {
+        child.to_string()
+    } else {
+        format!("{parent}{child}")
+    }
+}
+
+fn child_state_keeps_capability_instances(state: ChildState) -> bool {
+    matches!(
+        state,
+        ChildState::CreatePrepared | ChildState::CreateCommittedHidden | ChildState::Live
+    )
+}
+
+fn refresh_capability_instances(state: &mut FrameworkControlState) -> Result<()> {
+    state.capability_instances = collect_capability_instances(state)?;
+    Ok(())
+}
+
+fn collect_capability_instances(
+    state: &FrameworkControlState,
+) -> Result<BTreeMap<String, CapabilityInstanceRecord>> {
+    let active_children = all_child_records(state)
+        .filter(|child| child_state_keeps_capability_instances(child.state))
+        .collect::<Vec<_>>();
+
+    let mut moniker_by_id = state
+        .base_scenario
+        .components
+        .iter()
+        .map(|component| (component.id, component.moniker.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for child in &active_children {
+        let Some(fragment) = child.fragment.as_ref() else {
+            continue;
+        };
+        moniker_by_id.extend(
+            fragment
+                .components
+                .iter()
+                .map(|component| (component.id, component.moniker.clone())),
+        );
+    }
+
+    let mut site_by_moniker = state.placement.assignments.clone();
+    for child in &active_children {
+        site_by_moniker.extend(child.assignments.clone());
+    }
+
+    let mut records = BTreeMap::new();
+    for binding in &state.base_scenario.bindings {
+        collect_capability_instance_from_binding(
+            &mut records,
+            binding,
+            &moniker_by_id,
+            &site_by_moniker,
+            state.generation,
+        )?;
+    }
+    for child in &active_children {
+        let Some(fragment) = child.fragment.as_ref() else {
+            continue;
+        };
+        for binding in &fragment.bindings {
+            collect_capability_instance_from_binding(
+                &mut records,
+                &binding.binding,
+                &moniker_by_id,
+                &site_by_moniker,
+                state.generation,
+            )?;
+        }
+    }
+    Ok(records)
+}
+
+fn collect_capability_instance_from_binding(
+    records: &mut BTreeMap<String, CapabilityInstanceRecord>,
+    binding: &BindingIr,
+    moniker_by_id: &BTreeMap<usize, String>,
+    site_by_moniker: &BTreeMap<String, String>,
+    generation: u64,
+) -> Result<()> {
+    let BindingFromIr::Framework {
+        authority_realm,
+        capability,
+    } = &binding.from
+    else {
+        return Ok(());
+    };
+    if capability != "component" {
+        return Ok(());
+    }
+
+    let authority_realm_moniker = moniker_by_id.get(authority_realm).cloned().ok_or_else(|| {
+        miette::miette!(
+            "framework.component authority realm id {authority_realm} is missing from the \
+             authoritative live graph"
+        )
+    })?;
+    let recipient_component_moniker = moniker_by_id
+        .get(&binding.to.component)
+        .cloned()
+        .ok_or_else(|| {
+            miette::miette!(
+                "framework.component recipient component id {} is missing from the authoritative \
+                 live graph",
+                binding.to.component
+            )
+        })?;
+    let recipient_site_id = site_by_moniker
+        .get(&recipient_component_moniker)
+        .cloned()
+        .ok_or_else(|| {
+            miette::miette!(
+                "framework.component recipient `{recipient_component_moniker}` is missing a site \
+                 assignment in the authoritative live graph"
+            )
+        })?;
+    let cap_instance_id = framework_cap_instance_id(
+        authority_realm_moniker.as_str(),
+        recipient_component_moniker.as_str(),
+        &binding.to.component.to_string(),
+        &binding.to.slot,
+        capability,
+    );
+    records.insert(
+        cap_instance_id.clone(),
+        CapabilityInstanceRecord {
+            cap_instance_id: cap_instance_id.clone(),
+            route_id: cap_instance_id,
+            authority_realm_id: *authority_realm,
+            authority_realm_moniker,
+            recipient_component_id: binding.to.component,
+            recipient_component_moniker: recipient_component_moniker.clone(),
+            recipient_peer_id: recipient_component_moniker,
+            recipient_site_id,
+            capability: capability.clone(),
+            slot: binding.to.slot.clone(),
+            generation,
+        },
+    );
+    Ok(())
+}
+
+fn template_mode(template: &ChildTemplate) -> TemplateMode {
+    if template.manifest.is_some() {
+        TemplateMode::Exact
+    } else {
+        TemplateMode::Open
+    }
+}
+
+fn template_manifest_description(
+    scenario: &Scenario,
+    template: &ChildTemplate,
+) -> std::result::Result<TemplateManifestDescription, ProtocolErrorResponse> {
+    let mut description = TemplateManifestDescription {
+        mode: template_mode(template),
+        catalog_key: template.manifest.clone(),
+        digest: None,
+        allowed_catalog_keys: template.allowed_manifests.clone().unwrap_or_default(),
+    };
+    if let Some(key) = description.catalog_key.as_ref() {
+        description.digest = Some(
+            scenario
+                .manifest_catalog
+                .get(key)
+                .ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        "frozen manifest catalog entry is missing",
+                    )
+                })?
+                .digest
+                .to_string(),
+        );
+    }
+    Ok(description)
+}
+
+#[derive(Clone)]
+struct ResolvedBindingSource {
+    from: BindingFrom,
+    weak: bool,
+}
+
+#[derive(Clone)]
+struct BindableSourceCandidate {
+    selector: String,
+    handle: Option<String>,
+    decl: CapabilityDecl,
+    sources: Vec<ResolvedBindingSource>,
+    source_child_id: Option<u64>,
+    dynamic_child_output: Option<DynamicChildOutputSource>,
+}
+
+fn placement_file_from_state(state: &FrameworkControlState) -> PlacementFile {
+    let mut components = state.placement.placement_components.clone();
+    for child in visible_child_records(state) {
+        components.extend(child.assignments.clone());
+    }
+    PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: state.placement.offered_sites.clone(),
+        defaults: state.placement.defaults.clone(),
+        components,
+    }
+}
+
+fn run_plan_activation_from_state(state: &FrameworkControlState) -> RunPlanActivationState {
+    let mut initial_active_sites = state.placement.initial_active_sites.clone();
+    let mut dynamic_enabled_sites = state.placement.dynamic_enabled_sites.clone();
+    let mut active_site_capabilities = state.placement.active_site_capabilities.clone();
+    for site_id in state.placement.placement_components.values() {
+        if !initial_active_sites.contains(site_id) {
+            initial_active_sites.push(site_id.clone());
+        }
+        if !dynamic_enabled_sites.contains(site_id) {
+            dynamic_enabled_sites.push(site_id.clone());
+        }
+        active_site_capabilities
+            .entry(site_id.clone())
+            .or_insert(ActiveSiteCapabilities {
+                cross_site_routing: true,
+                dynamic_workloads: true,
+                privileged_control: true,
+            });
+    }
+    RunPlanActivationState {
+        standby_sites: state.placement.standby_sites.clone(),
+        initial_active_sites,
+        dynamic_enabled_sites,
+        control_only_sites: state.placement.control_only_sites.clone(),
+        active_site_capabilities,
+    }
+}
+
+fn live_assignment_map(state: &FrameworkControlState) -> BTreeMap<String, String> {
+    let mut assignments = state.placement.assignments.clone();
+    for child in visible_child_records(state) {
+        assignments.extend(child.assignments.clone());
+    }
+    assignments
+}
+
+fn scenario_with_fragment(
+    current_live_scenario_ir: &ScenarioIr,
+    fragment: &LiveScenarioFragment,
+) -> std::result::Result<Scenario, ProtocolErrorResponse> {
+    let mut scenario_ir = current_live_scenario_ir.clone();
+    scenario_ir.components.extend(fragment.components.clone());
+    scenario_ir.bindings.extend(
+        fragment
+            .bindings
+            .iter()
+            .map(|binding| binding.binding.clone()),
+    );
+    for component in &mut scenario_ir.components {
+        component.children.clear();
+    }
+    let parent_edges = scenario_ir
+        .components
+        .iter()
+        .filter_map(|component| component.parent.map(|parent| (parent, component.id)))
+        .collect::<Vec<_>>();
+    for (parent, child) in parent_edges {
+        let parent_component = scenario_ir
+            .components
+            .iter_mut()
+            .find(|component| component.id == parent)
+            .ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "live fragment references missing parent component id {parent} for child \
+                         {child}"
+                    ),
+                )
+            })?;
+        parent_component.children.push(child);
+    }
+    Scenario::try_from(scenario_ir).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("failed to materialize combined live scenario: {err}"),
+        )
+    })
+}
+
+fn live_scenario_ir(
+    state: &FrameworkControlState,
+) -> std::result::Result<ScenarioIr, ProtocolErrorResponse> {
+    let mut components = state
+        .base_scenario
+        .components
+        .iter()
+        .cloned()
+        .map(|component| (component.id, component))
+        .collect::<BTreeMap<_, _>>();
+    let mut bindings = state.base_scenario.bindings.clone();
+
+    for child in visible_child_records(state) {
+        let Some(fragment) = child.fragment.as_ref() else {
+            continue;
+        };
+        for component in &fragment.components {
+            components.insert(component.id, component.clone());
+        }
+        bindings.extend(
+            fragment
+                .bindings
+                .iter()
+                .map(|binding| binding.binding.clone()),
+        );
+    }
+
+    for component in components.values_mut() {
+        component.children.clear();
+    }
+    let parent_edges = components
+        .values()
+        .filter_map(|component| component.parent.map(|parent| (parent, component.id)))
+        .collect::<Vec<_>>();
+    for (parent, child) in parent_edges {
+        let parent_component = components.get_mut(&parent).ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "live fragment references missing parent component id {parent} for child \
+                     {child}"
+                ),
+            )
+        })?;
+        parent_component.children.push(child);
+    }
+    let monikers = components
+        .iter()
+        .map(|(id, component)| (*id, component.moniker.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for component in components.values_mut() {
+        component.children.sort_by(|left, right| {
+            let left_moniker = monikers
+                .get(left)
+                .map(|moniker| moniker.as_str())
+                .unwrap_or("/");
+            let right_moniker = monikers
+                .get(right)
+                .map(|moniker| moniker.as_str())
+                .unwrap_or("/");
+            left_moniker.cmp(right_moniker)
+        });
+    }
+
+    Ok(ScenarioIr {
+        schema: state.base_scenario.schema.clone(),
+        version: state.base_scenario.version,
+        root: state.base_scenario.root,
+        components: components.into_values().collect(),
+        bindings,
+        exports: state.base_scenario.exports.clone(),
+        manifest_catalog: state.base_scenario.manifest_catalog.clone(),
+    })
+}
+
+fn decode_live_scenario(
+    state: &FrameworkControlState,
+) -> std::result::Result<Scenario, ProtocolErrorResponse> {
+    Scenario::try_from(live_scenario_ir(state)?).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("failed to decode authoritative live scenario: {err}"),
+        )
+    })
+}
+
+fn normalize_scenario_ir_order(scenario_ir: &mut ScenarioIr) {
+    scenario_ir.components.sort_by(|left, right| {
+        left.moniker
+            .cmp(&right.moniker)
+            .then(left.id.cmp(&right.id))
+    });
+    let id_map = scenario_ir
+        .components
+        .iter()
+        .enumerate()
+        .map(|(new_id, component)| (component.id, new_id))
+        .collect::<BTreeMap<_, _>>();
+    scenario_ir.root = *id_map
+        .get(&scenario_ir.root)
+        .expect("snapshot root component should remain present");
+
+    for component in &mut scenario_ir.components {
+        component.id = *id_map
+            .get(&component.id)
+            .expect("snapshot component id should remain present");
+        component.parent = component.parent.map(|parent| {
+            *id_map
+                .get(&parent)
+                .expect("snapshot parent component id should remain present")
+        });
+        for child in &mut component.children {
+            *child = *id_map
+                .get(child)
+                .expect("snapshot child component id should remain present");
+        }
+    }
+
+    let monikers = scenario_ir
+        .components
+        .iter()
+        .map(|component| (component.id, component.moniker.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for component in &mut scenario_ir.components {
+        component.children.sort_by(|left, right| {
+            let left_moniker = monikers.get(left).map(String::as_str).unwrap_or("/");
+            let right_moniker = monikers.get(right).map(String::as_str).unwrap_or("/");
+            left_moniker.cmp(right_moniker)
+        });
+    }
+    for binding in &mut scenario_ir.bindings {
+        match &mut binding.from {
+            BindingFromIr::Component { component, .. }
+            | BindingFromIr::Resource { component, .. } => {
+                *component = *id_map
+                    .get(component)
+                    .expect("snapshot binding source component id should remain present");
+            }
+            BindingFromIr::Framework {
+                authority_realm, ..
+            } => {
+                *authority_realm = *id_map
+                    .get(authority_realm)
+                    .expect("snapshot framework authority realm should remain present");
+            }
+            BindingFromIr::External { slot } => {
+                slot.component = *id_map
+                    .get(&slot.component)
+                    .expect("snapshot external slot component id should remain present");
+            }
+        }
+        binding.to.component = *id_map
+            .get(&binding.to.component)
+            .expect("snapshot binding target component id should remain present");
+    }
+    scenario_ir.bindings.sort_by(|left, right| {
+        binding_sort_key(left, &monikers).cmp(&binding_sort_key(right, &monikers))
+    });
+    for export in &mut scenario_ir.exports {
+        export.from.component = *id_map
+            .get(&export.from.component)
+            .expect("snapshot export source component id should remain present");
+    }
+    scenario_ir
+        .exports
+        .sort_by(|left, right| left.name.cmp(&right.name));
+}
+
+fn binding_sort_key(binding: &BindingIr, monikers: &BTreeMap<usize, String>) -> String {
+    let source = match &binding.from {
+        BindingFromIr::Component { component, provide } => format!(
+            "component:{}:{provide}",
+            monikers.get(component).map(String::as_str).unwrap_or("/")
+        ),
+        BindingFromIr::Resource {
+            component,
+            resource,
+        } => format!(
+            "resource:{}:{resource}",
+            monikers.get(component).map(String::as_str).unwrap_or("/")
+        ),
+        BindingFromIr::Framework {
+            capability,
+            authority_realm,
+        } => format!(
+            "framework:{}:{capability}",
+            monikers
+                .get(authority_realm)
+                .map(String::as_str)
+                .unwrap_or("/")
+        ),
+        BindingFromIr::External { slot } => format!("external:{}:{}", slot.component, slot.slot),
+    };
+    format!(
+        "{}:{}:{}:{}",
+        monikers
+            .get(&binding.to.component)
+            .map(String::as_str)
+            .unwrap_or("/"),
+        binding.to.slot,
+        source,
+        binding.weak
+    )
+}
+
+fn live_child_component_owner(state: &FrameworkControlState, component_id: usize) -> Option<u64> {
+    all_child_records(state)
+        .filter_map(|child| {
+            let fragment = child.fragment.as_ref()?;
+            fragment
+                .components
+                .iter()
+                .any(|component| component.id == component_id)
+                .then_some(child.child_id)
+        })
+        .next()
+}
+
+fn output_sources_from_record(
+    output: &OutputHandleRecord,
+) -> std::result::Result<Vec<ResolvedBindingSource>, ProtocolErrorResponse> {
+    output
+        .sources
+        .iter()
+        .map(|source| {
+            Ok(ResolvedBindingSource {
+                from: binding_from_from_ir(source.from.clone())?,
+                weak: source.weak,
+            })
+        })
+        .collect()
+}
+
+fn bindable_source_candidates(
+    scenario: &Scenario,
+    scenario_ir: &ScenarioIr,
+    state: &FrameworkControlState,
+    authority_realm: ComponentId,
+) -> std::result::Result<Vec<BindableSourceCandidate>, ProtocolErrorResponse> {
+    let component = scenario.component(authority_realm);
+    let mut out = Vec::new();
+
+    for (name, slot) in &component.slots {
+        out.push(BindableSourceCandidate {
+            selector: format!("slots.{name}"),
+            handle: None,
+            decl: slot.decl.clone(),
+            sources: slot_binding_sources(scenario, authority_realm, name),
+            source_child_id: None,
+            dynamic_child_output: None,
+        });
+    }
+
+    out.extend(
+        component
+            .provides
+            .iter()
+            .map(|(name, provide)| BindableSourceCandidate {
+                selector: format!("provides.{name}"),
+                handle: None,
+                decl: provide.decl.clone(),
+                sources: vec![ResolvedBindingSource {
+                    from: BindingFrom::Component(ProvideRef {
+                        component: authority_realm,
+                        name: name.clone(),
+                    }),
+                    weak: false,
+                }],
+                source_child_id: None,
+                dynamic_child_output: None,
+            }),
+    );
+    out.extend(
+        component
+            .resources
+            .iter()
+            .map(|(name, resource)| BindableSourceCandidate {
+                selector: format!("resources.{name}"),
+                handle: None,
+                decl: CapabilityDecl::builder().kind(resource.kind).build(),
+                sources: vec![ResolvedBindingSource {
+                    from: BindingFrom::Resource(ResourceRef {
+                        component: authority_realm,
+                        name: name.clone(),
+                    }),
+                    weak: false,
+                }],
+                source_child_id: None,
+                dynamic_child_output: None,
+            }),
+    );
+    out.extend(static_child_export_candidates(
+        scenario,
+        scenario_ir,
+        state,
+        authority_realm,
+    )?);
+
+    for child in
+        visible_child_records(state).filter(|child| child.authority_realm_id == authority_realm.0)
+    {
+        for (export_name, output) in &child.outputs {
+            out.push(BindableSourceCandidate {
+                selector: format!("children.{}.exports.{export_name}", child.name),
+                handle: output.handle.clone(),
+                decl: output.decl.clone(),
+                sources: output_sources_from_record(output)?,
+                source_child_id: Some(child.child_id),
+                dynamic_child_output: dynamic_child_output_source(child, output),
+            });
+        }
+    }
+
+    if authority_realm == scenario.root && scenario.component(scenario.root).program.is_some() {
+        out.extend(
+            scenario
+                .bindings
+                .iter()
+                .filter_map(|binding| match &binding.from {
+                    BindingFrom::External(slot) if slot.component == scenario.root => {
+                        Some((slot.name.clone(), binding.to.name.clone()))
+                    }
+                    _ => None,
+                })
+                .filter_map(|(external_name, slot_name)| {
+                    component
+                        .slots
+                        .get(slot_name.as_str())
+                        .map(|slot| BindableSourceCandidate {
+                            selector: format!("external.{external_name}"),
+                            handle: None,
+                            decl: slot.decl.clone(),
+                            sources: vec![ResolvedBindingSource {
+                                from: BindingFrom::External(SlotRef {
+                                    component: scenario.root,
+                                    name: external_name,
+                                }),
+                                weak: true,
+                            }],
+                            source_child_id: None,
+                            dynamic_child_output: None,
+                        })
+                }),
+        );
+    }
+
+    Ok(out)
+}
+
+fn slot_binding_sources(
+    scenario: &Scenario,
+    component_id: ComponentId,
+    slot_name: &str,
+) -> Vec<ResolvedBindingSource> {
+    scenario
+        .bindings
+        .iter()
+        .filter(|binding| binding.to.component == component_id && binding.to.name == slot_name)
+        .map(|binding| ResolvedBindingSource {
+            from: binding.from.clone(),
+            weak: binding.weak,
+        })
+        .collect()
+}
+
+fn static_child_export_candidates(
+    scenario: &Scenario,
+    scenario_ir: &ScenarioIr,
+    state: &FrameworkControlState,
+    authority_realm: ComponentId,
+) -> std::result::Result<Vec<BindableSourceCandidate>, ProtocolErrorResponse> {
+    let authority_component = scenario.component(authority_realm);
+    let authority_component_ir = component_ir(scenario_ir, authority_realm)?;
+    let dynamic_child_roots = state
+        .live_children
+        .iter()
+        .chain(state.pending_destroys.iter().map(|record| &record.child))
+        .filter(|child| child.authority_realm_id == authority_realm.0)
+        .filter(|child| child_is_visible(child))
+        .filter_map(|child| {
+            child
+                .fragment
+                .as_ref()
+                .map(|fragment| fragment.root_component_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut out = Vec::new();
+
+    for child_id in &authority_component_ir.children {
+        if dynamic_child_roots.contains(child_id) {
+            continue;
+        }
+        let child_component_id = ComponentId(*child_id);
+        let child_component = scenario.component(child_component_id);
+        let Some(child_name) = child_alias(
+            authority_component.moniker.as_str(),
+            child_component.moniker.as_str(),
+        ) else {
+            continue;
+        };
+        let child_component_ir = component_ir(scenario_ir, child_component_id)?;
+        for export_name in child_component_ir.exports.keys() {
+            let resolved = resolve_component_export_candidate(
+                scenario,
+                scenario_ir,
+                child_component_id,
+                export_name,
+            )?;
+            out.push(BindableSourceCandidate {
+                selector: format!("children.{child_name}.exports.{export_name}"),
+                handle: None,
+                decl: resolved.decl,
+                sources: resolved.sources,
+                source_child_id: None,
+                dynamic_child_output: None,
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+fn component_ir(
+    scenario_ir: &ScenarioIr,
+    component_id: ComponentId,
+) -> std::result::Result<&ComponentIr, ProtocolErrorResponse> {
+    scenario_ir
+        .components
+        .iter()
+        .find(|component| component.id == component_id.0)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "component id {} is missing from frozen scenario IR",
+                    component_id.0
+                ),
+            )
+        })
+}
+
+struct ResolvedComponentExportCandidate {
+    decl: CapabilityDecl,
+    sources: Vec<ResolvedBindingSource>,
+}
+
+fn resolve_component_export_candidate(
+    scenario: &Scenario,
+    scenario_ir: &ScenarioIr,
+    component_id: ComponentId,
+    export_name: &str,
+) -> std::result::Result<ResolvedComponentExportCandidate, ProtocolErrorResponse> {
+    resolve_component_export_candidate_inner(
+        scenario,
+        scenario_ir,
+        component_id,
+        export_name,
+        &mut BTreeSet::new(),
+    )
+}
+
+fn resolve_component_export_candidate_inner(
+    scenario: &Scenario,
+    scenario_ir: &ScenarioIr,
+    component_id: ComponentId,
+    export_name: &str,
+    visited: &mut BTreeSet<(usize, String)>,
+) -> std::result::Result<ResolvedComponentExportCandidate, ProtocolErrorResponse> {
+    if !visited.insert((component_id.0, export_name.to_string())) {
+        return Err(protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "component export cycle detected while resolving component {} export \
+                 `{export_name}`",
+                component_id.0
+            ),
+        ));
+    }
+
+    let result = resolve_component_export_candidate_target(
+        scenario,
+        scenario_ir,
+        component_id,
+        export_name,
+        visited,
+    );
+    visited.remove(&(component_id.0, export_name.to_string()));
+    result
+}
+
+fn resolve_component_export_candidate_target(
+    scenario: &Scenario,
+    scenario_ir: &ScenarioIr,
+    component_id: ComponentId,
+    export_name: &str,
+    visited: &mut BTreeSet<(usize, String)>,
+) -> std::result::Result<ResolvedComponentExportCandidate, ProtocolErrorResponse> {
+    let component = scenario.component(component_id);
+    let component_ir = component_ir(scenario_ir, component_id)?;
+    let target = component_ir.exports.get(export_name).ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "component {} export `{export_name}` is missing from frozen scenario IR",
+                component_id.0
+            ),
+        )
+    })?;
+
+    match target {
+        ComponentExportTargetIr::SelfProvide { provide } => {
+            let provide_decl = component.provides.get(provide).ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "component {} export `{export_name}` references missing provide \
+                         `{provide}`",
+                        component_id.0
+                    ),
+                )
+            })?;
+            Ok(ResolvedComponentExportCandidate {
+                decl: provide_decl.decl.clone(),
+                sources: vec![ResolvedBindingSource {
+                    from: BindingFrom::Component(ProvideRef {
+                        component: component_id,
+                        name: provide.clone(),
+                    }),
+                    weak: false,
+                }],
+            })
+        }
+        ComponentExportTargetIr::SelfSlot { slot } => {
+            let slot_decl = component.slots.get(slot).ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "component {} export `{export_name}` references missing slot `{slot}`",
+                        component_id.0
+                    ),
+                )
+            })?;
+            Ok(ResolvedComponentExportCandidate {
+                decl: slot_decl.decl.clone(),
+                sources: slot_binding_sources(scenario, component_id, slot),
+            })
+        }
+        ComponentExportTargetIr::ChildExport { child, export } => {
+            let parent_moniker = component.moniker.as_str();
+            let child_component_id = component_ir
+                .children
+                .iter()
+                .copied()
+                .find(|child_id| {
+                    child_alias(
+                        parent_moniker,
+                        scenario.component(ComponentId(*child_id)).moniker.as_str(),
+                    ) == Some(child.as_str())
+                })
+                .map(ComponentId)
+                .ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!(
+                            "component {} export `{export_name}` references missing child \
+                             `{child}`",
+                            component_id.0
+                        ),
+                    )
+                })?;
+            resolve_component_export_candidate_inner(
+                scenario,
+                scenario_ir,
+                child_component_id,
+                export,
+                visited,
+            )
+        }
+    }
+}
+
+fn child_alias<'a>(parent_moniker: &str, child_moniker: &'a str) -> Option<&'a str> {
+    if child_moniker == "/" {
+        return None;
+    }
+    let remainder = if parent_moniker == "/" {
+        child_moniker.strip_prefix('/')?
+    } else {
+        child_moniker
+            .strip_prefix(parent_moniker)?
+            .strip_prefix('/')?
+    };
+    remainder.split('/').find(|segment| !segment.is_empty())
+}
+
+fn dynamic_child_output_source(
+    child: &LiveChildRecord,
+    output: &OutputHandleRecord,
+) -> Option<DynamicChildOutputSource> {
+    let BindingFromIr::Component { component, provide } = output.sources.first()?.from.clone()
+    else {
+        return None;
+    };
+    let provider_component = child
+        .fragment
+        .as_ref()?
+        .components
+        .iter()
+        .find(|candidate| candidate.id == component)?
+        .moniker
+        .clone();
+    let protocol = match output.decl.kind.transport() {
+        CapabilityTransport::Http => "http",
+        CapabilityTransport::NonNetwork => return None,
+        _ => return None,
+    };
+    Some(DynamicChildOutputSource {
+        provider_component,
+        provide,
+        protocol: protocol.to_string(),
+        capability_kind: output.decl.kind.to_string(),
+        capability_profile: output.decl.profile.clone(),
+    })
+}
+
+fn find_bindable_source<'a>(
+    bindable_sources: &'a [BindableSourceCandidate],
+    selector: &str,
+) -> std::result::Result<&'a BindableSourceCandidate, ProtocolErrorResponse> {
+    let candidate = bindable_sources
+        .iter()
+        .find(|candidate| candidate.selector == selector)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::BindingSourceNotFound,
+                &format!("binding source `{selector}` is not present in the authority realm"),
+            )
+        })?;
+    if candidate.sources.is_empty() {
+        return Err(protocol_error(
+            ProtocolErrorCode::BindingSourceNotFound,
+            &format!("binding source `{selector}` is currently unbound"),
+        ));
+    }
+    Ok(candidate)
+}
+
+fn find_bindable_source_by_handle<'a>(
+    bindable_sources: &'a [BindableSourceCandidate],
+    handle: &str,
+) -> std::result::Result<&'a BindableSourceCandidate, ProtocolErrorResponse> {
+    bindable_sources
+        .iter()
+        .find(|candidate| candidate.handle.as_deref() == Some(handle))
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::BindingSourceNotFound,
+                &format!("binding handle `{handle}` is not valid in the authority realm"),
+            )
+        })
+}
+
+fn runtime_backend_name(backend: &amber_manifest::RuntimeBackend) -> String {
+    serde_json::to_value(backend)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn frozen_template_contract(
+    template: &ChildTemplate,
+) -> std::result::Result<&ChildTemplate, ProtocolErrorResponse> {
+    if template.frozen {
+        return Ok(template);
+    }
+    Err(protocol_error(
+        ProtocolErrorCode::ControlStateUnavailable,
+        "framework.component requires compiler-frozen child template contracts; recompile with \
+         the current compiler",
+    ))
+}
+
+fn template_config_fields(
+    template: &ChildTemplate,
+) -> std::result::Result<BTreeMap<String, TemplateConfigField>, ProtocolErrorResponse> {
+    Ok(frozen_template_contract(template)?.config.clone())
+}
+
+fn template_binding_fields(
+    template: &ChildTemplate,
+) -> std::result::Result<BTreeMap<String, TemplateBinding>, ProtocolErrorResponse> {
+    Ok(frozen_template_contract(template)?.bindings.clone())
+}
+
+fn root_template_slot_decl<'a>(
+    template: &'a ChildTemplate,
+    slot_name: &str,
+) -> std::result::Result<&'a amber_manifest::SlotDecl, ProtocolErrorResponse> {
+    frozen_template_contract(template)?
+        .slot_decls
+        .get(slot_name)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                "child template root slot is missing from the frozen child template contract",
+            )
+        })
+}
+
+fn visible_exports(
+    template: &ChildTemplate,
+) -> std::result::Result<Vec<String>, ProtocolErrorResponse> {
+    frozen_template_contract(template)?
+        .visible_exports
+        .clone()
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                "child template visible exports are missing from the frozen child template \
+                 contract",
+            )
+        })
+}
+
+fn source_compatible(target: CapabilityDecl, candidate: CapabilityDecl) -> bool {
+    target.kind == candidate.kind && target.profile == candidate.profile
+}
+
+fn decode_base_scenario(
+    state: &FrameworkControlState,
+) -> std::result::Result<Scenario, ProtocolErrorResponse> {
+    Scenario::try_from(state.base_scenario.clone()).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("failed to decode frozen base scenario: {err}"),
+        )
+    })
+}
+
+fn binding_from_from_ir(
+    from: BindingFromIr,
+) -> std::result::Result<BindingFrom, ProtocolErrorResponse> {
+    match from {
+        BindingFromIr::Component { component, provide } => Ok(BindingFrom::Component(ProvideRef {
+            component: ComponentId(component),
+            name: provide,
+        })),
+        BindingFromIr::Resource {
+            component,
+            resource,
+        } => Ok(BindingFrom::Resource(ResourceRef {
+            component: ComponentId(component),
+            name: resource,
+        })),
+        BindingFromIr::Framework {
+            capability,
+            authority_realm,
+        } => {
+            let capability =
+                FrameworkCapabilityName::try_from(capability.as_str()).map_err(|_| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!("unknown framework capability `{capability}` in control state"),
+                    )
+                })?;
+            Ok(BindingFrom::Framework(FrameworkRef {
+                authority: ComponentId(authority_realm),
+                capability,
+            }))
+        }
+        BindingFromIr::External { slot } => Ok(BindingFrom::External(SlotRef {
+            component: ComponentId(slot.component),
+            name: slot.slot,
+        })),
+    }
+}
+
+fn live_binding_source_record(from: &BindingFrom, weak: bool) -> LiveBindingSourceRecord {
+    LiveBindingSourceRecord {
+        from: BindingFromIr::from(from),
+        weak,
+    }
+}
+
+pub(crate) fn protocol_error(code: ProtocolErrorCode, message: &str) -> ProtocolErrorResponse {
+    ProtocolErrorResponse {
+        code,
+        message: message.to_string(),
+        details: None,
+    }
+}
+
+#[derive(Clone)]
+struct FrozenCatalogBackend {
+    entries: Arc<BTreeMap<String, ManifestCatalogEntryIr>>,
+    extra_manifests: Arc<BTreeMap<String, Manifest>>,
+}
+
+impl Backend for FrozenCatalogBackend {
+    fn resolve_url<'a>(
+        &'a self,
+        url: &'a url::Url,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = std::result::Result<Resolution, amber_resolver::Error>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let key = url.to_string();
+            if let Some(manifest) = self.extra_manifests.get(&key) {
+                return Ok(Resolution {
+                    url: url.clone(),
+                    manifest: manifest.clone(),
+                    source: Arc::<str>::from(""),
+                    spans: Arc::new(ManifestSpans::default()),
+                    bundle_source: None,
+                });
+            }
+            let entry = self.entries.get(&key).ok_or_else(|| {
+                amber_resolver::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("frozen manifest catalog is missing `{key}`"),
+                ))
+            })?;
+            Ok(Resolution {
+                url: url.clone(),
+                manifest: entry.manifest.clone(),
+                source: Arc::<str>::from(""),
+                spans: Arc::new(ManifestSpans::default()),
+                bundle_source: None,
+            })
+        })
+    }
+}
+
+fn frozen_catalog_schemes<'a>(
+    entries: impl Iterator<Item = &'a ManifestCatalogEntryIr>,
+) -> Vec<String> {
+    let mut schemes = entries
+        .filter_map(|entry| {
+            url::Url::parse(&entry.source_ref)
+                .ok()
+                .map(|url| url.scheme().to_string())
+        })
+        .collect::<Vec<_>>();
+    schemes.sort();
+    schemes.dedup();
+    schemes
+}
+
+#[derive(Clone)]
+struct ControlStateApp {
+    control_state: Arc<Mutex<FrameworkControlState>>,
+    client: ReqwestClient,
+    state_path: PathBuf,
+    run_root: PathBuf,
+    state_root: PathBuf,
+    mesh_scope: Arc<str>,
+    control_state_auth_token: Arc<str>,
+    authority_locks: Arc<Mutex<BTreeMap<usize, Arc<Mutex<()>>>>>,
+    bridge_proxies: Arc<Mutex<BTreeMap<BridgeProxyKey, BridgeProxyHandle>>>,
+}
+
+#[derive(Clone)]
+struct CcsApp {
+    client: ReqwestClient,
+    control_state_url: Arc<str>,
+    router_auth_token: Arc<str>,
+    control_state_auth_token: Arc<str>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SiteManagerStateView {
+    status: String,
+    kind: SiteKind,
+    artifact_dir: String,
+    supervisor_pid: u32,
+    #[serde(default)]
+    process_pid: Option<u32>,
+    #[serde(default)]
+    compose_project: Option<String>,
+    #[serde(default)]
+    kubernetes_namespace: Option<String>,
+    #[serde(default)]
+    port_forward_pid: Option<u32>,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    router_control: Option<String>,
+    #[serde(default)]
+    router_mesh_addr: Option<String>,
+    #[serde(default)]
+    router_identity_id: Option<String>,
+    #[serde(default)]
+    router_public_key_b64: Option<String>,
+}
+
