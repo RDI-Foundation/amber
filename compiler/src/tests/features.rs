@@ -306,8 +306,8 @@ async fn resolution_environments_allow_parent_to_enable_resolvers_for_children()
 }
 
 #[tokio::test]
-async fn child_template_selector_expands_into_sorted_frozen_catalog() {
-    let dir = tmp_dir("scenario-child-template-selector");
+async fn child_template_manifest_arrays_preserve_sorted_frozen_catalog() {
+    let dir = tmp_dir("scenario-child-template-manifest-array");
     let root_path = dir.path().join("root.json5");
     let jobs_dir = dir.path().join("jobs");
     fs::create_dir_all(&jobs_dir).unwrap();
@@ -366,10 +366,7 @@ async fn child_template_selector_expands_into_sorted_frozen_catalog() {
           },
           child_templates: {
             worker: {
-              allowed_manifests: {
-                root: "./jobs",
-                include: ["**/*.json5"],
-              },
+              manifest: ["./jobs/nested/leaf.json5", "./jobs/beta.json5", "./jobs/alpha.json5"],
               bindings: {
                 realm: "slots.realm",
               },
@@ -393,13 +390,13 @@ async fn child_template_selector_expands_into_sorted_frozen_catalog() {
         .child_templates
         .get("worker")
         .expect("child template should be linked");
-    let allowed = template
-        .allowed_manifests
+    let manifests = template
+        .manifests
         .as_ref()
-        .expect("open template should carry allowed manifest keys");
+        .expect("bounded template should carry frozen manifest keys");
 
     assert_eq!(
-        allowed,
+        manifests,
         &vec![
             file_url(&alpha_path).to_string(),
             file_url(&beta_path).to_string(),
@@ -412,7 +409,6 @@ async fn child_template_selector_expands_into_sorted_frozen_catalog() {
             selector: "slots.realm".parse().unwrap(),
         })
     );
-    assert!(template.manifest.is_none());
     assert!(template.config.is_empty());
     assert!(matches!(
         template.bindings.get("realm"),

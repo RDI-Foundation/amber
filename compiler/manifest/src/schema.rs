@@ -486,26 +486,12 @@ impl FromStr for RealmSelector {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder)]
-#[builder(on(String, into))]
-#[serde(deny_unknown_fields)]
-#[non_exhaustive]
-pub struct ChildTemplateManifestSelector {
-    pub root: String,
-    #[serde(default)]
-    #[builder(default)]
-    pub include: Vec<String>,
-    #[serde(default)]
-    #[builder(default)]
-    pub exclude: Vec<String>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum ChildTemplateAllowedManifests {
-    Refs(Vec<ManifestRef>),
-    Selector(ChildTemplateManifestSelector),
+pub enum ChildTemplateManifestDecl {
+    One(ManifestRef),
+    Many(Vec<ManifestRef>),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder)]
@@ -525,9 +511,7 @@ pub struct ChildTemplateLimitsDecl {
 #[non_exhaustive]
 pub struct ChildTemplateDecl {
     #[serde(default)]
-    pub manifest: Option<ManifestRef>,
-    #[serde(default)]
-    pub allowed_manifests: Option<ChildTemplateAllowedManifests>,
+    pub manifest: Option<ChildTemplateManifestDecl>,
     #[serde(default)]
     pub config: BTreeMap<String, Value>,
     #[serde(default)]

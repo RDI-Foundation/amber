@@ -20,7 +20,7 @@ fn child_templates_require_component_slot() {
 }
 
 #[test]
-fn child_template_requires_exactly_one_manifest_source() {
+fn child_template_manifest_may_be_omitted() {
     let raw = parse_raw(
         r#"
         {
@@ -30,10 +30,30 @@ fn child_template_requires_exactly_one_manifest_source() {
           },
           child_templates: {
             worker: {
-              manifest: "https://example.com/worker.json5",
-              allowed_manifests: [
-                "https://example.com/other.json5",
-              ],
+              bindings: {
+                realm: "slots.realm",
+              },
+            },
+          },
+        }
+        "#,
+    );
+    raw.validate()
+        .expect("omitted child-template manifest should remain valid");
+}
+
+#[test]
+fn child_template_manifest_array_must_not_be_empty() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            realm: { kind: "component" },
+          },
+          child_templates: {
+            worker: {
+              manifest: [],
             },
           },
         }
@@ -44,14 +64,14 @@ fn child_template_requires_exactly_one_manifest_source() {
     match err {
         Error::InvalidChildTemplate { template, message } => {
             assert_eq!(template, "worker");
-            assert!(message.contains("exactly one"));
+            assert!(message.contains("empty array"));
         }
         other => panic!("expected InvalidChildTemplate, got {other:?}"),
     }
 }
 
 #[test]
-fn child_template_allowed_manifests_must_be_non_empty() {
+fn child_template_manifest_array_must_not_be_singleton() {
     let raw = parse_raw(
         r#"
         {
@@ -61,7 +81,7 @@ fn child_template_allowed_manifests_must_be_non_empty() {
           },
           child_templates: {
             worker: {
-              allowed_manifests: [],
+              manifest: ["https://example.com/worker.json5"],
             },
           },
         }
@@ -72,7 +92,7 @@ fn child_template_allowed_manifests_must_be_non_empty() {
     match err {
         Error::InvalidChildTemplate { template, message } => {
             assert_eq!(template, "worker");
-            assert!(message.contains("must not be empty"));
+            assert!(message.contains("at least two"));
         }
         other => panic!("expected InvalidChildTemplate, got {other:?}"),
     }

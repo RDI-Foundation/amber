@@ -2,6 +2,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 NAME = os.environ["NAME"]
+LABEL = os.environ["LABEL"]
 PORT = int(os.environ["PORT"])
 
 
@@ -16,8 +17,8 @@ def send(handler, status, body):
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/id":
-            send(self, 200, NAME)
+        if self.path in ("/", "/id"):
+            send(self, 200, f"{NAME}:{LABEL}")
             return
         send(self, 200, "ok")
 

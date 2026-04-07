@@ -58,7 +58,11 @@ impl ProtocolApiError {
             ProtocolErrorCode::PrepareFailed | ProtocolErrorCode::PublishFailed => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
-            ProtocolErrorCode::ManifestNotAllowed
+            ProtocolErrorCode::ManifestRequired
+            | ProtocolErrorCode::ManifestNotAllowed
+            | ProtocolErrorCode::InvalidManifestRef
+            | ProtocolErrorCode::ManifestDigestMismatch
+            | ProtocolErrorCode::ManifestResolutionFailed
             | ProtocolErrorCode::InvalidConfig
             | ProtocolErrorCode::InvalidBinding
             | ProtocolErrorCode::BindingTypeMismatch

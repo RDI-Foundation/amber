@@ -974,7 +974,7 @@ async fn create_snapshot_and_destroy_exact_child() {
 }
 
 #[tokio::test]
-async fn open_template_selection_uses_requested_catalog_key() {
+async fn open_template_admits_requested_manifest_ref() {
     let dir = TempDir::new().expect("temp dir");
     let root_path = dir.path().join("root.json5");
     let alpha_path = dir.path().join("alpha.json5");
@@ -1011,24 +1011,18 @@ async fn open_template_selection_uses_requested_catalog_key() {
     );
     write_file(
         &root_path,
-        &format!(
-            r#"
-                {{
-                  manifest_version: "0.3.0",
-                  program: {{ path: "/bin/echo", args: ["root"] }},
-                  slots: {{
-                    ctl: {{ kind: "component", optional: true }}
-                  }},
-                  child_templates: {{
-                    worker: {{
-                      allowed_manifests: ["{alpha}", "{beta}"]
-                    }}
-                  }},
-                }}
-                "#,
-            alpha = file_url(&alpha_path),
-            beta = file_url(&beta_path),
-        ),
+        r#"
+            {
+              manifest_version: "0.3.0",
+              program: { path: "/bin/echo", args: ["root"] },
+              slots: {
+                ctl: { kind: "component", optional: true }
+              },
+              child_templates: {
+                worker: {}
+              },
+            }
+            "#,
     );
 
     let mut state = compile_control_state(&root_path).await;
@@ -1043,11 +1037,7 @@ async fn open_template_selection_uses_requested_catalog_key() {
         CreateChildRequest {
             template: "worker".to_string(),
             name: "job-open".to_string(),
-            manifest: Some(
-                amber_mesh::component_protocol::CreateChildManifestSelection {
-                    catalog_key: beta_key.clone(),
-                },
-            ),
+            manifest: Some(beta_key.parse().expect("manifest ref")),
             config: BTreeMap::new(),
             bindings: BTreeMap::new(),
         },
@@ -1079,7 +1069,7 @@ async fn open_template_selection_uses_requested_catalog_key() {
 }
 
 #[tokio::test]
-async fn open_template_replay_uses_frozen_manifest_catalog_after_source_mutation() {
+async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
     let dir = TempDir::new().expect("temp dir");
     let root_path = dir.path().join("root.json5");
     let alpha_path = dir.path().join("alpha.json5");
@@ -1116,24 +1106,18 @@ async fn open_template_replay_uses_frozen_manifest_catalog_after_source_mutation
     );
     write_file(
         &root_path,
-        &format!(
-            r#"
-                {{
-                  manifest_version: "0.3.0",
-                  program: {{ path: "/bin/echo", args: ["root"] }},
-                  slots: {{
-                    realm: {{ kind: "component", optional: true }}
-                  }},
-                  child_templates: {{
-                    worker: {{
-                      allowed_manifests: ["{alpha}", "{beta}"]
-                    }}
-                  }},
-                }}
-                "#,
-            alpha = file_url(&alpha_path),
-            beta = file_url(&beta_path),
-        ),
+        r#"
+            {
+              manifest_version: "0.3.0",
+              program: { path: "/bin/echo", args: ["root"] },
+              slots: {
+                realm: { kind: "component", optional: true }
+              },
+              child_templates: {
+                worker: {}
+              },
+            }
+            "#,
     );
 
     let mut state = compile_control_state(&root_path).await;
@@ -1141,6 +1125,21 @@ async fn open_template_replay_uses_frozen_manifest_catalog_after_source_mutation
     write_control_state(&state_path, &state).expect("state should write");
     let root_authority = state.base_scenario.root;
     let beta_key = file_url(&beta_path);
+
+    create_child(
+        &mut state,
+        root_authority,
+        CreateChildRequest {
+            template: "worker".to_string(),
+            name: "job-open".to_string(),
+            manifest: Some(beta_key.parse().expect("manifest ref")),
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        },
+        &state_path,
+    )
+    .await
+    .expect("open-template create should admit the selected manifest");
 
     write_file(
         &beta_path,
@@ -1158,25 +1157,6 @@ async fn open_template_replay_uses_frozen_manifest_catalog_after_source_mutation
             "#,
     );
     fs::remove_file(&alpha_path).expect("alpha source should be removable after compile");
-
-    create_child(
-        &mut state,
-        root_authority,
-        CreateChildRequest {
-            template: "worker".to_string(),
-            name: "job-open".to_string(),
-            manifest: Some(
-                amber_mesh::component_protocol::CreateChildManifestSelection {
-                    catalog_key: beta_key.clone(),
-                },
-            ),
-            config: BTreeMap::new(),
-            bindings: BTreeMap::new(),
-        },
-        &state_path,
-    )
-    .await
-    .expect("open-template create should use the frozen catalog");
 
     let snapshot_response =
         snapshot(&state, root_authority).expect("snapshot should succeed after create");
@@ -1200,48 +1180,49 @@ async fn open_template_replay_uses_frozen_manifest_catalog_after_source_mutation
 
     fs::remove_file(&beta_path).expect("beta source should be removable before replay");
 
-    let mut replayed = compile_control_state_from_snapshot(&snapshot_response).await;
+    let replayed = compile_control_state_from_snapshot(&snapshot_response).await;
     let replay_state_path = dir.path().join("replay-control-state.json");
     write_control_state(&replay_state_path, &replayed).expect("replay state should write");
     let replay_root_authority = replayed.base_scenario.root;
 
-    create_child(
-        &mut replayed,
-        replay_root_authority,
-        CreateChildRequest {
-            template: "worker".to_string(),
-            name: "job-replay".to_string(),
-            manifest: Some(
-                amber_mesh::component_protocol::CreateChildManifestSelection {
-                    catalog_key: file_url(&alpha_path),
-                },
-            ),
-            config: BTreeMap::new(),
-            bindings: BTreeMap::new(),
-        },
-        &replay_state_path,
-    )
-    .await
-    .expect("replayed snapshot should preserve future dynamic create affordances");
-
-    let replay_snapshot =
-        snapshot(&replayed, replay_root_authority).expect("replay snapshot should succeed");
-    let replay_ir: ScenarioIr =
-        serde_json::from_value(replay_snapshot.scenario).expect("replay scenario should decode");
-    let replay_child = replay_ir
-        .components
-        .iter()
-        .find(|component| component.moniker == "/job-replay")
-        .expect("replay should contain the newly created child");
+    let replay_scenario = decode_live_scenario(&replayed).expect("replayed scenario");
+    let replay_child = replay_scenario
+        .components_iter()
+        .find(|(_, component)| component.moniker.as_str() == "/job-open")
+        .map(|(_, component)| component)
+        .expect("replay should restore the admitted child");
     let replay_program =
         serde_json::to_string(&replay_child.program).expect("program should encode");
     assert!(
-        replay_program.contains("alpha-original"),
-        "replay should still use the frozen manifest content, got {replay_program}"
+        replay_program.contains("beta-original"),
+        "replay should still use the admitted manifest content, got {replay_program}"
     );
     assert!(
         !replay_program.contains("beta-mutated-on-disk"),
         "replay must not fall back to mutated on-disk content, got {replay_program}"
+    );
+
+    let resolved = resolve_template(
+        &replayed,
+        replay_root_authority,
+        "worker",
+        TemplateResolveRequest {
+            manifest: Some(beta_key.parse().expect("manifest ref")),
+        },
+    )
+    .await
+    .expect("replayed snapshot should preserve admitted manifest affordances");
+    assert!(
+        resolved
+            .manifest
+            .manifest
+            .expect("resolved template should report the selected manifest")
+            .url
+            .as_url()
+            .expect("manifest should be absolute")
+            .as_str()
+            == beta_key,
+        "resolve should continue to use the admitted manifest ref"
     );
 }
 
@@ -2019,12 +2000,9 @@ async fn max_live_children_is_scoped_per_template() {
     state.live_children = vec![alpha_child];
 
     let template = ChildTemplate {
-        frozen: false,
-        manifest: Some("file:///templates/worker.json5".to_string()),
-        allowed_manifests: None,
+        manifests: Some(vec!["file:///templates/worker.json5".to_string()]),
         config: BTreeMap::new(),
         bindings: BTreeMap::new(),
-        slot_decls: BTreeMap::new(),
         visible_exports: None,
         limits: Some(amber_scenario::ChildTemplateLimits {
             max_live_children: Some(1),
@@ -2201,7 +2179,7 @@ async fn create_rejects_unoffered_backend_without_committing_child_state() {
                   }},
                   child_templates: {{
                     worker: {{
-                      allowed_manifests: ["{compose_child}", "{direct_child}"]
+                      manifest: ["{compose_child}", "{direct_child}"]
                     }}
                   }},
                 }}
@@ -3161,8 +3139,21 @@ async fn describe_template_exposes_dynamic_child_exports_as_binding_candidates()
     .await
     .expect("producer child should be created");
 
-    let description =
+    let authored =
         describe_template(&state, root_authority, "consumer").expect("template should exist");
+    assert!(
+        authored.bindings.is_empty(),
+        "authored inspection should not invent unresolved binding fields",
+    );
+
+    let description = resolve_template(
+        &state,
+        root_authority,
+        "consumer",
+        TemplateResolveRequest { manifest: None },
+    )
+    .await
+    .expect("exact template should resolve without an explicit manifest");
     let upstream = description
         .bindings
         .get("upstream")
@@ -3236,8 +3227,21 @@ async fn describe_template_exposes_static_child_exports_as_binding_candidates() 
     );
 
     let state = compile_control_state(&root_path).await;
-    let description = describe_template(&state, state.base_scenario.root, "consumer")
+    let authored = describe_template(&state, state.base_scenario.root, "consumer")
         .expect("template should exist");
+    assert!(
+        authored.bindings.is_empty(),
+        "authored inspection should not expose unresolved binding fields",
+    );
+
+    let description = resolve_template(
+        &state,
+        state.base_scenario.root,
+        "consumer",
+        TemplateResolveRequest { manifest: None },
+    )
+    .await
+    .expect("exact template should resolve without an explicit manifest");
     let upstream = description
         .bindings
         .get("upstream")
@@ -3314,7 +3318,7 @@ async fn root_external_bindable_sources_are_listed_and_weak() {
 }
 
 #[tokio::test]
-async fn open_template_rejects_manifest_outside_frozen_allowed_set() {
+async fn bounded_template_rejects_manifest_outside_frozen_allowed_set() {
     let dir = TempDir::new().expect("temp dir");
     let root_path = dir.path().join("root.json5");
     let alpha_path = dir.path().join("alpha.json5");
@@ -3348,7 +3352,7 @@ async fn open_template_rejects_manifest_outside_frozen_allowed_set() {
                   }},
                   child_templates: {{
                     worker: {{
-                      allowed_manifests: ["{alpha}", "{beta}"]
+                      manifest: ["{alpha}", "{beta}"]
                     }}
                   }},
                 }}
@@ -3369,11 +3373,7 @@ async fn open_template_rejects_manifest_outside_frozen_allowed_set() {
         CreateChildRequest {
             template: "worker".to_string(),
             name: "job".to_string(),
-            manifest: Some(
-                amber_mesh::component_protocol::CreateChildManifestSelection {
-                    catalog_key: file_url(&gamma_path),
-                },
-            ),
+            manifest: Some(file_url(&gamma_path).parse().expect("manifest ref")),
             config: BTreeMap::new(),
             bindings: BTreeMap::new(),
         },
@@ -3488,31 +3488,84 @@ async fn execute_destroy_child_resumes_pending_destroy_transactions() {
 }
 
 #[tokio::test]
-async fn describe_template_rejects_unfrozen_template_contracts() {
-    let (_, mut state, _) = compile_exact_template_control_state().await;
-    let root_authority = state.base_scenario.root;
-    let root_component = state
-        .base_scenario
-        .components
-        .iter_mut()
-        .find(|component| component.id == root_authority)
-        .expect("root component should exist");
-    let template = root_component
-        .child_templates
-        .get_mut("worker")
-        .expect("worker template should exist");
-    template.frozen = false;
-    template.visible_exports = None;
-    template.slot_decls.clear();
-
-    let err = describe_template(&state, root_authority, "worker")
-        .expect_err("framework.component should reject unfrozen template contracts");
-    assert_eq!(err.code, ProtocolErrorCode::ControlStateUnavailable);
-    assert!(
-        err.message.contains("recompile with the current compiler"),
-        "error should direct the operator toward recompilation, got: {}",
-        err.message
+async fn describe_template_returns_authored_prefills_only() {
+    let dir = TempDir::new().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let worker_path = dir.path().join("worker.json5");
+    write_file(
+        &worker_path,
+        r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                realm: { kind: "component", optional: true }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["worker", "${slots.realm.url}"]
+              }
+            }
+            "#,
     );
+    write_file(
+        &root_path,
+        &format!(
+            r#"
+                {{
+                  manifest_version: "0.3.0",
+                  program: {{ path: "/bin/echo", args: ["root"] }},
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  child_templates: {{
+                    worker: {{
+                      manifest: "{worker}",
+                      bindings: {{
+                        realm: "slots.realm"
+                      }},
+                      limits: {{
+                        max_live_children: 2
+                      }}
+                    }}
+                  }},
+                }}
+                "#,
+            worker = file_url(&worker_path),
+        ),
+    );
+
+    let state = compile_control_state(&root_path).await;
+    let description = describe_template(&state, state.base_scenario.root, "worker")
+        .expect("template should exist");
+    assert_eq!(description.manifest.mode, TemplateMode::Exact);
+    let manifest = description
+        .manifest
+        .manifest
+        .expect("exact template should expose its manifest ref");
+    assert_eq!(
+        manifest
+            .url
+            .as_url()
+            .expect("manifest url should be absolute")
+            .as_str(),
+        file_url(&worker_path)
+    );
+    assert!(
+        manifest.digest.is_some(),
+        "authored exact template refs should surface the frozen digest",
+    );
+    assert_eq!(
+        description.bindings.get("realm"),
+        Some(&BindingInputDescription {
+            state: InputState::Prefilled,
+            selector: Some("slots.realm".to_string()),
+            optional: None,
+            compatible_kind: None,
+            candidates: Vec::new(),
+        })
+    );
+    assert!(description.config.is_empty());
+    assert_eq!(description.limits.max_live_children, Some(2));
 }
 
 #[tokio::test]

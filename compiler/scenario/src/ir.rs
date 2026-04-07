@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use amber_manifest::{
     CapabilityDecl, CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ProvideDecl,
@@ -14,8 +14,8 @@ use crate::{
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
-pub const SCENARIO_IR_VERSION: u32 = 5;
-const MIN_SCENARIO_IR_VERSION: u32 = 4;
+pub const SCENARIO_IR_VERSION: u32 = 6;
+const MIN_SCENARIO_IR_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScenarioIr {
@@ -32,7 +32,6 @@ pub struct ScenarioIr {
 
 impl From<&Scenario> for ScenarioIr {
     fn from(scenario: &Scenario) -> Self {
-        assert_persistable_child_templates(scenario);
         let components = scenario
             .components_iter()
             .map(|(id, component)| ComponentIr::from_component(id, component))
@@ -104,28 +103,13 @@ impl TryFrom<ScenarioIr> for Scenario {
                 ensure_name_no_dot(name)?;
             }
             for (name, template) in &component.child_templates {
-                match (&template.manifest, &template.allowed_manifests) {
-                    (Some(_), None) | (None, Some(_)) => {}
-                    (Some(_), Some(_)) => {
-                        return Err(invalid_scenario(format!(
-                            "child template `{name}` must not specify both `manifest` and \
-                             `allowed_manifests`"
-                        )));
-                    }
-                    (None, None) => {
-                        return Err(invalid_scenario(format!(
-                            "child template `{name}` must specify one of `manifest` or \
-                             `allowed_manifests`"
-                        )));
-                    }
-                }
                 if template
-                    .allowed_manifests
+                    .manifests
                     .as_ref()
-                    .is_some_and(|allowed| allowed.is_empty())
+                    .is_some_and(|manifests| manifests.is_empty())
                 {
                     return Err(invalid_scenario(format!(
-                        "child template `{name}` must not have an empty `allowed_manifests` list"
+                        "child template `{name}` must not have an empty `manifests` list"
                     )));
                 }
             }
@@ -328,23 +312,14 @@ pub enum ComponentExportTargetIr {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChildTemplateIr {
     #[serde(default)]
-    #[serde(skip_serializing_if = "is_false")]
-    pub frozen: bool,
-    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub manifest: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed_manifests: Option<Vec<String>>,
+    pub manifests: Option<Vec<String>>,
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, TemplateConfigFieldIr>,
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, TemplateBindingIr>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub slot_decls: BTreeMap<String, SlotDecl>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visible_exports: Option<Vec<String>>,
@@ -359,9 +334,7 @@ pub struct ChildTemplateIr {
 impl From<&ChildTemplate> for ChildTemplateIr {
     fn from(template: &ChildTemplate) -> Self {
         Self {
-            frozen: template.frozen,
-            manifest: template.manifest.clone(),
-            allowed_manifests: template.allowed_manifests.clone(),
+            manifests: template.manifests.clone(),
             config: template
                 .config
                 .iter()
@@ -372,7 +345,6 @@ impl From<&ChildTemplate> for ChildTemplateIr {
                 .iter()
                 .map(|(name, field)| (name.clone(), TemplateBindingIr::from(field)))
                 .collect(),
-            slot_decls: template.slot_decls.clone(),
             visible_exports: template.visible_exports.clone(),
             limits: template.limits.as_ref().map(ChildTemplateLimitsIr::from),
             possible_backends: template.possible_backends.clone(),
@@ -383,9 +355,7 @@ impl From<&ChildTemplate> for ChildTemplateIr {
 impl ChildTemplateIr {
     fn into_template(self) -> ChildTemplate {
         ChildTemplate {
-            frozen: self.frozen,
-            manifest: self.manifest,
-            allowed_manifests: self.allowed_manifests,
+            manifests: self.manifests,
             config: self
                 .config
                 .into_iter()
@@ -396,7 +366,6 @@ impl ChildTemplateIr {
                 .into_iter()
                 .map(|(name, field)| (name, field.into_field()))
                 .collect(),
-            slot_decls: self.slot_decls,
             visible_exports: self.visible_exports,
             limits: self.limits.map(ChildTemplateLimitsIr::into_limits),
             possible_backends: self.possible_backends,
@@ -488,10 +457,6 @@ impl ChildTemplateLimitsIr {
             name_pattern: self.name_pattern,
         }
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1096,39 +1061,10 @@ fn validate_component_tree(scenario: &Scenario) -> Result<(), ScenarioIrError> {
 fn validate_child_templates(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     for component in scenario.components.iter().flatten() {
         for (name, template) in &component.child_templates {
-            match (&template.manifest, &template.allowed_manifests) {
-                (Some(_), None) | (None, Some(_)) => {}
-                (Some(_), Some(_)) => {
-                    return Err(invalid_scenario(format!(
-                        "component {} child template `{name}` specifies both `manifest` and \
-                         `allowed_manifests`",
-                        component.moniker.as_str()
-                    )));
-                }
-                (None, None) => {
-                    return Err(invalid_scenario(format!(
-                        "component {} child template `{name}` must specify one of `manifest` or \
-                         `allowed_manifests`",
-                        component.moniker.as_str()
-                    )));
-                }
-            }
-
-            if let Some(key) = &template.manifest
-                && !scenario.manifest_catalog.contains_key(key)
-            {
-                return Err(invalid_scenario(format!(
-                    "component {} child template `{name}` references missing manifest catalog key \
-                     `{key}`",
-                    component.moniker.as_str()
-                )));
-            }
-
-            if let Some(keys) = &template.allowed_manifests {
+            if let Some(keys) = &template.manifests {
                 if keys.is_empty() {
                     return Err(invalid_scenario(format!(
-                        "component {} child template `{name}` has an empty `allowed_manifests` \
-                         list",
+                        "component {} child template `{name}` has an empty `manifests` list",
                         component.moniker.as_str()
                     )));
                 }
@@ -1142,14 +1078,6 @@ fn validate_child_templates(scenario: &Scenario) -> Result<(), ScenarioIrError> 
                     }
                 }
             }
-            if !template.frozen {
-                return Err(invalid_scenario(format!(
-                    "component {} child template `{name}` must use a frozen child template \
-                     contract in ScenarioIr; recompile with the current compiler",
-                    component.moniker.as_str()
-                )));
-            }
-            validate_frozen_child_template_contract(scenario, component, name, template)?;
         }
     }
 
@@ -1160,167 +1088,6 @@ fn validate_child_templates(scenario: &Scenario) -> Result<(), ScenarioIrError> 
                 entry.digest,
                 entry.manifest.digest()
             )));
-        }
-    }
-
-    Ok(())
-}
-
-fn assert_persistable_child_templates(scenario: &Scenario) {
-    for component in scenario.components.iter().flatten() {
-        for (template_name, template) in &component.child_templates {
-            assert!(
-                template.frozen,
-                "component {} child template `{template_name}` must be frozen before serializing \
-                 ScenarioIr",
-                component.moniker.as_str()
-            );
-        }
-    }
-}
-
-fn validate_frozen_child_template_contract(
-    scenario: &Scenario,
-    component: &Component,
-    template_name: &str,
-    template: &ChildTemplate,
-) -> Result<(), ScenarioIrError> {
-    let binding_names = template.bindings.keys().collect::<BTreeSet<_>>();
-    let slot_decl_names = template.slot_decls.keys().collect::<BTreeSet<_>>();
-    if binding_names != slot_decl_names {
-        return Err(invalid_scenario(format!(
-            "component {} child template `{template_name}` has mismatched frozen binding and slot \
-             declaration sets",
-            component.moniker.as_str()
-        )));
-    }
-
-    let manifest_keys = template
-        .manifest
-        .iter()
-        .cloned()
-        .chain(template.allowed_manifests.clone().unwrap_or_default())
-        .collect::<Vec<_>>();
-    for key in manifest_keys {
-        let manifest = &scenario
-            .manifest_catalog
-            .get(&key)
-            .expect("validated manifest catalog key should exist")
-            .manifest;
-        validate_frozen_child_template_manifest(
-            component,
-            template_name,
-            template,
-            manifest,
-            &key,
-        )?;
-    }
-    Ok(())
-}
-
-fn validate_frozen_child_template_manifest(
-    component: &Component,
-    template_name: &str,
-    template: &ChildTemplate,
-    manifest: &Manifest,
-    manifest_catalog_key: &str,
-) -> Result<(), ScenarioIrError> {
-    let properties = manifest
-        .config_schema()
-        .and_then(|schema| schema.0.get("properties"))
-        .and_then(serde_json::Value::as_object)
-        .into_iter()
-        .flatten()
-        .collect::<BTreeMap<_, _>>();
-    let required = manifest
-        .config_schema()
-        .and_then(|schema| schema.0.get("required"))
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .collect::<BTreeSet<_>>();
-    for (name, field) in &template.config {
-        if !properties.contains_key(name) {
-            return Err(invalid_scenario(format!(
-                "component {} child template `{template_name}` frozen config references missing \
-                 field `{name}` in manifest `{manifest_catalog_key}`",
-                component.moniker.as_str()
-            )));
-        }
-        if let TemplateConfigField::Open {
-            required: open_required,
-        } = field
-            && *open_required != required.contains(name.as_str())
-        {
-            return Err(invalid_scenario(format!(
-                "component {} child template `{template_name}` frozen config field `{name}` does \
-                 not match manifest `{manifest_catalog_key}` requiredness",
-                component.moniker.as_str()
-            )));
-        }
-    }
-    for name in properties.keys() {
-        if !template.config.contains_key(name.as_str()) {
-            return Err(invalid_scenario(format!(
-                "component {} child template `{template_name}` omits config field `{name}` from \
-                 frozen contract for manifest `{manifest_catalog_key}`",
-                component.moniker.as_str()
-            )));
-        }
-    }
-
-    for (name, binding) in &template.bindings {
-        let slot = manifest.slots().get(name.as_str()).ok_or_else(|| {
-            invalid_scenario(format!(
-                "component {} child template `{template_name}` frozen binding references missing \
-                 slot `{name}` in manifest `{manifest_catalog_key}`",
-                component.moniker.as_str()
-            ))
-        })?;
-        let frozen_slot = template.slot_decls.get(name.as_str()).ok_or_else(|| {
-            invalid_scenario(format!(
-                "component {} child template `{template_name}` is missing frozen slot declaration \
-                 `{name}`",
-                component.moniker.as_str()
-            ))
-        })?;
-        if frozen_slot != slot {
-            return Err(invalid_scenario(format!(
-                "component {} child template `{template_name}` frozen slot declaration `{name}` \
-                 does not match manifest `{manifest_catalog_key}`",
-                component.moniker.as_str()
-            )));
-        }
-        if let TemplateBinding::Open { optional } = binding
-            && *optional != slot.optional
-        {
-            return Err(invalid_scenario(format!(
-                "component {} child template `{template_name}` frozen binding `{name}` does not \
-                 match manifest `{manifest_catalog_key}` optionality",
-                component.moniker.as_str()
-            )));
-        }
-    }
-    for name in manifest.slots().keys() {
-        if !template.bindings.contains_key(name.as_str()) {
-            return Err(invalid_scenario(format!(
-                "component {} child template `{template_name}` omits slot `{name}` from frozen \
-                 contract for manifest `{manifest_catalog_key}`",
-                component.moniker.as_str()
-            )));
-        }
-    }
-
-    if let Some(visible_exports) = template.visible_exports.as_ref() {
-        for export_name in visible_exports {
-            if !manifest.exports().contains_key(export_name.as_str()) {
-                return Err(invalid_scenario(format!(
-                    "component {} child template `{template_name}` exposes missing export \
-                     `{export_name}` from manifest `{manifest_catalog_key}`",
-                    component.moniker.as_str()
-                )));
-            }
         }
     }
 
@@ -1943,9 +1710,7 @@ mod tests {
             child_templates: BTreeMap::from([(
                 "worker".to_string(),
                 ChildTemplate {
-                    frozen: true,
-                    manifest: Some(catalog_key.clone()),
-                    allowed_manifests: None,
+                    manifests: Some(vec![catalog_key.clone()]),
                     config: BTreeMap::from([(
                         "mode".to_string(),
                         TemplateConfigField::Prefilled {
@@ -1958,7 +1723,6 @@ mod tests {
                             selector: "slots.realm".parse().unwrap(),
                         },
                     )]),
-                    slot_decls: BTreeMap::from([("realm".to_string(), slot_decl("component"))]),
                     visible_exports: Some(vec!["api".to_string()]),
                     limits: Some(ChildTemplateLimits {
                         max_live_children: Some(4),
@@ -1994,8 +1758,8 @@ mod tests {
                 .component(ComponentId(0))
                 .child_templates
                 .get("worker")
-                .and_then(|template| template.manifest.as_ref()),
-            Some(&catalog_key)
+                .and_then(|template| template.manifests.as_ref()),
+            Some(&vec![catalog_key.clone()])
         );
         assert_eq!(
             roundtripped.manifest_catalog.get(&catalog_key),
@@ -2004,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn scenario_ir_rejects_unfrozen_child_template_contracts() {
+    fn scenario_ir_accepts_unresolved_bounded_child_templates() {
         let alpha: amber_manifest::Manifest = r#"
             {
               manifest_version: "0.1.0",
@@ -2062,7 +1826,7 @@ mod tests {
         let alpha_key = "file:///templates/alpha.json5".to_string();
         let beta_key = "file:///templates/beta.json5".to_string();
 
-        let err = Scenario::try_from(ScenarioIr {
+        Scenario::try_from(ScenarioIr {
             schema: SCENARIO_IR_SCHEMA.to_string(),
             version: SCENARIO_IR_VERSION,
             root: 0,
@@ -2083,12 +1847,9 @@ mod tests {
                 child_templates: BTreeMap::from([(
                     "worker".to_string(),
                     ChildTemplateIr {
-                        frozen: false,
-                        manifest: None,
-                        allowed_manifests: Some(vec![alpha_key.clone(), beta_key.clone()]),
+                        manifests: Some(vec![alpha_key.clone(), beta_key.clone()]),
                         config: BTreeMap::new(),
                         bindings: BTreeMap::new(),
-                        slot_decls: BTreeMap::new(),
                         visible_exports: None,
                         limits: None,
                         possible_backends: Vec::new(),
@@ -2117,13 +1878,7 @@ mod tests {
                 ),
             ]),
         })
-        .expect_err("unfrozen child template contracts should be rejected");
-
-        assert!(
-            err.to_string()
-                .contains("must use a frozen child template contract"),
-            "unexpected error: {err}",
-        );
+        .expect("unresolved bounded child templates should deserialize");
     }
 
     #[test]

@@ -519,7 +519,7 @@ fn compile_direct_rejects_scenario_ir_with_non_resource_storage_mount_binding() 
         &ir_path,
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema": "amber.scenario.ir",
-            "version": 5,
+            "version": 6,
             "root": 0,
             "components": [
                 {

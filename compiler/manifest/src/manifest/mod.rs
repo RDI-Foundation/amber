@@ -22,11 +22,10 @@ use crate::{
     },
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
-        Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind,
-        ChildTemplateAllowedManifests, ChildTemplateDecl, ComponentDecl, ConfigSchema,
-        EnvironmentDecl, ExportTarget, LocalCapabilityRefKind, LocalComponentRef, ManifestBinding,
-        MountSource, Program, ProvideDecl, RawBinding, RawExportTarget, RawProgram, ResourceDecl,
-        SlotDecl, VmScalarU32,
+        Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ChildTemplateDecl,
+        ChildTemplateManifestDecl, ComponentDecl, ConfigSchema, EnvironmentDecl, ExportTarget,
+        LocalCapabilityRefKind, LocalComponentRef, ManifestBinding, MountSource, Program,
+        ProvideDecl, RawBinding, RawExportTarget, RawProgram, ResourceDecl, SlotDecl, VmScalarU32,
     },
 };
 
@@ -344,46 +343,26 @@ fn validate_child_templates(
     }
 
     for (template_name, template) in child_templates {
-        match (&template.manifest, &template.allowed_manifests) {
-            (Some(_), None) | (None, Some(_)) => {}
-            (Some(_), Some(_)) => {
-                return Err(Error::InvalidChildTemplate {
-                    template: template_name.to_string(),
-                    message: "exactly one of `manifest` or `allowed_manifests` must be present"
-                        .to_string(),
-                });
-            }
-            (None, None) => {
-                return Err(Error::InvalidChildTemplate {
-                    template: template_name.to_string(),
-                    message: "one of `manifest` or `allowed_manifests` is required".to_string(),
-                });
-            }
-        }
-
         if let Some(reference) = &template.manifest {
-            validate_manifest_ref(reference)?;
-        }
-
-        if let Some(allowed) = &template.allowed_manifests {
-            match allowed {
-                ChildTemplateAllowedManifests::Refs(refs) => {
+            match reference {
+                ChildTemplateManifestDecl::One(reference) => validate_manifest_ref(reference)?,
+                ChildTemplateManifestDecl::Many(refs) => {
                     if refs.is_empty() {
                         return Err(Error::InvalidChildTemplate {
                             template: template_name.to_string(),
-                            message: "`allowed_manifests` must not be empty".to_string(),
+                            message: "`manifest` must not be an empty array".to_string(),
+                        });
+                    }
+                    if refs.len() == 1 {
+                        return Err(Error::InvalidChildTemplate {
+                            template: template_name.to_string(),
+                            message: "`manifest` arrays must contain at least two refs; use the \
+                                      scalar form for exact templates"
+                                .to_string(),
                         });
                     }
                     for reference in refs {
                         validate_manifest_ref(reference)?;
-                    }
-                }
-                ChildTemplateAllowedManifests::Selector(selector) => {
-                    if selector.root.trim().is_empty() {
-                        return Err(Error::InvalidChildTemplate {
-                            template: template_name.to_string(),
-                            message: "`allowed_manifests.root` must not be empty".to_string(),
-                        });
                     }
                 }
             }

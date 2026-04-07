@@ -7,7 +7,6 @@ pub(crate) mod store;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
-    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -15,7 +14,7 @@ use std::{
 };
 
 use amber_manifest::{
-    ChildTemplateAllowedManifests, ChildTemplateDecl, ComponentDecl, ExperimentalFeature, Manifest,
+    ChildTemplateDecl, ChildTemplateManifestDecl, ComponentDecl, ExperimentalFeature, Manifest,
     ManifestDigest, ManifestRef,
 };
 use amber_resolver::{self as resolver, RemoteResolver, Resolver};
@@ -558,21 +557,21 @@ fn resolve_child_template_manifest_refs(
     template_name: &str,
     decl: &ChildTemplateDecl,
 ) -> Result<Vec<ManifestRef>, Error> {
-    match (&decl.manifest, &decl.allowed_manifests) {
-        (Some(reference), None) => Ok(vec![resolve_manifest_ref_for_template(
-            realm_url,
-            template_name,
-            reference,
-        )?]),
-        (None, Some(ChildTemplateAllowedManifests::Refs(refs))) => refs
+    match decl.manifest.as_ref() {
+        None => Ok(Vec::new()),
+        Some(ChildTemplateManifestDecl::One(reference)) => {
+            Ok(vec![resolve_manifest_ref_for_template(
+                realm_url,
+                template_name,
+                reference,
+            )?])
+        }
+        Some(ChildTemplateManifestDecl::Many(refs)) => refs
             .iter()
             .map(|reference| resolve_manifest_ref_for_template(realm_url, template_name, reference))
             .collect(),
-        (None, Some(ChildTemplateAllowedManifests::Selector(selector))) => {
-            expand_child_template_selector(realm_url, template_name, selector)
-        }
-        (Some(_), Some(_)) | (None, None) | (None, Some(_)) => {
-            unreachable!("manifest validation handles this")
+        Some(_) => {
+            unreachable!("manifest validation handles unknown child-template manifest forms")
         }
     }
 }
@@ -607,141 +606,6 @@ fn resolve_manifest_ref_for_template(
             src: None,
             span: None,
         })
-}
-
-fn expand_child_template_selector(
-    realm_url: &Url,
-    template_name: &str,
-    selector: &amber_manifest::ChildTemplateManifestSelector,
-) -> Result<Vec<ManifestRef>, Error> {
-    if realm_url.scheme() != "file" {
-        return Err(Error::ManifestRefResolution {
-            realm_path: display_url(realm_url).into(),
-            child: template_name.into(),
-            reference: selector.root.clone().into(),
-            message: "allowed_manifests selectors require a file:// owning manifest".into(),
-            src: None,
-            span: None,
-        });
-    }
-
-    let base_path = realm_url
-        .to_file_path()
-        .map_err(|_| Error::ManifestRefResolution {
-            realm_path: display_url(realm_url).into(),
-            child: template_name.into(),
-            reference: selector.root.clone().into(),
-            message: "owning manifest is not a filesystem path".into(),
-            src: None,
-            span: None,
-        })?;
-    let manifest_dir = base_path.parent().unwrap_or(Path::new("/"));
-    let root_path = manifest_dir.join(&selector.root);
-    let root_path =
-        normalize_selector_root(&root_path).map_err(|message| Error::ManifestRefResolution {
-            realm_path: display_url(realm_url).into(),
-            child: template_name.into(),
-            reference: selector.root.clone().into(),
-            message: message.into(),
-            src: None,
-            span: None,
-        })?;
-
-    let include_patterns = if selector.include.is_empty() {
-        vec!["**/*.json5".to_string()]
-    } else {
-        selector.include.clone()
-    };
-    let exclude_patterns = selector.exclude.clone();
-
-    let mut matches = BTreeSet::new();
-    for pattern in include_patterns {
-        let absolute = root_path.join(pattern);
-        let pattern = absolute.to_string_lossy().replace('\\', "/");
-        for entry in glob::glob(&pattern).map_err(|err| Error::ManifestRefResolution {
-            realm_path: display_url(realm_url).into(),
-            child: template_name.into(),
-            reference: selector.root.clone().into(),
-            message: format!("invalid include glob `{}`: {err}", pattern).into(),
-            src: None,
-            span: None,
-        })? {
-            let path = entry.map_err(|err| Error::ManifestRefResolution {
-                realm_path: display_url(realm_url).into(),
-                child: template_name.into(),
-                reference: selector.root.clone().into(),
-                message: format!("failed to expand include glob: {err}").into(),
-                src: None,
-                span: None,
-            })?;
-            if path.is_file() {
-                matches.insert(path);
-            }
-        }
-    }
-
-    for pattern in exclude_patterns {
-        let absolute = root_path.join(pattern);
-        let pattern = absolute.to_string_lossy().replace('\\', "/");
-        for entry in glob::glob(&pattern).map_err(|err| Error::ManifestRefResolution {
-            realm_path: display_url(realm_url).into(),
-            child: template_name.into(),
-            reference: selector.root.clone().into(),
-            message: format!("invalid exclude glob `{}`: {err}", pattern).into(),
-            src: None,
-            span: None,
-        })? {
-            let path = entry.map_err(|err| Error::ManifestRefResolution {
-                realm_path: display_url(realm_url).into(),
-                child: template_name.into(),
-                reference: selector.root.clone().into(),
-                message: format!("failed to expand exclude glob: {err}").into(),
-                src: None,
-                span: None,
-            })?;
-            matches.remove(&path);
-        }
-    }
-
-    let mut refs = Vec::with_capacity(matches.len());
-    for path in matches {
-        let url = Url::from_file_path(&path).map_err(|_| Error::ManifestRefResolution {
-            realm_path: display_url(realm_url).into(),
-            child: template_name.into(),
-            reference: path.display().to_string().into(),
-            message: "matched path is not representable as a file URL".into(),
-            src: None,
-            span: None,
-        })?;
-        refs.push(ManifestRef::from_url(url));
-    }
-    Ok(refs)
-}
-
-fn normalize_selector_root(root_path: &Path) -> Result<PathBuf, String> {
-    if root_path.as_os_str().is_empty() {
-        return Err("selector root must not be empty".to_string());
-    }
-    let root_path = if root_path.is_absolute() {
-        root_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|err| format!("failed to resolve selector root: {err}"))?
-            .join(root_path)
-    };
-    if !root_path.exists() {
-        return Err(format!(
-            "selector root `{}` does not exist",
-            root_path.display()
-        ));
-    }
-    if !root_path.is_dir() {
-        return Err(format!(
-            "selector root `{}` is not a directory",
-            root_path.display()
-        ));
-    }
-    Ok(root_path)
 }
 
 fn validate_child_experimental_features(

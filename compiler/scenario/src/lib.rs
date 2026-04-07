@@ -247,23 +247,14 @@ pub struct Component {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildTemplate {
     #[serde(default)]
-    #[serde(skip_serializing_if = "is_false")]
-    pub frozen: bool,
-    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub manifest: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed_manifests: Option<Vec<String>>,
+    pub manifests: Option<Vec<String>>,
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, TemplateConfigField>,
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, TemplateBinding>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub slot_decls: BTreeMap<String, SlotDecl>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visible_exports: Option<Vec<String>>,
@@ -297,10 +288,6 @@ pub struct ChildTemplateLimits {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name_pattern: Option<String>,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
