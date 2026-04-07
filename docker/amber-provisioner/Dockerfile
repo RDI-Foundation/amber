@@ -46,6 +46,7 @@ RUN mkdir -p cli/src compiler/config/src compiler/src runtime/docker-gateway/src
     touch cli/src/main.rs compiler/config/src/lib.rs compiler/src/lib.rs runtime/docker-gateway/src/main.rs runtime/helper/src/main.rs images/src/lib.rs manager/src/lib.rs manager/src/main.rs compiler/json5/src/lib.rs compiler/manifest/src/lib.rs runtime/mesh/src/lib.rs runtime/proxy/src/lib.rs runtime/provisioner/src/main.rs runtime/router/src/main.rs compiler/resolver/src/lib.rs compiler/scenario/src/lib.rs compiler/template/src/lib.rs
 RUN cargo fetch --locked
 
+COPY compiler ./compiler
 COPY runtime/mesh ./runtime/mesh
 COPY runtime/provisioner ./runtime/provisioner
 

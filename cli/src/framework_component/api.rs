@@ -348,7 +348,7 @@ pub(crate) fn snapshot(
         ));
     }
     let mut live_scenario_ir = live_scenario_ir(state)?;
-    let required_catalog_keys = live_scenario_ir
+    let required_catalog_roots = live_scenario_ir
         .components
         .iter()
         .flat_map(|component| component.child_templates.values())
@@ -358,6 +358,8 @@ pub(crate) fn snapshot(
                 .filter_map(|child| child.selected_manifest_catalog_key.clone()),
         )
         .collect::<BTreeSet<_>>();
+    let required_catalog_keys =
+        manifest_catalog_closure(&live_scenario_ir.manifest_catalog, required_catalog_roots)?;
     live_scenario_ir
         .manifest_catalog
         .retain(|key, _| required_catalog_keys.contains(key));

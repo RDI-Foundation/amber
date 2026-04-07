@@ -450,6 +450,7 @@ pub(super) async fn select_manifest_catalog_key(
                         ),
                     ));
                 }
+                admit_runtime_manifest_dependencies(state, &selected_url).await?;
                 return Ok(selected_url);
             }
             admit_runtime_manifest(state, &selected).await
@@ -461,35 +462,201 @@ async fn admit_runtime_manifest(
     state: &mut FrameworkControlState,
     manifest: &ManifestRef,
 ) -> std::result::Result<String, ProtocolErrorResponse> {
-    let url = manifest
-        .url
-        .as_url()
-        .expect("validated runtime manifest refs are absolute")
-        .clone();
-    let resolution = Resolver::new()
-        .resolve(&url, manifest.digest)
-        .await
-        .map_err(|err| match err {
-            amber_resolver::Error::MismatchedDigest(_) => protocol_error(
-                ProtocolErrorCode::ManifestDigestMismatch,
-                &format!("manifest `{url}` digest mismatch"),
-            ),
-            other => protocol_error(
-                ProtocolErrorCode::ManifestResolutionFailed,
-                &format!("failed to resolve manifest `{url}`: {other}"),
-            ),
+    let resolver = Resolver::new();
+    let mut pending = vec![manifest.clone()];
+    let mut root_key = None;
+
+    while let Some(current) = pending.pop() {
+        let requested_url = current
+            .url
+            .as_url()
+            .expect("validated runtime manifest refs are absolute")
+            .clone();
+        let resolution = resolver
+            .resolve(&requested_url, current.digest)
+            .await
+            .map_err(|err| match err {
+                amber_resolver::Error::MismatchedDigest(_) => protocol_error(
+                    ProtocolErrorCode::ManifestDigestMismatch,
+                    &format!("manifest `{requested_url}` digest mismatch"),
+                ),
+                other => protocol_error(
+                    ProtocolErrorCode::ManifestResolutionFailed,
+                    &format!("failed to resolve manifest `{requested_url}`: {other}"),
+                ),
+            })?;
+        let key = resolution.url.to_string();
+        if root_key.is_none() {
+            root_key = Some(key.clone());
+        }
+        if state.base_scenario.manifest_catalog.contains_key(&key) {
+            continue;
+        }
+
+        let dependencies = runtime_manifest_dependencies(&resolution.manifest, &resolution.url)?;
+        let digest = resolution.manifest.digest();
+        state.base_scenario.manifest_catalog.insert(
+            key.clone(),
+            ManifestCatalogEntryIr {
+                source_ref: key.clone(),
+                digest,
+                manifest: resolution.manifest,
+            },
+        );
+        pending.extend(dependencies);
+    }
+
+    Ok(root_key.expect("root runtime manifest should always resolve"))
+}
+
+async fn admit_runtime_manifest_dependencies(
+    state: &mut FrameworkControlState,
+    root_key: &str,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let mut pending = vec![root_key.to_string()];
+    let mut visited = BTreeSet::new();
+
+    while let Some(key) = pending.pop() {
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+
+        let (source_ref, manifest) = {
+            let entry = state
+                .base_scenario
+                .manifest_catalog
+                .get(&key)
+                .ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!("frozen manifest catalog entry `{key}` is missing"),
+                    )
+                })?;
+            (entry.source_ref.clone(), entry.manifest.clone())
+        };
+        let base_url = url::Url::parse(&source_ref).map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("invalid frozen manifest catalog source_ref `{source_ref}`: {err}"),
+            )
         })?;
-    let key = url.to_string();
-    state
-        .base_scenario
-        .manifest_catalog
-        .entry(key.clone())
-        .or_insert(ManifestCatalogEntryIr {
-            source_ref: key.clone(),
-            digest: resolution.manifest.digest(),
-            manifest: resolution.manifest,
+
+        for dependency in runtime_manifest_dependencies(&manifest, &base_url)? {
+            let dependency_key = dependency
+                .url
+                .as_url()
+                .expect("resolved runtime manifest dependencies are absolute")
+                .to_string();
+            if let Some(entry) = state.base_scenario.manifest_catalog.get(&dependency_key) {
+                if let Some(digest) = dependency.digest
+                    && digest != entry.digest
+                {
+                    return Err(protocol_error(
+                        ProtocolErrorCode::ManifestDigestMismatch,
+                        &format!(
+                            "manifest `{dependency_key}` digest does not match the admitted \
+                             manifest"
+                        ),
+                    ));
+                }
+                pending.push(dependency_key);
+                continue;
+            }
+
+            pending.push(admit_runtime_manifest(state, &dependency).await?);
+        }
+    }
+
+    Ok(())
+}
+
+fn runtime_manifest_dependencies(
+    manifest: &Manifest,
+    base_url: &url::Url,
+) -> std::result::Result<Vec<ManifestRef>, ProtocolErrorResponse> {
+    let component_refs = manifest
+        .components()
+        .values()
+        .map(|component| match component {
+            ComponentDecl::Reference(reference) => reference,
+            ComponentDecl::Object(component) => &component.manifest,
+            _ => unreachable!("manifest component declarations only carry manifest references"),
         });
-    Ok(key)
+    let template_refs = manifest.child_templates().values().flat_map(|template| {
+        template
+            .manifest
+            .as_ref()
+            .into_iter()
+            .flat_map(|manifest| match manifest {
+                amber_manifest::ChildTemplateManifestDecl::One(reference) => {
+                    std::slice::from_ref(reference).iter()
+                }
+                amber_manifest::ChildTemplateManifestDecl::Many(references) => references.iter(),
+                _ => unreachable!("child template manifests are normalized to manifest refs"),
+            })
+    });
+
+    component_refs
+        .chain(template_refs)
+        .map(|reference| {
+            let resolved_url = reference.url.resolve(base_url).map_err(|err| {
+                protocol_error(
+                    ProtocolErrorCode::ManifestResolutionFailed,
+                    &format!(
+                        "failed to resolve manifest `{}` relative to `{base_url}`: {err}",
+                        reference.url.as_str()
+                    ),
+                )
+            })?;
+            Ok(ManifestRef::new(resolved_url, reference.digest))
+        })
+        .collect()
+}
+
+pub(super) fn manifest_catalog_closure<I>(
+    manifest_catalog: &BTreeMap<String, ManifestCatalogEntryIr>,
+    roots: I,
+) -> std::result::Result<BTreeSet<String>, ProtocolErrorResponse>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut required = BTreeSet::new();
+    let mut pending = roots.into_iter().collect::<Vec<_>>();
+
+    while let Some(key) = pending.pop() {
+        if !required.insert(key.clone()) {
+            continue;
+        }
+
+        let entry = manifest_catalog.get(&key).ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("frozen manifest catalog entry `{key}` is missing"),
+            )
+        })?;
+        let base_url = url::Url::parse(&entry.source_ref).map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "invalid frozen manifest catalog source_ref `{}` for `{key}`: {err}",
+                    entry.source_ref
+                ),
+            )
+        })?;
+        pending.extend(
+            runtime_manifest_dependencies(&entry.manifest, &base_url)?
+                .into_iter()
+                .map(|reference| {
+                    reference
+                        .url
+                        .as_url()
+                        .expect("resolved runtime manifest dependencies are absolute")
+                        .to_string()
+                }),
+        );
+    }
+
+    Ok(required)
 }
 
 pub(super) fn resolve_template_contract(

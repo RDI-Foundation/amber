@@ -51,10 +51,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     touch cli/src/main.rs compiler/config/src/lib.rs compiler/src/lib.rs runtime/docker-gateway/src/main.rs runtime/helper/src/main.rs images/src/lib.rs manager/src/lib.rs manager/src/main.rs compiler/json5/src/lib.rs compiler/manifest/src/lib.rs runtime/mesh/src/lib.rs runtime/proxy/src/lib.rs runtime/router/src/main.rs compiler/resolver/src/lib.rs compiler/scenario/src/lib.rs compiler/template/src/lib.rs runtime/provisioner/src/main.rs && \
     cargo fetch --locked
 
-COPY compiler/config ./compiler/config
+COPY compiler ./compiler
 COPY runtime/helper ./runtime/helper
 COPY runtime/mesh ./runtime/mesh
-COPY compiler/template ./compiler/template
 
 ARG BUILD_MODE=release
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \

@@ -320,10 +320,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "amber-node"
-version = "0.0.0"
-
-[[package]]
 name = "amber-provisioner"
 version = "0.0.0"
 dependencies = [

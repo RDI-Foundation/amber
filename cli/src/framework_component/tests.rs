@@ -17,6 +17,115 @@ fn file_url(path: &Path) -> String {
         .to_string()
 }
 
+fn accept_with_deadline(
+    listener: &std::net::TcpListener,
+    deadline: std::time::Instant,
+) -> std::net::TcpStream {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("timed out waiting for manifest request");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => panic!("accept failed: {err}"),
+        }
+    }
+}
+
+fn read_request_path(stream: &mut std::net::TcpStream) -> String {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("request read timeout should set");
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !buf.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = std::io::Read::read(stream, &mut chunk).expect("request should read");
+        if read == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..read]);
+    }
+
+    let text = std::str::from_utf8(&buf).expect("request should be valid UTF-8");
+    let first_line = text
+        .lines()
+        .next()
+        .expect("request should have a request line");
+    let mut parts = first_line.split_whitespace();
+    let _method = parts.next().expect("request should have a method");
+    parts
+        .next()
+        .expect("request should have a path")
+        .to_string()
+}
+
+fn manifest_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json5\r\nContent-Length: {}\r\nConnection: \
+         close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn spawn_redirecting_runtime_manifest_server(
+    leaf_manifest: String,
+) -> (String, String, String, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("manifest listener");
+    listener
+        .set_nonblocking(true)
+        .expect("manifest listener should be nonblocking");
+    let addr = listener.local_addr().expect("manifest listener address");
+    let base = format!("http://{addr}");
+    let requested_url = format!("{base}/alias/worker.json5");
+    let canonical_root_url = format!("{base}/canonical/worker.json5");
+    let canonical_leaf_url = format!("{base}/canonical/leaf.json5");
+    let root_manifest = format!(
+        r##"
+            {{
+              manifest_version: "0.3.0",
+              components: {{
+                leaf: "{canonical_leaf_url}"
+              }},
+              exports: {{
+                leaf: "#leaf.out"
+              }}
+            }}
+        "##
+    );
+    let server_root_url = canonical_root_url.clone();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for _ in 0..3 {
+            let mut stream = accept_with_deadline(&listener, deadline);
+            let path = read_request_path(&mut stream);
+            let response = match path.as_str() {
+                "/alias/worker.json5" => format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {server_root_url}\r\nConnection: \
+                     close\r\nContent-Length: 0\r\n\r\n"
+                ),
+                "/canonical/worker.json5" => manifest_response(&root_manifest),
+                "/canonical/leaf.json5" => manifest_response(&leaf_manifest),
+                _ => "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    .to_string(),
+            };
+            std::io::Write::write_all(&mut stream, response.as_bytes())
+                .expect("response should write");
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    (
+        requested_url,
+        canonical_root_url,
+        canonical_leaf_url,
+        server,
+    )
+}
+
 async fn compile_control_state_with_placement(
     root_path: &Path,
     placement: Option<&PlacementFile>,
@@ -1074,6 +1183,7 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
     let root_path = dir.path().join("root.json5");
     let alpha_path = dir.path().join("alpha.json5");
     let beta_path = dir.path().join("beta.json5");
+    let beta_leaf_path = dir.path().join("beta-leaf.json5");
     write_file(
         &alpha_path,
         r#"
@@ -1091,13 +1201,34 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
     );
     write_file(
         &beta_path,
-        r#"
+        r##"
             {
               manifest_version: "0.3.0",
               program: {
                 path: "/bin/echo",
                 args: ["beta-original"],
                 network: { endpoints: [{ name: "out", port: 8082 }] }
+              },
+              components: {
+                leaf: "./beta-leaf.json5"
+              },
+              provides: { out: { kind: "http", endpoint: "out" } },
+              exports: {
+                out: "provides.out",
+                leaf: "#leaf.out"
+              },
+            }
+            "##,
+    );
+    write_file(
+        &beta_leaf_path,
+        r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/echo",
+                args: ["beta-leaf-original"],
+                network: { endpoints: [{ name: "out", port: 8083 }] }
               },
               provides: { out: { kind: "http", endpoint: "out" } },
               exports: { out: "provides.out" },
@@ -1167,8 +1298,15 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
         .iter()
         .find(|component| component.moniker == "/job-open")
         .expect("snapshot should contain the created child");
+    let created_leaf = scenario_ir
+        .components
+        .iter()
+        .find(|component| component.moniker == "/job-open/leaf")
+        .expect("snapshot should contain the admitted transitive child");
     let created_program =
         serde_json::to_string(&created_child.program).expect("program should encode");
+    let created_leaf_program =
+        serde_json::to_string(&created_leaf.program).expect("leaf program should encode");
     assert!(
         created_program.contains("beta-original"),
         "snapshot should preserve the frozen selected manifest, got {created_program}"
@@ -1177,8 +1315,13 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
         !created_program.contains("beta-mutated-on-disk"),
         "snapshot must not reread the current disk manifest, got {created_program}"
     );
+    assert!(
+        created_leaf_program.contains("beta-leaf-original"),
+        "snapshot should preserve admitted transitive manifests, got {created_leaf_program}"
+    );
 
     fs::remove_file(&beta_path).expect("beta source should be removable before replay");
+    fs::remove_file(&beta_leaf_path).expect("beta leaf source should be removable before replay");
 
     let replayed = compile_control_state_from_snapshot(&snapshot_response).await;
     let replay_state_path = dir.path().join("replay-control-state.json");
@@ -1200,6 +1343,17 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
     assert!(
         !replay_program.contains("beta-mutated-on-disk"),
         "replay must not fall back to mutated on-disk content, got {replay_program}"
+    );
+    let replay_leaf = replay_scenario
+        .components_iter()
+        .find(|(_, component)| component.moniker.as_str() == "/job-open/leaf")
+        .map(|(_, component)| component)
+        .expect("replay should restore admitted transitive children");
+    let replay_leaf_program =
+        serde_json::to_string(&replay_leaf.program).expect("leaf program should encode");
+    assert!(
+        replay_leaf_program.contains("beta-leaf-original"),
+        "replay should still use admitted transitive manifests, got {replay_leaf_program}"
     );
 
     let resolved = resolve_template(
@@ -1223,6 +1377,96 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
             .as_str()
             == beta_key,
         "resolve should continue to use the admitted manifest ref"
+    );
+}
+
+#[tokio::test]
+async fn open_template_admission_uses_canonical_manifest_url_and_freezes_redirected_dependencies() {
+    let dir = TempDir::new().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    write_file(
+        &root_path,
+        r#"
+            {
+              manifest_version: "0.3.0",
+              program: { path: "/bin/echo", args: ["root"] },
+              slots: {
+                realm: { kind: "component", optional: true }
+              },
+              child_templates: {
+                worker: {}
+              },
+            }
+            "#,
+    );
+
+    let leaf_manifest = r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            path: "/bin/echo",
+            args: ["redirect-leaf"],
+            network: { endpoints: [{ name: "out", port: 8084 }] }
+          },
+          provides: { out: { kind: "http", endpoint: "out" } },
+          exports: { out: "provides.out" }
+        }
+    "#;
+    let (requested_url, canonical_root_url, canonical_leaf_url, server) =
+        spawn_redirecting_runtime_manifest_server(leaf_manifest.to_string());
+
+    let mut state = compile_control_state(&root_path).await;
+    let state_path = dir.path().join("control-state.json");
+    write_control_state(&state_path, &state).expect("state should write");
+    let root_authority = state.base_scenario.root;
+
+    create_child(
+        &mut state,
+        root_authority,
+        CreateChildRequest {
+            template: "worker".to_string(),
+            name: "job-open".to_string(),
+            manifest: Some(requested_url.parse().expect("manifest ref")),
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        },
+        &state_path,
+    )
+    .await
+    .expect("redirected open-template create should succeed");
+    server.join().expect("manifest server should stop cleanly");
+
+    assert_eq!(
+        state.live_children[0]
+            .selected_manifest_catalog_key
+            .as_deref(),
+        Some(canonical_root_url.as_str())
+    );
+    assert!(
+        state
+            .base_scenario
+            .manifest_catalog
+            .contains_key(canonical_root_url.as_str()),
+        "admitted runtime manifests should be keyed by the resolver's final URL"
+    );
+    assert!(
+        state
+            .base_scenario
+            .manifest_catalog
+            .contains_key(canonical_leaf_url.as_str()),
+        "admitting an open template should freeze transitive redirected dependencies"
+    );
+
+    let snapshot_response =
+        snapshot(&state, root_authority).expect("snapshot should succeed after redirected create");
+    let scenario_ir: ScenarioIr = serde_json::from_value(snapshot_response.scenario)
+        .expect("snapshot scenario should decode");
+    assert!(
+        scenario_ir
+            .components
+            .iter()
+            .any(|component| component.moniker == "/job-open/leaf"),
+        "snapshot should contain the redirected transitive child component"
     );
 }
 
