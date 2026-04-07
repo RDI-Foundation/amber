@@ -142,6 +142,70 @@ fn dot_renders_clusters_and_edges() {
 }
 
 #[test]
+fn dot_omits_composite_wrapper_node_without_direct_edges() {
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/alpha")),
+        Some(component(2, "/beta")),
+        Some(component(3, "/alpha/gamma")),
+    ];
+    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[3].as_mut().unwrap().parent = Some(ComponentId(1));
+
+    components[0]
+        .as_mut()
+        .unwrap()
+        .children
+        .extend([ComponentId(1), ComponentId(2)]);
+    components[1]
+        .as_mut()
+        .unwrap()
+        .children
+        .push(ComponentId(3));
+
+    let bindings = vec![BindingEdge {
+        from: BindingFrom::Component(ProvideRef {
+            component: ComponentId(3),
+            name: "cap".to_string(),
+        }),
+        to: SlotRef {
+            component: ComponentId(2),
+            name: "needs".to_string(),
+        },
+        weak: false,
+    }];
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings,
+        exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
+    };
+
+    let dot = render_dot(&scenario);
+    let expected = r#"digraph scenario {
+  rankdir=LR;
+  compound=true;
+  subgraph cluster_0 {
+    penwidth=2;
+    label="/";
+    subgraph cluster_1 {
+      penwidth=1;
+      label="/alpha";
+      c3 [label="/alpha/gamma"];
+    }
+    c2 [label="/beta"];
+  }
+  c3 -> c2 [label="cap"];
+}
+"#;
+
+    assert_eq!(dot, expected);
+}
+
+#[test]
 fn dot_renders_root_program_node() {
     let root_manifest: Manifest = r#"
         {

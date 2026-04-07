@@ -53,15 +53,7 @@ fn render_dot_with_exports(s: &Scenario) -> Result<String, ReporterError> {
 
 fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     let root = s.root;
-    let root_has_program = s.component(root).program.is_some();
-    let root_has_binding = s.bindings.iter().any(|b| {
-        matches!(&b.from, BindingFrom::Component(from) if from.component == root)
-            || matches!(&b.from, BindingFrom::Resource(from) if from.component == root)
-            || b.to.component == root
-    });
-    let root_needs_node =
-        !root_has_program && (exports.iter().any(|e| e.from == root) || root_has_binding);
-    let root_has_node = root_has_program || root_needs_node;
+    let root_has_node = composite_needs_node(s, root, exports);
     let has_framework = s
         .bindings
         .iter()
@@ -76,7 +68,7 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     let _ = writeln!(out, "  rankdir=LR;");
     let _ = writeln!(out, "  compound=true;");
 
-    render_root(s, root_needs_node, 1, &mut out);
+    render_root(s, root_has_node, 1, &mut out);
     for (id, c) in s.components_iter() {
         if id == root || c.parent.is_some() {
             continue;
@@ -155,6 +147,19 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     out
 }
 
+fn composite_needs_node(s: &Scenario, id: ComponentId, exports: &[ExportEdge]) -> bool {
+    let component = s.component(id);
+    if component.program.is_some() {
+        return true;
+    }
+
+    s.bindings.iter().any(|b| {
+        matches!(&b.from, BindingFrom::Component(from) if from.component == id)
+            || matches!(&b.from, BindingFrom::Resource(from) if from.component == id)
+            || b.to.component == id
+    }) || exports.iter().any(|e| e.from == id)
+}
+
 fn endpoint_label_for_provide(
     component: &Component,
     component_id: ComponentId,
@@ -224,7 +229,9 @@ fn render_component(s: &Scenario, id: ComponentId, indent: usize, out: &mut Stri
     write_escaped_label(out, c.moniker.as_str());
     let _ = writeln!(out, "\";");
 
-    render_node(s, id, indent + 1, out);
+    if composite_needs_node(s, id, &[]) {
+        render_node(s, id, indent + 1, out);
+    }
 
     for child in &c.children {
         render_component(s, *child, indent + 1, out);
