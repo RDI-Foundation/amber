@@ -1,4 +1,6 @@
-async fn prepare_child_record(
+use super::{api::*, state::*, *};
+
+pub(super) async fn prepare_child_record(
     state: &mut FrameworkControlState,
     authority_realm_id: usize,
     request: &CreateChildRequest,
@@ -117,7 +119,10 @@ async fn prepare_child_record(
     Ok(child)
 }
 
-fn remove_incident_bindings_from_survivors(state: &mut FrameworkControlState, child_id: u64) {
+pub(super) fn remove_incident_bindings_from_survivors(
+    state: &mut FrameworkControlState,
+    child_id: u64,
+) {
     for live_child in &mut state.live_children {
         if live_child.child_id == child_id {
             continue;
@@ -154,7 +159,7 @@ fn remove_incident_bindings_from_survivors(state: &mut FrameworkControlState, ch
 }
 
 #[cfg(test)]
-async fn create_child(
+pub(super) async fn create_child(
     state: &mut FrameworkControlState,
     authority_realm_id: usize,
     request: CreateChildRequest,
@@ -198,7 +203,7 @@ async fn create_child(
 }
 
 #[cfg(test)]
-async fn destroy_child(
+pub(super) async fn destroy_child(
     state: &mut FrameworkControlState,
     authority_realm_id: usize,
     child_name: &str,
@@ -236,18 +241,18 @@ async fn destroy_child(
     Ok(())
 }
 
-fn child_is_visible(child: &LiveChildRecord) -> bool {
+pub(super) fn child_is_visible(child: &LiveChildRecord) -> bool {
     matches!(child.state, ChildState::Live | ChildState::DestroyRequested)
 }
 
-fn child_counts_toward_template_limits(child: &LiveChildRecord) -> bool {
+pub(super) fn child_counts_toward_template_limits(child: &LiveChildRecord) -> bool {
     !matches!(
         child.state,
         ChildState::CreateAborted | ChildState::DestroyCommitted
     )
 }
 
-fn validate_child_name(name: &str) -> std::result::Result<(), ProtocolErrorResponse> {
+pub(super) fn validate_child_name(name: &str) -> std::result::Result<(), ProtocolErrorResponse> {
     if name.trim().is_empty() {
         return Err(protocol_error(
             ProtocolErrorCode::InvalidConfig,
@@ -263,7 +268,7 @@ fn validate_child_name(name: &str) -> std::result::Result<(), ProtocolErrorRespo
     Ok(())
 }
 
-fn validate_child_name_available(
+pub(super) fn validate_child_name_available(
     state: &FrameworkControlState,
     authority_realm_id: usize,
     child_name: &str,
@@ -282,7 +287,7 @@ fn validate_child_name_available(
     Ok(())
 }
 
-fn validate_template_limits(
+pub(super) fn validate_template_limits(
     state: &FrameworkControlState,
     authority_realm_id: usize,
     template_name: &str,
@@ -333,7 +338,7 @@ fn validate_template_limits(
     Ok(())
 }
 
-fn select_manifest_catalog_key(
+pub(super) fn select_manifest_catalog_key(
     template: &ChildTemplate,
     request: &CreateChildRequest,
 ) -> std::result::Result<String, ProtocolErrorResponse> {
@@ -372,7 +377,7 @@ fn select_manifest_catalog_key(
     }
 }
 
-fn build_child_config(
+pub(super) fn build_child_config(
     template: &ChildTemplate,
     request: &CreateChildRequest,
 ) -> std::result::Result<Option<serde_json::Value>, ProtocolErrorResponse> {
@@ -414,7 +419,7 @@ fn build_child_config(
     Ok((!config.is_empty()).then_some(serde_json::Value::Object(config)))
 }
 
-fn resolve_template_bindings(
+pub(super) fn resolve_template_bindings(
     template: &ChildTemplate,
     request: &CreateChildRequest,
     bindable_sources: &[BindableSourceCandidate],
@@ -487,7 +492,7 @@ fn resolve_template_bindings(
         .map(|bindings| bindings.into_iter().flatten().collect())
 }
 
-fn build_wrapper_manifest(
+pub(super) fn build_wrapper_manifest(
     state: &FrameworkControlState,
     template: &ChildTemplate,
     child_name: &str,
@@ -622,7 +627,7 @@ fn build_wrapper_manifest(
     Ok((manifest, synthetic_sources))
 }
 
-fn raw_binding(
+pub(super) fn raw_binding(
     to: &str,
     slot: String,
     from: &str,
@@ -644,7 +649,7 @@ fn raw_binding(
     })
 }
 
-fn component_ref_from_url(
+pub(super) fn component_ref_from_url(
     manifest: ManifestRef,
     config: Option<serde_json::Value>,
 ) -> std::result::Result<ComponentRef, ProtocolErrorResponse> {
@@ -662,24 +667,24 @@ fn component_ref_from_url(
     })
 }
 
-fn wrapper_manifest_url(authority_realm_id: usize, child_id: u64) -> url::Url {
+pub(super) fn wrapper_manifest_url(authority_realm_id: usize, child_id: u64) -> url::Url {
     url::Url::parse(&format!(
         "amber+framework://rendered-child/{authority_realm_id}/{child_id}"
     ))
     .expect("synthetic wrapper URL should parse")
 }
 
-fn allocate_child_id(state: &mut FrameworkControlState) -> u64 {
+pub(super) fn allocate_child_id(state: &mut FrameworkControlState) -> u64 {
     state.next_child_id += 1;
     state.next_child_id
 }
 
-fn allocate_tx_id(state: &mut FrameworkControlState) -> u64 {
+pub(super) fn allocate_tx_id(state: &mut FrameworkControlState) -> u64 {
     state.next_tx_id += 1;
     state.next_tx_id
 }
 
-fn append_journal_entry(
+pub(super) fn append_journal_entry(
     state: &mut FrameworkControlState,
     tx_id: u64,
     child: &LiveChildRecord,
@@ -696,7 +701,7 @@ fn append_journal_entry(
     });
 }
 
-fn transition_child_state(
+pub(super) fn transition_child_state(
     state: &mut FrameworkControlState,
     child_id: u64,
     next_state: ChildState,
@@ -706,7 +711,7 @@ fn transition_child_state(
     Ok(())
 }
 
-fn move_pending_create_to_live(
+pub(super) fn move_pending_create_to_live(
     state: &mut FrameworkControlState,
     child_id: u64,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
@@ -726,7 +731,7 @@ fn move_pending_create_to_live(
     Ok(())
 }
 
-fn remove_pending_create(
+pub(super) fn remove_pending_create(
     state: &mut FrameworkControlState,
     child_id: u64,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
@@ -744,7 +749,7 @@ fn remove_pending_create(
     Ok(())
 }
 
-fn move_live_child_to_pending_destroy(
+pub(super) fn move_live_child_to_pending_destroy(
     state: &mut FrameworkControlState,
     child_id: u64,
     tx_id: u64,
@@ -767,7 +772,7 @@ fn move_live_child_to_pending_destroy(
     Ok(())
 }
 
-fn remove_pending_destroy(
+pub(super) fn remove_pending_destroy(
     state: &mut FrameworkControlState,
     child_id: u64,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
@@ -785,7 +790,7 @@ fn remove_pending_destroy(
     Ok(())
 }
 
-fn remove_child_record(
+pub(super) fn remove_child_record(
     state: &mut FrameworkControlState,
     child_id: u64,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
@@ -803,7 +808,7 @@ fn remove_child_record(
     Ok(())
 }
 
-fn dynamic_site_plans(
+pub(super) fn dynamic_site_plans(
     desired_site_plans: &BTreeMap<String, amber_compiler::run_plan::RunSitePlan>,
     assignments: &BTreeMap<String, String>,
     fragment: &LiveScenarioFragment,
@@ -962,7 +967,7 @@ fn dynamic_site_plans(
     Ok(site_plans)
 }
 
-fn dynamic_input_route_records(
+pub(super) fn dynamic_input_route_records(
     scenario: &Scenario,
     assignments: &BTreeMap<String, String>,
     fragment: &LiveScenarioFragment,
@@ -1030,7 +1035,7 @@ fn dynamic_input_route_records(
         .collect()
 }
 
-fn dynamic_proxy_export_record(
+pub(super) fn dynamic_proxy_export_record(
     fragment: &LiveScenarioFragment,
     component_id: usize,
     provide_name: &str,
@@ -1084,7 +1089,7 @@ fn dynamic_proxy_export_record(
     })
 }
 
-fn dynamic_overlay_records(
+pub(super) fn dynamic_overlay_records(
     links: &[RunLink],
     fragment: &LiveScenarioFragment,
 ) -> Vec<DynamicOverlayRecord> {
@@ -1121,7 +1126,7 @@ fn dynamic_overlay_records(
     overlays
 }
 
-fn create_child_response(child: &LiveChildRecord) -> CreateChildResponse {
+pub(super) fn create_child_response(child: &LiveChildRecord) -> CreateChildResponse {
     CreateChildResponse {
         child: ChildHandle {
             name: child.name.clone(),
@@ -1143,7 +1148,7 @@ fn create_child_response(child: &LiveChildRecord) -> CreateChildResponse {
     }
 }
 
-fn extract_live_child_fragment(
+pub(super) fn extract_live_child_fragment(
     state: &mut FrameworkControlState,
     compiled: &CompiledScenario,
     synthetic_sources: &BTreeMap<String, SyntheticSourceRecord>,
@@ -1356,7 +1361,7 @@ fn extract_live_child_fragment(
     ))
 }
 
-async fn compile_frozen_manifest(
+pub(super) async fn compile_frozen_manifest(
     state: &FrameworkControlState,
     root: ManifestRef,
     extra_manifests: BTreeMap<String, Manifest>,
@@ -1391,7 +1396,7 @@ async fn compile_frozen_manifest(
     })
 }
 
-fn joined_moniker(parent: &str, child: &str) -> String {
+pub(super) fn joined_moniker(parent: &str, child: &str) -> String {
     if parent == "/" {
         child.to_string()
     } else {
@@ -1399,19 +1404,19 @@ fn joined_moniker(parent: &str, child: &str) -> String {
     }
 }
 
-fn child_state_keeps_capability_instances(state: ChildState) -> bool {
+pub(super) fn child_state_keeps_capability_instances(state: ChildState) -> bool {
     matches!(
         state,
         ChildState::CreatePrepared | ChildState::CreateCommittedHidden | ChildState::Live
     )
 }
 
-fn refresh_capability_instances(state: &mut FrameworkControlState) -> Result<()> {
+pub(super) fn refresh_capability_instances(state: &mut FrameworkControlState) -> Result<()> {
     state.capability_instances = collect_capability_instances(state)?;
     Ok(())
 }
 
-fn collect_capability_instances(
+pub(super) fn collect_capability_instances(
     state: &FrameworkControlState,
 ) -> Result<BTreeMap<String, CapabilityInstanceRecord>> {
     let active_children = all_child_records(state)
@@ -1468,7 +1473,7 @@ fn collect_capability_instances(
     Ok(records)
 }
 
-fn collect_capability_instance_from_binding(
+pub(super) fn collect_capability_instance_from_binding(
     records: &mut BTreeMap<String, CapabilityInstanceRecord>,
     binding: &BindingIr,
     moniker_by_id: &BTreeMap<usize, String>,
@@ -1537,7 +1542,7 @@ fn collect_capability_instance_from_binding(
     Ok(())
 }
 
-fn template_mode(template: &ChildTemplate) -> TemplateMode {
+pub(super) fn template_mode(template: &ChildTemplate) -> TemplateMode {
     if template.manifest.is_some() {
         TemplateMode::Exact
     } else {
@@ -1545,7 +1550,7 @@ fn template_mode(template: &ChildTemplate) -> TemplateMode {
     }
 }
 
-fn template_manifest_description(
+pub(super) fn template_manifest_description(
     scenario: &Scenario,
     template: &ChildTemplate,
 ) -> std::result::Result<TemplateManifestDescription, ProtocolErrorResponse> {
@@ -1574,22 +1579,22 @@ fn template_manifest_description(
 }
 
 #[derive(Clone)]
-struct ResolvedBindingSource {
-    from: BindingFrom,
-    weak: bool,
+pub(super) struct ResolvedBindingSource {
+    pub(super) from: BindingFrom,
+    pub(super) weak: bool,
 }
 
 #[derive(Clone)]
-struct BindableSourceCandidate {
-    selector: String,
-    handle: Option<String>,
-    decl: CapabilityDecl,
-    sources: Vec<ResolvedBindingSource>,
-    source_child_id: Option<u64>,
-    dynamic_child_output: Option<DynamicChildOutputSource>,
+pub(super) struct BindableSourceCandidate {
+    pub(super) selector: String,
+    pub(super) handle: Option<String>,
+    pub(super) decl: CapabilityDecl,
+    pub(super) sources: Vec<ResolvedBindingSource>,
+    pub(super) source_child_id: Option<u64>,
+    pub(super) dynamic_child_output: Option<DynamicChildOutputSource>,
 }
 
-fn placement_file_from_state(state: &FrameworkControlState) -> PlacementFile {
+pub(super) fn placement_file_from_state(state: &FrameworkControlState) -> PlacementFile {
     let mut components = state.placement.placement_components.clone();
     for child in visible_child_records(state) {
         components.extend(child.assignments.clone());
@@ -1603,7 +1608,9 @@ fn placement_file_from_state(state: &FrameworkControlState) -> PlacementFile {
     }
 }
 
-fn run_plan_activation_from_state(state: &FrameworkControlState) -> RunPlanActivationState {
+pub(super) fn run_plan_activation_from_state(
+    state: &FrameworkControlState,
+) -> RunPlanActivationState {
     let mut initial_active_sites = state.placement.initial_active_sites.clone();
     let mut dynamic_enabled_sites = state.placement.dynamic_enabled_sites.clone();
     let mut active_site_capabilities = state.placement.active_site_capabilities.clone();
@@ -1631,7 +1638,7 @@ fn run_plan_activation_from_state(state: &FrameworkControlState) -> RunPlanActiv
     }
 }
 
-fn live_assignment_map(state: &FrameworkControlState) -> BTreeMap<String, String> {
+pub(super) fn live_assignment_map(state: &FrameworkControlState) -> BTreeMap<String, String> {
     let mut assignments = state.placement.assignments.clone();
     for child in visible_child_records(state) {
         assignments.extend(child.assignments.clone());
@@ -1639,7 +1646,7 @@ fn live_assignment_map(state: &FrameworkControlState) -> BTreeMap<String, String
     assignments
 }
 
-fn scenario_with_fragment(
+pub(super) fn scenario_with_fragment(
     current_live_scenario_ir: &ScenarioIr,
     fragment: &LiveScenarioFragment,
 ) -> std::result::Result<Scenario, ProtocolErrorResponse> {
@@ -1683,7 +1690,7 @@ fn scenario_with_fragment(
     })
 }
 
-fn live_scenario_ir(
+pub(super) fn live_scenario_ir(
     state: &FrameworkControlState,
 ) -> std::result::Result<ScenarioIr, ProtocolErrorResponse> {
     let mut components = state
@@ -1758,7 +1765,7 @@ fn live_scenario_ir(
     })
 }
 
-fn decode_live_scenario(
+pub(super) fn decode_live_scenario(
     state: &FrameworkControlState,
 ) -> std::result::Result<Scenario, ProtocolErrorResponse> {
     Scenario::try_from(live_scenario_ir(state)?).map_err(|err| {
@@ -1769,7 +1776,7 @@ fn decode_live_scenario(
     })
 }
 
-fn normalize_scenario_ir_order(scenario_ir: &mut ScenarioIr) {
+pub(super) fn normalize_scenario_ir_order(scenario_ir: &mut ScenarioIr) {
     scenario_ir.components.sort_by(|left, right| {
         left.moniker
             .cmp(&right.moniker)
@@ -1851,7 +1858,7 @@ fn normalize_scenario_ir_order(scenario_ir: &mut ScenarioIr) {
         .sort_by(|left, right| left.name.cmp(&right.name));
 }
 
-fn binding_sort_key(binding: &BindingIr, monikers: &BTreeMap<usize, String>) -> String {
+pub(super) fn binding_sort_key(binding: &BindingIr, monikers: &BTreeMap<usize, String>) -> String {
     let source = match &binding.from {
         BindingFromIr::Component { component, provide } => format!(
             "component:{}:{provide}",
@@ -1888,7 +1895,10 @@ fn binding_sort_key(binding: &BindingIr, monikers: &BTreeMap<usize, String>) -> 
     )
 }
 
-fn live_child_component_owner(state: &FrameworkControlState, component_id: usize) -> Option<u64> {
+pub(super) fn live_child_component_owner(
+    state: &FrameworkControlState,
+    component_id: usize,
+) -> Option<u64> {
     all_child_records(state)
         .filter_map(|child| {
             let fragment = child.fragment.as_ref()?;
@@ -1901,7 +1911,7 @@ fn live_child_component_owner(state: &FrameworkControlState, component_id: usize
         .next()
 }
 
-fn output_sources_from_record(
+pub(super) fn output_sources_from_record(
     output: &OutputHandleRecord,
 ) -> std::result::Result<Vec<ResolvedBindingSource>, ProtocolErrorResponse> {
     output
@@ -1916,7 +1926,7 @@ fn output_sources_from_record(
         .collect()
 }
 
-fn bindable_source_candidates(
+pub(super) fn bindable_source_candidates(
     scenario: &Scenario,
     scenario_ir: &ScenarioIr,
     state: &FrameworkControlState,
@@ -2032,7 +2042,7 @@ fn bindable_source_candidates(
     Ok(out)
 }
 
-fn slot_binding_sources(
+pub(super) fn slot_binding_sources(
     scenario: &Scenario,
     component_id: ComponentId,
     slot_name: &str,
@@ -2048,7 +2058,7 @@ fn slot_binding_sources(
         .collect()
 }
 
-fn static_child_export_candidates(
+pub(super) fn static_child_export_candidates(
     scenario: &Scenario,
     scenario_ir: &ScenarioIr,
     state: &FrameworkControlState,
@@ -2105,7 +2115,7 @@ fn static_child_export_candidates(
     Ok(out)
 }
 
-fn component_ir(
+pub(super) fn component_ir(
     scenario_ir: &ScenarioIr,
     component_id: ComponentId,
 ) -> std::result::Result<&ComponentIr, ProtocolErrorResponse> {
@@ -2124,12 +2134,12 @@ fn component_ir(
         })
 }
 
-struct ResolvedComponentExportCandidate {
+pub(super) struct ResolvedComponentExportCandidate {
     decl: CapabilityDecl,
     sources: Vec<ResolvedBindingSource>,
 }
 
-fn resolve_component_export_candidate(
+pub(super) fn resolve_component_export_candidate(
     scenario: &Scenario,
     scenario_ir: &ScenarioIr,
     component_id: ComponentId,
@@ -2144,7 +2154,7 @@ fn resolve_component_export_candidate(
     )
 }
 
-fn resolve_component_export_candidate_inner(
+pub(super) fn resolve_component_export_candidate_inner(
     scenario: &Scenario,
     scenario_ir: &ScenarioIr,
     component_id: ComponentId,
@@ -2173,7 +2183,7 @@ fn resolve_component_export_candidate_inner(
     result
 }
 
-fn resolve_component_export_candidate_target(
+pub(super) fn resolve_component_export_candidate_target(
     scenario: &Scenario,
     scenario_ir: &ScenarioIr,
     component_id: ComponentId,
@@ -2264,7 +2274,7 @@ fn resolve_component_export_candidate_target(
     }
 }
 
-fn child_alias<'a>(parent_moniker: &str, child_moniker: &'a str) -> Option<&'a str> {
+pub(super) fn child_alias<'a>(parent_moniker: &str, child_moniker: &'a str) -> Option<&'a str> {
     if child_moniker == "/" {
         return None;
     }
@@ -2278,7 +2288,7 @@ fn child_alias<'a>(parent_moniker: &str, child_moniker: &'a str) -> Option<&'a s
     remainder.split('/').find(|segment| !segment.is_empty())
 }
 
-fn dynamic_child_output_source(
+pub(super) fn dynamic_child_output_source(
     child: &LiveChildRecord,
     output: &OutputHandleRecord,
 ) -> Option<DynamicChildOutputSource> {
@@ -2308,7 +2318,7 @@ fn dynamic_child_output_source(
     })
 }
 
-fn find_bindable_source<'a>(
+pub(super) fn find_bindable_source<'a>(
     bindable_sources: &'a [BindableSourceCandidate],
     selector: &str,
 ) -> std::result::Result<&'a BindableSourceCandidate, ProtocolErrorResponse> {
@@ -2330,7 +2340,7 @@ fn find_bindable_source<'a>(
     Ok(candidate)
 }
 
-fn find_bindable_source_by_handle<'a>(
+pub(super) fn find_bindable_source_by_handle<'a>(
     bindable_sources: &'a [BindableSourceCandidate],
     handle: &str,
 ) -> std::result::Result<&'a BindableSourceCandidate, ProtocolErrorResponse> {
@@ -2345,14 +2355,14 @@ fn find_bindable_source_by_handle<'a>(
         })
 }
 
-fn runtime_backend_name(backend: &amber_manifest::RuntimeBackend) -> String {
+pub(super) fn runtime_backend_name(backend: &amber_manifest::RuntimeBackend) -> String {
     serde_json::to_value(backend)
         .ok()
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn frozen_template_contract(
+pub(super) fn frozen_template_contract(
     template: &ChildTemplate,
 ) -> std::result::Result<&ChildTemplate, ProtocolErrorResponse> {
     if template.frozen {
@@ -2365,19 +2375,19 @@ fn frozen_template_contract(
     ))
 }
 
-fn template_config_fields(
+pub(super) fn template_config_fields(
     template: &ChildTemplate,
 ) -> std::result::Result<BTreeMap<String, TemplateConfigField>, ProtocolErrorResponse> {
     Ok(frozen_template_contract(template)?.config.clone())
 }
 
-fn template_binding_fields(
+pub(super) fn template_binding_fields(
     template: &ChildTemplate,
 ) -> std::result::Result<BTreeMap<String, TemplateBinding>, ProtocolErrorResponse> {
     Ok(frozen_template_contract(template)?.bindings.clone())
 }
 
-fn root_template_slot_decl<'a>(
+pub(super) fn root_template_slot_decl<'a>(
     template: &'a ChildTemplate,
     slot_name: &str,
 ) -> std::result::Result<&'a amber_manifest::SlotDecl, ProtocolErrorResponse> {
@@ -2392,7 +2402,7 @@ fn root_template_slot_decl<'a>(
         })
 }
 
-fn visible_exports(
+pub(super) fn visible_exports(
     template: &ChildTemplate,
 ) -> std::result::Result<Vec<String>, ProtocolErrorResponse> {
     frozen_template_contract(template)?
@@ -2407,11 +2417,11 @@ fn visible_exports(
         })
 }
 
-fn source_compatible(target: CapabilityDecl, candidate: CapabilityDecl) -> bool {
+pub(super) fn source_compatible(target: CapabilityDecl, candidate: CapabilityDecl) -> bool {
     target.kind == candidate.kind && target.profile == candidate.profile
 }
 
-fn decode_base_scenario(
+pub(super) fn decode_base_scenario(
     state: &FrameworkControlState,
 ) -> std::result::Result<Scenario, ProtocolErrorResponse> {
     Scenario::try_from(state.base_scenario.clone()).map_err(|err| {
@@ -2422,7 +2432,7 @@ fn decode_base_scenario(
     })
 }
 
-fn binding_from_from_ir(
+pub(super) fn binding_from_from_ir(
     from: BindingFromIr,
 ) -> std::result::Result<BindingFrom, ProtocolErrorResponse> {
     match from {
@@ -2460,7 +2470,10 @@ fn binding_from_from_ir(
     }
 }
 
-fn live_binding_source_record(from: &BindingFrom, weak: bool) -> LiveBindingSourceRecord {
+pub(super) fn live_binding_source_record(
+    from: &BindingFrom,
+    weak: bool,
+) -> LiveBindingSourceRecord {
     LiveBindingSourceRecord {
         from: BindingFromIr::from(from),
         weak,
@@ -2476,7 +2489,7 @@ pub(crate) fn protocol_error(code: ProtocolErrorCode, message: &str) -> Protocol
 }
 
 #[derive(Clone)]
-struct FrozenCatalogBackend {
+pub(super) struct FrozenCatalogBackend {
     entries: Arc<BTreeMap<String, ManifestCatalogEntryIr>>,
     extra_manifests: Arc<BTreeMap<String, Manifest>>,
 }
@@ -2518,7 +2531,7 @@ impl Backend for FrozenCatalogBackend {
     }
 }
 
-fn frozen_catalog_schemes<'a>(
+pub(super) fn frozen_catalog_schemes<'a>(
     entries: impl Iterator<Item = &'a ManifestCatalogEntryIr>,
 ) -> Vec<String> {
     let mut schemes = entries
@@ -2534,49 +2547,48 @@ fn frozen_catalog_schemes<'a>(
 }
 
 #[derive(Clone)]
-struct ControlStateApp {
-    control_state: Arc<Mutex<FrameworkControlState>>,
-    client: ReqwestClient,
-    state_path: PathBuf,
-    run_root: PathBuf,
-    state_root: PathBuf,
-    mesh_scope: Arc<str>,
-    control_state_auth_token: Arc<str>,
-    authority_locks: Arc<Mutex<BTreeMap<usize, Arc<Mutex<()>>>>>,
-    bridge_proxies: Arc<Mutex<BTreeMap<BridgeProxyKey, BridgeProxyHandle>>>,
+pub(super) struct ControlStateApp {
+    pub(super) control_state: Arc<Mutex<FrameworkControlState>>,
+    pub(super) client: ReqwestClient,
+    pub(super) state_path: PathBuf,
+    pub(super) run_root: PathBuf,
+    pub(super) state_root: PathBuf,
+    pub(super) mesh_scope: Arc<str>,
+    pub(super) control_state_auth_token: Arc<str>,
+    pub(super) authority_locks: Arc<Mutex<BTreeMap<usize, Arc<Mutex<()>>>>>,
+    pub(super) bridge_proxies: Arc<Mutex<BTreeMap<BridgeProxyKey, BridgeProxyHandle>>>,
 }
 
 #[derive(Clone)]
-struct CcsApp {
-    client: ReqwestClient,
-    control_state_url: Arc<str>,
-    router_auth_token: Arc<str>,
-    control_state_auth_token: Arc<str>,
+pub(super) struct CcsApp {
+    pub(super) client: ReqwestClient,
+    pub(super) control_state_url: Arc<str>,
+    pub(super) router_auth_token: Arc<str>,
+    pub(super) control_state_auth_token: Arc<str>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct SiteManagerStateView {
-    status: String,
-    kind: SiteKind,
-    artifact_dir: String,
-    supervisor_pid: u32,
+pub(super) struct SiteManagerStateView {
+    pub(super) status: String,
+    pub(super) kind: SiteKind,
+    pub(super) artifact_dir: String,
+    pub(super) supervisor_pid: u32,
     #[serde(default)]
-    process_pid: Option<u32>,
+    pub(super) process_pid: Option<u32>,
     #[serde(default)]
-    compose_project: Option<String>,
+    pub(super) compose_project: Option<String>,
     #[serde(default)]
-    kubernetes_namespace: Option<String>,
+    pub(super) kubernetes_namespace: Option<String>,
     #[serde(default)]
-    port_forward_pid: Option<u32>,
+    pub(super) port_forward_pid: Option<u32>,
     #[serde(default)]
-    context: Option<String>,
+    pub(super) context: Option<String>,
     #[serde(default)]
-    router_control: Option<String>,
+    pub(super) router_control: Option<String>,
     #[serde(default)]
-    router_mesh_addr: Option<String>,
+    pub(super) router_mesh_addr: Option<String>,
     #[serde(default)]
-    router_identity_id: Option<String>,
+    pub(super) router_identity_id: Option<String>,
     #[serde(default)]
-    router_public_key_b64: Option<String>,
+    pub(super) router_public_key_b64: Option<String>,
 }
-

@@ -68,13 +68,23 @@ use crate::mixed_run::{
     stop_bridge_proxies, update_desired_overlay_for_consumer, update_desired_overlay_for_provider,
 };
 
-include!("state.rs");
-include!("api.rs");
-include!("planner.rs");
-include!("orchestration.rs");
-include!("http.rs");
-
+mod api;
+mod http;
+mod orchestration;
+mod planner;
+mod state;
 #[cfg(test)]
-mod tests {
-    include!("tests.rs");
-}
+mod tests;
+
+pub(crate) use self::{
+    http::{run_framework_ccs, run_framework_control_state},
+    orchestration::{
+        SiteActuatorDestroyRequest, SiteActuatorPrepareRequest, SiteActuatorPublishRequest,
+    },
+    state::{
+        DynamicInputRouteRecord, DynamicInputRouteTarget, DynamicProxyExportRecord,
+        DynamicSitePlanRecord, build_control_state, ccs_listen_addr_for_site, ccs_url_for_site,
+        control_state_service_url, generate_framework_auth_token, write_control_state,
+        write_control_state_service_plan, write_framework_ccs_plan,
+    },
+};

@@ -1,3 +1,5 @@
+use super::{planner::*, state::*, *};
+
 pub(crate) fn authorize_capability_instance<'a>(
     state: &'a FrameworkControlState,
     cap_instance_id: &str,
@@ -13,7 +15,7 @@ pub(crate) fn authorize_capability_instance<'a>(
     Ok(record)
 }
 
-fn capability_instance_record<'a>(
+pub(super) fn capability_instance_record<'a>(
     state: &'a FrameworkControlState,
     cap_instance_id: &str,
 ) -> std::result::Result<&'a CapabilityInstanceRecord, ProtocolErrorResponse> {
@@ -28,7 +30,7 @@ fn capability_instance_record<'a>(
         })
 }
 
-fn scenario_component_checked(
+pub(super) fn scenario_component_checked(
     scenario: &Scenario,
     component_id: ComponentId,
 ) -> std::result::Result<&Component, ProtocolErrorResponse> {
@@ -262,28 +264,27 @@ pub(crate) fn snapshot(
 }
 
 #[derive(Clone)]
-struct ResolvedTemplateBinding {
-    slot_name: String,
-    slot_decl: amber_manifest::SlotDecl,
-    sources: Vec<ResolvedBindingSource>,
-    source_child_id: Option<u64>,
-    dynamic_child_output: Option<DynamicChildOutputSource>,
+pub(super) struct ResolvedTemplateBinding {
+    pub(super) slot_name: String,
+    pub(super) slot_decl: amber_manifest::SlotDecl,
+    pub(super) sources: Vec<ResolvedBindingSource>,
+    pub(super) source_child_id: Option<u64>,
+    pub(super) dynamic_child_output: Option<DynamicChildOutputSource>,
 }
 
 #[derive(Clone)]
-struct SyntheticSourceRecord {
-    slot_name: String,
-    actual_source: BindingFrom,
-    source_child_id: Option<u64>,
-    weak: bool,
+pub(super) struct SyntheticSourceRecord {
+    pub(super) slot_name: String,
+    pub(super) actual_source: BindingFrom,
+    pub(super) source_child_id: Option<u64>,
+    pub(super) weak: bool,
 }
 
 #[derive(Clone)]
-struct DynamicChildOutputSource {
-    provider_component: String,
-    provide: String,
-    protocol: String,
-    capability_kind: String,
-    capability_profile: Option<String>,
+pub(super) struct DynamicChildOutputSource {
+    pub(super) provider_component: String,
+    pub(super) provide: String,
+    pub(super) protocol: String,
+    pub(super) capability_kind: String,
+    pub(super) capability_profile: Option<String>,
 }
-
