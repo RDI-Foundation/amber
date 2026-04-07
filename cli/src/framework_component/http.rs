@@ -1,3 +1,5 @@
+use super::{api::*, orchestration::*, planner::*, state::*, *};
+
 pub(crate) async fn run_framework_control_state(plan_path: PathBuf) -> Result<()> {
     let plan: FrameworkControlStateServicePlan =
         read_json(plan_path.as_path(), "framework control-state plan")?;
@@ -86,11 +88,11 @@ pub(crate) async fn run_framework_ccs(plan_path: PathBuf) -> Result<()> {
         .wrap_err("framework CCS failed")
 }
 
-async fn healthz() -> Json<serde_json::Value> {
+pub(super) async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
 
-async fn cleanup_dynamic_bridge_proxies(app: &ControlStateApp) -> Result<()> {
+pub(super) async fn cleanup_dynamic_bridge_proxies(app: &ControlStateApp) -> Result<()> {
     let mut bridge_proxies = {
         let mut guard = app.bridge_proxies.lock().await;
         std::mem::take(&mut *guard)
@@ -98,7 +100,7 @@ async fn cleanup_dynamic_bridge_proxies(app: &ControlStateApp) -> Result<()> {
     stop_bridge_proxies(&mut bridge_proxies).await
 }
 
-async fn get_control_state(
+pub(super) async fn get_control_state(
     State(app): State<ControlStateApp>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<FrameworkControlState>, ProtocolApiError> {
@@ -106,7 +108,7 @@ async fn get_control_state(
     Ok(Json(app.control_state.lock().await.clone()))
 }
 
-async fn control_create_child(
+pub(super) async fn control_create_child(
     State(app): State<ControlStateApp>,
     headers: HeaderMap,
     Json(request): Json<ControlCreateChildRequest>,
@@ -123,7 +125,7 @@ async fn control_create_child(
     ))
 }
 
-async fn control_destroy_child(
+pub(super) async fn control_destroy_child(
     State(app): State<ControlStateApp>,
     headers: HeaderMap,
     AxumPath(child): AxumPath<String>,
@@ -140,7 +142,7 @@ async fn control_destroy_child(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn ccs_list_templates(
+pub(super) async fn ccs_list_templates(
     State(app): State<CcsApp>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<TemplateListResponse>, ProtocolApiError> {
@@ -148,7 +150,7 @@ async fn ccs_list_templates(
     Ok(Json(list_templates(&state, record.authority_realm_id)?))
 }
 
-async fn ccs_describe_template(
+pub(super) async fn ccs_describe_template(
     State(app): State<CcsApp>,
     headers: HeaderMap,
     AxumPath(template): AxumPath<String>,
@@ -161,7 +163,7 @@ async fn ccs_describe_template(
     )?))
 }
 
-async fn ccs_list_children(
+pub(super) async fn ccs_list_children(
     State(app): State<CcsApp>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<ChildListResponse>, ProtocolApiError> {
@@ -169,7 +171,7 @@ async fn ccs_list_children(
     Ok(Json(list_children(&state, record.authority_realm_id)))
 }
 
-async fn ccs_create_child(
+pub(super) async fn ccs_create_child(
     State(app): State<CcsApp>,
     headers: HeaderMap,
     Json(request): Json<CreateChildRequest>,
@@ -180,7 +182,7 @@ async fn ccs_create_child(
     ))
 }
 
-async fn ccs_describe_child(
+pub(super) async fn ccs_describe_child(
     State(app): State<CcsApp>,
     headers: HeaderMap,
     AxumPath(child): AxumPath<String>,
@@ -193,7 +195,7 @@ async fn ccs_describe_child(
     )?))
 }
 
-async fn ccs_snapshot(
+pub(super) async fn ccs_snapshot(
     State(app): State<CcsApp>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<SnapshotResponse>, ProtocolApiError> {
@@ -201,7 +203,7 @@ async fn ccs_snapshot(
     Ok(Json(snapshot(&state, record.authority_realm_id)?))
 }
 
-async fn ccs_destroy_child(
+pub(super) async fn ccs_destroy_child(
     State(app): State<CcsApp>,
     headers: HeaderMap,
     AxumPath(child): AxumPath<String>,
@@ -211,7 +213,7 @@ async fn ccs_destroy_child(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn authorize_request(
+pub(super) async fn authorize_request(
     app: &CcsApp,
     headers: &HeaderMap,
 ) -> std::result::Result<(String, CapabilityInstanceRecord, FrameworkControlState), ProtocolApiError>
@@ -226,7 +228,7 @@ async fn authorize_request(
     Ok((peer_id, record, state))
 }
 
-fn authorize_framework_auth_header(
+pub(super) fn authorize_framework_auth_header(
     headers: &HeaderMap,
     expected: &str,
 ) -> std::result::Result<(), ProtocolApiError> {
@@ -239,7 +241,7 @@ fn authorize_framework_auth_header(
     Ok(())
 }
 
-fn required_header(
+pub(super) fn required_header(
     headers: &HeaderMap,
     name: &str,
 ) -> std::result::Result<String, ProtocolApiError> {
@@ -256,7 +258,7 @@ fn required_header(
         })
 }
 
-async fn fetch_control_state(
+pub(super) async fn fetch_control_state(
     app: &CcsApp,
 ) -> std::result::Result<FrameworkControlState, ProtocolApiError> {
     let url = format!(
@@ -288,7 +290,7 @@ async fn fetch_control_state(
     })
 }
 
-async fn forward_create_child(
+pub(super) async fn forward_create_child(
     app: &CcsApp,
     cap_instance_id: &str,
     request: CreateChildRequest,
@@ -315,7 +317,7 @@ async fn forward_create_child(
     parse_control_service_json(response).await
 }
 
-async fn forward_destroy_child(
+pub(super) async fn forward_destroy_child(
     app: &CcsApp,
     cap_instance_id: &str,
     child: &str,
@@ -341,7 +343,7 @@ async fn forward_destroy_child(
     parse_control_service_empty(response).await
 }
 
-async fn parse_control_service_json<T: for<'de> Deserialize<'de>>(
+pub(super) async fn parse_control_service_json<T: for<'de> Deserialize<'de>>(
     response: reqwest::Response,
 ) -> std::result::Result<T, ProtocolApiError> {
     if response.status().is_success() {
@@ -365,7 +367,7 @@ async fn parse_control_service_json<T: for<'de> Deserialize<'de>>(
     )))
 }
 
-async fn parse_control_service_empty(
+pub(super) async fn parse_control_service_empty(
     response: reqwest::Response,
 ) -> std::result::Result<(), ProtocolApiError> {
     if response.status().is_success() {
@@ -385,7 +387,7 @@ async fn parse_control_service_empty(
     )))
 }
 
-async fn shutdown_signal() {
+pub(super) async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -412,7 +414,7 @@ async fn shutdown_signal() {
     ctrl_c.await;
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(super) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .into_diagnostic()
@@ -423,7 +425,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_bytes_atomic(path, &bytes)
 }
 
-fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -469,7 +471,7 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn sync_parent_directory(path: &Path) -> Result<()> {
+pub(super) fn sync_parent_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         if let Some(parent) = path.parent() {
@@ -490,11 +492,10 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T> {
+pub(super) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T> {
     let bytes = fs::read(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read {label} {}", path.display()))?;
     serde_json::from_slice(&bytes)
         .map_err(|err| miette::miette!("invalid {label} {}: {err}", path.display()))
 }
-

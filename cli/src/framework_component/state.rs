@@ -1,13 +1,16 @@
-const CONTROL_STATE_SCHEMA: &str = "amber.framework_component.control_state";
-const CONTROL_STATE_VERSION: u32 = 1;
-const CONTROL_SERVICE_PLAN_SCHEMA: &str = "amber.framework_component.control_service_plan";
-const CONTROL_SERVICE_PLAN_VERSION: u32 = 1;
-const CCS_PLAN_SCHEMA: &str = "amber.framework_component.ccs_plan";
-const CCS_PLAN_VERSION: u32 = 1;
-const CONTROL_SERVICE_PATH: &str = "/v1/control-state";
-const FRAMEWORK_ROUTE_ID_HEADER: &str = "x-amber-route-id";
-const FRAMEWORK_PEER_ID_HEADER: &str = "x-amber-peer-id";
-const FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
+use super::{http::*, orchestration::*, planner::*, *};
+
+pub(super) const CONTROL_STATE_SCHEMA: &str = "amber.framework_component.control_state";
+pub(super) const CONTROL_STATE_VERSION: u32 = 1;
+pub(super) const CONTROL_SERVICE_PLAN_SCHEMA: &str =
+    "amber.framework_component.control_service_plan";
+pub(super) const CONTROL_SERVICE_PLAN_VERSION: u32 = 1;
+pub(super) const CCS_PLAN_SCHEMA: &str = "amber.framework_component.ccs_plan";
+pub(super) const CCS_PLAN_VERSION: u32 = 1;
+pub(super) const CONTROL_SERVICE_PATH: &str = "/v1/control-state";
+pub(super) const FRAMEWORK_ROUTE_ID_HEADER: &str = "x-amber-route-id";
+pub(super) const FRAMEWORK_PEER_ID_HEADER: &str = "x-amber-peer-id";
+pub(super) const FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct FrozenPlacementState {
@@ -311,12 +314,12 @@ pub(crate) fn write_control_state(path: &Path, state: &FrameworkControlState) ->
     write_json(path, state)
 }
 
-fn persist_control_state(path: &Path, state: &mut FrameworkControlState) -> Result<()> {
+pub(super) fn persist_control_state(path: &Path, state: &mut FrameworkControlState) -> Result<()> {
     refresh_capability_instances(state)?;
     write_control_state(path, state)
 }
 
-fn persist_control_state_update<T>(
+pub(super) fn persist_control_state_update<T>(
     state: &mut FrameworkControlState,
     path: &Path,
     step: &str,
@@ -338,13 +341,15 @@ fn persist_control_state_update<T>(
 }
 
 #[derive(Clone, Copy)]
-enum ChildRecordLocation {
+pub(super) enum ChildRecordLocation {
     Live(usize),
     PendingCreate(usize),
     PendingDestroy(usize),
 }
 
-fn all_child_records(state: &FrameworkControlState) -> impl Iterator<Item = &LiveChildRecord> {
+pub(super) fn all_child_records(
+    state: &FrameworkControlState,
+) -> impl Iterator<Item = &LiveChildRecord> {
     state
         .live_children
         .iter()
@@ -352,7 +357,9 @@ fn all_child_records(state: &FrameworkControlState) -> impl Iterator<Item = &Liv
         .chain(state.pending_destroys.iter().map(|record| &record.child))
 }
 
-fn visible_child_records(state: &FrameworkControlState) -> impl Iterator<Item = &LiveChildRecord> {
+pub(super) fn visible_child_records(
+    state: &FrameworkControlState,
+) -> impl Iterator<Item = &LiveChildRecord> {
     state
         .live_children
         .iter()
@@ -360,7 +367,7 @@ fn visible_child_records(state: &FrameworkControlState) -> impl Iterator<Item = 
         .filter(|child| child_is_visible(child))
 }
 
-fn child_record_location(
+pub(super) fn child_record_location(
     state: &FrameworkControlState,
     child_id: u64,
 ) -> std::result::Result<ChildRecordLocation, ProtocolErrorResponse> {
@@ -391,7 +398,7 @@ fn child_record_location(
     ))
 }
 
-fn child_record_mut(
+pub(super) fn child_record_mut(
     state: &mut FrameworkControlState,
     child_id: u64,
 ) -> std::result::Result<&mut LiveChildRecord, ProtocolErrorResponse> {
@@ -402,7 +409,7 @@ fn child_record_mut(
     }
 }
 
-fn child_create_tx_id(
+pub(super) fn child_create_tx_id(
     state: &FrameworkControlState,
     child_id: u64,
 ) -> std::result::Result<u64, ProtocolErrorResponse> {
@@ -419,7 +426,7 @@ fn child_create_tx_id(
         })
 }
 
-fn child_destroy_tx_id(
+pub(super) fn child_destroy_tx_id(
     state: &FrameworkControlState,
     child_id: u64,
 ) -> std::result::Result<u64, ProtocolErrorResponse> {
@@ -479,4 +486,3 @@ pub(crate) fn write_framework_ccs_plan(
     write_json(path, &plan)?;
     Ok(plan)
 }
-

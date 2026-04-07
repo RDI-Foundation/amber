@@ -1,3 +1,5 @@
+use super::{http::*, planner::*, state::*, *};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SiteActuatorPrepareRequest {
     pub(crate) site_plan: DynamicSitePlanRecord,
@@ -15,21 +17,21 @@ pub(crate) struct SiteActuatorDestroyRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ControlCreateChildRequest {
-    cap_instance_id: String,
-    request: CreateChildRequest,
+pub(super) struct ControlCreateChildRequest {
+    pub(super) cap_instance_id: String,
+    pub(super) request: CreateChildRequest,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ControlDestroyChildRequest {
-    cap_instance_id: String,
+pub(super) struct ControlDestroyChildRequest {
+    pub(super) cap_instance_id: String,
 }
 
 #[derive(Debug)]
-struct ProtocolApiError(ProtocolErrorResponse);
+pub(super) struct ProtocolApiError(pub(super) ProtocolErrorResponse);
 
 impl ProtocolApiError {
-    fn control_state_unavailable(message: impl Into<String>) -> Self {
+    pub(super) fn control_state_unavailable(message: impl Into<String>) -> Self {
         Self(ProtocolErrorResponse {
             code: ProtocolErrorCode::ControlStateUnavailable,
             message: message.into(),
@@ -37,7 +39,7 @@ impl ProtocolApiError {
         })
     }
 
-    fn unauthorized(message: impl Into<String>) -> Self {
+    pub(super) fn unauthorized(message: impl Into<String>) -> Self {
         Self(ProtocolErrorResponse {
             code: ProtocolErrorCode::Unauthorized,
             message: message.into(),
@@ -45,7 +47,7 @@ impl ProtocolApiError {
         })
     }
 
-    fn status_code(&self) -> StatusCode {
+    pub(super) fn status_code(&self) -> StatusCode {
         match self.0.code {
             ProtocolErrorCode::Unauthorized => StatusCode::FORBIDDEN,
             ProtocolErrorCode::UnknownTemplate
@@ -79,14 +81,17 @@ impl IntoResponse for ProtocolApiError {
     }
 }
 
-fn control_state_step_error(step: &str, err: impl std::fmt::Display) -> ProtocolErrorResponse {
+pub(super) fn control_state_step_error(
+    step: &str,
+    err: impl std::fmt::Display,
+) -> ProtocolErrorResponse {
     protocol_error(
         ProtocolErrorCode::ControlStateUnavailable,
         &format!("failed to persist {step}: {err}"),
     )
 }
 
-fn actuator_protocol_error(
+pub(super) fn actuator_protocol_error(
     code: ProtocolErrorCode,
     site_id: &str,
     action: &str,
@@ -98,19 +103,19 @@ fn actuator_protocol_error(
     )
 }
 
-fn site_state_root_for(app: &ControlStateApp, site_id: &str) -> PathBuf {
+pub(super) fn site_state_root_for(app: &ControlStateApp, site_id: &str) -> PathBuf {
     Path::new(&app.state_root).join(site_id)
 }
 
-fn site_actuator_plan_path_for_site(app: &ControlStateApp, site_id: &str) -> PathBuf {
+pub(super) fn site_actuator_plan_path_for_site(app: &ControlStateApp, site_id: &str) -> PathBuf {
     site_state_root_for(app, site_id).join("site-actuator-plan.json")
 }
 
-fn site_actuator_base_url(plan: &SiteActuatorPlan) -> String {
+pub(super) fn site_actuator_base_url(plan: &SiteActuatorPlan) -> String {
     format!("http://{}", plan.listen_addr)
 }
 
-fn site_receipt_from_manager_state(state: &SiteManagerStateView) -> SiteReceipt {
+pub(super) fn site_receipt_from_manager_state(state: &SiteManagerStateView) -> SiteReceipt {
     SiteReceipt {
         kind: state.kind,
         artifact_dir: state.artifact_dir.clone(),
@@ -127,7 +132,7 @@ fn site_receipt_from_manager_state(state: &SiteManagerStateView) -> SiteReceipt 
     }
 }
 
-fn full_site_plan_record(
+pub(super) fn full_site_plan_record(
     site_id: &str,
     site_plan: &amber_compiler::run_plan::RunSitePlan,
 ) -> DynamicSitePlanRecord {
@@ -149,7 +154,7 @@ fn full_site_plan_record(
     }
 }
 
-fn desired_site_plan_map(
+pub(super) fn desired_site_plan_map(
     state: &FrameworkControlState,
     site_ids: &BTreeSet<String>,
 ) -> std::result::Result<BTreeMap<String, DynamicSitePlanRecord>, ProtocolErrorResponse> {
@@ -172,7 +177,7 @@ fn desired_site_plan_map(
         .collect())
 }
 
-fn load_site_manager_state(
+pub(super) fn load_site_manager_state(
     app: &ControlStateApp,
     site_id: &str,
 ) -> std::result::Result<SiteManagerStateView, ProtocolErrorResponse> {
@@ -188,7 +193,7 @@ fn load_site_manager_state(
     })
 }
 
-fn load_launched_site(
+pub(super) fn load_launched_site(
     app: &ControlStateApp,
     site_id: &str,
 ) -> std::result::Result<LaunchedSite, ProtocolErrorResponse> {
@@ -208,7 +213,7 @@ fn load_launched_site(
     })
 }
 
-fn load_site_actuator_plan(
+pub(super) fn load_site_actuator_plan(
     app: &ControlStateApp,
     site_id: &str,
 ) -> std::result::Result<SiteActuatorPlan, ProtocolErrorResponse> {
@@ -221,7 +226,7 @@ fn load_site_actuator_plan(
     })
 }
 
-async fn call_site_actuator<B: Serialize>(
+pub(super) async fn call_site_actuator<B: Serialize>(
     app: &ControlStateApp,
     site_id: &str,
     path: &str,
@@ -254,7 +259,7 @@ async fn call_site_actuator<B: Serialize>(
     ))
 }
 
-async fn prepare_child_on_site(
+pub(super) async fn prepare_child_on_site(
     app: &ControlStateApp,
     child_id: u64,
     site_plan: &DynamicSitePlanRecord,
@@ -273,7 +278,7 @@ async fn prepare_child_on_site(
     .await
 }
 
-async fn publish_child_on_site(
+pub(super) async fn publish_child_on_site(
     app: &ControlStateApp,
     child_id: u64,
     site_plan: &DynamicSitePlanRecord,
@@ -292,7 +297,11 @@ async fn publish_child_on_site(
     .await
 }
 
-async fn rollback_child_on_site(app: &ControlStateApp, child_id: u64, site_id: &str) -> Result<()> {
+pub(super) async fn rollback_child_on_site(
+    app: &ControlStateApp,
+    child_id: u64,
+    site_id: &str,
+) -> Result<()> {
     let path = format!("/v1/children/{child_id}/rollback");
     let plan = load_site_actuator_plan(app, site_id)
         .map_err(|err| miette::miette!("failed to load site actuator plan: {}", err.message))?;
@@ -315,7 +324,7 @@ async fn rollback_child_on_site(app: &ControlStateApp, child_id: u64, site_id: &
     ))
 }
 
-async fn destroy_child_on_site(
+pub(super) async fn destroy_child_on_site(
     app: &ControlStateApp,
     child_id: u64,
     site_id: &str,
@@ -333,7 +342,7 @@ async fn destroy_child_on_site(
     .await
 }
 
-async fn publish_external_slot_overlay(
+pub(super) async fn publish_external_slot_overlay(
     app: &ControlStateApp,
     child: &LiveChildRecord,
     link: &RunLink,
@@ -398,7 +407,7 @@ async fn publish_external_slot_overlay(
     })
 }
 
-async fn publish_export_peer_overlay(
+pub(super) async fn publish_export_peer_overlay(
     app: &ControlStateApp,
     child: &LiveChildRecord,
     link: &RunLink,
@@ -450,7 +459,7 @@ async fn publish_export_peer_overlay(
     })
 }
 
-fn child_link_records(child: &LiveChildRecord) -> Vec<RunLink> {
+pub(super) fn child_link_records(child: &LiveChildRecord) -> Vec<RunLink> {
     let mut links = BTreeMap::new();
     for overlay in &child.overlays {
         let DynamicOverlayAction::ExternalSlot { link } = &overlay.action else {
@@ -469,7 +478,7 @@ fn child_link_records(child: &LiveChildRecord) -> Vec<RunLink> {
     links.into_values().collect()
 }
 
-fn child_link_overlays_are_active(child: &LiveChildRecord) -> bool {
+pub(super) fn child_link_overlays_are_active(child: &LiveChildRecord) -> bool {
     matches!(
         child.state,
         ChildState::CreateCommittedHidden
@@ -479,7 +488,7 @@ fn child_link_overlays_are_active(child: &LiveChildRecord) -> bool {
     )
 }
 
-fn link_still_required(
+pub(super) fn link_still_required(
     state: &FrameworkControlState,
     removed_child_id: u64,
     link: &RunLink,
@@ -494,7 +503,7 @@ fn link_still_required(
         })
 }
 
-fn provider_output_dir_for_link(
+pub(super) fn provider_output_dir_for_link(
     app: &ControlStateApp,
     child: &LiveChildRecord,
     provider_artifact_dir: &Path,
@@ -516,7 +525,7 @@ fn provider_output_dir_for_link(
     .join("artifact")
 }
 
-fn export_peer_route_id(
+pub(super) fn export_peer_route_id(
     child: &LiveChildRecord,
     link: &RunLink,
 ) -> std::result::Result<String, ProtocolErrorResponse> {
@@ -542,7 +551,7 @@ fn export_peer_route_id(
     })
 }
 
-fn overlay_id_for_link_action<'a>(
+pub(super) fn overlay_id_for_link_action<'a>(
     child: &'a LiveChildRecord,
     link: &RunLink,
     match_action: impl Fn(&DynamicOverlayAction) -> bool,
@@ -565,7 +574,7 @@ fn overlay_id_for_link_action<'a>(
         })
 }
 
-fn link_mesh_protocol(protocol: NetworkProtocol) -> Result<MeshProtocol> {
+pub(super) fn link_mesh_protocol(protocol: NetworkProtocol) -> Result<MeshProtocol> {
     Ok(match protocol {
         NetworkProtocol::Http | NetworkProtocol::Https => MeshProtocol::Http,
         NetworkProtocol::Tcp => MeshProtocol::Tcp,
@@ -577,7 +586,7 @@ fn link_mesh_protocol(protocol: NetworkProtocol) -> Result<MeshProtocol> {
     })
 }
 
-async fn publish_link_overlays(
+pub(super) async fn publish_link_overlays(
     app: &ControlStateApp,
     child: &LiveChildRecord,
     link: &RunLink,
@@ -586,7 +595,7 @@ async fn publish_link_overlays(
     publish_export_peer_overlay(app, child, link).await
 }
 
-async fn retract_link_overlays(
+pub(super) async fn retract_link_overlays(
     app: &ControlStateApp,
     child: &LiveChildRecord,
     link: &RunLink,
@@ -595,7 +604,7 @@ async fn retract_link_overlays(
     clear_export_peer_overlay(app, child.child_id, child, link).await
 }
 
-async fn clear_external_slot_overlay(
+pub(super) async fn clear_external_slot_overlay(
     app: &ControlStateApp,
     child_id: u64,
     child: &LiveChildRecord,
@@ -636,7 +645,7 @@ async fn clear_external_slot_overlay(
     })
 }
 
-async fn clear_export_peer_overlay(
+pub(super) async fn clear_export_peer_overlay(
     app: &ControlStateApp,
     child_id: u64,
     child: &LiveChildRecord,
@@ -685,7 +694,7 @@ async fn clear_export_peer_overlay(
     })
 }
 
-async fn publish_child_overlays(
+pub(super) async fn publish_child_overlays(
     app: &ControlStateApp,
     child: &LiveChildRecord,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
@@ -695,7 +704,7 @@ async fn publish_child_overlays(
     Ok(())
 }
 
-async fn retract_child_overlays(
+pub(super) async fn retract_child_overlays(
     app: &ControlStateApp,
     child: &LiveChildRecord,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
@@ -705,7 +714,7 @@ async fn retract_child_overlays(
     Ok(())
 }
 
-fn child_site_publish_waves(child: &LiveChildRecord) -> Vec<Vec<String>> {
+pub(super) fn child_site_publish_waves(child: &LiveChildRecord) -> Vec<Vec<String>> {
     let site_ids = child
         .site_plans
         .iter()
@@ -778,7 +787,7 @@ fn child_site_publish_waves(child: &LiveChildRecord) -> Vec<Vec<String>> {
     waves
 }
 
-fn cloned_child_record(
+pub(super) fn cloned_child_record(
     state: &FrameworkControlState,
     child_id: u64,
 ) -> std::result::Result<LiveChildRecord, ProtocolErrorResponse> {
@@ -793,7 +802,7 @@ fn cloned_child_record(
         })
 }
 
-async fn rollback_prepared_sites(
+pub(super) async fn rollback_prepared_sites(
     app: &ControlStateApp,
     child_id: u64,
     prepared_sites: &[String],
@@ -804,7 +813,7 @@ async fn rollback_prepared_sites(
     Ok(())
 }
 
-async fn acquire_authority_lock(
+pub(super) async fn acquire_authority_lock(
     app: &ControlStateApp,
     authority_realm_id: usize,
 ) -> tokio::sync::OwnedMutexGuard<()> {
@@ -818,7 +827,7 @@ async fn acquire_authority_lock(
     lock.lock_owned().await
 }
 
-async fn continue_create_committed_hidden(
+pub(super) async fn continue_create_committed_hidden(
     app: &ControlStateApp,
     child_id: u64,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
@@ -905,7 +914,7 @@ async fn continue_create_committed_hidden(
     })
 }
 
-async fn continue_destroy_retracted(
+pub(super) async fn continue_destroy_retracted(
     app: &ControlStateApp,
     child_id: u64,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
@@ -968,7 +977,7 @@ async fn continue_destroy_retracted(
     })
 }
 
-async fn continue_destroy_requested(
+pub(super) async fn continue_destroy_requested(
     app: &ControlStateApp,
     child_id: u64,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
@@ -1000,7 +1009,7 @@ async fn continue_destroy_requested(
     continue_destroy_retracted(app, child_id).await
 }
 
-async fn execute_create_child(
+pub(super) async fn execute_create_child(
     app: &ControlStateApp,
     authority_realm_id: usize,
     request: CreateChildRequest,
@@ -1094,7 +1103,7 @@ async fn execute_create_child(
     Ok(create_child_response(&live_child))
 }
 
-async fn execute_destroy_child(
+pub(super) async fn execute_destroy_child(
     app: &ControlStateApp,
     authority_realm_id: usize,
     child_name: &str,
@@ -1148,7 +1157,7 @@ async fn execute_destroy_child(
     Ok(())
 }
 
-async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
+pub(super) async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
     let children = {
         let state = app.control_state.lock().await;
         all_child_records(&state).cloned().collect::<Vec<_>>()
@@ -1229,4 +1238,3 @@ async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
     }
     Ok(())
 }
-
