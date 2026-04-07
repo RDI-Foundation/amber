@@ -1332,9 +1332,48 @@ fn parse_sse_events_parses_framed_messages() {
         events[0].data,
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#
     );
+    assert_eq!(events[0].data_bytes, events[0].data.len());
+    assert!(!events[0].truncated);
     assert_eq!(events[1].event, None);
     assert_eq!(events[1].id, None);
     assert_eq!(events[1].data, "plain");
+    assert_eq!(events[1].data_bytes, 5);
+    assert!(!events[1].truncated);
+}
+
+#[test]
+fn parse_sse_events_in_chunks_truncates_large_data_lines() {
+    let payload = "A".repeat(DEFAULT_HTTP_SSE_EVENT_CAPTURE_LIMIT_BYTES + 1024);
+    let body = format!("event: artifact\ndata: {payload}\n\n");
+    let chunks = [&body[..32], &body[32..8192], &body[8192..]];
+    let events = parse_sse_events_in_chunks(&chunks);
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.as_deref(), Some("artifact"));
+    assert_eq!(events[0].data_bytes, payload.len());
+    assert_eq!(
+        events[0].data.len(),
+        DEFAULT_HTTP_SSE_EVENT_CAPTURE_LIMIT_BYTES
+    );
+    assert!(events[0].truncated);
+    assert!(events[0].data.chars().all(|ch| ch == 'A'));
+}
+
+#[test]
+fn parse_sse_events_does_not_truncate_empty_data_line_that_exactly_fills_limit() {
+    let payload = "A".repeat(DEFAULT_HTTP_SSE_EVENT_CAPTURE_LIMIT_BYTES - 1);
+    let body = format!("event: message\nid: 7\ndata: {payload}\ndata:\n\n");
+    let events = parse_sse_events(&body);
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.as_deref(), Some("message"));
+    assert_eq!(events[0].id.as_deref(), Some("7"));
+    assert_eq!(events[0].data, format!("{payload}\n"));
+    assert_eq!(
+        events[0].data_bytes,
+        DEFAULT_HTTP_SSE_EVENT_CAPTURE_LIMIT_BYTES
+    );
+    assert!(!events[0].truncated);
 }
 
 #[test]

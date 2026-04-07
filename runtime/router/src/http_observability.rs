@@ -1,6 +1,7 @@
 use super::*;
 
 const DEFAULT_HTTP_BODY_CAPTURE_LIMIT_BYTES: usize = 256 * 1024;
+pub(super) const DEFAULT_HTTP_SSE_EVENT_CAPTURE_LIMIT_BYTES: usize = 64 * 1024;
 
 // We keep local HeaderMap adapters because opentelemetry-http currently uses
 // `http` 0.2 while the router stack uses `http` 1.x.
@@ -1136,42 +1137,70 @@ pub(super) struct ParsedSseEvent {
     pub(super) event: Option<String>,
     pub(super) id: Option<String>,
     pub(super) data: String,
+    pub(super) data_bytes: usize,
+    pub(super) truncated: bool,
 }
 
 #[derive(Default)]
 struct SseStreamParser {
-    pending_line: String,
+    pending_line: Vec<u8>,
+    next_search_offset: usize,
     event_name: Option<String>,
     event_id: Option<String>,
-    data_lines: Vec<String>,
+    data: String,
+    saw_data_field: bool,
+    data_bytes: usize,
+    data_truncated: bool,
+    captured_data_bytes: usize,
 }
 
 impl SseStreamParser {
-    fn push_text(&mut self, chunk: &str, is_final: bool) -> Vec<ParsedSseEvent> {
-        self.pending_line.push_str(chunk);
+    fn push_bytes(&mut self, chunk: &[u8], is_final: bool) -> Vec<ParsedSseEvent> {
+        let mut pending_line = std::mem::take(&mut self.pending_line);
+        pending_line.extend_from_slice(chunk);
         let mut events = Vec::new();
+        let mut line_start = 0usize;
+        let mut search_offset = self.next_search_offset.min(pending_line.len());
 
-        while let Some(index) = self.pending_line.find('\n') {
-            let mut line = self.pending_line[..index].to_string();
-            self.pending_line.drain(..=index);
-            if line.ends_with('\r') {
-                line.pop();
-            }
-            self.process_line(line.as_str(), &mut events);
+        while let Some(relative_index) = pending_line[search_offset..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let index = search_offset + relative_index;
+            let line = pending_line[line_start..index]
+                .strip_suffix(b"\r")
+                .unwrap_or(&pending_line[line_start..index]);
+            self.process_line_bytes(line, &mut events);
+            line_start = index + 1;
+            search_offset = line_start;
+        }
+
+        if line_start > 0 {
+            pending_line.drain(..line_start);
+            self.next_search_offset = 0;
+        } else {
+            self.next_search_offset = pending_line.len();
         }
 
         if is_final {
-            if !self.pending_line.is_empty() {
-                let mut line = std::mem::take(&mut self.pending_line);
-                if line.ends_with('\r') {
-                    line.pop();
-                }
-                self.process_line(line.as_str(), &mut events);
+            if !pending_line.is_empty() {
+                let line = pending_line
+                    .strip_suffix(b"\r")
+                    .unwrap_or(pending_line.as_slice());
+                self.process_line_bytes(line, &mut events);
+                pending_line.clear();
             }
+            self.next_search_offset = 0;
             self.flush_event(&mut events);
         }
 
+        self.pending_line = pending_line;
         events
+    }
+
+    fn process_line_bytes(&mut self, line: &[u8], events: &mut Vec<ParsedSseEvent>) {
+        let line = String::from_utf8_lossy(line);
+        self.process_line(line.as_ref(), events);
     }
 
     fn process_line(&mut self, line: &str, events: &mut Vec<ParsedSseEvent>) {
@@ -1189,27 +1218,95 @@ impl SseStreamParser {
         match field {
             "event" => self.event_name = Some(value.to_string()),
             "id" => self.event_id = Some(value.to_string()),
-            "data" => self.data_lines.push(value.to_string()),
+            "data" => self.push_data_line(value),
             _ => {}
         }
     }
 
+    fn push_data_line(&mut self, value: &str) {
+        let separator_len = usize::from(self.saw_data_field);
+        self.saw_data_field = true;
+        self.data_bytes = self
+            .data_bytes
+            .saturating_add(separator_len.saturating_add(value.len()));
+        if self.data_truncated {
+            return;
+        }
+
+        if separator_len == 1 {
+            if self.captured_data_bytes == DEFAULT_HTTP_SSE_EVENT_CAPTURE_LIMIT_BYTES {
+                self.data_truncated = true;
+                return;
+            }
+            self.data.push('\n');
+            self.captured_data_bytes += 1;
+        }
+
+        let remaining =
+            DEFAULT_HTTP_SSE_EVENT_CAPTURE_LIMIT_BYTES.saturating_sub(self.captured_data_bytes);
+        if remaining == 0 {
+            if !value.is_empty() {
+                self.data_truncated = true;
+            }
+            return;
+        }
+
+        let captured = truncate_to_utf8_boundary(value, remaining);
+        self.data.push_str(captured);
+        self.captured_data_bytes += captured.len();
+        if captured.len() != value.len() {
+            self.data_truncated = true;
+        }
+    }
+
     fn flush_event(&mut self, events: &mut Vec<ParsedSseEvent>) {
-        if !self.data_lines.is_empty() || self.event_name.is_some() || self.event_id.is_some() {
+        if self.saw_data_field || self.event_name.is_some() || self.event_id.is_some() {
             events.push(ParsedSseEvent {
                 event: self.event_name.take(),
                 id: self.event_id.take(),
-                data: self.data_lines.join("\n"),
+                data: std::mem::take(&mut self.data),
+                data_bytes: std::mem::take(&mut self.data_bytes),
+                truncated: std::mem::take(&mut self.data_truncated),
             });
-            self.data_lines.clear();
+            self.saw_data_field = false;
+            self.captured_data_bytes = 0;
         }
+    }
+}
+
+fn truncate_to_utf8_boundary(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = 0usize;
+    for (index, _) in value.char_indices() {
+        if index > max_bytes {
+            break;
+        }
+        end = index;
+    }
+    if end == 0 && max_bytes == value.len() {
+        value
+    } else {
+        &value[..end]
     }
 }
 
 #[cfg(test)]
 pub(super) fn parse_sse_events(body_text: &str) -> Vec<ParsedSseEvent> {
     let mut parser = SseStreamParser::default();
-    parser.push_text(body_text, true)
+    parser.push_bytes(body_text.as_bytes(), true)
+}
+
+#[cfg(test)]
+pub(super) fn parse_sse_events_in_chunks(chunks: &[&str]) -> Vec<ParsedSseEvent> {
+    let mut parser = SseStreamParser::default();
+    let mut events = Vec::new();
+    for chunk in chunks {
+        events.extend(parser.push_bytes(chunk.as_bytes(), false));
+    }
+    events.extend(parser.push_bytes(&[], true));
+    events
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1253,12 +1350,16 @@ fn emit_sse_event(
     telemetry: &HttpExchangeTelemetryContext,
     sse_event: ParsedSseEvent,
 ) {
-    let summary = extract_protocol_summary(telemetry, &sse_event.data);
+    let summary = if sse_event.truncated {
+        ProtocolSummary::default()
+    } else {
+        extract_protocol_summary(telemetry, &sse_event.data)
+    };
     let message = format!(
         "{} [stream event]",
         exchange_message(telemetry, HttpLifecyclePart::Response, &summary)
     );
-    let mut extra_attributes = Vec::with_capacity(3);
+    let mut extra_attributes = Vec::with_capacity(5);
     push_nonempty_log_attr(
         &mut extra_attributes,
         "amber_sse_event",
@@ -1268,6 +1369,18 @@ fn emit_sse_event(
         &mut extra_attributes,
         "amber_sse_id",
         sse_event.id.as_deref().unwrap_or(""),
+    );
+    if sse_event.data_bytes > 0 {
+        push_log_attr(
+            &mut extra_attributes,
+            "amber_sse_data_size_bytes",
+            i64::try_from(sse_event.data_bytes).unwrap_or(i64::MAX),
+        );
+    }
+    push_true_log_attr(
+        &mut extra_attributes,
+        "amber_sse_data_truncated",
+        sse_event.truncated,
     );
     push_nonempty_log_attr(
         &mut extra_attributes,
@@ -1376,7 +1489,7 @@ fn emit_captured_body_completion(
     sse_parser: &mut Option<SseStreamParser>,
 ) {
     if let Some(mut parser) = sse_parser.take() {
-        for sse_event in parser.push_text("", true) {
+        for sse_event in parser.push_bytes(&[], true) {
             emit_sse_event(&completion.span, &completion.telemetry, sse_event);
         }
     }
@@ -1480,8 +1593,7 @@ pub(super) fn capture_box_body(
                                 }
                             }
                             if let Some(parser) = sse_parser.as_mut() {
-                                let chunk_text = String::from_utf8_lossy(chunk.as_ref());
-                                for sse_event in parser.push_text(chunk_text.as_ref(), false) {
+                                for sse_event in parser.push_bytes(chunk.as_ref(), false) {
                                     emit_sse_event(&span, &telemetry, sse_event);
                                 }
                             }
