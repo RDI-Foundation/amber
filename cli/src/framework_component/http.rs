@@ -63,6 +63,10 @@ pub(crate) async fn run_framework_ccs(plan_path: PathBuf) -> Result<()> {
         .route("/v1/templates", get(ccs_list_templates))
         .route("/v1/templates/{template}", get(ccs_describe_template))
         .route(
+            "/v1/templates/{template}/resolve",
+            post(ccs_resolve_template),
+        )
+        .route(
             "/v1/children",
             get(ccs_list_children).post(ccs_create_child),
         )
@@ -161,6 +165,18 @@ pub(super) async fn ccs_describe_template(
         record.authority_realm_id,
         &template,
     )?))
+}
+
+pub(super) async fn ccs_resolve_template(
+    State(app): State<CcsApp>,
+    headers: HeaderMap,
+    AxumPath(template): AxumPath<String>,
+    Json(request): Json<TemplateResolveRequest>,
+) -> std::result::Result<Json<TemplateDescribeResponse>, ProtocolApiError> {
+    let (_, record, state) = authorize_request(&app, &headers).await?;
+    Ok(Json(
+        resolve_template(&state, record.authority_realm_id, &template, request).await?,
+    ))
 }
 
 pub(super) async fn ccs_list_children(

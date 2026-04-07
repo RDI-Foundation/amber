@@ -99,7 +99,7 @@ impl fmt::Display for ManifestDigest {
 #[non_exhaustive]
 pub struct ManifestRef {
     pub url: ManifestUrl,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<ManifestDigest>,
 }
 

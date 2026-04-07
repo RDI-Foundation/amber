@@ -418,7 +418,7 @@ fn framework_child_artifact(run: &RunHandle, site_id: &str, child_id: u64) -> Pa
         .join("artifact")
 }
 
-fn framework_manifest_catalog_key(path: &Path) -> String {
+fn framework_manifest_url(path: &Path) -> String {
     let canonical = path
         .canonicalize()
         .unwrap_or_else(|err| panic!("failed to canonicalize {}: {err}", path.display()));
@@ -1248,8 +1248,8 @@ fn framework_component_direct_create_destroy_live() {
 
 #[test]
 #[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
-fn framework_component_open_template_frozen_source_replay_live() {
-    let temp = temp_output_dir("framework-component-frozen-open-template-");
+fn framework_component_bounded_template_frozen_source_replay_live() {
+    let temp = temp_output_dir("framework-component-frozen-bounded-template-");
     let admin_port = pick_free_port();
     let alpha_port = pick_free_port();
     let beta_port = pick_free_port();
@@ -1268,8 +1268,8 @@ fn framework_component_open_template_frozen_source_replay_live() {
     write_framework_worker_component(temp.path(), "beta.json5", false, "beta-original", beta_port);
     let alpha_path = temp.path().join("alpha.json5");
     let beta_path = temp.path().join("beta.json5");
-    let alpha_key = framework_manifest_catalog_key(&alpha_path);
-    let beta_key = framework_manifest_catalog_key(&beta_path);
+    let alpha_manifest = framework_manifest_url(&alpha_path);
+    let beta_manifest = framework_manifest_url(&beta_path);
 
     let manifest = temp.path().join("root.json5");
     write_json(
@@ -1284,7 +1284,7 @@ fn framework_component_open_template_frozen_source_replay_live() {
             },
             "child_templates": {
                 "worker": {
-                    "allowed_manifests": [alpha_key.clone(), beta_key.clone()]
+                    "manifest": [alpha_manifest.clone(), beta_manifest.clone()]
                 }
             },
             "bindings": [
@@ -1341,14 +1341,12 @@ fn framework_component_open_template_frozen_source_replay_live() {
         &json!({
             "template": "worker",
             "name": "job-beta",
-            "manifest": {
-                "catalog_key": beta_key
-            }
+            "manifest": beta_manifest
         }),
     );
     assert_eq!(
         create_status, 200,
-        "open-template create should use the frozen catalog; response: {create_response}"
+        "bounded-template create should use the frozen catalog; response: {create_response}"
     );
 
     let control_state_path = framework_control_state_path(&run);
@@ -1409,9 +1407,7 @@ fn framework_component_open_template_frozen_source_replay_live() {
         &json!({
             "template": "worker",
             "name": "job-alpha",
-            "manifest": {
-                "catalog_key": alpha_key
-            }
+            "manifest": alpha_manifest
         }),
     );
     assert_eq!(
@@ -1718,9 +1714,8 @@ fn framework_component_create_to_unoffered_site_fails_deterministically_live() {
         direct_worker_port,
     );
 
-    let compose_manifest =
-        framework_manifest_catalog_key(&temp.path().join("compose-worker.json5"));
-    let direct_manifest = framework_manifest_catalog_key(&temp.path().join("direct-worker.json5"));
+    let compose_manifest = framework_manifest_url(&temp.path().join("compose-worker.json5"));
+    let direct_manifest = framework_manifest_url(&temp.path().join("direct-worker.json5"));
 
     let manifest = temp.path().join("root.json5");
     write_json(
@@ -1735,7 +1730,7 @@ fn framework_component_create_to_unoffered_site_fails_deterministically_live() {
             },
             "child_templates": {
                 "worker": {
-                    "allowed_manifests": [
+                    "manifest": [
                         compose_manifest,
                         direct_manifest
                     ]
@@ -1776,8 +1771,8 @@ fn framework_component_create_to_unoffered_site_fails_deterministically_live() {
         .expect("failed to run amber");
     assert!(
         !output.status.success(),
-        "run should fail deterministically when an open template allows a manifest that requires \
-         an unoffered site\nstdout:\n{}\nstderr:\n{}",
+        "run should fail deterministically when a bounded template allows a manifest that \
+         requires an unoffered site\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );

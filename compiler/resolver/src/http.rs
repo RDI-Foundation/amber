@@ -184,7 +184,12 @@ mod tests {
     fn accept_with_deadline(listener: &TcpListener, deadline: Instant) -> std::net::TcpStream {
         loop {
             match listener.accept() {
-                Ok((stream, _)) => return stream,
+                Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("accepted redirect test stream should be blocking");
+                    return stream;
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
                         panic!("timed out waiting for client connection");

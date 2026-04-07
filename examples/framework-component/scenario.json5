@@ -7,8 +7,13 @@
     admin: "./admin.json5",
   },
   child_templates: {
-    worker: {
-      manifest: "./worker.json5",
+    exact_worker: {
+      manifest: "./worker-red.json5",
+    },
+    bounded_worker: {
+      manifest: ["./worker-blue.json5", "./worker-green.json5"],
+    },
+    open_worker: {
     },
   },
   bindings: [

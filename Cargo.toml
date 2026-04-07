@@ -10,7 +10,6 @@ members = [
   "compiler/template",
   "images",
   "manager",
-  "node",
   "runtime/docker-gateway",
   "runtime/helper",
   "runtime/mesh",

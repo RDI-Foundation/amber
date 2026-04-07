@@ -78,7 +78,6 @@ pub(crate) fn describe_template(
     template_name: &str,
 ) -> std::result::Result<TemplateDescribeResponse, ProtocolErrorResponse> {
     let scenario = decode_live_scenario(state)?;
-    let scenario_ir = live_scenario_ir(state)?;
     let component = scenario_component_checked(&scenario, ComponentId(authority_realm_id))?;
     let template = component
         .child_templates
@@ -87,16 +86,149 @@ pub(crate) fn describe_template(
             protocol_error(ProtocolErrorCode::UnknownTemplate, "unknown child template")
         })?;
     let manifest = template_manifest_description(&scenario, template)?;
+    let config = template
+        .config
+        .iter()
+        .filter_map(|(name, field)| match field {
+            TemplateConfigField::Prefilled { value } => Some((
+                name.clone(),
+                ConfigFieldDescription {
+                    state: InputState::Prefilled,
+                    value: Some(value.clone()),
+                    required: None,
+                },
+            )),
+            TemplateConfigField::Open { .. } => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let bindings = template
+        .bindings
+        .iter()
+        .filter_map(|(name, field)| match field {
+            TemplateBinding::Prefilled { selector } => Some((
+                name.clone(),
+                BindingInputDescription {
+                    state: InputState::Prefilled,
+                    selector: Some(selector.to_string()),
+                    optional: None,
+                    compatible_kind: None,
+                    candidates: Vec::new(),
+                },
+            )),
+            TemplateBinding::Open { .. } => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    Ok(TemplateDescribeResponse {
+        name: template_name.to_string(),
+        manifest,
+        config,
+        bindings,
+        exports: TemplateExportsDescription {
+            visible: template.visible_exports.clone().unwrap_or_default(),
+        },
+        limits: TemplateLimits {
+            max_live_children: template
+                .limits
+                .as_ref()
+                .and_then(|limits| limits.max_live_children.map(u64::from)),
+        },
+        possible_backends: template
+            .possible_backends
+            .iter()
+            .map(runtime_backend_name)
+            .collect(),
+    })
+}
+
+pub(crate) async fn resolve_template(
+    state: &FrameworkControlState,
+    authority_realm_id: usize,
+    template_name: &str,
+    request: TemplateResolveRequest,
+) -> std::result::Result<TemplateDescribeResponse, ProtocolErrorResponse> {
+    let scenario = decode_live_scenario(state)?;
+    let scenario_ir = live_scenario_ir(state)?;
+    let component = scenario_component_checked(&scenario, ComponentId(authority_realm_id))?;
+    let template = component
+        .child_templates
+        .get(template_name)
+        .ok_or_else(|| {
+            protocol_error(ProtocolErrorCode::UnknownTemplate, "unknown child template")
+        })?
+        .clone();
     let bindable_sources = bindable_source_candidates(
         &scenario,
         &scenario_ir,
         state,
         ComponentId(authority_realm_id),
     )?;
-    let template_config = template_config_fields(template)?;
-    let template_bindings = template_binding_fields(template)?;
 
-    let config = template_config
+    let mut preview_state = state.clone();
+    let selected_manifest_catalog_key = select_manifest_catalog_key(
+        &mut preview_state,
+        &template,
+        &CreateChildRequest {
+            template: template_name.to_string(),
+            name: "__resolve__".to_string(),
+            manifest: request.manifest,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        },
+    )
+    .await?;
+    let contract = resolve_template_contract(
+        &preview_state.base_scenario.manifest_catalog,
+        &template,
+        &selected_manifest_catalog_key,
+    )?;
+    let bindings = contract
+        .bindings
+        .iter()
+        .map(
+            |(name, field)| -> std::result::Result<_, ProtocolErrorResponse> {
+                let slot_decl = contract.slot_decls.get(name.as_str()).ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!("resolved template contract is missing slot `{name}`"),
+                    )
+                })?;
+                Ok((
+                    name.clone(),
+                    match field {
+                        TemplateBinding::Prefilled { selector } => BindingInputDescription {
+                            state: InputState::Prefilled,
+                            selector: Some(selector.to_string()),
+                            optional: None,
+                            compatible_kind: None,
+                            candidates: Vec::new(),
+                        },
+                        TemplateBinding::Open { optional } => BindingInputDescription {
+                            state: InputState::Open,
+                            selector: None,
+                            optional: Some(*optional),
+                            compatible_kind: Some(slot_decl.decl.kind.to_string()),
+                            candidates: bindable_sources
+                                .iter()
+                                .filter(|candidate| !candidate.sources.is_empty())
+                                .filter(|candidate| {
+                                    source_compatible(
+                                        slot_decl.decl.clone(),
+                                        candidate.decl.clone(),
+                                    )
+                                })
+                                .map(|candidate| candidate.selector.clone())
+                                .collect(),
+                        },
+                    },
+                ))
+            },
+        )
+        .collect::<std::result::Result<BTreeMap<_, _>, ProtocolErrorResponse>>()?;
+
+    let config = contract
+        .config
         .iter()
         .map(|(name, field)| {
             (
@@ -117,54 +249,33 @@ pub(crate) fn describe_template(
         })
         .collect();
 
-    let bindings = template_bindings
-        .iter()
-        .map(
-            |(name, field)| -> std::result::Result<_, ProtocolErrorResponse> {
-                Ok((
-                    name.clone(),
-                    match field {
-                        TemplateBinding::Prefilled { selector } => BindingInputDescription {
-                            state: InputState::Prefilled,
-                            selector: Some(selector.to_string()),
-                            optional: None,
-                            compatible_kind: None,
-                            candidates: Vec::new(),
-                        },
-                        TemplateBinding::Open { optional } => {
-                            let slot_decl = root_template_slot_decl(template, name)?;
-                            let candidates = bindable_sources
-                                .iter()
-                                .filter(|candidate| !candidate.sources.is_empty())
-                                .filter(|candidate| {
-                                    source_compatible(
-                                        slot_decl.decl.clone(),
-                                        candidate.decl.clone(),
-                                    )
-                                })
-                                .map(|candidate| candidate.selector.clone())
-                                .collect::<Vec<_>>();
-                            BindingInputDescription {
-                                state: InputState::Open,
-                                selector: None,
-                                optional: Some(*optional),
-                                compatible_kind: Some(slot_decl.decl.kind.to_string()),
-                                candidates,
-                            }
-                        }
-                    },
-                ))
-            },
-        )
-        .collect::<std::result::Result<BTreeMap<_, _>, ProtocolErrorResponse>>()?;
+    let manifest_entry = preview_state
+        .base_scenario
+        .manifest_catalog
+        .get(&selected_manifest_catalog_key)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "frozen manifest catalog entry `{selected_manifest_catalog_key}` is missing"
+                ),
+            )
+        })?;
 
     Ok(TemplateDescribeResponse {
         name: template_name.to_string(),
-        manifest,
+        manifest: TemplateManifestDescription {
+            mode: TemplateMode::Exact,
+            manifest: Some(manifest_ref_from_source(
+                &manifest_entry.source_ref,
+                manifest_entry.digest,
+            )?),
+            manifests: Vec::new(),
+        },
         config,
         bindings,
         exports: TemplateExportsDescription {
-            visible: visible_exports(template)?,
+            visible: contract.visible_exports,
         },
         limits: TemplateLimits {
             max_live_children: template
@@ -172,6 +283,11 @@ pub(crate) fn describe_template(
                 .as_ref()
                 .and_then(|limits| limits.max_live_children.map(u64::from)),
         },
+        possible_backends: template
+            .possible_backends
+            .iter()
+            .map(runtime_backend_name)
+            .collect(),
     })
 }
 
@@ -232,18 +348,18 @@ pub(crate) fn snapshot(
         ));
     }
     let mut live_scenario_ir = live_scenario_ir(state)?;
-    let required_catalog_keys = live_scenario_ir
+    let required_catalog_roots = live_scenario_ir
         .components
         .iter()
         .flat_map(|component| component.child_templates.values())
-        .flat_map(|template| {
-            template
-                .manifest
-                .iter()
-                .cloned()
-                .chain(template.allowed_manifests.clone().unwrap_or_default())
-        })
+        .flat_map(|template| template.manifests.clone().unwrap_or_default())
+        .chain(
+            visible_child_records(state)
+                .filter_map(|child| child.selected_manifest_catalog_key.clone()),
+        )
         .collect::<BTreeSet<_>>();
+    let required_catalog_keys =
+        manifest_catalog_closure(&live_scenario_ir.manifest_catalog, required_catalog_roots)?;
     live_scenario_ir
         .manifest_catalog
         .retain(|key, _| required_catalog_keys.contains(key));

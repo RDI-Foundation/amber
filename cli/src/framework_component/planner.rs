@@ -6,37 +6,45 @@ pub(super) async fn prepare_child_record(
     request: &CreateChildRequest,
 ) -> std::result::Result<LiveChildRecord, ProtocolErrorResponse> {
     validate_child_name(&request.name)?;
-    let current_live_scenario_ir = live_scenario_ir(state)?;
-    let live_scenario = decode_live_scenario(state)?;
     let authority_realm = ComponentId(authority_realm_id);
-    let authority_component = live_scenario.component(authority_realm);
-    let template = authority_component
+    let template = decode_live_scenario(state)?
+        .component(authority_realm)
         .child_templates
         .get(request.template.as_str())
         .ok_or_else(|| {
             protocol_error(ProtocolErrorCode::UnknownTemplate, "unknown child template")
-        })?;
+        })?
+        .clone();
     validate_child_name_available(state, authority_realm_id, &request.name)?;
     validate_template_limits(
         state,
         authority_realm_id,
         request.template.as_str(),
         &request.name,
-        template,
+        &template,
     )?;
+    let selected_manifest_catalog_key =
+        select_manifest_catalog_key(state, &template, request).await?;
+    let current_live_scenario_ir = live_scenario_ir(state)?;
+    let live_scenario = decode_live_scenario(state)?;
+    let authority_component = live_scenario.component(authority_realm);
     let bindable_sources = bindable_source_candidates(
         &live_scenario,
         &current_live_scenario_ir,
         state,
         authority_realm,
     )?;
-    let selected_manifest_catalog_key = select_manifest_catalog_key(template, request)?;
-    let rendered_config = build_child_config(template, request)?;
-    let resolved_bindings = resolve_template_bindings(template, request, &bindable_sources)?;
+    let contract = resolve_template_contract(
+        &state.base_scenario.manifest_catalog,
+        &template,
+        &selected_manifest_catalog_key,
+    )?;
+    let rendered_config = build_child_config(&contract, request)?;
+    let resolved_bindings = resolve_template_bindings(&contract, request, &bindable_sources)?;
     let child_id = allocate_child_id(state);
     let (wrapper_manifest, synthetic_sources) = build_wrapper_manifest(
         state,
-        template,
+        &contract,
         &request.name,
         &selected_manifest_catalog_key,
         rendered_config,
@@ -338,52 +346,492 @@ pub(super) fn validate_template_limits(
     Ok(())
 }
 
-pub(super) fn select_manifest_catalog_key(
+#[derive(Clone)]
+pub(super) struct ResolvedTemplateContract {
+    pub(super) config: BTreeMap<String, TemplateConfigField>,
+    pub(super) bindings: BTreeMap<String, TemplateBinding>,
+    pub(super) slot_decls: BTreeMap<String, SlotDecl>,
+    pub(super) visible_exports: Vec<String>,
+}
+
+fn runtime_manifest_ref(
+    manifest: &ManifestRef,
+) -> std::result::Result<ManifestRef, ProtocolErrorResponse> {
+    if manifest.url.is_relative() {
+        return Err(protocol_error(
+            ProtocolErrorCode::InvalidManifestRef,
+            "runtime child manifest refs must use absolute URLs",
+        ));
+    }
+    Ok(manifest.clone())
+}
+
+pub(super) async fn select_manifest_catalog_key(
+    state: &mut FrameworkControlState,
     template: &ChildTemplate,
     request: &CreateChildRequest,
 ) -> std::result::Result<String, ProtocolErrorResponse> {
-    match (&template.manifest, &template.allowed_manifests) {
-        (Some(key), None) => {
+    match template.manifests.as_ref() {
+        Some(keys) if keys.len() == 1 => {
             if request.manifest.is_some() {
                 return Err(protocol_error(
                     ProtocolErrorCode::ManifestNotAllowed,
                     "exact child templates must not specify `manifest` in CreateChild",
                 ));
             }
-            Ok(key.clone())
+            Ok(keys[0].clone())
         }
-        (None, Some(allowed)) => {
-            let selected = request.manifest.as_ref().ok_or_else(|| {
+        Some(keys) => {
+            let selected = runtime_manifest_ref(request.manifest.as_ref().ok_or_else(|| {
                 protocol_error(
-                    ProtocolErrorCode::ManifestNotAllowed,
-                    "open child templates must specify `manifest.catalog_key` in CreateChild",
+                    ProtocolErrorCode::ManifestRequired,
+                    "bounded child templates must specify `manifest` in CreateChild",
                 )
-            })?;
-            if !allowed
-                .iter()
-                .any(|candidate| candidate == &selected.catalog_key)
-            {
-                return Err(protocol_error(
-                    ProtocolErrorCode::ManifestNotAllowed,
-                    &format!(
-                        "manifest catalog key `{}` is not allowed for template `{}`",
-                        selected.catalog_key, request.template
-                    ),
-                ));
+            })?)?;
+            let selected_url = selected
+                .url
+                .as_url()
+                .expect("validated runtime manifest refs are absolute")
+                .as_str();
+            for key in keys {
+                let entry = state
+                    .base_scenario
+                    .manifest_catalog
+                    .get(key)
+                    .ok_or_else(|| {
+                        protocol_error(
+                            ProtocolErrorCode::ControlStateUnavailable,
+                            &format!("frozen manifest catalog entry `{key}` is missing"),
+                        )
+                    })?;
+                if entry.source_ref != selected_url {
+                    continue;
+                }
+                if let Some(digest) = selected.digest
+                    && digest != entry.digest
+                {
+                    return Err(protocol_error(
+                        ProtocolErrorCode::ManifestDigestMismatch,
+                        &format!(
+                            "manifest `{selected_url}` digest does not match the bounded template"
+                        ),
+                    ));
+                }
+                return Ok(key.clone());
             }
-            Ok(selected.catalog_key.clone())
+            Err(protocol_error(
+                ProtocolErrorCode::ManifestNotAllowed,
+                &format!(
+                    "manifest `{selected_url}` is not allowed for template `{}`",
+                    request.template
+                ),
+            ))
         }
-        _ => unreachable!("validated child template shape"),
+        None => {
+            let selected = runtime_manifest_ref(request.manifest.as_ref().ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ManifestRequired,
+                    "open child templates must specify `manifest` in CreateChild",
+                )
+            })?)?;
+            let selected_url = selected
+                .url
+                .as_url()
+                .expect("validated runtime manifest refs are absolute")
+                .to_string();
+            if let Some(entry) = state.base_scenario.manifest_catalog.get(&selected_url) {
+                if let Some(digest) = selected.digest
+                    && digest != entry.digest
+                {
+                    return Err(protocol_error(
+                        ProtocolErrorCode::ManifestDigestMismatch,
+                        &format!(
+                            "manifest `{selected_url}` digest does not match the admitted manifest"
+                        ),
+                    ));
+                }
+                admit_runtime_manifest_dependencies(state, &selected_url).await?;
+                return Ok(selected_url);
+            }
+            admit_runtime_manifest(state, &selected).await
+        }
     }
 }
 
-pub(super) fn build_child_config(
+async fn admit_runtime_manifest(
+    state: &mut FrameworkControlState,
+    manifest: &ManifestRef,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    let resolver = Resolver::new();
+    let mut pending = vec![manifest.clone()];
+    let mut root_key = None;
+
+    while let Some(current) = pending.pop() {
+        let requested_url = current
+            .url
+            .as_url()
+            .expect("validated runtime manifest refs are absolute")
+            .clone();
+        let resolution = resolver
+            .resolve(&requested_url, current.digest)
+            .await
+            .map_err(|err| match err {
+                amber_resolver::Error::MismatchedDigest(_) => protocol_error(
+                    ProtocolErrorCode::ManifestDigestMismatch,
+                    &format!("manifest `{requested_url}` digest mismatch"),
+                ),
+                other => protocol_error(
+                    ProtocolErrorCode::ManifestResolutionFailed,
+                    &format!("failed to resolve manifest `{requested_url}`: {other}"),
+                ),
+            })?;
+        let key = resolution.url.to_string();
+        if root_key.is_none() {
+            root_key = Some(key.clone());
+        }
+        if state.base_scenario.manifest_catalog.contains_key(&key) {
+            continue;
+        }
+
+        let dependencies = runtime_manifest_dependencies(&resolution.manifest, &resolution.url)?;
+        let digest = resolution.manifest.digest();
+        state.base_scenario.manifest_catalog.insert(
+            key.clone(),
+            ManifestCatalogEntryIr {
+                source_ref: key.clone(),
+                digest,
+                manifest: resolution.manifest,
+            },
+        );
+        pending.extend(dependencies);
+    }
+
+    Ok(root_key.expect("root runtime manifest should always resolve"))
+}
+
+async fn admit_runtime_manifest_dependencies(
+    state: &mut FrameworkControlState,
+    root_key: &str,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let mut pending = vec![root_key.to_string()];
+    let mut visited = BTreeSet::new();
+
+    while let Some(key) = pending.pop() {
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+
+        let (source_ref, manifest) = {
+            let entry = state
+                .base_scenario
+                .manifest_catalog
+                .get(&key)
+                .ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!("frozen manifest catalog entry `{key}` is missing"),
+                    )
+                })?;
+            (entry.source_ref.clone(), entry.manifest.clone())
+        };
+        let base_url = url::Url::parse(&source_ref).map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("invalid frozen manifest catalog source_ref `{source_ref}`: {err}"),
+            )
+        })?;
+
+        for dependency in runtime_manifest_dependencies(&manifest, &base_url)? {
+            let dependency_key = dependency
+                .url
+                .as_url()
+                .expect("resolved runtime manifest dependencies are absolute")
+                .to_string();
+            if let Some(entry) = state.base_scenario.manifest_catalog.get(&dependency_key) {
+                if let Some(digest) = dependency.digest
+                    && digest != entry.digest
+                {
+                    return Err(protocol_error(
+                        ProtocolErrorCode::ManifestDigestMismatch,
+                        &format!(
+                            "manifest `{dependency_key}` digest does not match the admitted \
+                             manifest"
+                        ),
+                    ));
+                }
+                pending.push(dependency_key);
+                continue;
+            }
+
+            pending.push(admit_runtime_manifest(state, &dependency).await?);
+        }
+    }
+
+    Ok(())
+}
+
+fn runtime_manifest_dependencies(
+    manifest: &Manifest,
+    base_url: &url::Url,
+) -> std::result::Result<Vec<ManifestRef>, ProtocolErrorResponse> {
+    let component_refs = manifest
+        .components()
+        .values()
+        .map(|component| match component {
+            ComponentDecl::Reference(reference) => reference,
+            ComponentDecl::Object(component) => &component.manifest,
+            _ => unreachable!("manifest component declarations only carry manifest references"),
+        });
+    let template_refs = manifest.child_templates().values().flat_map(|template| {
+        template
+            .manifest
+            .as_ref()
+            .into_iter()
+            .flat_map(|manifest| match manifest {
+                amber_manifest::ChildTemplateManifestDecl::One(reference) => {
+                    std::slice::from_ref(reference).iter()
+                }
+                amber_manifest::ChildTemplateManifestDecl::Many(references) => references.iter(),
+                _ => unreachable!("child template manifests are normalized to manifest refs"),
+            })
+    });
+
+    component_refs
+        .chain(template_refs)
+        .map(|reference| {
+            let resolved_url = reference.url.resolve(base_url).map_err(|err| {
+                protocol_error(
+                    ProtocolErrorCode::ManifestResolutionFailed,
+                    &format!(
+                        "failed to resolve manifest `{}` relative to `{base_url}`: {err}",
+                        reference.url.as_str()
+                    ),
+                )
+            })?;
+            Ok(ManifestRef::new(resolved_url, reference.digest))
+        })
+        .collect()
+}
+
+pub(super) fn manifest_catalog_closure<I>(
+    manifest_catalog: &BTreeMap<String, ManifestCatalogEntryIr>,
+    roots: I,
+) -> std::result::Result<BTreeSet<String>, ProtocolErrorResponse>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut required = BTreeSet::new();
+    let mut pending = roots.into_iter().collect::<Vec<_>>();
+
+    while let Some(key) = pending.pop() {
+        if !required.insert(key.clone()) {
+            continue;
+        }
+
+        let entry = manifest_catalog.get(&key).ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("frozen manifest catalog entry `{key}` is missing"),
+            )
+        })?;
+        let base_url = url::Url::parse(&entry.source_ref).map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "invalid frozen manifest catalog source_ref `{}` for `{key}`: {err}",
+                    entry.source_ref
+                ),
+            )
+        })?;
+        pending.extend(
+            runtime_manifest_dependencies(&entry.manifest, &base_url)?
+                .into_iter()
+                .map(|reference| {
+                    reference
+                        .url
+                        .as_url()
+                        .expect("resolved runtime manifest dependencies are absolute")
+                        .to_string()
+                }),
+        );
+    }
+
+    Ok(required)
+}
+
+pub(super) fn resolve_template_contract(
+    manifest_catalog: &BTreeMap<String, ManifestCatalogEntryIr>,
     template: &ChildTemplate,
+    selected_manifest_catalog_key: &str,
+) -> std::result::Result<ResolvedTemplateContract, ProtocolErrorResponse> {
+    let manifest = manifest_catalog
+        .get(selected_manifest_catalog_key)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "frozen manifest catalog entry `{selected_manifest_catalog_key}` is missing"
+                ),
+            )
+        })?
+        .manifest
+        .clone();
+
+    Ok(ResolvedTemplateContract {
+        config: resolve_template_config_fields(template, &manifest, selected_manifest_catalog_key)?,
+        bindings: resolve_template_binding_fields(
+            template,
+            &manifest,
+            selected_manifest_catalog_key,
+        )?,
+        slot_decls: manifest
+            .slots()
+            .iter()
+            .map(|(name, decl)| (name.to_string(), decl.clone()))
+            .collect(),
+        visible_exports: resolve_template_visible_exports(
+            template,
+            &manifest,
+            selected_manifest_catalog_key,
+        )?,
+    })
+}
+
+fn resolve_template_config_fields(
+    template: &ChildTemplate,
+    manifest: &Manifest,
+    selected_manifest_catalog_key: &str,
+) -> std::result::Result<BTreeMap<String, TemplateConfigField>, ProtocolErrorResponse> {
+    let Some(schema) = manifest.config_schema() else {
+        if let Some(name) = template.config.keys().next() {
+            return Err(protocol_error(
+                ProtocolErrorCode::InvalidConfig,
+                &format!(
+                    "template prefills config field `{name}`, but manifest \
+                     `{selected_manifest_catalog_key}` does not declare config"
+                ),
+            ));
+        }
+        return Ok(BTreeMap::new());
+    };
+
+    let properties = schema
+        .0
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .collect::<BTreeMap<_, _>>();
+    for name in template.config.keys() {
+        if !properties.contains_key(name) {
+            return Err(protocol_error(
+                ProtocolErrorCode::InvalidConfig,
+                &format!(
+                    "template prefills config field `{name}`, but manifest \
+                     `{selected_manifest_catalog_key}` does not declare it"
+                ),
+            ));
+        }
+    }
+
+    let required = schema
+        .0
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<BTreeSet<_>>();
+    Ok(properties
+        .keys()
+        .map(|name| {
+            let field = template
+                .config
+                .get(*name)
+                .map(|field| match field {
+                    TemplateConfigField::Prefilled { value } => TemplateConfigField::Prefilled {
+                        value: value.clone(),
+                    },
+                    TemplateConfigField::Open { .. } => {
+                        panic!("stored child templates must not persist open config fields")
+                    }
+                })
+                .unwrap_or(TemplateConfigField::Open {
+                    required: required.contains(name.as_str()),
+                });
+            ((*name).clone(), field)
+        })
+        .collect())
+}
+
+fn resolve_template_binding_fields(
+    template: &ChildTemplate,
+    manifest: &Manifest,
+    selected_manifest_catalog_key: &str,
+) -> std::result::Result<BTreeMap<String, TemplateBinding>, ProtocolErrorResponse> {
+    for slot_name in template.bindings.keys() {
+        if !manifest.slots().contains_key(slot_name.as_str()) {
+            return Err(protocol_error(
+                ProtocolErrorCode::InvalidBinding,
+                &format!(
+                    "template prefills binding `{slot_name}`, but manifest \
+                     `{selected_manifest_catalog_key}` does not declare that slot"
+                ),
+            ));
+        }
+    }
+
+    Ok(manifest
+        .slots()
+        .iter()
+        .map(|(slot_name, slot_decl)| {
+            let binding = template
+                .bindings
+                .get(slot_name.as_str())
+                .map(|binding| match binding {
+                    TemplateBinding::Prefilled { selector } => TemplateBinding::Prefilled {
+                        selector: selector.clone(),
+                    },
+                    TemplateBinding::Open { .. } => {
+                        panic!("stored child templates must not persist open bindings")
+                    }
+                })
+                .unwrap_or(TemplateBinding::Open {
+                    optional: slot_decl.optional,
+                });
+            (slot_name.to_string(), binding)
+        })
+        .collect())
+}
+
+fn resolve_template_visible_exports(
+    template: &ChildTemplate,
+    manifest: &Manifest,
+    selected_manifest_catalog_key: &str,
+) -> std::result::Result<Vec<String>, ProtocolErrorResponse> {
+    if let Some(visible_exports) = template.visible_exports.as_ref() {
+        for export_name in visible_exports {
+            if !manifest.exports().contains_key(export_name.as_str()) {
+                return Err(protocol_error(
+                    ProtocolErrorCode::InvalidConfig,
+                    &format!(
+                        "template exposes export `{export_name}`, but manifest \
+                         `{selected_manifest_catalog_key}` does not declare it"
+                    ),
+                ));
+            }
+        }
+        return Ok(visible_exports.clone());
+    }
+    Ok(manifest.exports().keys().map(ToString::to_string).collect())
+}
+
+pub(super) fn build_child_config(
+    contract: &ResolvedTemplateContract,
     request: &CreateChildRequest,
 ) -> std::result::Result<Option<serde_json::Value>, ProtocolErrorResponse> {
-    let template_config = template_config_fields(template)?;
     for key in request.config.keys() {
-        if !template_config.contains_key(key.as_str()) {
+        if !contract.config.contains_key(key.as_str()) {
             return Err(protocol_error(
                 ProtocolErrorCode::InvalidConfig,
                 &format!("unknown child config field `{key}`"),
@@ -392,7 +840,7 @@ pub(super) fn build_child_config(
     }
 
     let mut config = serde_json::Map::new();
-    for (name, field) in &template_config {
+    for (name, field) in &contract.config {
         match field {
             TemplateConfigField::Prefilled { value } => {
                 if request.config.contains_key(name.as_str()) {
@@ -420,13 +868,12 @@ pub(super) fn build_child_config(
 }
 
 pub(super) fn resolve_template_bindings(
-    template: &ChildTemplate,
+    contract: &ResolvedTemplateContract,
     request: &CreateChildRequest,
     bindable_sources: &[BindableSourceCandidate],
 ) -> std::result::Result<Vec<ResolvedTemplateBinding>, ProtocolErrorResponse> {
-    let template_bindings = template_binding_fields(template)?;
     for key in request.bindings.keys() {
-        if !template_bindings.contains_key(key.as_str()) {
+        if !contract.bindings.contains_key(key.as_str()) {
             return Err(protocol_error(
                 ProtocolErrorCode::InvalidBinding,
                 &format!("unknown child binding field `{key}`"),
@@ -434,10 +881,20 @@ pub(super) fn resolve_template_bindings(
         }
     }
 
-    template_bindings
+    contract
+        .bindings
         .iter()
         .map(|(slot_name, field)| {
-            let slot_decl = root_template_slot_decl(template, slot_name)?.clone();
+            let slot_decl = contract
+                .slot_decls
+                .get(slot_name.as_str())
+                .ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!("resolved template contract is missing slot `{slot_name}`"),
+                    )
+                })?
+                .clone();
             let candidate = match field {
                 TemplateBinding::Prefilled { selector } => {
                     Some(find_bindable_source(bindable_sources, selector.as_str())?)
@@ -467,18 +924,20 @@ pub(super) fn resolve_template_bindings(
                             ));
                         }
                     };
-                    if !source_compatible(slot_decl.decl.clone(), selected.decl.clone()) {
-                        return Err(protocol_error(
-                            ProtocolErrorCode::BindingTypeMismatch,
-                            &format!(
-                                "binding `{slot_name}` expects `{}` but `{}` provides `{}`",
-                                slot_decl.decl.kind, selected.selector, selected.decl.kind
-                            ),
-                        ));
-                    }
                     Some(selected)
                 }
             };
+            if let Some(selected) = candidate.as_ref()
+                && !source_compatible(slot_decl.decl.clone(), selected.decl.clone())
+            {
+                return Err(protocol_error(
+                    ProtocolErrorCode::BindingTypeMismatch,
+                    &format!(
+                        "binding `{slot_name}` expects `{}` but `{}` provides `{}`",
+                        slot_decl.decl.kind, selected.selector, selected.decl.kind
+                    ),
+                ));
+            }
 
             Ok(candidate.map(|candidate| ResolvedTemplateBinding {
                 slot_name: slot_name.clone(),
@@ -494,7 +953,7 @@ pub(super) fn resolve_template_bindings(
 
 pub(super) fn build_wrapper_manifest(
     state: &FrameworkControlState,
-    template: &ChildTemplate,
+    contract: &ResolvedTemplateContract,
     child_name: &str,
     selected_manifest_catalog_key: &str,
     rendered_config: Option<serde_json::Value>,
@@ -590,8 +1049,10 @@ pub(super) fn build_wrapper_manifest(
         }
     }
 
-    let exports = visible_exports(template)?
-        .into_iter()
+    let exports = contract
+        .visible_exports
+        .iter()
+        .cloned()
         .map(|export_name| {
             let target = format!("#{child_name}.{export_name}")
                 .parse::<RawExportTarget>()
@@ -1543,11 +2004,24 @@ pub(super) fn collect_capability_instance_from_binding(
 }
 
 pub(super) fn template_mode(template: &ChildTemplate) -> TemplateMode {
-    if template.manifest.is_some() {
-        TemplateMode::Exact
-    } else {
-        TemplateMode::Open
+    match template.manifests.as_ref() {
+        Some(manifests) if manifests.len() == 1 => TemplateMode::Exact,
+        Some(_) => TemplateMode::Bounded,
+        None => TemplateMode::Open,
     }
+}
+
+pub(super) fn manifest_ref_from_source(
+    source_ref: &str,
+    digest: amber_manifest::ManifestDigest,
+) -> std::result::Result<ManifestRef, ProtocolErrorResponse> {
+    let url = url::Url::parse(source_ref).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("invalid frozen manifest catalog source_ref `{source_ref}`: {err}"),
+        )
+    })?;
+    Ok(ManifestRef::new(url, Some(digest)))
 }
 
 pub(super) fn template_manifest_description(
@@ -1556,24 +2030,37 @@ pub(super) fn template_manifest_description(
 ) -> std::result::Result<TemplateManifestDescription, ProtocolErrorResponse> {
     let mut description = TemplateManifestDescription {
         mode: template_mode(template),
-        catalog_key: template.manifest.clone(),
-        digest: None,
-        allowed_catalog_keys: template.allowed_manifests.clone().unwrap_or_default(),
+        manifest: None,
+        manifests: Vec::new(),
     };
-    if let Some(key) = description.catalog_key.as_ref() {
-        description.digest = Some(
-            scenario
+    match template.manifests.as_ref() {
+        Some(manifests) if manifests.len() == 1 => {
+            let entry = scenario
                 .manifest_catalog
-                .get(key)
+                .get(&manifests[0])
                 .ok_or_else(|| {
                     protocol_error(
                         ProtocolErrorCode::ControlStateUnavailable,
                         "frozen manifest catalog entry is missing",
                     )
-                })?
-                .digest
-                .to_string(),
-        );
+                })?;
+            description.manifest = Some(manifest_ref_from_source(&entry.source_ref, entry.digest)?);
+        }
+        Some(manifests) => {
+            description.manifests = manifests
+                .iter()
+                .map(|key| {
+                    let entry = scenario.manifest_catalog.get(key).ok_or_else(|| {
+                        protocol_error(
+                            ProtocolErrorCode::ControlStateUnavailable,
+                            &format!("frozen manifest catalog entry `{key}` is missing"),
+                        )
+                    })?;
+                    manifest_ref_from_source(&entry.source_ref, entry.digest)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+        }
+        None => {}
     }
     Ok(description)
 }
@@ -2360,61 +2847,6 @@ pub(super) fn runtime_backend_name(backend: &amber_manifest::RuntimeBackend) -> 
         .ok()
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .unwrap_or_else(|| "unknown".to_string())
-}
-
-pub(super) fn frozen_template_contract(
-    template: &ChildTemplate,
-) -> std::result::Result<&ChildTemplate, ProtocolErrorResponse> {
-    if template.frozen {
-        return Ok(template);
-    }
-    Err(protocol_error(
-        ProtocolErrorCode::ControlStateUnavailable,
-        "framework.component requires compiler-frozen child template contracts; recompile with \
-         the current compiler",
-    ))
-}
-
-pub(super) fn template_config_fields(
-    template: &ChildTemplate,
-) -> std::result::Result<BTreeMap<String, TemplateConfigField>, ProtocolErrorResponse> {
-    Ok(frozen_template_contract(template)?.config.clone())
-}
-
-pub(super) fn template_binding_fields(
-    template: &ChildTemplate,
-) -> std::result::Result<BTreeMap<String, TemplateBinding>, ProtocolErrorResponse> {
-    Ok(frozen_template_contract(template)?.bindings.clone())
-}
-
-pub(super) fn root_template_slot_decl<'a>(
-    template: &'a ChildTemplate,
-    slot_name: &str,
-) -> std::result::Result<&'a amber_manifest::SlotDecl, ProtocolErrorResponse> {
-    frozen_template_contract(template)?
-        .slot_decls
-        .get(slot_name)
-        .ok_or_else(|| {
-            protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
-                "child template root slot is missing from the frozen child template contract",
-            )
-        })
-}
-
-pub(super) fn visible_exports(
-    template: &ChildTemplate,
-) -> std::result::Result<Vec<String>, ProtocolErrorResponse> {
-    frozen_template_contract(template)?
-        .visible_exports
-        .clone()
-        .ok_or_else(|| {
-            protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
-                "child template visible exports are missing from the frozen child template \
-                 contract",
-            )
-        })
 }
 
 pub(super) fn source_compatible(target: CapabilityDecl, candidate: CapabilityDecl) -> bool {

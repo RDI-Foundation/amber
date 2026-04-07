@@ -302,6 +302,7 @@ dependencies = [
 name = "amber-mesh"
 version = "0.0.0"
 dependencies = [
+ "amber-manifest",
  "base64",
  "ed25519-dalek",
  "opentelemetry",
@@ -317,10 +318,6 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
 ]
-
-[[package]]
-name = "amber-node"
-version = "0.0.0"
 
 [[package]]
 name = "amber-provisioner"

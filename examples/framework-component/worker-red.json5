@@ -1,0 +1,31 @@
+{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      label: { type: "string" },
+    },
+    required: ["label"],
+    additionalProperties: false,
+  },
+  program: {
+    path: "/usr/bin/env",
+    args: ["python3", "-u", "-c", { file: "./worker.py" }],
+    env: {
+      NAME: "worker-red",
+      LABEL: "${config.label}",
+      PORT: "18083",
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 18083, protocol: "http" },
+      ],
+    },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}

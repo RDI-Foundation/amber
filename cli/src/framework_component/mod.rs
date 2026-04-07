@@ -30,7 +30,7 @@ use amber_mesh::{
         ChildSummary, ConfigFieldDescription, CreateChildRequest, CreateChildResponse, InputState,
         ProtocolErrorCode, ProtocolErrorResponse, SnapshotResponse, TemplateDescribeResponse,
         TemplateExportsDescription, TemplateLimits, TemplateListResponse,
-        TemplateManifestDescription, TemplateMode, TemplateSummary,
+        TemplateManifestDescription, TemplateMode, TemplateResolveRequest, TemplateSummary,
     },
     framework_cap_instance_id, router_dynamic_export_route_id, router_export_route_id,
 };

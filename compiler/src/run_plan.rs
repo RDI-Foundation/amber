@@ -6,7 +6,7 @@ use std::{
 use amber_json5 as json5;
 use amber_manifest::{
     BindingSource as ManifestBindingSource, BindingTarget as ManifestBindingTarget, CapabilityKind,
-    ChildTemplateAllowedManifests, ChildTemplateDecl, ComponentDecl, Manifest, ManifestRef,
+    ChildTemplateDecl, ChildTemplateManifestDecl, ComponentDecl, Manifest, ManifestRef,
     MountSource, NetworkProtocol, Program as ManifestProgram, SlotDecl,
 };
 use amber_scenario::{
@@ -14,7 +14,6 @@ use amber_scenario::{
     ScenarioIr, SlotRef, graph,
 };
 use base64::Engine as _;
-use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use thiserror::Error;
@@ -983,8 +982,7 @@ fn default_placement_defaults() -> PlacementDefaults {
 
 #[derive(Clone, Debug)]
 struct FrozenChildTemplateSpec {
-    manifest: Option<String>,
-    allowed_manifests: Option<Vec<String>>,
+    manifests: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1014,31 +1012,16 @@ fn analyze_standby_sites(
     let mut requested_sites = BTreeSet::new();
 
     for template in collect_frozen_child_templates(scenario)? {
-        match (
-            template.manifest.as_deref(),
-            template.allowed_manifests.as_ref(),
-        ) {
-            (Some(key), None) => {
-                requested_sites.extend(analyze_manifest_root_sites(
-                    &scenario.manifest_catalog,
-                    site_definitions,
-                    defaults,
-                    key,
-                )?);
-            }
-            (None, Some(keys)) => {
-                for key in keys {
-                    requested_sites.extend(analyze_manifest_root_sites(
-                        &scenario.manifest_catalog,
-                        site_definitions,
-                        defaults,
-                        key,
-                    )?);
-                }
-            }
-            (Some(_), Some(_)) | (None, None) => {
-                unreachable!("scenario IR validation enforces child-template manifest shape")
-            }
+        let Some(keys) = template.manifests.as_ref() else {
+            continue;
+        };
+        for key in keys {
+            requested_sites.extend(analyze_manifest_root_sites(
+                &scenario.manifest_catalog,
+                site_definitions,
+                defaults,
+                key,
+            )?);
         }
     }
 
@@ -1053,8 +1036,7 @@ fn collect_frozen_child_templates(
     for (_, component) in scenario.components_iter() {
         templates.extend(component.child_templates.values().map(|template| {
             FrozenChildTemplateSpec {
-                manifest: template.manifest.clone(),
-                allowed_manifests: template.allowed_manifests.clone(),
+                manifests: template.manifests.clone(),
             }
         }));
     }
@@ -1083,32 +1065,22 @@ fn freeze_manifest_child_template(
     base_url: &Url,
     template: &ChildTemplateDecl,
 ) -> Result<FrozenChildTemplateSpec, RunPlanError> {
-    let manifest = template
-        .manifest
-        .as_ref()
-        .map(|manifest| resolve_catalog_key(base_url, manifest, catalog))
-        .transpose()?;
-    let allowed_manifests = match template.allowed_manifests.as_ref() {
-        Some(ChildTemplateAllowedManifests::Refs(refs)) => Some(
+    let manifests = match template.manifest.as_ref() {
+        None => None,
+        Some(ChildTemplateManifestDecl::One(manifest)) => {
+            Some(vec![resolve_catalog_key(base_url, manifest, catalog)?])
+        }
+        Some(ChildTemplateManifestDecl::Many(refs)) => Some(
             refs.iter()
                 .map(|manifest| resolve_catalog_key(base_url, manifest, catalog))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        Some(ChildTemplateAllowedManifests::Selector(selector)) => {
-            Some(expand_catalog_selector(catalog, base_url, selector)?)
-        }
-        None => None,
         Some(_) => {
-            return Err(RunPlanError::Other(
-                "unsupported frozen child-template allowed_manifests shape".to_string(),
-            ));
+            unreachable!("manifest validation handles unknown child-template manifest forms")
         }
     };
 
-    Ok(FrozenChildTemplateSpec {
-        manifest,
-        allowed_manifests,
-    })
+    Ok(FrozenChildTemplateSpec { manifests })
 }
 
 fn resolve_catalog_key(
@@ -1134,95 +1106,6 @@ fn resolve_catalog_key(
             "frozen manifest catalog is missing `{key}`"
         )))
     }
-}
-
-fn expand_catalog_selector(
-    catalog: &BTreeMap<String, amber_scenario::ManifestCatalogEntry>,
-    base_url: &Url,
-    selector: &amber_manifest::ChildTemplateManifestSelector,
-) -> Result<Vec<String>, RunPlanError> {
-    let root = base_url.join(&selector.root).map_err(|err| {
-        RunPlanError::Other(format!(
-            "failed to resolve selector root `{}`: {err}",
-            selector.root
-        ))
-    })?;
-    let include_patterns = if selector.include.is_empty() {
-        vec![Pattern::new("**/*.json5").expect("default selector pattern should compile")]
-    } else {
-        selector
-            .include
-            .iter()
-            .map(|pattern| {
-                Pattern::new(pattern).map_err(|err| {
-                    RunPlanError::Other(format!(
-                        "invalid selector include pattern `{pattern}`: {err}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    let exclude_patterns = selector
-        .exclude
-        .iter()
-        .map(|pattern| {
-            Pattern::new(pattern).map_err(|err| {
-                RunPlanError::Other(format!(
-                    "invalid selector exclude pattern `{pattern}`: {err}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut matches = catalog
-        .values()
-        .filter_map(|entry| {
-            let entry_url = Url::parse(&entry.source_ref).ok()?;
-            let relative = relative_catalog_path(&root, &entry_url)?;
-            include_patterns
-                .iter()
-                .any(|pattern| pattern.matches(&relative))
-                .then_some((relative, entry.source_ref.clone()))
-        })
-        .filter(|(relative, _)| {
-            !exclude_patterns
-                .iter()
-                .any(|pattern| pattern.matches(relative.as_str()))
-        })
-        .map(|(_, source_ref)| source_ref)
-        .collect::<Vec<_>>();
-    matches.sort();
-    matches.dedup();
-
-    if matches.is_empty() {
-        return Err(RunPlanError::Other(format!(
-            "selector rooted at `{}` matched no frozen manifests",
-            root
-        )));
-    }
-
-    Ok(matches)
-}
-
-fn relative_catalog_path(root: &Url, candidate: &Url) -> Option<String> {
-    if root.scheme() != candidate.scheme()
-        || root.host_str() != candidate.host_str()
-        || root.port_or_known_default() != candidate.port_or_known_default()
-    {
-        return None;
-    }
-
-    let root_segments = root.path_segments()?.collect::<Vec<_>>();
-    let candidate_segments = candidate.path_segments()?.collect::<Vec<_>>();
-    if candidate_segments.len() < root_segments.len() {
-        return None;
-    }
-    if !candidate_segments.starts_with(&root_segments) {
-        return None;
-    }
-
-    let relative = candidate_segments[root_segments.len()..].join("/");
-    (!relative.is_empty()).then_some(relative)
 }
 
 fn analyze_manifest_root_sites(
@@ -2378,9 +2261,11 @@ mod tests {
     async fn bounded_templates_use_manifest_analysis_even_with_possible_backends_hints() {
         let dir = tmp_dir("run-plan-standby-bounded-template-");
         let worker = dir.path().join("worker.json5");
+        let worker_two = dir.path().join("worker-two.json5");
         let root = dir.path().join("root.json5");
 
         write(&worker, dynamic_worker_manifest());
+        write(&worker_two, dynamic_worker_manifest());
         write(
             &root,
             r#"{
@@ -2388,7 +2273,7 @@ mod tests {
   slots: { realm: { kind: "component", optional: true } },
   child_templates: {
     worker: {
-      allowed_manifests: ["./worker.json5"],
+      manifest: ["./worker-two.json5", "./worker.json5"],
       possible_backends: ["compose"]
     }
   },

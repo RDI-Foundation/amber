@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use amber_manifest::ManifestRef;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +40,8 @@ pub struct TemplateDescribeResponse {
     pub exports: TemplateExportsDescription,
     #[serde(default, skip_serializing_if = "TemplateLimits::is_empty")]
     pub limits: TemplateLimits,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub possible_backends: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,11 +49,9 @@ pub struct TemplateDescribeResponse {
 pub struct TemplateManifestDescription {
     pub mode: TemplateMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub catalog_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub digest: Option<String>,
+    pub manifest: Option<ManifestRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_catalog_keys: Vec<String>,
+    pub manifests: Vec<ManifestRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,8 +116,13 @@ impl TemplateLimits {
 pub struct CreateChildRequest {
     pub template: String,
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest: Option<CreateChildManifestSelection>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_manifest_request",
+        deserialize_with = "deserialize_manifest_request"
+    )]
+    pub manifest: Option<ManifestRef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -125,8 +131,37 @@ pub struct CreateChildRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct CreateChildManifestSelection {
-    pub catalog_key: String,
+pub struct TemplateResolveRequest {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_manifest_request",
+        deserialize_with = "deserialize_manifest_request"
+    )]
+    pub manifest: Option<ManifestRef>,
+}
+
+fn serialize_manifest_request<S>(
+    manifest: &Option<ManifestRef>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match manifest {
+        None => serializer.serialize_none(),
+        Some(manifest) if manifest.digest.is_none() => {
+            serializer.serialize_str(manifest.url.as_str())
+        }
+        Some(manifest) => manifest.serialize(serializer),
+    }
+}
+
+fn deserialize_manifest_request<'de, D>(deserializer: D) -> Result<Option<ManifestRef>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<ManifestRef>::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,7 +254,11 @@ pub enum ProtocolErrorCode {
     UnknownTemplate,
     UnknownChild,
     NameConflict,
+    ManifestRequired,
     ManifestNotAllowed,
+    InvalidManifestRef,
+    ManifestDigestMismatch,
+    ManifestResolutionFailed,
     InvalidConfig,
     InvalidBinding,
     BindingSourceNotFound,
@@ -279,9 +318,12 @@ mod tests {
             name: "worker".to_string(),
             manifest: TemplateManifestDescription {
                 mode: TemplateMode::Exact,
-                catalog_key: Some("catalog/worker".to_string()),
-                digest: Some("sha256:abc123".to_string()),
-                allowed_catalog_keys: Vec::new(),
+                manifest: Some(
+                    "https://example.com/worker.json5"
+                        .parse()
+                        .expect("manifest ref"),
+                ),
+                manifests: Vec::new(),
             },
             config: BTreeMap::from([
                 (
@@ -332,6 +374,7 @@ mod tests {
             limits: TemplateLimits {
                 max_live_children: Some(64),
             },
+            possible_backends: vec!["compose".to_string()],
         };
 
         let json = serde_json::to_value(&response).expect("serialize template description");
@@ -341,8 +384,9 @@ mod tests {
                 "name": "worker",
                 "manifest": {
                     "mode": "exact",
-                    "catalog_key": "catalog/worker",
-                    "digest": "sha256:abc123"
+                    "manifest": {
+                        "url": "https://example.com/worker.json5"
+                    }
                 },
                 "config": {
                     "mode": {
@@ -374,7 +418,8 @@ mod tests {
                 },
                 "limits": {
                     "max_live_children": 64
-                }
+                },
+                "possible_backends": ["compose"]
             })
         );
     }
@@ -445,9 +490,11 @@ mod tests {
         let request = CreateChildRequest {
             template: "arbitrary_job".to_string(),
             name: "job-2".to_string(),
-            manifest: Some(CreateChildManifestSelection {
-                catalog_key: "catalog/jobs/reporter".to_string(),
-            }),
+            manifest: Some(
+                "https://example.com/jobs/reporter.json5"
+                    .parse()
+                    .expect("manifest ref"),
+            ),
             config: BTreeMap::new(),
             bindings: BTreeMap::from([(
                 "input".to_string(),
@@ -463,14 +510,30 @@ mod tests {
             serde_json::json!({
                 "template": "arbitrary_job",
                 "name": "job-2",
-                "manifest": {
-                    "catalog_key": "catalog/jobs/reporter"
-                },
+                "manifest": "https://example.com/jobs/reporter.json5",
                 "bindings": {
                     "input": {
                         "selector": "children.prev-job.exports.result"
                     }
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn template_resolve_request_matches_design_fixture() {
+        let request = TemplateResolveRequest {
+            manifest: Some(
+                "https://example.com/jobs/reporter.json5"
+                    .parse()
+                    .expect("manifest ref"),
+            ),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&request).expect("serialize resolve request"),
+            serde_json::json!({
+                "manifest": "https://example.com/jobs/reporter.json5"
             })
         );
     }
