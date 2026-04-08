@@ -795,7 +795,10 @@ fn kubernetes_templates_dynamic_caps_sidecar_control_env() {
         "{kustomization}"
     );
     assert!(
-        !kustomization.contains(&format!("resources:\n- {}", super::COMPONENT_SIDECAR_ENV_FILE)),
+        !kustomization.contains(&format!(
+            "resources:\n- {}",
+            super::COMPONENT_SIDECAR_ENV_FILE
+        )),
         "{kustomization}"
     );
     assert!(
