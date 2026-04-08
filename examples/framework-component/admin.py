@@ -8,6 +8,8 @@ from urllib.request import Request, urlopen
 NAME = os.environ["NAME"]
 PORT = int(os.environ["PORT"])
 CTL_URL = os.environ["CTL_URL"].rstrip("/")
+DYNAMIC_CAPS_API_URL = os.environ.get("AMBER_DYNAMIC_CAPS_API_URL", "").rstrip("/")
+FRAMEWORK_COMPONENT_TIMEOUT_SECS = 180
 
 
 def send(handler, status, body, content_type="text/plain; charset=utf-8"):
@@ -44,7 +46,7 @@ def call(method, path, payload=None):
         headers["Content-Type"] = "application/json"
     request = Request(f"{CTL_URL}{path}", data=data, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=30) as response:
+        with urlopen(request, timeout=FRAMEWORK_COMPONENT_TIMEOUT_SECS) as response:
             return (
                 response.status,
                 response.headers.get("content-type", "application/json; charset=utf-8"),
@@ -71,6 +73,77 @@ def proxy(handler, method, path, payload=None):
     send(handler, status, body or "", content_type)
 
 
+def dynamic_caps_call(method, path, payload=None):
+    if not DYNAMIC_CAPS_API_URL:
+        return (
+            503,
+            "application/json; charset=utf-8",
+            json.dumps({"error": "AMBER_DYNAMIC_CAPS_API_URL is not set"}),
+        )
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {"Connection": "close"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = Request(
+        f"{DYNAMIC_CAPS_API_URL}{path}",
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            return (
+                response.status,
+                response.headers.get("content-type", "application/json; charset=utf-8"),
+                response.read().decode("utf-8"),
+            )
+    except HTTPError as err:
+        return (
+            err.code,
+            err.headers.get("content-type", "application/json; charset=utf-8"),
+            err.read().decode("utf-8"),
+        )
+    except URLError as err:
+        return (
+            502,
+            "application/json; charset=utf-8",
+            json.dumps(
+                {"error": f"failed to reach dynamic capabilities service: {err.reason}"}
+            ),
+        )
+
+
+def admin_http_held_id():
+    status, _, body = dynamic_caps_call("GET", "/v1/held")
+    if status != 200:
+        raise RuntimeError(f"GET /v1/held failed: {body}")
+    held = json.loads(body)
+    for entry in held.get("held", []):
+        selector = entry.get("root_authority_selector", {})
+        if (
+            entry.get("entry_kind") == "root_authority"
+            and entry.get("state") == "live"
+            and selector.get("kind") == "self_provide"
+            and selector.get("provide_name") == "http"
+        ):
+            return entry["held_id"]
+    raise RuntimeError("missing live self-provided admin.http root authority")
+
+
+def provision_child_capability(child_name):
+    status, _, body = dynamic_caps_call(
+        "POST",
+        "/v1/share",
+        {
+            "source": {"kind": "held_id", "value": admin_http_held_id()},
+            "recipient": f"components./{child_name}",
+        },
+    )
+    if status != 200:
+        raise RuntimeError(body)
+    return json.loads(body)
+
+
 def guide():
     return {
         "service": NAME,
@@ -83,6 +156,10 @@ def guide():
             "create": "/create/<child-name>?template=<template>&label=<label>&manifest=<absolute-url>",
             "destroy": "/destroy/<child-name>",
             "snapshot": "/snapshot",
+        },
+        "provisioning": {
+            "create": "new children automatically receive the admin.http capability as a live delegated grant",
+            "rediscover": "workers expose /held and /materialize so they can rediscover and use that grant",
         },
         "templates": {
             "exact_worker": "fixed manifest, runtime label required",
@@ -138,7 +215,35 @@ class Handler(BaseHTTPRequestHandler):
                 payload["manifest"] = query["manifest"]
             if query.get("label"):
                 payload["config"] = {"label": query["label"]}
-            proxy(self, "POST", "/v1/children", payload)
+            create_status, _, create_body = call("POST", "/v1/children", payload)
+            if create_status != 200:
+                send(self, create_status, create_body or "", "application/json; charset=utf-8")
+                return
+            child = json.loads(create_body or "{}")
+            try:
+                provisioning = provision_child_capability(payload["name"])
+            except Exception as err:
+                send_json(
+                    self,
+                    502,
+                    {
+                        "error": f"child created but capability provisioning failed: {err}",
+                        "child": child,
+                    },
+                )
+                return
+            send_json(
+                self,
+                200,
+                {
+                    "child": child,
+                    "provisioned_capability": {
+                        "source": "admin.http",
+                        "recipient": f"components./{payload['name']}",
+                        "share": provisioning,
+                    },
+                },
+            )
             return
         if path.startswith("/destroy/"):
             proxy(self, "DELETE", f"/v1/children/{path.removeprefix('/destroy/')}")

@@ -197,6 +197,8 @@ pub(crate) struct FrameworkControlState {
     pub(crate) version: u32,
     pub(crate) run_id: String,
     pub(crate) base_scenario: ScenarioIr,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) run_links: Vec<RunLink>,
     pub(crate) placement: FrozenPlacementState,
     #[serde(default)]
     pub(crate) generation: u64,
@@ -210,6 +212,14 @@ pub(crate) struct FrameworkControlState {
     pub(crate) capability_instances: BTreeMap<String, CapabilityInstanceRecord>,
     #[serde(default)]
     pub(crate) journal: Vec<ControlJournalEntry>,
+    #[serde(default)]
+    pub(crate) dynamic_capability_signing_seed_b64: String,
+    #[serde(default)]
+    pub(crate) next_dynamic_capability_grant_id: u64,
+    #[serde(default)]
+    pub(crate) dynamic_capability_grants: BTreeMap<String, dynamic_caps::DynamicGrantRecord>,
+    #[serde(default)]
+    pub(crate) dynamic_capability_journal: Vec<dynamic_caps::DynamicCapabilityJournalEntry>,
     #[serde(default)]
     pub(crate) live_children: Vec<LiveChildRecord>,
     #[serde(default)]
@@ -235,6 +245,7 @@ pub(crate) struct FrameworkCcsPlan {
     pub(crate) schema: String,
     pub(crate) version: u32,
     pub(crate) site_id: String,
+    pub(crate) site_state_root: String,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) control_state_url: String,
     pub(crate) router_auth_token: String,
@@ -259,6 +270,7 @@ pub(crate) fn build_control_state(
         version: CONTROL_STATE_VERSION,
         run_id: run_id.to_string(),
         base_scenario: run_plan.base_scenario.clone(),
+        run_links: run_plan.links.clone(),
         placement: FrozenPlacementState {
             offered_sites: run_plan.offered_sites.clone(),
             defaults: run_plan.defaults.clone(),
@@ -276,11 +288,26 @@ pub(crate) fn build_control_state(
         next_component_id,
         capability_instances: BTreeMap::new(),
         journal: Vec::new(),
+        dynamic_capability_signing_seed_b64: amber_mesh::dynamic_caps::signing_seed_b64(
+            &amber_mesh::dynamic_caps::signing_key_from_seed(
+                amber_mesh::dynamic_caps::generate_dynamic_capability_signing_seed(),
+            ),
+        ),
+        next_dynamic_capability_grant_id: 0,
+        dynamic_capability_grants: BTreeMap::new(),
+        dynamic_capability_journal: Vec::new(),
         live_children: Vec::new(),
         pending_creates: Vec::new(),
         pending_destroys: Vec::new(),
     };
     refresh_capability_instances(&mut state)?;
+    dynamic_caps::restore_dynamic_capabilities_from_snapshot(
+        &mut state,
+        run_plan.dynamic_capabilities.as_ref(),
+    )
+    .map_err(|err| miette::miette!(err.message.clone()))?;
+    dynamic_caps::reconcile_dynamic_capability_grants(&mut state)
+        .map_err(|err| miette::miette!(err.message.clone()))?;
     Ok(state)
 }
 
@@ -316,6 +343,8 @@ pub(crate) fn write_control_state(path: &Path, state: &FrameworkControlState) ->
 
 pub(super) fn persist_control_state(path: &Path, state: &mut FrameworkControlState) -> Result<()> {
     refresh_capability_instances(state)?;
+    dynamic_caps::reconcile_dynamic_capability_grants(state)
+        .map_err(|err| miette::miette!(err.message.clone()))?;
     write_control_state(path, state)
 }
 
@@ -469,6 +498,7 @@ pub(crate) fn write_control_state_service_plan(
 pub(crate) fn write_framework_ccs_plan(
     path: &Path,
     site_id: &str,
+    site_state_root: &Path,
     listen_addr: SocketAddr,
     control_state_url: &str,
     router_auth_token: &str,
@@ -478,6 +508,7 @@ pub(crate) fn write_framework_ccs_plan(
         schema: CCS_PLAN_SCHEMA.to_string(),
         version: CCS_PLAN_VERSION,
         site_id: site_id.to_string(),
+        site_state_root: site_state_root.display().to_string(),
         listen_addr,
         control_state_url: control_state_url.to_string(),
         router_auth_token: router_auth_token.to_string(),

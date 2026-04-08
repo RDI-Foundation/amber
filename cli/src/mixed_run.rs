@@ -419,6 +419,12 @@ struct SiteActuatorState {
     children: BTreeMap<u64, SiteActuatorChildRecord>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct LiveComponentRuntimeMetadata {
+    pub(crate) moniker: String,
+    pub(crate) mesh_config: MeshConfigPublic,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SiteActuatorChildRecord {
     child_id: u64,
@@ -481,6 +487,7 @@ struct MaterializedFrameworkControlState {
     receipt: FrameworkControlStateReceipt,
     router_auth_token: String,
     control_state_auth_token: String,
+    dynamic_caps_token_verify_key_b64: String,
 }
 
 #[derive(Clone, Debug)]
@@ -2778,6 +2785,229 @@ fn local_kubernetes_peer_identities(
     Ok(peers)
 }
 
+pub(crate) fn collect_live_component_runtime_metadata(
+    plan: &SiteActuatorPlan,
+) -> Result<BTreeMap<String, LiveComponentRuntimeMetadata>> {
+    let state: SiteActuatorState = read_json(
+        &site_actuator_state_path(Path::new(&plan.site_state_root)),
+        "site actuator state",
+    )?;
+    let published_children = state
+        .children
+        .values()
+        .filter(|child| child.published)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut components = match plan.kind {
+        SiteKind::Direct => collect_direct_artifact_runtime_metadata(
+            Path::new(&plan.artifact_dir),
+            Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
+                miette::miette!("direct site `{}` is missing its runtime root", plan.site_id)
+            })?),
+        )?,
+        SiteKind::Vm => collect_vm_artifact_runtime_metadata(
+            Path::new(&plan.artifact_dir),
+            Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
+                miette::miette!("vm site `{}` is missing its runtime root", plan.site_id)
+            })?),
+        )?,
+        SiteKind::Compose => collect_compose_artifact_runtime_metadata(
+            Path::new(&plan.artifact_dir),
+            plan.compose_project.as_deref(),
+        )?,
+        SiteKind::Kubernetes => {
+            collect_kubernetes_artifact_runtime_metadata(plan, Path::new(&plan.artifact_dir))?
+        }
+    };
+    for child in &published_children {
+        let child_components = match plan.kind {
+            SiteKind::Direct => collect_direct_artifact_runtime_metadata(
+                Path::new(&child.artifact_root),
+                &site_actuator_child_runtime_root(plan, child.child_id),
+            )?,
+            SiteKind::Vm => collect_vm_artifact_runtime_metadata(
+                Path::new(&child.artifact_root),
+                &site_actuator_child_runtime_root(plan, child.child_id),
+            )?,
+            SiteKind::Compose => collect_compose_artifact_runtime_metadata(
+                Path::new(&child.artifact_root),
+                plan.compose_project.as_deref(),
+            )?,
+            SiteKind::Kubernetes => {
+                collect_kubernetes_artifact_runtime_metadata(plan, Path::new(&child.artifact_root))?
+            }
+        };
+        components.extend(child_components);
+    }
+    Ok(components)
+}
+
+fn collect_direct_artifact_runtime_metadata(
+    artifact_root: &Path,
+    runtime_root: &Path,
+) -> Result<BTreeMap<String, LiveComponentRuntimeMetadata>> {
+    let state: crate::direct_runtime::DirectRuntimeState = read_json(
+        &direct_runtime_state_path(artifact_root),
+        "direct runtime state",
+    )?;
+    let plan: DirectPlan = read_json(&artifact_root.join("direct-plan.json"), "direct plan")?;
+    let mut components = BTreeMap::new();
+    for component in &plan.components {
+        let mesh_config: MeshConfigPublic = read_json(
+            &runtime_root.join(&component.sidecar.mesh_config_path),
+            "mesh config",
+        )?;
+        state
+            .component_mesh_port_by_id
+            .get(&component.id)
+            .copied()
+            .ok_or_else(|| {
+                miette::miette!(
+                    "direct runtime state is missing mesh port for component {}",
+                    component.moniker
+                )
+            })?;
+        components.insert(
+            component.moniker.clone(),
+            LiveComponentRuntimeMetadata {
+                moniker: component.moniker.clone(),
+                mesh_config,
+            },
+        );
+    }
+    Ok(components)
+}
+
+fn collect_vm_artifact_runtime_metadata(
+    artifact_root: &Path,
+    runtime_root: &Path,
+) -> Result<BTreeMap<String, LiveComponentRuntimeMetadata>> {
+    let state = load_vm_runtime_state_for_artifact(artifact_root, runtime_root)?;
+    let plan: VmPlan = read_json(&artifact_root.join("vm-plan.json"), "vm plan")?;
+    let mut components = BTreeMap::new();
+    for component in &plan.components {
+        let mesh_config: MeshConfigPublic = read_json(
+            &runtime_root.join(&component.mesh_config_path),
+            "mesh config",
+        )?;
+        state
+            .component_mesh_port_by_id
+            .get(&component.id)
+            .copied()
+            .ok_or_else(|| {
+                miette::miette!(
+                    "vm runtime state is missing mesh port for component {}",
+                    component.moniker
+                )
+            })?;
+        components.insert(
+            component.moniker.clone(),
+            LiveComponentRuntimeMetadata {
+                moniker: component.moniker.clone(),
+                mesh_config,
+            },
+        );
+    }
+    Ok(components)
+}
+
+fn collect_compose_artifact_runtime_metadata(
+    artifact_root: &Path,
+    compose_project: Option<&str>,
+) -> Result<BTreeMap<String, LiveComponentRuntimeMetadata>> {
+    let mesh_plan = if artifact_root.join("mesh-provision-plan.json").is_file() {
+        read_json(
+            &artifact_root.join("mesh-provision-plan.json"),
+            "mesh provision plan",
+        )?
+    } else {
+        read_embedded_compose_mesh_provision_plan(artifact_root)?
+    };
+    let mut components = BTreeMap::new();
+    for target in &mesh_plan.targets {
+        if !matches!(target.kind, MeshProvisionTargetKind::Component) {
+            continue;
+        }
+        let MeshProvisionOutput::Filesystem { dir } = &target.output else {
+            return Err(miette::miette!(
+                "compose artifact {} has non-filesystem mesh output for component {}",
+                artifact_root.display(),
+                target.config.identity.id
+            ));
+        };
+        let service_name = Path::new(dir)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                miette::miette!(
+                    "compose artifact {} has invalid mesh output {} for component {}",
+                    artifact_root.display(),
+                    dir,
+                    target.config.identity.id
+                )
+            })?;
+        let mesh_config = if Path::new(dir).is_absolute() {
+            let compose_project = compose_project.ok_or_else(|| {
+                miette::miette!(
+                    "compose artifact {} requires a compose project to resolve mesh output {}",
+                    artifact_root.display(),
+                    dir
+                )
+            })?;
+            read_compose_volume_mesh_config(compose_project, service_name)?
+        } else {
+            read_json(
+                &artifact_root.join(dir).join(MESH_CONFIG_FILENAME),
+                "mesh config",
+            )?
+        };
+        components.insert(
+            target.config.identity.id.clone(),
+            LiveComponentRuntimeMetadata {
+                moniker: target.config.identity.id.clone(),
+                mesh_config,
+            },
+        );
+    }
+    Ok(components)
+}
+
+fn collect_kubernetes_artifact_runtime_metadata(
+    plan: &SiteActuatorPlan,
+    artifact_root: &Path,
+) -> Result<BTreeMap<String, LiveComponentRuntimeMetadata>> {
+    let mesh_plan = read_kubernetes_runtime_mesh_provision_plan(artifact_root)?;
+    let mut components = BTreeMap::new();
+    for target in &mesh_plan.targets {
+        if !matches!(target.kind, MeshProvisionTargetKind::Component) {
+            continue;
+        }
+        let MeshProvisionOutput::KubernetesSecret { name, namespace } = &target.output else {
+            return Err(miette::miette!(
+                "kubernetes artifact {} has non-secret mesh output for component {}",
+                artifact_root.display(),
+                target.config.identity.id
+            ));
+        };
+        name.strip_suffix("-mesh").ok_or_else(|| {
+            miette::miette!(
+                "kubernetes artifact {} component {} uses invalid mesh secret name {}",
+                artifact_root.display(),
+                target.config.identity.id,
+                name
+            )
+        })?;
+        components.insert(
+            target.config.identity.id.clone(),
+            LiveComponentRuntimeMetadata {
+                moniker: target.config.identity.id.clone(),
+                mesh_config: load_kubernetes_mesh_config_public(plan, name, namespace.as_deref())?,
+            },
+        );
+    }
+    Ok(components)
+}
+
 fn prepare_dynamic_compose_child_artifact(
     plan: &SiteActuatorPlan,
     site_plan: &DynamicSitePlanRecord,
@@ -4280,6 +4510,14 @@ fn dynamic_child_route_overlay_id(plan: &SiteActuatorPlan, child_id: u64) -> Str
 }
 
 fn site_router_control_endpoint(plan: &SiteActuatorPlan) -> Result<ControlEndpoint> {
+    let state_path = Path::new(&plan.site_state_root).join("manager-state.json");
+    if state_path.is_file() {
+        let state: SiteManagerState = read_json(&state_path, "site manager state")?;
+        if let Some(raw) = state.router_control {
+            return parse_control_endpoint(&raw);
+        }
+    }
+
     match plan.kind {
         SiteKind::Direct => Ok(ControlEndpoint::Unix(direct_current_control_socket_path(
             Path::new(&plan.artifact_dir),
@@ -4287,19 +4525,10 @@ fn site_router_control_endpoint(plan: &SiteActuatorPlan) -> Result<ControlEndpoi
         SiteKind::Vm => Ok(ControlEndpoint::Unix(vm_current_control_socket_path(
             Path::new(&plan.artifact_dir),
         ))),
-        SiteKind::Compose | SiteKind::Kubernetes => {
-            let state: SiteManagerState = read_json(
-                &Path::new(&plan.site_state_root).join("manager-state.json"),
-                "site manager state",
-            )?;
-            let raw = state.router_control.ok_or_else(|| {
-                miette::miette!(
-                    "site `{}` manager state is missing router control endpoint",
-                    plan.site_id
-                )
-            })?;
-            parse_control_endpoint(&raw)
-        }
+        SiteKind::Compose | SiteKind::Kubernetes => Err(miette::miette!(
+            "site `{}` manager state is missing router control endpoint",
+            plan.site_id
+        )),
     }
 }
 

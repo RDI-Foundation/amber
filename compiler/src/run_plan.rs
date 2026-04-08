@@ -9,6 +9,7 @@ use amber_manifest::{
     ChildTemplateDecl, ChildTemplateManifestDecl, ComponentDecl, Manifest, ManifestRef,
     MountSource, NetworkProtocol, Program as ManifestProgram, SlotDecl,
 };
+use amber_mesh::dynamic_caps::DynamicCapabilitiesSnapshotIr;
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProvideRef, Scenario, ScenarioExport,
     ScenarioIr, SlotRef, graph,
@@ -57,6 +58,8 @@ pub struct RunPlan {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub placement_components: BTreeMap<String, String>,
     pub assignments: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_capabilities: Option<DynamicCapabilitiesSnapshotIr>,
     pub sites: BTreeMap<String, RunSitePlan>,
     pub links: Vec<RunLink>,
     pub startup_waves: Vec<Vec<String>>,
@@ -137,6 +140,8 @@ pub struct PlacementFile {
     pub defaults: PlacementDefaults,
     #[serde(default)]
     pub components: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_capabilities: Option<DynamicCapabilitiesSnapshotIr>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,6 +472,8 @@ pub fn build_run_plan_with_activation(
         active_site_capabilities,
         placement_components,
         assignments,
+        dynamic_capabilities: placement
+            .and_then(|placement| placement.dynamic_capabilities.clone()),
         sites,
         links,
         startup_waves,
@@ -515,6 +522,7 @@ pub fn build_homogeneous_export_run_plan(
             image: Some(site_id),
         },
         components: BTreeMap::new(),
+        dynamic_capabilities: None,
     };
     build_run_plan(compiled, Some(&placement))
 }

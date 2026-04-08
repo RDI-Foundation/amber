@@ -276,6 +276,294 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 "#;
 
+const DYNAMIC_CAPS_APP: &str = r#"import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, urlsplit
+from urllib.request import Request, urlopen
+
+NAME = os.environ["NAME"]
+PORT = int(os.environ["PORT"])
+DYNAMIC_CAPS_API_URL = os.environ.get("AMBER_DYNAMIC_CAPS_API_URL", "").rstrip("/")
+UPSTREAMS = {
+    key.removeprefix("UPSTREAM_").lower(): value.rstrip("/")
+    for key, value in os.environ.items()
+    if key.startswith("UPSTREAM_") and value
+}
+LAST_MESSAGE = ""
+LAST_MESSAGE_CONTENT_TYPE = "text/plain; charset=utf-8"
+
+def send(handler, status, body, content_type="text/plain; charset=utf-8"):
+    payload = body.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("content-type", content_type)
+    handler.send_header("content-length", str(len(payload)))
+    handler.end_headers()
+    handler.wfile.write(payload)
+
+def send_json(handler, status, payload):
+    send(
+        handler,
+        status,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        "application/json; charset=utf-8",
+    )
+
+def request_target(target):
+    parsed = urlsplit(target)
+    query = {
+        key: values[-1]
+        for key, values in parse_qs(parsed.query, keep_blank_values=True).items()
+    }
+    return parsed.path, query
+
+def read_body(handler):
+    length = int(handler.headers.get("content-length", "0") or "0")
+    return handler.rfile.read(length).decode("utf-8") if length else ""
+
+def parse_json_body(handler):
+    raw = read_body(handler)
+    if not raw:
+        return {}, raw
+    return json.loads(raw), raw
+
+def http_call(base_url, method, path, payload=None, content_type="application/json"):
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {"Connection": "close"}
+    if data is not None:
+        headers["Content-Type"] = content_type
+    request = Request(f"{base_url.rstrip('/')}{path}", data=data, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=30) as response:
+            return (
+                response.status,
+                response.headers.get("content-type", "application/json; charset=utf-8"),
+                response.read().decode("utf-8"),
+            )
+    except HTTPError as err:
+        return (
+            err.code,
+            err.headers.get("content-type", "application/json; charset=utf-8"),
+            err.read().decode("utf-8"),
+        )
+    except URLError as err:
+        return (
+            502,
+            "application/json; charset=utf-8",
+            json.dumps({"error": f"{err.__class__.__name__}: {err.reason}"}),
+        )
+
+def api_call(method, path, payload=None):
+    if not DYNAMIC_CAPS_API_URL:
+        return (
+            503,
+            "application/json; charset=utf-8",
+            json.dumps({"error": "AMBER_DYNAMIC_CAPS_API_URL is not set"}),
+        )
+    return http_call(DYNAMIC_CAPS_API_URL, method, path, payload)
+
+def proxy_response(handler, status, content_type, body):
+    send(handler, status, body or "", content_type)
+
+def join_url(base, suffix):
+    if not suffix:
+        return base
+    return f"{base.rstrip('/')}/{suffix.lstrip('/')}"
+
+def fetch_text(url, timeout=30.0):
+    request = Request(url, headers={"Connection": "close"})
+    with urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8")
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        global LAST_MESSAGE, LAST_MESSAGE_CONTENT_TYPE
+
+        path, query = request_target(self.path)
+        try:
+            if path == "/id":
+                send(self, 200, NAME)
+                return
+            if path == "/held":
+                proxy_response(self, *api_call("GET", "/v1/held"))
+                return
+            if path.startswith("/held/"):
+                held_id = quote(path.removeprefix("/held/"), safe="")
+                proxy_response(self, *api_call("GET", f"/v1/held/{held_id}"))
+                return
+            if path == "/last-message":
+                send(self, 200, LAST_MESSAGE, LAST_MESSAGE_CONTENT_TYPE)
+                return
+            if path == "/call-upstream":
+                alias = query.get("alias", "upstream")
+                upstream = UPSTREAMS.get(alias)
+                if not upstream:
+                    send_json(self, 404, {"error": f"missing upstream {alias}"})
+                    return
+                send(self, 200, fetch_text(join_url(upstream, query.get("suffix", "/id"))))
+                return
+            if path == "/call-url":
+                url = query.get("url")
+                if not url:
+                    send_json(self, 400, {"error": "missing url"})
+                    return
+                send(self, 200, fetch_text(join_url(url, query.get("suffix", ""))))
+                return
+            if path == "/call-last-message-field":
+                field = query.get("field", "url")
+                suffix = query.get("suffix", "")
+                payload = json.loads(LAST_MESSAGE or "{}")
+                url = payload.get(field)
+                if not url:
+                    send_json(self, 404, {"error": f"missing field {field}"})
+                    return
+                send(self, 200, fetch_text(join_url(url, suffix)))
+                return
+            send(self, 404, "missing")
+        except HTTPError as err:
+            send(self, err.code, err.read().decode("utf-8", errors="replace"))
+        except Exception as err:
+            send_json(self, 502, {"error": f"{err.__class__.__name__}: {err}"})
+
+    def do_POST(self):
+        global LAST_MESSAGE, LAST_MESSAGE_CONTENT_TYPE
+
+        path, query = request_target(self.path)
+        try:
+            if path == "/message":
+                raw = read_body(self)
+                LAST_MESSAGE = raw
+                LAST_MESSAGE_CONTENT_TYPE = self.headers.get(
+                    "content-type", "text/plain; charset=utf-8"
+                )
+                send(
+                    self,
+                    200,
+                    raw or "{}",
+                    LAST_MESSAGE_CONTENT_TYPE,
+                )
+                return
+
+            payload, _ = parse_json_body(self)
+            if path == "/share":
+                status, content_type, body = api_call(
+                    "POST",
+                    "/v1/share",
+                    {
+                        "source": {
+                            "kind": payload["source_kind"],
+                            "value": payload["value"],
+                        },
+                        "recipient": payload["recipient"],
+                        "idempotency_key": payload.get("idempotency_key"),
+                        "options": payload.get("options", {}),
+                    },
+                )
+                proxy_response(self, status, content_type, body)
+                return
+            if path == "/forward-share":
+                alias = payload.get("alias", "peer")
+                peer_url = UPSTREAMS.get(alias)
+                if not peer_url:
+                    send_json(self, 404, {"error": f"missing upstream {alias}"})
+                    return
+                status, content_type, body = api_call(
+                    "POST",
+                    "/v1/share",
+                    {
+                        "source": {
+                            "kind": payload["source_kind"],
+                            "value": payload["value"],
+                        },
+                        "recipient": payload["recipient"],
+                        "idempotency_key": payload.get("idempotency_key"),
+                        "options": payload.get("options", {}),
+                    },
+                )
+                share_json = json.loads(body or "{}")
+                if status != 200 or not share_json.get("ref"):
+                    proxy_response(self, status, content_type, body)
+                    return
+                delivery_payload = payload.get("delivery_payload", {"ref": share_json["ref"]})
+                delivery = http_call(
+                    peer_url,
+                    "POST",
+                    payload.get("path", "/message"),
+                    delivery_payload,
+                )
+                send_json(
+                    self,
+                    200,
+                    {
+                        "share": share_json,
+                        "delivery": {
+                            "status": delivery[0],
+                            "content_type": delivery[1],
+                            "body": delivery[2],
+                        },
+                    },
+                )
+                return
+            if path == "/inspect-ref":
+                proxy_response(self, *api_call("POST", "/v1/inspect-ref", payload))
+                return
+            if path == "/inspect-last-message-ref":
+                field = query.get("field", "ref")
+                message = json.loads(LAST_MESSAGE or "{}")
+                proxy_response(
+                    self,
+                    *api_call("POST", "/v1/inspect-ref", {"ref": message.get(field)}),
+                )
+                return
+            if path == "/materialize":
+                proxy_response(self, *api_call("POST", "/v1/materialize", payload))
+                return
+            if path == "/materialize-last-message-ref":
+                field = query.get("field", "ref")
+                message = json.loads(LAST_MESSAGE or "{}")
+                proxy_response(
+                    self,
+                    *api_call("POST", "/v1/materialize", {"ref": message.get(field)}),
+                )
+                return
+            if path == "/revoke":
+                proxy_response(self, *api_call("POST", "/v1/revoke", payload))
+                return
+            if path == "/inspect-handle":
+                proxy_response(self, *api_call("POST", "/v1/inspect-handle", payload))
+                return
+            if path == "/inspect-last-message-handle":
+                field = query.get("field", "url")
+                message = json.loads(LAST_MESSAGE or "{}")
+                proxy_response(
+                    self,
+                    *api_call(
+                        "POST",
+                        "/v1/inspect-handle",
+                        {"handle": message.get(field)},
+                    ),
+                )
+                return
+            if path == "/call-url":
+                url = payload.get("url")
+                if not url:
+                    send_json(self, 400, {"error": "missing url"})
+                    return
+                send(self, 200, fetch_text(join_url(url, payload.get("suffix", ""))))
+                return
+            send(self, 404, "missing")
+        except HTTPError as err:
+            send(self, err.code, err.read().decode("utf-8", errors="replace"))
+        except Exception as err:
+            send_json(self, 502, {"error": f"{err.__class__.__name__}: {err}"})
+
+    def log_message(self, fmt, *args):
+        print(f"[dynamic-caps:{NAME}] {fmt % args}", flush=True)
+
+ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+"#;
+
 fn write_framework_admin_component(root: &Path, file_name: &str, image: bool, port: u16) {
     let program = if image {
         json!({
@@ -372,6 +660,79 @@ fn write_framework_worker_component(
             },
             "exports": {
                 "http": "http"
+            }
+        }),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_dynamic_caps_component(
+    root: &Path,
+    file_name: &str,
+    image: bool,
+    name: &str,
+    port: u16,
+    provide_kind: &str,
+    slots: &[(&str, &str)],
+    extra_env: &[(&str, &str)],
+) {
+    let env = slots
+        .iter()
+        .map(|(slot_name, _)| {
+            (
+                format!("UPSTREAM_{}", slot_name.to_ascii_uppercase()),
+                json!(format!("${{slots.{slot_name}.url}}")),
+            )
+        })
+        .chain(
+            extra_env
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), json!(value))),
+        )
+        .chain(std::iter::once(("NAME".to_string(), json!(name))))
+        .chain(std::iter::once((
+            "PORT".to_string(),
+            json!(port.to_string()),
+        )))
+        .collect::<serde_json::Map<_, _>>();
+    let slots = slots
+        .iter()
+        .map(|(slot_name, kind)| ((*slot_name).to_string(), json!({ "kind": kind })))
+        .collect::<serde_json::Map<_, _>>();
+    let program = if image {
+        json!({
+            "image": TEST_APP_IMAGE,
+            "entrypoint": ["python3", "-u", "-c", { "file": "./dynamic_caps_app.py" }],
+            "env": env,
+            "network": {
+                "endpoints": [
+                    { "name": "http", "port": port, "protocol": "http" }
+                ]
+            }
+        })
+    } else {
+        json!({
+            "path": "/usr/bin/env",
+            "args": ["python3", "-u", "-c", { "file": "./dynamic_caps_app.py" }],
+            "env": env,
+            "network": {
+                "endpoints": [
+                    { "name": "http", "port": port, "protocol": "http" }
+                ]
+            }
+        })
+    };
+    write_json(
+        &root.join(file_name),
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": slots,
+            "program": program,
+            "provides": {
+                "api": { "kind": provide_kind, "endpoint": "http" }
+            },
+            "exports": {
+                "api": "api"
             }
         }),
     );
@@ -1022,10 +1383,59 @@ fn write_snapshot_run_inputs(root: &Path, snapshot: &Value) -> (PathBuf, PathBuf
             "components": snapshot["placement"]
                 .get("assignments")
                 .cloned()
-                .unwrap_or_else(|| json!({}))
+                .unwrap_or_else(|| json!({})),
+            "dynamic_capabilities": snapshot["dynamic_capabilities"],
         }),
     );
     (scenario_path, placement_path)
+}
+
+fn app_post_json(port: u16, path: &str, payload: &Value) -> (u16, String) {
+    let body = serde_json::to_string(payload).expect("request body should serialize");
+    http_request_with_timeout("POST", port, path, Some(&body), Duration::from_secs(30))
+        .expect("app request should return an HTTP response")
+}
+
+fn app_get_json(port: u16, path: &str) -> Value {
+    let (status, body) = http_get_with_timeout(port, path, Duration::from_secs(30))
+        .expect("app request should return an HTTP response");
+    assert_eq!(status, 200, "GET {path} should succeed: {body}");
+    serde_json::from_str(&body).expect("response should be valid json")
+}
+
+fn held_id_with_kind(held: &Value, entry_kind: &str) -> String {
+    held["held"]
+        .as_array()
+        .expect("held response should contain an array")
+        .iter()
+        .find(|entry| entry["entry_kind"] == entry_kind && entry["state"] == "live")
+        .and_then(|entry| entry["held_id"].as_str())
+        .unwrap_or_else(|| panic!("missing live held entry of kind {entry_kind}: {held}"))
+        .to_string()
+}
+
+fn delegated_held_id_from_component(held: &Value, from_component: &str) -> String {
+    held["held"]
+        .as_array()
+        .expect("held response should contain an array")
+        .iter()
+        .find(|entry| {
+            entry["entry_kind"] == "delegated_grant"
+                && entry["state"] == "live"
+                && entry["from_component"] == from_component
+        })
+        .and_then(|entry| entry["held_id"].as_str())
+        .unwrap_or_else(|| panic!("missing delegated grant from {from_component}: {held}"))
+        .to_string()
+}
+
+fn response_json(status: u16, body: &str, context: &str) -> Value {
+    assert_eq!(status, 200, "{context} should succeed: {body}");
+    serde_json::from_str(body).expect("response should be valid json")
+}
+
+fn response_json_from(response: (u16, String), context: &str) -> Value {
+    response_json(response.0, &response.1, context)
 }
 
 #[test]
@@ -3848,6 +4258,1571 @@ fn mixed_run_detached_stop_smoke() {
         || !run.run_root.join("receipt.json").exists(),
         "detached run receipt removal",
     );
+}
+
+#[test]
+#[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
+fn dynamic_capabilities_manual_materialization_live() {
+    let temp = temp_output_dir("dynamic-caps-manual-");
+    let provider_port = pick_free_port();
+    let sender_port = pick_free_port();
+    let receiver_port = pick_free_port();
+
+    fs::write(temp.path().join("dynamic_caps_app.py"), DYNAMIC_CAPS_APP)
+        .expect("failed to write dynamic_caps_app.py");
+    write_dynamic_caps_component(
+        temp.path(),
+        "provider.json5",
+        false,
+        "provider",
+        provider_port,
+        "http",
+        &[],
+        &[],
+    );
+    write_dynamic_caps_component(
+        temp.path(),
+        "sender.json5",
+        false,
+        "sender",
+        sender_port,
+        "http",
+        &[("upstream", "http"), ("peer", "http")],
+        &[],
+    );
+    write_dynamic_caps_component(
+        temp.path(),
+        "receiver.json5",
+        false,
+        "receiver",
+        receiver_port,
+        "http",
+        &[],
+        &[],
+    );
+
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "components": {
+                "provider": "./provider.json5",
+                "sender": "./sender.json5",
+                "receiver": "./receiver.json5"
+            },
+            "bindings": [
+                { "to": "#sender.upstream", "from": "#provider.api" },
+                { "to": "#sender.peer", "from": "#receiver.api" }
+            ],
+            "exports": {
+                "sender_api": "#sender.api",
+                "receiver_api": "#receiver.api"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "direct_a": { "kind": "direct" },
+                "direct_b": { "kind": "direct" }
+            },
+            "defaults": {
+                "path": "direct_a"
+            },
+            "components": {
+                "/provider": "direct_a",
+                "/sender": "direct_a",
+                "/receiver": "direct_b"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest(&manifest, &placement, &storage_root);
+    wait_for_state_status(
+        &run.run_root,
+        "direct_a",
+        "running",
+        Duration::from_secs(60),
+    );
+    wait_for_state_status(
+        &run.run_root,
+        "direct_b",
+        "running",
+        Duration::from_secs(60),
+    );
+
+    let sender_proxy_port = pick_free_port();
+    let mut sender_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_a"),
+        "sender_api",
+        sender_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut sender_proxy,
+        sender_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    let receiver_proxy_port = pick_free_port();
+    let mut receiver_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_b"),
+        "receiver_api",
+        receiver_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut receiver_proxy,
+        receiver_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let sender_root =
+        held_id_with_kind(&app_get_json(sender_proxy_port, "/held"), "root_authority");
+    let (forward_status, forward_body) = app_post_json(
+        sender_proxy_port,
+        "/forward-share",
+        &json!({
+            "source_kind": "held_id",
+            "value": sender_root,
+            "recipient": "components./receiver"
+        }),
+    );
+    let forward_json = response_json(forward_status, &forward_body, "manual forward share");
+    assert_eq!(forward_json["share"]["outcome"], "created");
+    assert_eq!(forward_json["delivery"]["status"], 200);
+
+    let last_message = app_get_json(receiver_proxy_port, "/last-message");
+    let raw_ref = last_message["ref"]
+        .as_str()
+        .expect("receiver should record the shared ref");
+    assert!(
+        raw_ref.starts_with("amber://ref/"),
+        "plain http delivery must preserve the raw ref, got {raw_ref}"
+    );
+
+    let (inspect_status, inspect_body) = app_post_json(
+        receiver_proxy_port,
+        "/inspect-ref",
+        &json!({ "ref": raw_ref }),
+    );
+    let inspect = response_json(inspect_status, &inspect_body, "inspect ref");
+    assert_eq!(inspect["state"], "live");
+    assert_eq!(inspect["holder_component_id"], "components./receiver");
+
+    let (materialize_status, materialize_body) = app_post_json(
+        receiver_proxy_port,
+        "/materialize",
+        &json!({ "ref": raw_ref }),
+    );
+    let materialized = response_json(materialize_status, &materialize_body, "materialize ref");
+    let handle = materialized["url"]
+        .as_str()
+        .expect("materialize should return a url");
+
+    let (call_status, call_body) = app_post_json(
+        receiver_proxy_port,
+        "/call-url",
+        &json!({ "url": handle, "suffix": "/id" }),
+    );
+    assert_eq!(
+        call_status, 200,
+        "materialized handle should be usable: {call_body}"
+    );
+    assert_eq!(call_body, "provider");
+
+    stop_proxy(&mut receiver_proxy);
+    stop_proxy(&mut sender_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
+fn dynamic_capabilities_a2a_auto_materialization_live() {
+    let temp = temp_output_dir("dynamic-caps-a2a-");
+    let provider_port = pick_free_port();
+    let sender_port = pick_free_port();
+    let receiver_port = pick_free_port();
+
+    fs::write(temp.path().join("dynamic_caps_app.py"), DYNAMIC_CAPS_APP)
+        .expect("failed to write dynamic_caps_app.py");
+    write_dynamic_caps_component(
+        temp.path(),
+        "provider.json5",
+        false,
+        "provider",
+        provider_port,
+        "a2a",
+        &[],
+        &[],
+    );
+    write_dynamic_caps_component(
+        temp.path(),
+        "sender.json5",
+        false,
+        "sender",
+        sender_port,
+        "http",
+        &[("upstream", "a2a"), ("peer", "a2a")],
+        &[],
+    );
+    write_dynamic_caps_component(
+        temp.path(),
+        "receiver.json5",
+        false,
+        "receiver",
+        receiver_port,
+        "a2a",
+        &[],
+        &[],
+    );
+
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "components": {
+                "provider": "./provider.json5",
+                "sender": "./sender.json5",
+                "receiver": "./receiver.json5"
+            },
+            "bindings": [
+                { "to": "#sender.upstream", "from": "#provider.api" },
+                { "to": "#sender.peer", "from": "#receiver.api" }
+            ],
+            "exports": {
+                "sender_api": "#sender.api",
+                "receiver_api": "#receiver.api"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "direct_a": { "kind": "direct" },
+                "direct_b": { "kind": "direct" }
+            },
+            "defaults": {
+                "path": "direct_a"
+            },
+            "components": {
+                "/provider": "direct_a",
+                "/sender": "direct_a",
+                "/receiver": "direct_b"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest(&manifest, &placement, &storage_root);
+    wait_for_state_status(
+        &run.run_root,
+        "direct_a",
+        "running",
+        Duration::from_secs(60),
+    );
+    wait_for_state_status(
+        &run.run_root,
+        "direct_b",
+        "running",
+        Duration::from_secs(60),
+    );
+
+    let sender_proxy_port = pick_free_port();
+    let mut sender_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_a"),
+        "sender_api",
+        sender_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut sender_proxy,
+        sender_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    let receiver_proxy_port = pick_free_port();
+    let mut receiver_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_b"),
+        "receiver_api",
+        receiver_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut receiver_proxy,
+        receiver_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let sender_root =
+        held_id_with_kind(&app_get_json(sender_proxy_port, "/held"), "root_authority");
+    let (forward_status, forward_body) = app_post_json(
+        sender_proxy_port,
+        "/forward-share",
+        &json!({
+            "source_kind": "held_id",
+            "value": sender_root,
+            "recipient": "components./receiver"
+        }),
+    );
+    let forward_json = response_json(forward_status, &forward_body, "a2a forward share");
+    assert_eq!(forward_json["share"]["outcome"], "created");
+    assert_eq!(forward_json["delivery"]["status"], 200);
+
+    let last_message = app_get_json(receiver_proxy_port, "/last-message");
+    let auto_handle = last_message["ref"]
+        .as_str()
+        .expect("receiver should record the auto-materialized handle");
+    assert!(
+        !auto_handle.starts_with("amber://ref/"),
+        "a2a delivery should auto-materialize the ref, got {auto_handle}"
+    );
+    assert!(
+        auto_handle.starts_with("http://127.0.0.1:"),
+        "auto-materialization should yield a local loopback handle, got {auto_handle}"
+    );
+
+    let receiver_held = app_get_json(receiver_proxy_port, "/held");
+    assert!(
+        receiver_held["held"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| {
+                entry["entry_kind"] == "delegated_grant"
+                    && entry["state"] == "live"
+                    && entry["materializations"]
+                        .as_array()
+                        .is_some_and(|materializations| !materializations.is_empty())
+            })),
+        "auto-materialization should register a local handle in held inventory: {receiver_held}"
+    );
+
+    let (inspect_status, inspect_body) = app_post_json(
+        receiver_proxy_port,
+        "/inspect-handle",
+        &json!({ "handle": auto_handle }),
+    );
+    let inspect = response_json(inspect_status, &inspect_body, "inspect handle");
+    assert_eq!(inspect["state"], "live");
+
+    let (call_status, call_body) = http_get_with_timeout(
+        receiver_proxy_port,
+        "/call-last-message-field?field=ref&suffix=/id",
+        Duration::from_secs(30),
+    )
+    .expect("receiver should answer call-last-message-field");
+    assert_eq!(
+        call_status, 200,
+        "auto-materialized handle should work: {call_body}"
+    );
+    assert_eq!(call_body, "provider");
+
+    let (note_share_status, note_share_body) = app_post_json(
+        sender_proxy_port,
+        "/share",
+        &json!({
+            "source_kind": "held_id",
+            "value": sender_root,
+            "recipient": "components./receiver"
+        }),
+    );
+    let note_share = response_json(note_share_status, &note_share_body, "note-only share");
+    let note_ref = note_share["ref"]
+        .as_str()
+        .expect("note-only share should return a ref");
+    let note_grant_id = note_share["grant_id"]
+        .as_str()
+        .expect("note-only share should return a grant id");
+
+    let (message_status, message_body) = app_post_json(
+        receiver_proxy_port,
+        "/message",
+        &json!({ "note": note_ref }),
+    );
+    assert_eq!(
+        message_status, 200,
+        "receiver should accept note-only a2a payloads: {message_body}"
+    );
+    let last_message = app_get_json(receiver_proxy_port, "/last-message");
+    assert_eq!(last_message["note"], note_ref);
+
+    let receiver_held = app_get_json(receiver_proxy_port, "/held");
+    let note_entry = receiver_held["held"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["grant_id"] == note_grant_id)
+                .cloned()
+        })
+        .expect("receiver should list the note-only grant");
+    assert!(
+        note_entry["materializations"]
+            .as_array()
+            .is_some_and(|materializations| materializations.is_empty()),
+        "non-capability-bearing fields must not auto-materialize refs: {note_entry}"
+    );
+
+    let (note_materialize_status, note_materialize_body) = app_post_json(
+        receiver_proxy_port,
+        "/materialize-last-message-ref?field=note",
+        &json!({}),
+    );
+    let note_materialized = response_json(
+        note_materialize_status,
+        &note_materialize_body,
+        "explicit materialization from non-ref field",
+    );
+    let note_handle = note_materialized["url"]
+        .as_str()
+        .expect("explicit materialization should return a url");
+    let (note_call_status, note_call_body) = http_get_with_timeout(
+        receiver_proxy_port,
+        "/call-last-message-field?field=note&suffix=/id",
+        Duration::from_secs(30),
+    )
+    .expect("receiver should answer call-last-message-field for note");
+    assert_eq!(
+        note_call_status, 502,
+        "non-ref fields should remain raw refs until explicitly materialized: {note_call_body}"
+    );
+    let (explicit_call_status, explicit_call_body) = app_post_json(
+        receiver_proxy_port,
+        "/call-url",
+        &json!({ "url": note_handle, "suffix": "/id" }),
+    );
+    assert_eq!(
+        explicit_call_status, 200,
+        "explicitly materialized handle should work: {explicit_call_body}"
+    );
+    assert_eq!(explicit_call_body, "provider");
+
+    stop_proxy(&mut receiver_proxy);
+    stop_proxy(&mut sender_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
+fn dynamic_capabilities_three_site_transit_live() {
+    let temp = temp_output_dir("dynamic-caps-transit-");
+    let a_port = pick_free_port();
+    let b_port = pick_free_port();
+    let c_port = pick_free_port();
+
+    fs::write(temp.path().join("dynamic_caps_app.py"), DYNAMIC_CAPS_APP)
+        .expect("failed to write dynamic_caps_app.py");
+    write_dynamic_caps_component(temp.path(), "a.json5", false, "a", a_port, "http", &[], &[]);
+    write_dynamic_caps_component(temp.path(), "b.json5", false, "b", b_port, "http", &[], &[]);
+    write_dynamic_caps_component(temp.path(), "c.json5", false, "c", c_port, "http", &[], &[]);
+
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "components": {
+                "a": "./a.json5",
+                "b": "./b.json5",
+                "c": "./c.json5"
+            },
+            "exports": {
+                "a_api": "#a.api",
+                "b_api": "#b.api",
+                "c_api": "#c.api"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "direct_a": { "kind": "direct" },
+                "direct_b": { "kind": "direct" },
+                "direct_c": { "kind": "direct" }
+            },
+            "defaults": {
+                "path": "direct_a"
+            },
+            "components": {
+                "/a": "direct_a",
+                "/b": "direct_b",
+                "/c": "direct_c"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest(&manifest, &placement, &storage_root);
+    wait_for_state_status(
+        &run.run_root,
+        "direct_a",
+        "running",
+        Duration::from_secs(60),
+    );
+    wait_for_state_status(
+        &run.run_root,
+        "direct_b",
+        "running",
+        Duration::from_secs(60),
+    );
+    wait_for_state_status(
+        &run.run_root,
+        "direct_c",
+        "running",
+        Duration::from_secs(60),
+    );
+
+    let a_proxy_port = pick_free_port();
+    let mut a_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_a"),
+        "a_api",
+        a_proxy_port,
+        &[],
+    );
+    wait_for_path(&mut a_proxy, a_proxy_port, "/id", Duration::from_secs(60));
+    let b_proxy_port = pick_free_port();
+    let mut b_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_b"),
+        "b_api",
+        b_proxy_port,
+        &[],
+    );
+    wait_for_path(&mut b_proxy, b_proxy_port, "/id", Duration::from_secs(60));
+    let c_proxy_port = pick_free_port();
+    let mut c_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_c"),
+        "c_api",
+        c_proxy_port,
+        &[],
+    );
+    wait_for_path(&mut c_proxy, c_proxy_port, "/id", Duration::from_secs(60));
+
+    let a_root = held_id_with_kind(&app_get_json(a_proxy_port, "/held"), "root_authority");
+    let (share_b_status, share_b_body) = app_post_json(
+        a_proxy_port,
+        "/share",
+        &json!({
+            "source_kind": "held_id",
+            "value": a_root,
+            "recipient": "components./b"
+        }),
+    );
+    let _share_b = response_json(share_b_status, &share_b_body, "share a->b");
+
+    let b_held = app_get_json(b_proxy_port, "/held");
+    let b_grant = delegated_held_id_from_component(&b_held, "components./a");
+    let (share_c_status, share_c_body) = app_post_json(
+        b_proxy_port,
+        "/share",
+        &json!({
+            "source_kind": "held_id",
+            "value": b_grant,
+            "recipient": "components./c"
+        }),
+    );
+    let share_c = response_json(share_c_status, &share_c_body, "share b->c");
+    let c_ref = share_c["ref"].as_str().expect("share should return a ref");
+
+    let (materialize_status, materialize_body) =
+        app_post_json(c_proxy_port, "/materialize", &json!({ "ref": c_ref }));
+    let materialized = response_json(materialize_status, &materialize_body, "materialize c ref");
+    let c_handle = materialized["url"]
+        .as_str()
+        .expect("materialize should return a url");
+
+    let (call_status, call_body) = app_post_json(
+        c_proxy_port,
+        "/call-url",
+        &json!({ "url": c_handle, "suffix": "/id" }),
+    );
+    assert_eq!(
+        call_status, 200,
+        "c should use the transit capability: {call_body}"
+    );
+    assert_eq!(call_body, "a");
+
+    let (revoke_status, revoke_body) =
+        app_post_json(b_proxy_port, "/revoke", &json!({ "held_id": b_grant }));
+    let revoke = response_json(revoke_status, &revoke_body, "revoke b grant");
+    assert_eq!(revoke["outcome"], "revoked");
+
+    let (revoked_call_status, revoked_call_body) = app_post_json(
+        c_proxy_port,
+        "/call-url",
+        &json!({ "url": c_handle, "suffix": "/id" }),
+    );
+    assert_ne!(
+        revoked_call_status, 200,
+        "revoking the middle hop should remove c's access, got: {revoked_call_body}"
+    );
+
+    stop_proxy(&mut c_proxy);
+    stop_proxy(&mut b_proxy);
+    stop_proxy(&mut a_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
+fn dynamic_capabilities_diamond_revocation_live() {
+    let temp = temp_output_dir("dynamic-caps-diamond-");
+    let a_port = pick_free_port();
+    let b_port = pick_free_port();
+    let c_port = pick_free_port();
+    let d_port = pick_free_port();
+
+    fs::write(temp.path().join("dynamic_caps_app.py"), DYNAMIC_CAPS_APP)
+        .expect("failed to write dynamic_caps_app.py");
+    write_dynamic_caps_component(temp.path(), "a.json5", false, "a", a_port, "http", &[], &[]);
+    write_dynamic_caps_component(temp.path(), "b.json5", false, "b", b_port, "http", &[], &[]);
+    write_dynamic_caps_component(temp.path(), "c.json5", false, "c", c_port, "http", &[], &[]);
+    write_dynamic_caps_component(temp.path(), "d.json5", false, "d", d_port, "http", &[], &[]);
+
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "components": {
+                "a": "./a.json5",
+                "b": "./b.json5",
+                "c": "./c.json5",
+                "d": "./d.json5"
+            },
+            "exports": {
+                "a_api": "#a.api",
+                "b_api": "#b.api",
+                "c_api": "#c.api",
+                "d_api": "#d.api"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "direct_a": { "kind": "direct" },
+                "direct_b": { "kind": "direct" },
+                "direct_c": { "kind": "direct" },
+                "direct_d": { "kind": "direct" }
+            },
+            "defaults": {
+                "path": "direct_a"
+            },
+            "components": {
+                "/a": "direct_a",
+                "/b": "direct_b",
+                "/c": "direct_c",
+                "/d": "direct_d"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest(&manifest, &placement, &storage_root);
+    for site in ["direct_a", "direct_b", "direct_c", "direct_d"] {
+        wait_for_state_status(&run.run_root, site, "running", Duration::from_secs(60));
+    }
+
+    let a_proxy_port = pick_free_port();
+    let mut a_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_a"),
+        "a_api",
+        a_proxy_port,
+        &[],
+    );
+    wait_for_path(&mut a_proxy, a_proxy_port, "/id", Duration::from_secs(60));
+    let b_proxy_port = pick_free_port();
+    let mut b_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_b"),
+        "b_api",
+        b_proxy_port,
+        &[],
+    );
+    wait_for_path(&mut b_proxy, b_proxy_port, "/id", Duration::from_secs(60));
+    let c_proxy_port = pick_free_port();
+    let mut c_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_c"),
+        "c_api",
+        c_proxy_port,
+        &[],
+    );
+    wait_for_path(&mut c_proxy, c_proxy_port, "/id", Duration::from_secs(60));
+    let d_proxy_port = pick_free_port();
+    let mut d_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_d"),
+        "d_api",
+        d_proxy_port,
+        &[],
+    );
+    wait_for_path(&mut d_proxy, d_proxy_port, "/id", Duration::from_secs(60));
+
+    let a_root = held_id_with_kind(&app_get_json(a_proxy_port, "/held"), "root_authority");
+    let share_b = response_json_from(
+        app_post_json(
+            a_proxy_port,
+            "/share",
+            &json!({
+                "source_kind": "held_id",
+                "value": a_root,
+                "recipient": "components./b"
+            }),
+        ),
+        "share a->b",
+    );
+    let share_c = response_json_from(
+        app_post_json(
+            a_proxy_port,
+            "/share",
+            &json!({
+                "source_kind": "held_id",
+                "value": a_root,
+                "recipient": "components./c"
+            }),
+        ),
+        "share a->c",
+    );
+    let _ = share_b;
+    let _ = share_c;
+
+    let b_grant =
+        delegated_held_id_from_component(&app_get_json(b_proxy_port, "/held"), "components./a");
+    let c_grant =
+        delegated_held_id_from_component(&app_get_json(c_proxy_port, "/held"), "components./a");
+    let share_bd = response_json_from(
+        app_post_json(
+            b_proxy_port,
+            "/share",
+            &json!({
+                "source_kind": "held_id",
+                "value": b_grant,
+                "recipient": "components./d"
+            }),
+        ),
+        "share b->d",
+    );
+    let share_cd = response_json_from(
+        app_post_json(
+            c_proxy_port,
+            "/share",
+            &json!({
+                "source_kind": "held_id",
+                "value": c_grant,
+                "recipient": "components./d"
+            }),
+        ),
+        "share c->d",
+    );
+    let ref_bd = share_bd["ref"]
+        .as_str()
+        .expect("b->d share should return a ref");
+    let ref_cd = share_cd["ref"]
+        .as_str()
+        .expect("c->d share should return a ref");
+
+    let handle_bd = response_json_from(
+        app_post_json(d_proxy_port, "/materialize", &json!({ "ref": ref_bd })),
+        "materialize b->d ref",
+    )["url"]
+        .as_str()
+        .expect("materialize should return a url")
+        .to_string();
+    let handle_cd = response_json_from(
+        app_post_json(d_proxy_port, "/materialize", &json!({ "ref": ref_cd })),
+        "materialize c->d ref",
+    )["url"]
+        .as_str()
+        .expect("materialize should return a url")
+        .to_string();
+
+    let (call_bd_status, call_bd_body) = app_post_json(
+        d_proxy_port,
+        "/call-url",
+        &json!({ "url": handle_bd, "suffix": "/id" }),
+    );
+    let (call_cd_status, call_cd_body) = app_post_json(
+        d_proxy_port,
+        "/call-url",
+        &json!({ "url": handle_cd, "suffix": "/id" }),
+    );
+    assert_eq!(call_bd_status, 200, "b path should work: {call_bd_body}");
+    assert_eq!(call_cd_status, 200, "c path should work: {call_cd_body}");
+    assert_eq!(call_bd_body, "a");
+    assert_eq!(call_cd_body, "a");
+
+    let _ = response_json_from(
+        app_post_json(c_proxy_port, "/revoke", &json!({ "held_id": c_grant })),
+        "revoke c grant",
+    );
+    let (post_c_revoke_b_status, post_c_revoke_b_body) = app_post_json(
+        d_proxy_port,
+        "/call-url",
+        &json!({ "url": handle_bd, "suffix": "/id" }),
+    );
+    let (post_c_revoke_c_status, post_c_revoke_c_body) = app_post_json(
+        d_proxy_port,
+        "/call-url",
+        &json!({ "url": handle_cd, "suffix": "/id" }),
+    );
+    assert_eq!(
+        post_c_revoke_b_status, 200,
+        "d should retain access through b after c revokes: {post_c_revoke_b_body}"
+    );
+    assert_ne!(
+        post_c_revoke_c_status, 200,
+        "d should lose the c-derived path after c revokes: {post_c_revoke_c_body}"
+    );
+
+    let _ = response_json_from(
+        app_post_json(b_proxy_port, "/revoke", &json!({ "held_id": b_grant })),
+        "revoke b grant",
+    );
+    let (post_b_revoke_status, post_b_revoke_body) = app_post_json(
+        d_proxy_port,
+        "/call-url",
+        &json!({ "url": handle_bd, "suffix": "/id" }),
+    );
+    assert_ne!(
+        post_b_revoke_status, 200,
+        "d should lose all access once b also revokes: {post_b_revoke_body}"
+    );
+
+    stop_proxy(&mut d_proxy);
+    stop_proxy(&mut c_proxy);
+    stop_proxy(&mut b_proxy);
+    stop_proxy(&mut a_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
+fn dynamic_capabilities_external_slot_root_share_live() {
+    let temp = temp_output_dir("dynamic-caps-external-root-");
+    let catalog = HostHttpServer::start();
+    let catalog_url = format!("http://127.0.0.1:{}", catalog.port());
+    let root_port = pick_free_port();
+    let receiver_port = pick_free_port();
+
+    fs::write(temp.path().join("dynamic_caps_app.py"), DYNAMIC_CAPS_APP)
+        .expect("failed to write dynamic_caps_app.py");
+    write_dynamic_caps_component(
+        temp.path(),
+        "receiver.json5",
+        false,
+        "receiver",
+        receiver_port,
+        "http",
+        &[],
+        &[],
+    );
+    write_json(
+        &temp.path().join("root.json5"),
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "catalog_api": { "kind": "http" }
+            },
+            "program": {
+                "path": "/usr/bin/env",
+                "args": ["python3", "-u", "-c", { "file": "./dynamic_caps_app.py" }],
+                "env": {
+                    "NAME": "root",
+                    "PORT": root_port.to_string(),
+                    "UPSTREAM_CATALOG_API": "${slots.catalog_api.url}"
+                },
+                "network": {
+                    "endpoints": [
+                        { "name": "http", "port": root_port, "protocol": "http" }
+                    ]
+                }
+            },
+            "provides": {
+                "api": { "kind": "http", "endpoint": "http" }
+            },
+            "components": {
+                "receiver": "./receiver.json5"
+            },
+            "exports": {
+                "root_api": "api",
+                "receiver_api": "#receiver.api"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "direct_local": { "kind": "direct" }
+            },
+            "defaults": {
+                "path": "direct_local"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest_with_env(
+        &temp.path().join("root.json5"),
+        &placement,
+        &storage_root,
+        &[("AMBER_EXTERNAL_SLOT_CATALOG_API_URL", catalog_url.as_str())],
+    );
+    wait_for_state_status(
+        &run.run_root,
+        "direct_local",
+        "running",
+        Duration::from_secs(60),
+    );
+
+    let root_proxy_port = pick_free_port();
+    let mut root_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_local"),
+        "root_api",
+        root_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut root_proxy,
+        root_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    let receiver_proxy_port = pick_free_port();
+    let mut receiver_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_local"),
+        "receiver_api",
+        receiver_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut receiver_proxy,
+        receiver_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let root_held = app_get_json(root_proxy_port, "/held");
+    let root_authority = held_id_with_kind(&root_held, "root_authority");
+    let (root_materialize_status, root_materialize_body) = app_post_json(
+        root_proxy_port,
+        "/materialize",
+        &json!({ "held_id": root_authority }),
+    );
+    let root_materialized = response_json(
+        root_materialize_status,
+        &root_materialize_body,
+        "materialize root authority",
+    );
+    let root_handle = root_materialized["url"]
+        .as_str()
+        .expect("root materialization should return a url");
+    let (root_call_status, root_call_body) = app_post_json(
+        root_proxy_port,
+        "/call-url",
+        &json!({ "url": root_handle, "suffix": "/item/amber-mug" }),
+    );
+    assert_eq!(
+        root_call_status, 200,
+        "root should use the external slot directly: {root_call_body}"
+    );
+    assert_eq!(
+        root_call_body,
+        r#"{"source":"external","item":"amber mug"}"#
+    );
+
+    let (share_status, share_body) = app_post_json(
+        root_proxy_port,
+        "/share",
+        &json!({
+            "source_kind": "held_id",
+            "value": root_authority,
+            "recipient": "components./receiver"
+        }),
+    );
+    let share = response_json(share_status, &share_body, "share external root");
+    let shared_ref = share["ref"].as_str().expect("share should return a ref");
+
+    let (receiver_materialize_status, receiver_materialize_body) = app_post_json(
+        receiver_proxy_port,
+        "/materialize",
+        &json!({ "ref": shared_ref }),
+    );
+    let receiver_materialized = response_json(
+        receiver_materialize_status,
+        &receiver_materialize_body,
+        "materialize receiver ref",
+    );
+    let receiver_handle = receiver_materialized["url"]
+        .as_str()
+        .expect("receiver materialization should return a url");
+    let (receiver_call_status, receiver_call_body) = app_post_json(
+        receiver_proxy_port,
+        "/call-url",
+        &json!({ "url": receiver_handle, "suffix": "/item/amber-mug" }),
+    );
+    assert_eq!(
+        receiver_call_status, 200,
+        "shared external-root grant should be usable: {receiver_call_body}"
+    );
+    assert_eq!(
+        receiver_call_body,
+        r#"{"source":"external","item":"amber mug"}"#
+    );
+
+    let receiver_grant = delegated_held_id_from_component(
+        &app_get_json(receiver_proxy_port, "/held"),
+        "components./",
+    );
+    let _ = response_json_from(
+        app_post_json(
+            receiver_proxy_port,
+            "/revoke",
+            &json!({ "held_id": receiver_grant }),
+        ),
+        "revoke receiver grant",
+    );
+
+    let (revoked_status, revoked_body) = app_post_json(
+        receiver_proxy_port,
+        "/call-url",
+        &json!({ "url": receiver_handle, "suffix": "/item/amber-mug" }),
+    );
+    assert_ne!(
+        revoked_status, 200,
+        "revoked external-root grant should stop working: {revoked_body}"
+    );
+    assert_eq!(
+        held_id_with_kind(&app_get_json(root_proxy_port, "/held"), "root_authority"),
+        root_authority,
+        "root holder must retain its directly held external authority"
+    );
+
+    stop_proxy(&mut receiver_proxy);
+    stop_proxy(&mut root_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
+fn dynamic_capabilities_dynamic_child_post_create_share_live() {
+    let temp = temp_output_dir("dynamic-caps-dynamic-child-");
+    let admin_port = pick_free_port();
+    let provider_port = pick_free_port();
+    let consumer_port = pick_free_port();
+    let child_port = pick_free_port();
+
+    fs::write(temp.path().join("admin.py"), FRAMEWORK_ADMIN_APP).expect("failed to write admin.py");
+    fs::write(temp.path().join("dynamic_caps_app.py"), DYNAMIC_CAPS_APP)
+        .expect("failed to write dynamic_caps_app.py");
+    write_framework_admin_component(temp.path(), "admin.json5", false, admin_port);
+    write_dynamic_caps_component(
+        temp.path(),
+        "provider.json5",
+        false,
+        "provider",
+        provider_port,
+        "http",
+        &[],
+        &[],
+    );
+    write_dynamic_caps_component(
+        temp.path(),
+        "consumer.json5",
+        false,
+        "consumer",
+        consumer_port,
+        "http",
+        &[],
+        &[],
+    );
+    write_dynamic_caps_component(
+        temp.path(),
+        "child.json5",
+        false,
+        "child",
+        child_port,
+        "http",
+        &[],
+        &[],
+    );
+    let child_manifest_url = framework_manifest_url(&temp.path().join("child.json5"));
+
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true }
+            },
+            "components": {
+                "admin": "./admin.json5",
+                "provider": "./provider.json5",
+                "consumer": "./consumer.json5"
+            },
+            "child_templates": {
+                "open_worker": {}
+            },
+            "bindings": [
+                { "to": "#admin.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "admin_http": "#admin.http",
+                "provider_api": "#provider.api",
+                "consumer_api": "#consumer.api"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "direct_local": { "kind": "direct" }
+            },
+            "defaults": {
+                "path": "direct_local"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest(&manifest, &placement, &storage_root);
+    wait_for_state_status(
+        &run.run_root,
+        "direct_local",
+        "running",
+        Duration::from_secs(60),
+    );
+
+    let admin_proxy_port = pick_free_port();
+    let mut admin_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_local"),
+        "admin_http",
+        admin_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut admin_proxy,
+        admin_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    let provider_proxy_port = pick_free_port();
+    let mut provider_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_local"),
+        "provider_api",
+        provider_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut provider_proxy,
+        provider_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    let consumer_proxy_port = pick_free_port();
+    let mut consumer_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_local"),
+        "consumer_api",
+        consumer_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut consumer_proxy,
+        consumer_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let (create_status, create_body) = framework_create_child_with_request(
+        admin_proxy_port,
+        &json!({
+            "template": "open_worker",
+            "name": "job-dynamic",
+            "manifest": child_manifest_url
+        }),
+    );
+    assert_eq!(
+        create_status, 200,
+        "dynamic child create should succeed: {create_body}"
+    );
+    let control_state_path = framework_control_state_path(&run);
+    let child_id = wait_for_live_child(&control_state_path, "job-dynamic");
+    let child_artifact = framework_child_artifact(&run, "direct_local", child_id);
+    let child_proxy_port = pick_free_port();
+    let mut child_proxy = spawn_proxy(&child_artifact, "api", child_proxy_port, &[]);
+    wait_for_path(
+        &mut child_proxy,
+        child_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let provider_root = held_id_with_kind(
+        &app_get_json(provider_proxy_port, "/held"),
+        "root_authority",
+    );
+    let (share_status, share_body) = app_post_json(
+        provider_proxy_port,
+        "/share",
+        &json!({
+            "source_kind": "held_id",
+            "value": provider_root,
+            "recipient": "components./job-dynamic"
+        }),
+    );
+    let share = response_json(share_status, &share_body, "share to dynamic child");
+    let _shared_ref = share["ref"].as_str().expect("share should return a ref");
+
+    let child_grant = delegated_held_id_from_component(
+        &app_get_json(child_proxy_port, "/held"),
+        "components./provider",
+    );
+    let (child_materialize_status, child_materialize_body) = app_post_json(
+        child_proxy_port,
+        "/materialize",
+        &json!({ "held_id": child_grant }),
+    );
+    let child_materialized = response_json(
+        child_materialize_status,
+        &child_materialize_body,
+        "child materialization",
+    );
+    let child_handle = child_materialized["url"]
+        .as_str()
+        .expect("child materialization should return a url");
+    let (child_call_status, child_call_body) = app_post_json(
+        child_proxy_port,
+        "/call-url",
+        &json!({ "url": child_handle, "suffix": "/id" }),
+    );
+    assert_eq!(
+        child_call_status, 200,
+        "child should use the shared capability: {child_call_body}"
+    );
+    assert_eq!(child_call_body, "provider");
+
+    let (reshare_status, reshare_body) = app_post_json(
+        child_proxy_port,
+        "/share",
+        &json!({
+            "source_kind": "held_id",
+            "value": child_grant,
+            "recipient": "components./consumer"
+        }),
+    );
+    let _reshare = response_json(reshare_status, &reshare_body, "child reshare");
+    let consumer_grant = delegated_held_id_from_component(
+        &app_get_json(consumer_proxy_port, "/held"),
+        "components./job-dynamic",
+    );
+    let (consumer_materialize_status, consumer_materialize_body) = app_post_json(
+        consumer_proxy_port,
+        "/materialize",
+        &json!({ "held_id": consumer_grant }),
+    );
+    let consumer_materialized = response_json(
+        consumer_materialize_status,
+        &consumer_materialize_body,
+        "consumer materialization",
+    );
+    let consumer_handle = consumer_materialized["url"]
+        .as_str()
+        .expect("consumer materialization should return a url");
+    let (consumer_call_status, consumer_call_body) = app_post_json(
+        consumer_proxy_port,
+        "/call-url",
+        &json!({ "url": consumer_handle, "suffix": "/id" }),
+    );
+    assert_eq!(
+        consumer_call_status, 200,
+        "consumer should use the dynamic child's reshared capability: {consumer_call_body}"
+    );
+    assert_eq!(consumer_call_body, "provider");
+
+    stop_proxy(&mut child_proxy);
+    stop_proxy(&mut consumer_proxy);
+    stop_proxy(&mut provider_proxy);
+    stop_proxy(&mut admin_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
+fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
+    let temp = temp_output_dir("dynamic-caps-replay-child-");
+    let admin_port = pick_free_port();
+    let provider_port = pick_free_port();
+    let child_port = pick_free_port();
+
+    fs::write(temp.path().join("admin.py"), FRAMEWORK_ADMIN_APP).expect("failed to write admin.py");
+    fs::write(temp.path().join("dynamic_caps_app.py"), DYNAMIC_CAPS_APP)
+        .expect("failed to write dynamic_caps_app.py");
+    write_framework_admin_component(temp.path(), "admin.json5", false, admin_port);
+    write_dynamic_caps_component(
+        temp.path(),
+        "provider.json5",
+        false,
+        "provider",
+        provider_port,
+        "http",
+        &[],
+        &[],
+    );
+    write_dynamic_caps_component(
+        temp.path(),
+        "child.json5",
+        false,
+        "child",
+        child_port,
+        "http",
+        &[],
+        &[],
+    );
+    let child_manifest_url = framework_manifest_url(&temp.path().join("child.json5"));
+
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true }
+            },
+            "components": {
+                "admin": "./admin.json5",
+                "provider": "./provider.json5"
+            },
+            "child_templates": {
+                "open_worker": {}
+            },
+            "bindings": [
+                { "to": "#admin.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "admin_http": "#admin.http",
+                "provider_api": "#provider.api"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "direct_local": { "kind": "direct" }
+            },
+            "defaults": {
+                "path": "direct_local"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest(&manifest, &placement, &storage_root);
+    wait_for_state_status(
+        &run.run_root,
+        "direct_local",
+        "running",
+        Duration::from_secs(60),
+    );
+
+    let admin_proxy_port = pick_free_port();
+    let mut admin_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_local"),
+        "admin_http",
+        admin_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut admin_proxy,
+        admin_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    let provider_proxy_port = pick_free_port();
+    let mut provider_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_local"),
+        "provider_api",
+        provider_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut provider_proxy,
+        provider_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let (create_status, create_body) = framework_create_child_with_request(
+        admin_proxy_port,
+        &json!({
+            "template": "open_worker",
+            "name": "job-replay",
+            "manifest": child_manifest_url
+        }),
+    );
+    assert_eq!(
+        create_status, 200,
+        "dynamic child create should succeed: {create_body}"
+    );
+    let control_state_path = framework_control_state_path(&run);
+    let child_id = wait_for_live_child(&control_state_path, "job-replay");
+    let child_artifact = framework_child_artifact(&run, "direct_local", child_id);
+    let child_proxy_port = pick_free_port();
+    let mut child_proxy = spawn_proxy(&child_artifact, "api", child_proxy_port, &[]);
+    wait_for_path(
+        &mut child_proxy,
+        child_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let provider_root = held_id_with_kind(
+        &app_get_json(provider_proxy_port, "/held"),
+        "root_authority",
+    );
+    let (share_status, share_body) = app_post_json(
+        provider_proxy_port,
+        "/share",
+        &json!({
+            "source_kind": "held_id",
+            "value": provider_root,
+            "recipient": "components./job-replay"
+        }),
+    );
+    let share = response_json(share_status, &share_body, "share to replay child");
+    let old_ref = share["ref"]
+        .as_str()
+        .expect("share should return a ref")
+        .to_string();
+
+    let snapshot = framework_snapshot_via_admin(admin_proxy_port);
+
+    stop_proxy(&mut child_proxy);
+    stop_proxy(&mut provider_proxy);
+    stop_proxy(&mut admin_proxy);
+    run.stop();
+
+    let replay_root = temp.path().join("replay");
+    fs::create_dir_all(&replay_root).expect("failed to create replay dir");
+    let (snapshot_scenario, snapshot_placement) =
+        write_snapshot_run_inputs(&replay_root, &snapshot);
+    let replay_storage_root = temp.path().join("replay-state");
+    let mut replay_run = run_manifest(
+        &snapshot_scenario,
+        &snapshot_placement,
+        &replay_storage_root,
+    );
+    wait_for_state_status(
+        &replay_run.run_root,
+        "direct_local",
+        "running",
+        Duration::from_secs(60),
+    );
+
+    let replay_provider_proxy_port = pick_free_port();
+    let mut replay_provider_proxy = spawn_proxy(
+        &replay_run.site_artifact_dir("direct_local"),
+        "provider_api",
+        replay_provider_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut replay_provider_proxy,
+        replay_provider_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    let replay_control_state = framework_control_state_path(&replay_run);
+    wait_for_condition(
+        Duration::from_secs(60),
+        || {
+            read_json(&replay_control_state)["base_scenario"]["components"]
+                .as_array()
+                .is_some_and(|components| {
+                    components
+                        .iter()
+                        .any(|component| component["moniker"] == "/job-replay")
+                })
+        },
+        "replayed child `job-replay` in the replayed scenario graph",
+    );
+    wait_for_condition(
+        Duration::from_secs(60),
+        || {
+            http_get(child_port, "/id")
+                .is_some_and(|(status, body)| status == 200 && body == "child")
+        },
+        "replayed child `job-replay` HTTP endpoint",
+    );
+
+    let replay_held = app_get_json(child_port, "/held");
+    let replay_grant = delegated_held_id_from_component(&replay_held, "components./provider");
+    let (replay_materialize_status, replay_materialize_body) = app_post_json(
+        child_port,
+        "/materialize",
+        &json!({ "held_id": replay_grant }),
+    );
+    let replay_materialized = response_json(
+        replay_materialize_status,
+        &replay_materialize_body,
+        "replay child materialization",
+    );
+    let replay_handle = replay_materialized["url"]
+        .as_str()
+        .expect("replay child materialization should return a url");
+    let (replay_call_status, replay_call_body) = app_post_json(
+        child_port,
+        "/call-url",
+        &json!({ "url": replay_handle, "suffix": "/id" }),
+    );
+    assert_eq!(
+        replay_call_status, 200,
+        "replayed child should re-materialize the restored grant: {replay_call_body}"
+    );
+    assert_eq!(replay_call_body, "provider");
+
+    let (old_ref_status, old_ref_body) =
+        app_post_json(child_port, "/inspect-ref", &json!({ "ref": old_ref }));
+    assert_eq!(
+        old_ref_status, 400,
+        "old run refs should be rejected after replay"
+    );
+    assert!(
+        old_ref_body.contains("different run"),
+        "old ref failure should explain the run mismatch, got: {old_ref_body}"
+    );
+
+    stop_proxy(&mut replay_provider_proxy);
+    replay_run.stop();
 }
 
 #[test]

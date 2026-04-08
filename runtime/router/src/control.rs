@@ -21,6 +21,7 @@ pub(super) struct InboundRuntime {
     vetted_external_addrs: VettedExternalAddrs,
     client: Arc<HttpClient>,
     a2a_url_rewrite_table: Arc<a2a::UrlRewriteTable>,
+    dynamic_caps: Option<Arc<DynamicCapsRuntime>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +170,12 @@ pub async fn run_with_listeners(
     let config = Arc::new(config);
     let external_overrides = Arc::new(RwLock::new(HashMap::new()));
     let (client, vetted_external_addrs) = build_client();
+    let client = Arc::new(client);
+    let dynamic_caps = DynamicCapsRuntime::build(
+        config.clone(),
+        client.clone(),
+        a2a_url_rewrite_table.clone(),
+    )?;
     let mut listeners = JoinSet::new();
 
     {
@@ -181,8 +188,9 @@ pub async fn run_with_listeners(
                 dynamic_issuers: dynamic_issuers.clone(),
                 external_overrides: external_overrides.clone(),
                 vetted_external_addrs: vetted_external_addrs.clone(),
-                client: Arc::new(client),
+                client: client.clone(),
                 a2a_url_rewrite_table: a2a_url_rewrite_table.clone(),
+                dynamic_caps: dynamic_caps.clone(),
             },
             listeners_by_route.mesh.take(),
         ));
@@ -198,8 +206,13 @@ pub async fn run_with_listeners(
             config,
             trust,
             a2a_url_rewrite_table,
+            dynamic_caps.clone(),
             prebound_listener,
         ));
+    }
+
+    if let Some(dynamic_caps) = dynamic_caps.clone() {
+        listeners.spawn(run_dynamic_caps_server(dynamic_caps));
     }
 
     let control_socket_path = env::var(CONTROL_SOCKET_PATH_ENV)
@@ -363,6 +376,7 @@ pub(super) async fn handle_inbound(
         vetted_external_addrs,
         client,
         a2a_url_rewrite_table,
+        dynamic_caps,
     } = state;
     let noise_keys = noise_keys_for_identity(&config.identity)?;
     let mut session = accept_noise(stream, &noise_keys, &trust).await?;
@@ -401,6 +415,7 @@ pub(super) async fn handle_inbound(
                         &route,
                         &open,
                     ),
+                    dynamic_caps.clone(),
                 )
                 .await?;
             } else {
@@ -591,6 +606,7 @@ pub(super) async fn run_outbound_listener(
     config: Arc<MeshConfig>,
     trust: Arc<TrustBundle>,
     a2a_url_rewrite_table: Arc<a2a::UrlRewriteTable>,
+    dynamic_caps: Option<Arc<DynamicCapsRuntime>>,
     prebound_listener: Option<TcpListener>,
 ) -> Result<(), RouterError> {
     let listen_ip = route
@@ -617,9 +633,17 @@ pub(super) async fn run_outbound_listener(
         let config = config.clone();
         let trust = trust.clone();
         let a2a_url_rewrite_table = a2a_url_rewrite_table.clone();
+        let dynamic_caps = dynamic_caps.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_outbound(stream, route, config, trust, a2a_url_rewrite_table).await
+            if let Err(err) = handle_outbound(
+                stream,
+                route,
+                config,
+                trust,
+                a2a_url_rewrite_table,
+                dynamic_caps,
+            )
+            .await
             {
                 tracing::warn!(target: "amber.internal", "outbound connection failed: {err}");
             }
@@ -633,6 +657,7 @@ pub(super) async fn handle_outbound(
     config: Arc<MeshConfig>,
     trust: Arc<TrustBundle>,
     a2a_url_rewrite_table: Arc<a2a::UrlRewriteTable>,
+    dynamic_caps: Option<Arc<DynamicCapsRuntime>>,
 ) -> Result<(), RouterError> {
     let mut outbound = connect_noise(&route.peer_addr, &route.peer_id, &config, &trust).await?;
 
@@ -653,6 +678,7 @@ pub(super) async fn handle_outbound(
             stream,
             plugins,
             HttpExchangeLabels::outbound_from_route(config.identity.id.clone().into(), &route),
+            dynamic_caps,
         )
         .await?;
     } else {

@@ -107,6 +107,7 @@ fn assign_vm_runtime_ports_preserves_guest_slot_order() {
         },
         mesh_listen: "127.0.0.1:19000".parse().expect("mesh"),
         control_listen: None,
+        dynamic_caps_listen: None,
         control_allow: None,
         peers: Vec::new(),
         inbound: Vec::new(),

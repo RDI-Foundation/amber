@@ -530,7 +530,7 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
     assert_depends_on(program_service, gateway_name, "service_started");
     assert_eq!(
         env_value(program_service, "DOCKER_HOST").as_deref(),
-        Some("tcp://127.0.0.1:20000"),
+        Some("tcp://127.0.0.1:20001"),
     );
 }
 
@@ -626,7 +626,7 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
     assert_eq!(mount_specs.len(), 1);
     assert_eq!(mount_specs[0]["path"], "/var/run/docker.sock");
     assert_eq!(mount_specs[0]["tcp_host"], "127.0.0.1");
-    assert_eq!(mount_specs[0]["tcp_port"], 20000);
+    assert_eq!(mount_specs[0]["tcp_port"], 20001);
 }
 
 #[test]
@@ -807,12 +807,12 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         .iter()
         .find(|route| route.slot == "api")
         .expect("client outbound route missing");
-    assert_eq!(outbound.listen_port, 20000);
+    assert_eq!(outbound.listen_port, 20001);
 
-    // Slot URL should be rendered with local proxy port base (20000).
+    // Slot URL should follow the first route port after the reserved dynamic-caps listener.
     assert_eq!(
         env_value(service(&compose, "c2-client"), "URL").as_deref(),
-        Some("http://127.0.0.1:20000")
+        Some("http://127.0.0.1:20001")
     );
 }
 
@@ -1338,7 +1338,7 @@ fn compose_routes_external_slots_through_router() {
         compose
             .services
             .values()
-            .any(|svc| { env_value(svc, "API_URL").as_deref() == Some("http://127.0.0.1:20000") })
+            .any(|svc| { env_value(svc, "API_URL").as_deref() == Some("http://127.0.0.1:20001") })
     );
     let external_meta = compose
         .x_amber

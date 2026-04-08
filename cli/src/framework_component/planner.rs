@@ -2092,6 +2092,7 @@ pub(super) fn placement_file_from_state(state: &FrameworkControlState) -> Placem
         sites: state.placement.offered_sites.clone(),
         defaults: state.placement.defaults.clone(),
         components,
+        dynamic_capabilities: None,
     }
 }
 
@@ -2994,6 +2995,7 @@ pub(super) struct ControlStateApp {
 #[derive(Clone)]
 pub(super) struct CcsApp {
     pub(super) client: ReqwestClient,
+    pub(super) site_state_root: PathBuf,
     pub(super) control_state_url: Arc<str>,
     pub(super) router_auth_token: Arc<str>,
     pub(super) control_state_auth_token: Arc<str>,

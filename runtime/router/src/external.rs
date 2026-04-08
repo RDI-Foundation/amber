@@ -214,6 +214,7 @@ fn is_disallowed_external_ip(ip: IpAddr) -> bool {
 
 fn allows_loopback_external_target(target: &ExternalTarget) -> bool {
     target.url_env == amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV
+        || (target.url_env.starts_with("AMBER_EXTERNAL_SLOT_") && target.url_env.ends_with("_URL"))
 }
 
 pub(super) fn join_url(base: &Url, uri: &Uri) -> Url {

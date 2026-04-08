@@ -183,12 +183,7 @@ pub(crate) fn materialize_vm_runtime_with_existing(
 }
 
 pub(crate) fn hashed_temp_socket_path(namespace: &str, kind: &str, path: &Path) -> PathBuf {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    let suffix = hasher.finish();
-    env::temp_dir()
-        .join(namespace)
-        .join(format!("{kind}-{suffix:016x}.sock"))
+    amber_mesh::stable_temp_socket_path(namespace, kind, path)
 }
 
 pub(crate) fn assign_vm_runtime_ports(

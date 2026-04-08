@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -7,9 +7,7 @@ use aho_corasick::{AhoCorasick, Input, MatchKind};
 use amber_mesh::{HttpRoutePlugin, InboundRoute, InboundTarget, MeshProtocol, OutboundRoute};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::Method;
-#[cfg(test)]
-use serde_json::Value;
-use serde_json::value::RawValue;
+use serde_json::{Value, value::RawValue};
 use url::Url;
 
 use super::{BodyMode, HttpExchangePlugin, RewriteContext, RewriteFlow, StreamBodyRewriter};
@@ -21,6 +19,19 @@ const LOOPBACK_URL_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
 
 pub(super) fn is_agent_card_path(path: &str) -> bool {
     path == WELL_KNOWN_AGENT_CARD_PATH
+}
+
+pub(super) fn is_json_content_type(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return false;
+    };
+    let media_type = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    media_type == "application/json" || media_type.ends_with("+json")
 }
 
 #[derive(Clone, Debug)]
@@ -555,6 +566,89 @@ fn encode_json_string(value: &str) -> Option<Box<RawValue>> {
     RawValue::from_string(json).ok()
 }
 
+pub(super) fn collect_dynamic_capability_refs(raw: &[u8]) -> BTreeSet<String> {
+    let Ok(value) = serde_json::from_slice::<Value>(raw) else {
+        return BTreeSet::new();
+    };
+    let mut refs = BTreeSet::new();
+    collect_dynamic_capability_refs_from_value(&value, &mut refs);
+    refs
+}
+
+fn collect_dynamic_capability_refs_from_value(value: &Value, refs: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(fields) => {
+            for (key, field_value) in fields {
+                if key == "ref"
+                    && let Value::String(raw_ref) = field_value
+                    && raw_ref.starts_with("amber://ref/")
+                {
+                    refs.insert(raw_ref.clone());
+                    continue;
+                }
+                collect_dynamic_capability_refs_from_value(field_value, refs);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_dynamic_capability_refs_from_value(item, refs);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+pub(super) fn rewrite_dynamic_capability_ref_fields(
+    raw: &mut Vec<u8>,
+    replacements: &BTreeMap<String, String>,
+) -> bool {
+    if replacements.is_empty() {
+        return false;
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(raw) else {
+        return false;
+    };
+    if !rewrite_dynamic_capability_refs_in_value(&mut value, replacements) {
+        return false;
+    }
+    let Ok(encoded) = serde_json::to_vec(&value) else {
+        return false;
+    };
+    *raw = encoded;
+    true
+}
+
+fn rewrite_dynamic_capability_refs_in_value(
+    value: &mut Value,
+    replacements: &BTreeMap<String, String>,
+) -> bool {
+    match value {
+        Value::Object(fields) => {
+            let mut rewritten = false;
+            for (key, field_value) in fields {
+                if key == "ref"
+                    && let Value::String(raw_ref) = field_value
+                    && let Some(replacement) = replacements.get(raw_ref)
+                {
+                    *raw_ref = replacement.clone();
+                    rewritten = true;
+                    continue;
+                }
+                rewritten |= rewrite_dynamic_capability_refs_in_value(field_value, replacements);
+            }
+            rewritten
+        }
+        Value::Array(items) => {
+            let mut rewritten = false;
+            for item in items {
+                rewritten |= rewrite_dynamic_capability_refs_in_value(item, replacements);
+            }
+            rewritten
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
 fn rewrite_supported_interface_urls(
     raw_interfaces: &RawValue,
     abstract_base: &str,
@@ -858,6 +952,57 @@ mod tests {
             .expect("source url parse");
         let abstracted = table.upcast(&source).expect("upcast local provide url");
         assert!(abstracted.as_str().starts_with("amber://route/"));
+    }
+
+    #[test]
+    fn collect_dynamic_capability_refs_only_sees_ref_fields() {
+        let raw = br#"{
+            "ref": "amber://ref/root",
+            "note": "amber://ref/ignored",
+            "nested": {
+                "ref": "amber://ref/nested"
+            }
+        }"#;
+
+        let refs = collect_dynamic_capability_refs(raw);
+        assert_eq!(
+            refs.into_iter().collect::<Vec<_>>(),
+            vec![
+                "amber://ref/nested".to_string(),
+                "amber://ref/root".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_dynamic_capability_ref_fields_preserves_non_ref_strings() {
+        let mut raw = br#"{
+            "ref": "amber://ref/root",
+            "note": "amber://ref/ignored",
+            "nested": {
+                "ref": "amber://ref/nested"
+            }
+        }"#
+        .to_vec();
+        let replacements = BTreeMap::from([
+            (
+                "amber://ref/root".to_string(),
+                "http://127.0.0.1:23100/root".to_string(),
+            ),
+            (
+                "amber://ref/nested".to_string(),
+                "http://127.0.0.1:23100/nested".to_string(),
+            ),
+        ]);
+
+        assert!(rewrite_dynamic_capability_ref_fields(
+            &mut raw,
+            &replacements,
+        ));
+        let value: Value = serde_json::from_slice(&raw).expect("rewritten json should parse");
+        assert_eq!(value["ref"], "http://127.0.0.1:23100/root");
+        assert_eq!(value["nested"]["ref"], "http://127.0.0.1:23100/nested");
+        assert_eq!(value["note"], "amber://ref/ignored");
     }
 
     #[test]

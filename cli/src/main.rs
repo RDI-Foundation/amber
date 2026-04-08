@@ -18,7 +18,6 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env, fmt, fs,
-    hash::{Hash as _, Hasher as _},
     io::Write as _,
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},

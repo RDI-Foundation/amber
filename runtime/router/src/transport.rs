@@ -367,6 +367,7 @@ pub(super) async fn proxy_noise_to_external_tcp(
     proxy_noise_to_plain(session, upstream).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn proxy_noise_to_local_http(
     session: &mut NoiseSession,
     route_id: Arc<str>,
@@ -375,6 +376,7 @@ pub(super) async fn proxy_noise_to_local_http(
     client: Arc<HttpClient>,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     labels: HttpExchangeLabels,
+    dynamic_caps: Option<Arc<DynamicCapsRuntime>>,
 ) -> Result<(), RouterError> {
     let (local, remote) = duplex(64 * 1024);
     let mut noise_session = session.clone();
@@ -390,6 +392,7 @@ pub(super) async fn proxy_noise_to_local_http(
         route_id,
         peer_id,
         labels,
+        dynamic_caps,
     };
 
     let service =
@@ -451,6 +454,7 @@ pub(super) async fn proxy_noise_to_noise_http(
         plugins,
         route_id,
         labels,
+        dynamic_caps: None,
     };
 
     let service = ServiceBuilder::new()

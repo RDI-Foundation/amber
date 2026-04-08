@@ -911,6 +911,7 @@ fn kubernetes_smoke_export_routes_to_host() {
         identity: proxy_identity.clone(),
         mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         control_listen: None,
+        dynamic_caps_listen: None,
         control_allow: None,
         peers: vec![router_peer],
         inbound: Vec::new(),

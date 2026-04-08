@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fmt, fs,
-    hash::{Hash as _, Hasher as _},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
@@ -414,6 +413,7 @@ impl PreparedProxy {
             identity: self.proxy_identity,
             mesh_listen: self.mesh_listen,
             control_listen: None,
+            dynamic_caps_listen: None,
             control_allow: None,
             peers: vec![router_peer],
             inbound,
@@ -2004,12 +2004,7 @@ fn vm_current_control_socket_path(plan_root: &Path) -> PathBuf {
 }
 
 fn hashed_temp_socket_path(dir_name: &str, prefix: &str, path: &Path) -> PathBuf {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    let suffix = hasher.finish();
-    env::temp_dir()
-        .join(dir_name)
-        .join(format!("{prefix}-{suffix:016x}.sock"))
+    amber_mesh::stable_temp_socket_path(dir_name, prefix, path)
 }
 
 fn direct_runtime_state_path(plan_root: &Path) -> PathBuf {

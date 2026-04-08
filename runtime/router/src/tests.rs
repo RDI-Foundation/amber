@@ -9,6 +9,7 @@ fn test_mesh_config() -> MeshConfig {
         identity: MeshIdentity::generate("router", Some("test-scope".to_string())),
         mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         control_listen: None,
+        dynamic_caps_listen: None,
         control_allow: None,
         peers: Vec::new(),
         inbound: Vec::new(),
@@ -1647,6 +1648,28 @@ fn resolve_http_external_target_with_override_accepts_framework_loopback_ip_lite
         panic!("expected direct http target");
     };
     assert_eq!(url.as_str(), "http://127.0.0.1:6167/base/v1/children");
+}
+
+#[test]
+fn resolve_http_external_target_with_override_accepts_external_slot_loopback_ip_literals() {
+    let target = ExternalTarget {
+        name: "catalog_api".to_string(),
+        url_env: "AMBER_EXTERNAL_SLOT_CATALOG_API_URL".to_string(),
+        optional: false,
+        url_override: None,
+    };
+
+    let resolved = resolve_http_external_target_with_override(
+        &target,
+        Some("http://127.0.0.1:6167/base"),
+        &Uri::from_static("/item/amber-mug"),
+    )
+    .expect("external slot target should resolve");
+
+    let ResolvedHttpExternalTarget::Http(url) = resolved else {
+        panic!("expected direct http target");
+    };
+    assert_eq!(url.as_str(), "http://127.0.0.1:6167/base/item/amber-mug");
 }
 
 #[test]

@@ -1,4 +1,9 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{
+    collections::HashMap,
+    env,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use base64::Engine as _;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -8,6 +13,7 @@ use sha2::Digest as _;
 use thiserror::Error;
 
 pub mod component_protocol;
+pub mod dynamic_caps;
 pub mod telemetry;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -138,6 +144,8 @@ pub struct MeshConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_listen: Option<SocketAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_caps_listen: Option<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_allow: Option<Vec<String>>,
     pub peers: Vec<MeshPeer>,
     pub inbound: Vec<InboundRoute>,
@@ -153,6 +161,8 @@ pub struct MeshConfigPublic {
     pub mesh_listen: SocketAddr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_listen: Option<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_caps_listen: Option<SocketAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_allow: Option<Vec<String>>,
     pub peers: Vec<MeshPeer>,
@@ -184,6 +194,8 @@ pub struct MeshConfigTemplate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_listen: Option<SocketAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_caps_listen: Option<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_allow: Option<Vec<String>>,
     pub peers: Vec<MeshPeerTemplate>,
     pub inbound: Vec<InboundRoute>,
@@ -197,6 +209,30 @@ pub const MESH_CONFIG_FILENAME: &str = "mesh-config.json";
 pub const MESH_IDENTITY_FILENAME: &str = "mesh-identity.json";
 pub const FRAMEWORK_COMPONENT_CCS_URL_ENV: &str = "AMBER_FRAMEWORK_COMPONENT_CCS_URL";
 pub const FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV: &str = "AMBER_FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN";
+pub const DYNAMIC_CAPS_API_URL_ENV: &str = dynamic_caps::DYNAMIC_CAPS_API_URL_ENV;
+pub const DYNAMIC_CAPS_CONTROL_URL_ENV: &str = dynamic_caps::DYNAMIC_CAPS_CONTROL_URL_ENV;
+pub const DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV: &str =
+    dynamic_caps::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV;
+pub const DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV: &str =
+    dynamic_caps::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV;
+
+pub fn stable_temp_socket_path(namespace: &str, kind: &str, path: &Path) -> PathBuf {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"amber.temp_socket_path.v1\0");
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(kind.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(path.as_os_str().to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    env::temp_dir()
+        .join(namespace)
+        .join(format!("{kind}-{suffix}.sock"))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -412,6 +448,7 @@ impl MeshConfigPublic {
             identity: MeshIdentityPublic::from_identity(&config.identity),
             mesh_listen: config.mesh_listen,
             control_listen: config.control_listen,
+            dynamic_caps_listen: config.dynamic_caps_listen,
             control_allow: config.control_allow.clone(),
             peers: config.peers.clone(),
             inbound: config.inbound.clone(),
@@ -445,6 +482,7 @@ impl MeshConfigPublic {
             },
             mesh_listen: self.mesh_listen,
             control_listen: self.control_listen,
+            dynamic_caps_listen: self.dynamic_caps_listen,
             control_allow: self.control_allow,
             peers: self.peers,
             inbound: self.inbound,
@@ -476,6 +514,7 @@ impl MeshConfigTemplate {
             identity: MeshIdentityPublic::from_identity(identity),
             mesh_listen: self.mesh_listen,
             control_listen: self.control_listen,
+            dynamic_caps_listen: self.dynamic_caps_listen,
             control_allow: self.control_allow.clone(),
             peers,
             inbound: self.inbound.clone(),
@@ -536,5 +575,25 @@ mod key_serde_64 {
             .try_into()
             .map_err(serde::de::Error::custom)?;
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_temp_socket_path_is_deterministic_for_known_input() {
+        let path = stable_temp_socket_path(
+            "amber-direct-control",
+            "current",
+            Path::new("/tmp/amber/example/sites/direct_local/artifact"),
+        );
+        assert_eq!(
+            path,
+            env::temp_dir()
+                .join("amber-direct-control")
+                .join("current-9308da51951bac96.sock",)
+        );
     }
 }

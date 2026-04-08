@@ -76,6 +76,7 @@ fn component_program_read_only_mounts_resolve_parent_escape_paths() {
             mesh_port: 0,
             mesh_config_path: "mesh/components/app/mesh-config.json".to_string(),
             mesh_identity_path: "mesh/components/app/mesh-identity.json".to_string(),
+            env_passthrough: Vec::new(),
         },
         program: amber_compiler::reporter::direct::DirectProgramPlan {
             log_name: "app-program".to_string(),
@@ -148,6 +149,7 @@ fn build_runtime_template_context_uses_runtime_slot_ports() {
             8,
             BTreeMap::from([("upstream".to_string(), vec![32001, 32002])]),
         )]),
+        dynamic_caps_port_by_component: BTreeMap::new(),
         component_mesh_port_by_id: BTreeMap::new(),
         router_mesh_port: None,
     };
@@ -264,6 +266,7 @@ fn assign_direct_runtime_ports_preserves_repeated_slot_item_order() {
         },
         mesh_listen: "127.0.0.1:19000".parse().expect("mesh listen"),
         control_listen: None,
+        dynamic_caps_listen: None,
         control_allow: None,
         peers: Vec::new(),
         inbound: Vec::new(),
@@ -314,6 +317,7 @@ fn assign_direct_runtime_ports_preserves_repeated_slot_item_order() {
                 mesh_port: 0,
                 mesh_config_path: mesh_config_rel.display().to_string(),
                 mesh_identity_path: "mesh/components/app/mesh-identity.json".to_string(),
+                env_passthrough: Vec::new(),
             },
             program: amber_compiler::reporter::direct::DirectProgramPlan {
                 log_name: "app-program".to_string(),
@@ -417,6 +421,83 @@ fn direct_storage_root_uses_explicit_override() {
         root.ends_with("custom-storage-root"),
         "override should be used verbatim: {}",
         root.display()
+    );
+}
+
+#[test]
+fn framework_component_example_control_calls_use_extended_timeout_budget() {
+    let admin_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("examples")
+        .join("framework-component")
+        .join("admin.py");
+    let python = ["python3", "python"].into_iter().find(|candidate| {
+        std::process::Command::new(candidate)
+            .arg("--version")
+            .output()
+            .is_ok()
+    });
+    let Some(python) = python else {
+        return;
+    };
+
+    let script = r#"
+import os
+import sys
+
+source = open(sys.argv[1], "r", encoding="utf-8").read()
+source = source.rsplit("\nThreadingHTTPServer", 1)[0]
+module_globals = {"__name__": "amber_example_admin", "__file__": sys.argv[1]}
+exec(compile(source, sys.argv[1], "exec"), module_globals)
+
+class Module:
+    pass
+
+module = Module()
+for key, value in module_globals.items():
+    setattr(module, key, value)
+
+assert module.FRAMEWORK_COMPONENT_TIMEOUT_SECS >= 120, module.FRAMEWORK_COMPONENT_TIMEOUT_SECS
+
+seen = {}
+
+class FakeResponse:
+    status = 204
+    headers = {}
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        return False
+    def read(self):
+        return b""
+
+def fake_urlopen(request, timeout):
+    seen["timeout"] = timeout
+    return FakeResponse()
+
+module.urlopen = fake_urlopen
+module_globals["urlopen"] = fake_urlopen
+status, _, _ = module.call("POST", "/v1/children", {"name": "child"})
+assert status == 204, status
+assert seen["timeout"] == module.FRAMEWORK_COMPONENT_TIMEOUT_SECS, seen
+"#;
+
+    let output = std::process::Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(&admin_path)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("NAME", "admin")
+        .env("PORT", "18080")
+        .env("CTL_URL", "http://127.0.0.1:9")
+        .output()
+        .expect("python should execute");
+    assert!(
+        output.status.success(),
+        "python regression check failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 

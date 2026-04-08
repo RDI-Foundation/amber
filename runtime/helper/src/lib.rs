@@ -11,6 +11,7 @@ use std::{
 };
 
 use amber_config::{self as config, CONFIG_ENV_PREFIX, ConfigError};
+use amber_mesh::DYNAMIC_CAPS_API_URL_ENV;
 use amber_template::{
     ConfigTemplatePayload, MountSpec, ProgramArgTemplate, ProgramEnvTemplate,
     RepeatedProgramArgTemplate, RepeatedProgramEnvTemplate, RepeatedTemplateSource,
@@ -628,7 +629,7 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
 }
 
 fn should_passthrough_env(key: &str) -> bool {
-    matches!(key, "PATH" | "HOME" | "TMPDIR")
+    matches!(key, "PATH" | "HOME" | "TMPDIR") || key == DYNAMIC_CAPS_API_URL_ENV
 }
 
 fn template_spec_requires_config(spec: &TemplateSpec) -> bool {
@@ -1494,6 +1495,46 @@ mod tests {
             Some(&OsString::from(
                 "http://127.0.0.1:31001,http://127.0.0.1:31002"
             ))
+        );
+    }
+
+    #[test]
+    fn build_run_plan_preserves_dynamic_caps_api_url_for_helper_workloads() {
+        let template_spec = TemplateSpec {
+            program: amber_template::ProgramTemplateSpec {
+                entrypoint: vec![ProgramArgTemplate::Arg(vec![TemplatePart::lit(
+                    "/app/bin/server",
+                )])],
+                env: BTreeMap::from([(
+                    "NAME".to_string(),
+                    ProgramEnvTemplate::Value(vec![TemplatePart::lit("worker")]),
+                )]),
+            },
+        };
+
+        let env = BTreeMap::from([
+            (
+                TEMPLATE_SPEC_ENV.to_string(),
+                encode_spec_b64(&template_spec),
+            ),
+            (
+                DYNAMIC_CAPS_API_URL_ENV.to_string(),
+                "http://127.0.0.1:31077".to_string(),
+            ),
+        ]);
+
+        let os_env = env
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let plan = build_run_plan(os_env).expect("run plan should build");
+
+        assert_eq!(
+            plan.env.get(&OsString::from(DYNAMIC_CAPS_API_URL_ENV)),
+            Some(&OsString::from("http://127.0.0.1:31077"))
+        );
+        assert_eq!(
+            plan.env.get(&OsString::from("NAME")),
+            Some(&OsString::from("worker"))
         );
     }
 

@@ -27,6 +27,7 @@ fn router_config_b64() -> String {
         identity: MeshIdentity::generate("/router", None),
         mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         control_listen: None,
+        dynamic_caps_listen: None,
         control_allow: None,
         peers: Vec::new(),
         inbound: Vec::new(),
