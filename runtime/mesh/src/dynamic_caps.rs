@@ -84,7 +84,7 @@ pub struct HeldEntrySummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_component: Option<String>,
     pub descriptor: DescriptorIr,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub materializations: Vec<MaterializedHandleSummary>,
 }
 
@@ -635,6 +635,33 @@ mod tests {
         let encoded = verify_key_b64(&signing_key);
         let decoded = verify_key_from_b64(&encoded).expect("verify key should decode");
         assert_eq!(decoded.to_bytes(), signing_key.verifying_key().to_bytes());
+    }
+
+    #[test]
+    fn held_entry_summary_serialization_keeps_empty_materializations() {
+        let summary = HeldEntrySummary {
+            held_id: "held_grant_g_abc".to_string(),
+            entry_kind: HeldEntryKind::DelegatedGrant,
+            grant_id: Some("g_abc".to_string()),
+            root_authority_selector: None,
+            state: HeldEntryState::Live,
+            from_component: Some("components./sender".to_string()),
+            descriptor: DescriptorIr {
+                kind: "http".to_string(),
+                label: "provider.api".to_string(),
+                profile: None,
+            },
+            materializations: Vec::new(),
+        };
+
+        let value = serde_json::to_value(&summary).expect("held entry should serialize");
+        assert!(
+            value
+                .get("materializations")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|materializations| materializations.is_empty()),
+            "held entry summaries must keep an explicit empty materializations array: {value}",
+        );
     }
 
     #[test]

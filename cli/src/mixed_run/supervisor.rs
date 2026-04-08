@@ -57,6 +57,7 @@ pub(super) fn patch_site_artifacts(
     if matches!(kind, SiteKind::Kubernetes) {
         for env_file_name in [
             DEFAULT_EXTERNAL_ENV_FILE,
+            "component-sidecar.env",
             "root-config.env",
             "root-config-secret.env",
         ] {

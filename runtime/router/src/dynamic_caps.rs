@@ -31,6 +31,14 @@ const DYNAMIC_CAPS_HANDLE_PREFIX: &str = "/v1/handles/";
 const DYNAMIC_CAPS_HANDLE_ID_PREFIX: &str = "hdl_";
 const DYNAMIC_CAPS_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+#[derive(Debug)]
+struct DynamicCapsControlEnv {
+    control_url: String,
+    control_auth_token: String,
+    verify_key_raw: String,
+    run_id: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct ControlDynamicHeldListRequest {
     holder_component_id: String,
@@ -176,54 +184,23 @@ impl DynamicCapsRuntime {
         let Some(listen_addr) = config.dynamic_caps_listen else {
             return Ok(None);
         };
-        let control_url = env::var(amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                RouterError::InvalidConfig(format!(
-                    "{} must be set when dynamic_caps_listen is configured",
-                    amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV
-                ))
-            })?;
-        let control_auth_token = env::var(amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                RouterError::InvalidConfig(format!(
-                    "{} must be set when dynamic_caps_listen is configured",
-                    amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV
-                ))
-            })?;
-        let verify_key_raw = env::var(amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                RouterError::InvalidConfig(format!(
-                    "{} must be set when dynamic_caps_listen is configured",
-                    amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV
-                ))
-            })?;
-        let verify_key = mesh_dynamic_caps::verify_key_from_b64(&verify_key_raw)
+        let Some(control_env) = resolve_dynamic_caps_control_env()? else {
+            tracing::warn!(
+                target: "amber.internal",
+                component_id = %config.identity.id,
+                %listen_addr,
+                "dynamic capabilities disabled because control env is not configured"
+            );
+            return Ok(None);
+        };
+        let verify_key = mesh_dynamic_caps::verify_key_from_b64(&control_env.verify_key_raw)
             .map_err(|err| RouterError::InvalidConfig(err.to_string()))?;
-        let run_id = env::var(SCENARIO_RUN_ID_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                RouterError::InvalidConfig(format!(
-                    "{} must be set when dynamic_caps_listen is configured",
-                    SCENARIO_RUN_ID_ENV
-                ))
-            })?;
         Ok(Some(Arc::new(Self {
             listen_addr,
             component_id: Arc::<str>::from(format!("components.{}", config.identity.id)),
-            run_id: Arc::<str>::from(run_id),
-            control_url: Arc::<str>::from(control_url),
-            control_auth_token: Arc::<str>::from(control_auth_token),
+            run_id: Arc::<str>::from(control_env.run_id),
+            control_url: Arc::<str>::from(control_env.control_url),
+            control_auth_token: Arc::<str>::from(control_env.control_auth_token),
             verify_key,
             config,
             client,
@@ -1119,6 +1096,143 @@ impl DynamicCapsRuntime {
             req,
         )
         .await
+    }
+}
+
+fn nonempty_env_var(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn required_dynamic_caps_env_var(
+    name: &'static str,
+    value: Option<String>,
+) -> Result<String, RouterError> {
+    value.ok_or_else(|| {
+        RouterError::InvalidConfig(format!(
+            "{name} must be set when dynamic_caps_listen is configured"
+        ))
+    })
+}
+
+fn resolve_dynamic_caps_control_env() -> Result<Option<DynamicCapsControlEnv>, RouterError> {
+    let control_url = nonempty_env_var(amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV);
+    let control_auth_token = nonempty_env_var(amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV);
+    let verify_key_raw = nonempty_env_var(amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV);
+    if control_url.is_none() && control_auth_token.is_none() && verify_key_raw.is_none() {
+        return Ok(None);
+    }
+    let run_id =
+        required_dynamic_caps_env_var(SCENARIO_RUN_ID_ENV, nonempty_env_var(SCENARIO_RUN_ID_ENV))?;
+    Ok(Some(DynamicCapsControlEnv {
+        control_url: required_dynamic_caps_env_var(
+            amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV,
+            control_url,
+        )?,
+        control_auth_token: required_dynamic_caps_env_var(
+            amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV,
+            control_auth_token,
+        )?,
+        verify_key_raw: required_dynamic_caps_env_var(
+            amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
+            verify_key_raw,
+        )?,
+        run_id,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::*;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn replace(pairs: [(&'static str, Option<&str>); 4]) -> Self {
+            let saved = pairs
+                .iter()
+                .map(|(name, value)| {
+                    let previous = env::var(name).ok();
+                    unsafe {
+                        match value {
+                            Some(value) => env::set_var(name, value),
+                            None => env::remove_var(name),
+                        }
+                    }
+                    (*name, previous)
+                })
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.drain(..) {
+                unsafe {
+                    match value {
+                        Some(value) => env::set_var(name, value),
+                        None => env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_dynamic_caps_control_env_disables_listener_when_control_env_is_absent() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock");
+        let _env = EnvGuard::replace([
+            (amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV, None),
+            (amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV, None),
+            (amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, None),
+            (SCENARIO_RUN_ID_ENV, Some("run-1234")),
+        ]);
+
+        assert!(
+            resolve_dynamic_caps_control_env()
+                .expect("dynamic caps env should resolve")
+                .is_none(),
+            "sidecars without dynamic caps control env should leave the listener disabled",
+        );
+    }
+
+    #[test]
+    fn resolve_dynamic_caps_control_env_rejects_partial_configuration() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock");
+        let _env = EnvGuard::replace([
+            (
+                amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV,
+                Some("http://127.0.0.1:24000"),
+            ),
+            (amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV, None),
+            (amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, None),
+            (SCENARIO_RUN_ID_ENV, Some("run-1234")),
+        ]);
+
+        let err = resolve_dynamic_caps_control_env().expect_err("partial env must fail");
+        assert!(
+            matches!(
+                &err,
+                RouterError::InvalidConfig(message)
+                    if message.contains(amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV)
+            ),
+            "partial dynamic caps control env should fail with the missing variable name: {err}",
+        );
     }
 }
 
