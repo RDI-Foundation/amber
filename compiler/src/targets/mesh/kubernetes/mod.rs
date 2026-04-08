@@ -1647,6 +1647,7 @@ pub(crate) fn emit_kubernetes_artifact(
         if path == &PathBuf::from("root-config.env")
             || path == &PathBuf::from("root-config-secret.env")
             || path == &PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE)
+            || path == &PathBuf::from(COMPONENT_SIDECAR_ENV_FILE)
             || path == &PathBuf::from(PROXY_METADATA_FILENAME)
             || path == &PathBuf::from(GENERATED_README_FILENAME)
         {

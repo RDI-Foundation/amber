@@ -794,4 +794,13 @@ fn kubernetes_templates_dynamic_caps_sidecar_control_env() {
         kustomization.contains(super::COMPONENT_SIDECAR_ENV_FILE),
         "{kustomization}"
     );
+    assert!(
+        !kustomization.contains(&format!("resources:\n- {}", super::COMPONENT_SIDECAR_ENV_FILE)),
+        "{kustomization}"
+    );
+    assert!(
+        !kustomization.contains(&format!("\n- {}\n", super::COMPONENT_SIDECAR_ENV_FILE)),
+        "kustomization resources must not treat the sidecar env template as a manifest: \
+         {kustomization}"
+    );
 }
