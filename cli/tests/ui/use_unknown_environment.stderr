@@ -1,0 +1,11 @@
+Error: manifest::unknown_use_environment
+
+  × check failed
+  ╰─▶ use `#wrapper` references unknown environment `missing`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_unknown_environment.json5:7:20]
+ 6 │       manifest: "https://example.com/wrapper.json5",
+ 7 │       environment: "missing",
+   ·                    ────┬────
+   ·                        ╰── unknown environment referenced here
+ 8 │     },
+   ╰────

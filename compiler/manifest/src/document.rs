@@ -169,9 +169,11 @@ fn labels_for_manifest_error(
                 Some("export target here".to_string()),
             )]
         }
+        ManifestError::InvalidPolicyRef { input, .. } => labels_for_policy_ref(spans, input),
         ManifestError::AmbiguousCapabilityName { name } => {
             labels_for_ambiguous_capability_name(spans, name)
         }
+        ManifestError::UnknownPolicyUse { alias } => labels_for_policy_use(spans, alias),
         ManifestError::DuplicateBindingTarget { to, slot } => {
             labels_for_duplicate_binding_target(spans, to, slot)
         }
@@ -190,6 +192,9 @@ fn labels_for_manifest_error(
         ManifestError::UnknownFrameworkCapability { capability, .. }
         | ManifestError::FrameworkCapabilityRequiresFeature { capability, .. } => {
             labels_for_framework_capability_use(spans, capability)
+        }
+        ManifestError::SectionRequiresFeature { section, .. } => {
+            labels_for_section_requires_feature(spans, section)
         }
         ManifestError::DuplicateEndpointName { name } => {
             labels_for_duplicate_endpoint_name(spans, name)
@@ -251,6 +256,9 @@ fn labels_for_manifest_error(
         ManifestError::EnvironmentCycle { name } => labels_for_environment_cycle(spans, name),
         ManifestError::UnknownComponentEnvironment { child, .. } => {
             labels_for_unknown_component_environment(spans, child)
+        }
+        ManifestError::UnknownUseEnvironment { name, .. } => {
+            labels_for_unknown_use_environment(spans, name)
         }
         _ => Vec::new(),
     }
@@ -383,6 +391,7 @@ fn labels_for_invalid_name(
     let span = match kind {
         "environment" => spans.environments.get(name).map(|s| s.name),
         "child" => spans.components.get(name).map(|s| s.name),
+        "use" => spans.uses.get(name).map(|s| s.name),
         "slot" => spans.slots.get(name).map(|s| s.name),
         "provide" => spans.provides.get(name).map(|s| s.capability.name),
         "export" => spans.exports.get(name).map(|s| s.name),
@@ -778,6 +787,59 @@ fn labels_for_unknown_component_environment(
     vec![primary(
         span_or_default(span),
         Some("unknown environment referenced here".to_string()),
+    )]
+}
+
+fn labels_for_unknown_use_environment(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
+    let span = spans
+        .uses
+        .get(name)
+        .and_then(|component| component.environment.or(Some(component.name)));
+    vec![primary(
+        span_or_default(span),
+        Some("unknown environment referenced here".to_string()),
+    )]
+}
+
+fn labels_for_policy_ref(spans: &ManifestSpans, input: &str) -> Vec<LabeledSpan> {
+    let span = spans
+        .policies
+        .iter()
+        .find(|policy| policy.value.as_deref() == Some(input))
+        .map(|policy| policy.whole);
+    vec![primary(
+        span_or_default(span),
+        Some("policy ref here".to_string()),
+    )]
+}
+
+fn labels_for_policy_use(spans: &ManifestSpans, alias: &str) -> Vec<LabeledSpan> {
+    let prefix = format!("#{alias}.");
+    let span = spans
+        .policies
+        .iter()
+        .find(|policy| {
+            policy
+                .value
+                .as_deref()
+                .is_some_and(|value| value.starts_with(prefix.as_str()))
+        })
+        .map(|policy| policy.whole);
+    vec![primary(
+        span_or_default(span),
+        Some("unknown use referenced here".to_string()),
+    )]
+}
+
+fn labels_for_section_requires_feature(spans: &ManifestSpans, section: &str) -> Vec<LabeledSpan> {
+    let span = match section {
+        "use" => spans.use_section,
+        "policies" => spans.policies.first().map(|policy| policy.whole),
+        _ => None,
+    };
+    vec![primary(
+        span_or_default(span),
+        Some(format!("`{section}` used here")),
     )]
 }
 

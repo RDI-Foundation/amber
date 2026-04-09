@@ -10,9 +10,11 @@ use serde_json::{Map, Value};
 pub struct ManifestSpans {
     pub manifest_version: Option<SourceSpan>,
     pub experimental_features: Option<SourceSpan>,
+    pub use_section: Option<SourceSpan>,
     pub program: Option<ProgramSpans>,
     pub config_schema: Option<SourceSpan>,
     pub components: HashMap<Arc<str>, ComponentDeclSpans>,
+    pub uses: HashMap<Arc<str>, ComponentDeclSpans>,
     pub environments: HashMap<Arc<str>, EnvironmentSpans>,
     pub slots: HashMap<Arc<str>, CapabilityDeclSpans>,
     pub slots_section: Option<SourceSpan>,
@@ -20,6 +22,7 @@ pub struct ManifestSpans {
     pub resources: HashMap<Arc<str>, ResourceDeclSpans>,
     pub bindings: HashMap<BindingTargetKey, BindingSpans>,
     pub bindings_by_index: Vec<BindingSpans>,
+    pub policies: Vec<PolicyRefSpans>,
     pub exports: HashMap<Arc<str>, ExportSpans>,
 }
 
@@ -58,6 +61,12 @@ pub struct ComponentDeclSpans {
     pub environment: Option<SourceSpan>,
     pub config: Option<SourceSpan>,
     pub config_key: Option<SourceSpan>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PolicyRefSpans {
+    pub whole: SourceSpan,
+    pub value: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug)]
@@ -268,6 +277,7 @@ pub(crate) fn parse_manifest_spans(source: &str) -> Option<ManifestSpans> {
     let mut out = ManifestSpans {
         manifest_version: root.child_span("manifest_version"),
         experimental_features: root.child_span("experimental_features"),
+        use_section: root.child_span("use"),
         config_schema: root.child_span("config_schema"),
         ..ManifestSpans::default()
     };
@@ -283,11 +293,13 @@ pub(crate) fn parse_manifest_spans(source: &str) -> Option<ManifestSpans> {
     }
 
     collect_components(&root, root_obj, &mut out);
+    collect_uses(&root, root_obj, &mut out);
     collect_environments(&root, root_obj, &mut out);
     collect_slots(&root, root_obj, &mut out);
     collect_provides(&root, root_obj, &mut out);
     collect_resources(&root, root_obj, &mut out);
     collect_bindings(&root, root_obj, &mut out);
+    collect_policies(&root, root_obj, &mut out);
     collect_exports(&root, root_obj, &mut out);
 
     Some(out)
@@ -298,7 +310,20 @@ fn collect_components(
     root_obj: &Map<String, Value>,
     out: &mut ManifestSpans,
 ) {
-    let Some((components, components_obj)) = object_section(root, root_obj, "components") else {
+    collect_component_like_section(root, root_obj, "components", &mut out.components);
+}
+
+fn collect_uses(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &mut ManifestSpans) {
+    collect_component_like_section(root, root_obj, "use", &mut out.uses);
+}
+
+fn collect_component_like_section(
+    root: &SpanCursor<'_>,
+    root_obj: &Map<String, Value>,
+    key: &str,
+    out: &mut HashMap<Arc<str>, ComponentDeclSpans>,
+) {
+    let Some((components, components_obj)) = object_section(root, root_obj, key) else {
         return;
     };
 
@@ -340,7 +365,7 @@ fn collect_components(
             _ => {}
         }
 
-        out.components.insert(name.as_str().into(), spans);
+        out.insert(name.as_str().into(), spans);
     }
 }
 
@@ -552,6 +577,20 @@ fn collect_exports(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &m
                 target_value,
             },
         );
+    }
+}
+
+fn collect_policies(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &mut ManifestSpans) {
+    let Some((policies, policy_values)) = array_section(root, root_obj, "policies") else {
+        return;
+    };
+
+    for (idx, policy_value) in policy_values.iter().enumerate() {
+        let whole = span_or_default(policies.index_span(idx));
+        out.policies.push(PolicyRefSpans {
+            whole,
+            value: policy_value.as_str().map(Into::into),
+        });
     }
 }
 

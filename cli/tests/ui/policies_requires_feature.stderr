@@ -1,0 +1,13 @@
+Error: manifest::section_requires_feature
+
+  × check failed
+  ╰─▶ `policies` requires experimental feature `policies`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/policies_requires_feature.json5:3:14]
+ 2 │   manifest_version: "0.1.0",
+ 3 │   policies: ["#wrapper.rewrite"],
+   ·              ─────────┬────────
+   ·                       ╰── `policies` used here
+ 4 │ }
+   ╰────
+  help: Add this feature to `experimental_features` in the same manifest, or
+        stop using this section.
