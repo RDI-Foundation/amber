@@ -697,6 +697,30 @@ impl FromStr for RawExportTarget {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
+#[non_exhaustive]
+pub struct PolicyRef {
+    pub alias: String,
+    pub export: String,
+}
+
+impl fmt::Display for PolicyRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("#")?;
+        f.write_str(&self.alias)?;
+        f.write_str(".")?;
+        f.write_str(&self.export)
+    }
+}
+
+impl FromStr for PolicyRef {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        parse_policy_ref(input)
+    }
+}
+
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
 )]
@@ -1158,6 +1182,35 @@ fn split_binding_source(input: &str) -> Result<(BindingSourceRef, String), Error
     let source = parse_binding_source_ref(left)?;
     ensure_binding_ref_name_no_dot(right, input)?;
     Ok((source, right.to_string()))
+}
+
+fn parse_policy_ref(input: &str) -> Result<PolicyRef, Error> {
+    let Some(rest) = input.strip_prefix('#') else {
+        return Err(Error::InvalidPolicyRef {
+            input: input.to_string(),
+            message: "expected `#<use>.<export>`".to_string(),
+        });
+    };
+    let Some((alias, export)) = rest.split_once('.') else {
+        return Err(Error::InvalidPolicyRef {
+            input: input.to_string(),
+            message: "expected `#<use>.<export>`".to_string(),
+        });
+    };
+    if alias.is_empty() || export.is_empty() || export.contains('.') {
+        return Err(Error::InvalidPolicyRef {
+            input: input.to_string(),
+            message: "expected `#<use>.<export>`".to_string(),
+        });
+    }
+
+    crate::names::ensure_name_no_dot(alias, "use")?;
+    crate::names::ensure_name_no_dot(export, "export")?;
+
+    Ok(PolicyRef {
+        alias: alias.to_string(),
+        export: export.to_string(),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

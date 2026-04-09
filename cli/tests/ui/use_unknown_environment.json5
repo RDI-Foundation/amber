@@ -1,0 +1,13 @@
+{
+  manifest_version: "0.1.0",
+  experimental_features: ["policies"],
+  use: {
+    wrapper: {
+      manifest: "https://example.com/wrapper.json5",
+      environment: "missing",
+    },
+  },
+  environments: {
+    present: { resolvers: ["x"] },
+  },
+}

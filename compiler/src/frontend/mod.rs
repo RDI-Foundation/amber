@@ -147,6 +147,22 @@ pub enum Error {
         #[related]
         related: Vec<RelatedManifestSpan>,
     },
+
+    #[error("use `#{name}` requires root slot(s) that the main scenario cannot bind: {slots}")]
+    #[diagnostic(
+        code(compiler::use_requires_root_slots),
+        help("Make these slots optional or move the required inputs inside the used manifest.")
+    )]
+    UseRequiresRootSlots {
+        name: Box<str>,
+        slots: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "use declared here")]
+        span: Option<SourceSpan>,
+        #[related]
+        related: Vec<RelatedManifestSpan>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +179,7 @@ pub struct ResolvedNode {
     pub observed_url: Option<Url>,
     pub config: Option<serde_json::Value>,
     pub children: BTreeMap<String, ResolvedNode>,
+    pub uses: BTreeMap<String, ResolvedNode>,
     pub child_templates: BTreeMap<String, ResolvedChildTemplate>,
 }
 
@@ -294,6 +311,7 @@ async fn resolve_component(
                         let span = spans
                             .components
                             .get(name.as_str())
+                            .or_else(|| spans.uses.get(name.as_str()))
                             .and_then(|c| c.manifest)
                             .unwrap_or((0usize, 0usize).into());
                         (Some(src), Some(span))
@@ -338,6 +356,7 @@ async fn resolve_component(
     let referenced_envs: HashSet<String> = manifest
         .components()
         .values()
+        .chain(manifest.uses().values())
         .filter_map(component_decl_environment)
         .collect();
 
@@ -401,6 +420,64 @@ async fn resolve_component(
         children.insert(child_name, child_node);
     }
 
+    let uses_futs: Vec<_> = manifest
+        .uses()
+        .iter()
+        .map(|(use_name, decl)| {
+            let use_name = use_name.clone();
+            let (use_ref, use_cfg, use_env_name) = extract_component_decl(decl);
+            let svc = Arc::clone(&svc);
+            let parent_features = parent_features.clone();
+            let use_stack = stack.clone();
+            let use_path_set = path_set.clone();
+            let realm_url = realm_url.clone();
+
+            let use_env = match use_env_name {
+                None => Arc::clone(&env),
+                Some(env_name) => env_cache
+                    .get(&env_name)
+                    .cloned()
+                    .expect("referenced environment should be precomputed"),
+            };
+
+            async move {
+                let use_ctx = ResolveContext {
+                    svc: Arc::clone(&svc),
+                    env: use_env,
+                    base_url: Some(realm_url.clone()),
+                    stack: use_stack,
+                    path_set: use_path_set,
+                };
+                let use_node =
+                    resolve_component(use_ctx, use_name.clone(), use_ref, use_cfg).await?;
+                validate_child_experimental_features(
+                    &svc,
+                    &realm_url,
+                    use_name.as_str(),
+                    &parent_features,
+                    use_node.digest,
+                    &use_node.resolved_url,
+                )?;
+                validate_use_root_slots(
+                    &svc,
+                    &realm_url,
+                    use_name.as_str(),
+                    use_node.digest,
+                    &use_node.resolved_url,
+                )?;
+                Ok::<(String, ResolvedNode), Error>((use_name, use_node))
+            }
+        })
+        .collect();
+
+    let mut uses_stream = futures::stream::iter(uses_futs).buffer_unordered(svc.max_concurrency);
+
+    let mut uses = BTreeMap::new();
+    while let Some(res) = uses_stream.next().await {
+        let (use_name, use_node) = res?;
+        uses.insert(use_name, use_node);
+    }
+
     let child_templates = resolve_child_templates(
         &svc,
         &env,
@@ -420,6 +497,7 @@ async fn resolve_component(
         observed_url,
         config,
         children,
+        uses,
         child_templates,
     })
 }
@@ -443,6 +521,24 @@ fn child_manifest_decl_site(
             let span = spans
                 .components
                 .get(child_name)
+                .or_else(|| spans.uses.get(child_name))
+                .and_then(|component| component.manifest.or(Some(component.whole)))
+                .unwrap_or((0usize, 0usize).into());
+            (Some(src), Some(span))
+        })
+}
+
+fn use_manifest_decl_site(
+    svc: &ResolveService,
+    realm_url: &Url,
+    use_name: &str,
+) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
+    svc.store
+        .diagnostic_source(realm_url)
+        .map_or((None, None), |(src, spans)| {
+            let span = spans
+                .uses
+                .get(use_name)
                 .and_then(|component| component.manifest.or(Some(component.whole)))
                 .unwrap_or((0usize, 0usize).into());
             (Some(src), Some(span))
@@ -608,6 +704,56 @@ fn resolve_manifest_ref_for_template(
         })
 }
 
+fn validate_use_root_slots(
+    svc: &ResolveService,
+    realm_url: &Url,
+    use_name: &str,
+    digest: ManifestDigest,
+    use_url: &Url,
+) -> Result<(), Error> {
+    let manifest = svc
+        .store
+        .get(&digest)
+        .expect("used manifest should be in the digest store after resolution");
+    let required_slots: Vec<_> = manifest
+        .slots()
+        .iter()
+        .filter(|(_, slot)| !slot.optional)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    if required_slots.is_empty() {
+        return Ok(());
+    }
+
+    let (src, span) = use_manifest_decl_site(svc, realm_url, use_name);
+    let mut related = Vec::new();
+    if let Some(stored) = svc.store.get_source(use_url) {
+        for slot_name in &required_slots {
+            let span = stored
+                .spans
+                .slots
+                .get(slot_name.as_str())
+                .map(|slot| slot.name)
+                .unwrap_or((0usize, 0usize).into());
+            related.push(RelatedManifestSpan {
+                message: format!("use `#{use_name}` requires slot `{slot_name}` here"),
+                src: NamedSource::new(display_url(use_url), stored.source.clone())
+                    .with_language("json5"),
+                span,
+                label: "required slot declared here".to_string(),
+            });
+        }
+    }
+
+    Err(Error::UseRequiresRootSlots {
+        name: use_name.into(),
+        slots: required_slots.join(", ").into(),
+        src,
+        span,
+        related,
+    })
+}
+
 fn validate_child_experimental_features(
     svc: &ResolveService,
     realm_url: &Url,
@@ -637,6 +783,7 @@ fn validate_child_experimental_features(
                 let span = spans
                     .components
                     .get(child_name)
+                    .or_else(|| spans.uses.get(child_name))
                     .and_then(|component| component.manifest.or(Some(component.whole)))
                     .unwrap_or((0usize, 0usize).into());
                 (Some(src), Some(span))

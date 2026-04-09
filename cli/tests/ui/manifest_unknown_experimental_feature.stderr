@@ -2,11 +2,11 @@ Error: manifest::validation_error
 
   × check failed
   ╰─▶ manifest validation error at experimental_features[0]: unknown variant
-      `not_a_real_feature`, expected `docker` or `kvm`
+      `not_a_real_feature`, expected one of `docker`, `kvm`, `policies`
    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/manifest_unknown_experimental_feature.json5:3:27]
  2 │   manifest_version: "0.1.0",
  3 │   experimental_features: ["not_a_real_feature"],
    ·                           ──────────┬─────────
-   ·                                     ╰── unknown variant `not_a_real_feature`, expected `docker` or `kvm`
+   ·                                     ╰── unknown variant `not_a_real_feature`, expected one of `docker`, `kvm`, `policies`
  4 │ }
    ╰────

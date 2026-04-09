@@ -1,0 +1,24 @@
+Error: compiler::use_requires_root_slots
+
+  × check failed
+  ╰─▶ use `#wrapper` requires root slot(s) that the main scenario cannot bind:
+      upstream
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_requires_root_slot.json5:5:14]
+ 4 │   use: {
+ 5 │     wrapper: "./use_requires_root_slot_wrapper.json5",
+   ·              ────────────────────┬───────────────────
+   ·                                  ╰── use declared here
+ 6 │   },
+   ╰────
+  help: Make these slots optional or move the required inputs inside the used
+        manifest.
+
+Advice: 
+  ☞ use `#wrapper` requires slot `upstream` here
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_requires_root_slot_wrapper.json5:4:5]
+ 3 │   slots: {
+ 4 │     upstream: { kind: "http" },
+   ·     ────┬───
+   ·         ╰── required slot declared here
+ 5 │   },
+   ╰────

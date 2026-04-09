@@ -555,6 +555,58 @@ async fn experimental_features_are_checked_per_edge() {
 }
 
 #[tokio::test]
+async fn experimental_features_are_checked_for_use_edges() {
+    let dir = tmp_dir("scenario-experimental-use-edge");
+    let root_path = dir.path().join("root.json5");
+    let used_path = dir.path().join("used.json5");
+
+    write_file(
+        &used_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["docker"],
+        }
+        "#,
+    );
+
+    write_file(
+        &root_path,
+        &format!(
+            r#"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["policies"],
+              use: {{
+                wrapper: "{used}",
+              }},
+            }}
+            "#,
+            used = file_url(&used_path)
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let err = compiler
+        .compile(root_ref, CompileOptions::default())
+        .await
+        .expect_err("missing parent experimental feature on use edge should fail");
+
+    match err {
+        crate::Error::Frontend(crate::frontend::Error::ExperimentalFeatureNotEnabled {
+            child,
+            missing_features,
+            ..
+        }) => {
+            assert_eq!(child.as_ref(), "wrapper");
+            assert_eq!(missing_features.to_string(), "docker");
+        }
+        other => panic!("expected ExperimentalFeatureNotEnabled, got: {other}"),
+    }
+}
+
+#[tokio::test]
 async fn experimental_features_succeed_when_enabled_on_every_parent() {
     let dir = tmp_dir("scenario-experimental-enabled");
     let root_path = dir.path().join("root.json5");

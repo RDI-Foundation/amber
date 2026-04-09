@@ -337,6 +337,7 @@ fn compile_from_tree_handles_malformed_program_image_from_builder() {
             observed_url: None,
             config: None,
             children: BTreeMap::new(),
+            uses: BTreeMap::new(),
             child_templates: BTreeMap::new(),
         },
     };
@@ -401,6 +402,7 @@ fn check_from_tree_handles_malformed_program_image_from_builder_with_source() {
             observed_url: None,
             config: None,
             children: BTreeMap::new(),
+            uses: BTreeMap::new(),
             child_templates: BTreeMap::new(),
         },
     };
@@ -438,6 +440,7 @@ async fn bundle_builder_reserializes_when_source_missing() {
             observed_url: None,
             config: None,
             children: BTreeMap::new(),
+            uses: BTreeMap::new(),
             child_templates: BTreeMap::new(),
         },
     };

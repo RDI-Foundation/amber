@@ -480,3 +480,125 @@ async fn binding_rejects_duplicate_target_for_singular_child_slot() {
 
     assert!(error_contains(&err, "bound more than once"));
 }
+
+#[tokio::test]
+async fn resolve_tree_keeps_use_entries_out_of_component_tree() {
+    let dir = tmp_dir("scenario-use-resolution");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+    let wrapper_path = dir.path().join("wrapper.json5");
+
+    write_file(&child_path, r#"{ manifest_version: "0.1.0" }"#);
+    write_file(
+        &wrapper_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "wrapper",
+            entrypoint: ["wrapper"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { rewrite: { kind: "http", profile: "policy", endpoint: "api" } },
+          exports: { rewrite: "rewrite" },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["policies"],
+              use: {{
+                wrapper: "{wrapper}",
+              }},
+              policies: ["#wrapper.rewrite"],
+              components: {{
+                child: "{child}",
+              }},
+            }}
+            "##,
+            wrapper = file_url(&wrapper_path),
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let tree = compiler
+        .resolve_tree(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options().resolve,
+        )
+        .await
+        .unwrap();
+
+    assert!(tree.root.children.contains_key("child"));
+    assert!(tree.root.uses.contains_key("wrapper"));
+
+    let output = compiler
+        .compile_from_tree(tree, standard_compile_options().optimize)
+        .unwrap();
+    assert_eq!(output.scenario.components.len(), 2);
+}
+
+#[tokio::test]
+async fn used_manifest_must_not_require_root_slots() {
+    let dir = tmp_dir("scenario-use-required-slot");
+    let root_path = dir.path().join("root.json5");
+    let wrapper_path = dir.path().join("wrapper.json5");
+
+    write_file(
+        &wrapper_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { upstream: { kind: "http" } },
+          program: {
+            image: "wrapper",
+            entrypoint: ["wrapper"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { rewrite: { kind: "http", profile: "policy", endpoint: "api" } },
+          exports: { rewrite: "rewrite" },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["policies"],
+              use: {{
+                wrapper: "{wrapper}",
+              }},
+              policies: ["#wrapper.rewrite"],
+            }}
+            "##,
+            wrapper = file_url(&wrapper_path),
+        ),
+    );
+
+    let err = default_compiler()
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .unwrap_err();
+
+    match err {
+        crate::Error::Frontend(crate::frontend::Error::UseRequiresRootSlots {
+            name,
+            slots,
+            ..
+        }) => {
+            assert_eq!(name.as_ref(), "wrapper");
+            assert_eq!(slots.as_ref(), "upstream");
+        }
+        other => panic!("expected UseRequiresRootSlots error, got: {other}"),
+    }
+}
