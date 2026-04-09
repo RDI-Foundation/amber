@@ -14,8 +14,8 @@ use std::{
 };
 
 use amber_manifest::{
-    ChildTemplateDecl, ChildTemplateManifestDecl, ComponentDecl, ExperimentalFeature, Manifest,
-    ManifestDigest, ManifestRef,
+    CapabilityDecl, CapabilityKind, ChildTemplateDecl, ChildTemplateManifestDecl, ComponentDecl,
+    ExperimentalFeature, Manifest, ManifestDigest, ManifestRef, PolicyRef,
 };
 use amber_resolver::{self as resolver, RemoteResolver, Resolver};
 use futures::stream::StreamExt;
@@ -84,10 +84,10 @@ pub enum Error {
     #[diagnostic(code(compiler::relative_manifest_ref))]
     RelativeManifestRef { reference: Box<str> },
 
-    #[error("invalid manifest reference `{reference}` in {realm_url}: {message}")]
+    #[error("invalid manifest reference `{reference}` in {manifest_url}: {message}")]
     #[diagnostic(code(compiler::invalid_manifest_ref))]
     InvalidManifestRef {
-        realm_url: Box<Url>,
+        manifest_url: Box<Url>,
         reference: Box<str>,
         message: Box<str>,
         #[source_code]
@@ -98,11 +98,11 @@ pub enum Error {
 
     #[error(
         "failed to resolve manifest reference `{reference}` for component `#{child}` in \
-         {realm_path}: {message}"
+         {manifest_path}: {message}"
     )]
     #[diagnostic(code(compiler::manifest_ref_resolution))]
     ManifestRefResolution {
-        realm_path: Box<str>,
+        manifest_path: Box<str>,
         child: Box<str>,
         reference: Box<str>,
         message: Box<str>,
@@ -113,11 +113,11 @@ pub enum Error {
     },
 
     #[error(
-        "unknown resolver `{resolver}` referenced by environment `{environment}` in {realm_url}"
+        "unknown resolver `{resolver}` referenced by environment `{environment}` in {manifest_url}"
     )]
     #[diagnostic(code(compiler::unknown_resolver))]
     UnknownResolver {
-        realm_url: Box<Url>,
+        manifest_url: Box<Url>,
         environment: Box<str>,
         resolver: Box<str>,
         #[source_code]
@@ -143,6 +143,40 @@ pub enum Error {
         #[source_code]
         src: Option<NamedSource<Arc<str>>>,
         #[label(primary, "child declaration here")]
+        span: Option<SourceSpan>,
+        #[related]
+        related: Vec<RelatedManifestSpan>,
+    },
+
+    #[error("policy `{policy}` could not resolve export `{export}` from use `#{use_name}`")]
+    #[diagnostic(
+        code(compiler::policy_export_unresolved),
+        help(
+            "Ensure the used manifest exports this capability and that any child export chain \
+             resolves to a real export."
+        )
+    )]
+    PolicyExportUnresolved {
+        policy: Box<str>,
+        use_name: Box<str>,
+        export: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "policy referenced here")]
+        span: Option<SourceSpan>,
+    },
+
+    #[error("policy `{policy}` {message}")]
+    #[diagnostic(
+        code(compiler::invalid_policy_export),
+        help("Policy refs must resolve to an exported `http` provide with profile `policy`.")
+    )]
+    InvalidPolicyExport {
+        policy: Box<str>,
+        message: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "policy referenced here")]
         span: Option<SourceSpan>,
         #[related]
         related: Vec<RelatedManifestSpan>,
@@ -180,7 +214,27 @@ pub struct ResolvedNode {
     pub config: Option<serde_json::Value>,
     pub children: BTreeMap<String, ResolvedNode>,
     pub uses: BTreeMap<String, ResolvedNode>,
+    pub policies: Vec<ResolvedPolicy>,
     pub child_templates: BTreeMap<String, ResolvedChildTemplate>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedPolicy {
+    pub reference: PolicyRef,
+    pub capability: CapabilityDecl,
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedPolicyEndpoint {
+    Provide {
+        name: String,
+        decl: CapabilityDecl,
+        resolved_url: Url,
+    },
+    Slot {
+        name: String,
+        resolved_url: Url,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -318,7 +372,7 @@ async fn resolve_component(
                     });
 
             Error::InvalidManifestRef {
-                realm_url: Box::new(base.clone()),
+                manifest_url: Box::new(base.clone()),
                 reference: declared_ref.url.as_str().into(),
                 message: err.to_string().into(),
                 src,
@@ -360,12 +414,19 @@ async fn resolve_component(
         .filter_map(component_decl_environment)
         .collect();
 
-    let realm_url = resolved_url.clone();
+    let manifest_url = resolved_url.clone();
     let parent_features = manifest.experimental_features().clone();
 
     let mut env_cache: HashMap<String, Arc<ResolveEnv>> = HashMap::new();
     for env_name in &referenced_envs {
-        let _ = compute_environment(&svc, &env, &manifest, &realm_url, env_name, &mut env_cache)?;
+        let _ = compute_environment(
+            &svc,
+            &env,
+            &manifest,
+            &manifest_url,
+            env_name,
+            &mut env_cache,
+        )?;
     }
 
     let children_futs: Vec<_> = manifest
@@ -378,7 +439,7 @@ async fn resolve_component(
             let parent_features = parent_features.clone();
             let child_stack = stack.clone();
             let child_path_set = path_set.clone();
-            let realm_url = realm_url.clone();
+            let manifest_url = manifest_url.clone();
 
             let child_env = match child_env_name {
                 None => Arc::clone(&env),
@@ -392,7 +453,7 @@ async fn resolve_component(
                 let child_ctx = ResolveContext {
                     svc: Arc::clone(&svc),
                     env: child_env,
-                    base_url: Some(realm_url.clone()),
+                    base_url: Some(manifest_url.clone()),
                     stack: child_stack,
                     path_set: child_path_set,
                 };
@@ -400,7 +461,7 @@ async fn resolve_component(
                     resolve_component(child_ctx, child_name.clone(), child_ref, child_cfg).await?;
                 validate_child_experimental_features(
                     &svc,
-                    &realm_url,
+                    &manifest_url,
                     child_name.as_str(),
                     &parent_features,
                     child_node.digest,
@@ -430,7 +491,7 @@ async fn resolve_component(
             let parent_features = parent_features.clone();
             let use_stack = stack.clone();
             let use_path_set = path_set.clone();
-            let realm_url = realm_url.clone();
+            let manifest_url = manifest_url.clone();
 
             let use_env = match use_env_name {
                 None => Arc::clone(&env),
@@ -444,7 +505,7 @@ async fn resolve_component(
                 let use_ctx = ResolveContext {
                     svc: Arc::clone(&svc),
                     env: use_env,
-                    base_url: Some(realm_url.clone()),
+                    base_url: Some(manifest_url.clone()),
                     stack: use_stack,
                     path_set: use_path_set,
                 };
@@ -452,7 +513,7 @@ async fn resolve_component(
                     resolve_component(use_ctx, use_name.clone(), use_ref, use_cfg).await?;
                 validate_child_experimental_features(
                     &svc,
-                    &realm_url,
+                    &manifest_url,
                     use_name.as_str(),
                     &parent_features,
                     use_node.digest,
@@ -460,7 +521,7 @@ async fn resolve_component(
                 )?;
                 validate_use_root_slots(
                     &svc,
-                    &realm_url,
+                    &manifest_url,
                     use_name.as_str(),
                     use_node.digest,
                     &use_node.resolved_url,
@@ -478,11 +539,13 @@ async fn resolve_component(
         uses.insert(use_name, use_node);
     }
 
+    let policies = resolve_policies(&svc, &manifest, &manifest_url, &uses)?;
+
     let child_templates = resolve_child_templates(
         &svc,
         &env,
         &manifest,
-        &realm_url,
+        &manifest_url,
         &parent_features,
         &stack,
         &path_set,
@@ -498,6 +561,7 @@ async fn resolve_component(
         config,
         children,
         uses,
+        policies,
         child_templates,
     })
 }
@@ -510,13 +574,121 @@ fn component_decl_environment(decl: &ComponentDecl) -> Option<String> {
     }
 }
 
+fn resolve_policies(
+    svc: &ResolveService,
+    manifest: &Manifest,
+    manifest_url: &Url,
+    uses: &BTreeMap<String, ResolvedNode>,
+) -> Result<Vec<ResolvedPolicy>, Error> {
+    let mut resolved = Vec::with_capacity(manifest.policies().len());
+    for policy in manifest.policies() {
+        let use_node = uses
+            .get(policy.alias.as_str())
+            .expect("policy aliases are validated before resolution");
+        let endpoint =
+            resolve_policy_export(svc, use_node, policy.export.as_str()).map_err(|()| {
+                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy);
+                Error::PolicyExportUnresolved {
+                    policy: policy.to_string().into(),
+                    use_name: policy.alias.clone().into(),
+                    export: policy.export.clone().into(),
+                    src,
+                    span,
+                }
+            })?;
+
+        match &endpoint {
+            ResolvedPolicyEndpoint::Provide { decl, .. }
+                if decl.kind == CapabilityKind::Http
+                    && decl.profile.as_deref() == Some("policy") =>
+            {
+                resolved.push(ResolvedPolicy {
+                    reference: policy.clone(),
+                    capability: decl.clone(),
+                });
+            }
+            ResolvedPolicyEndpoint::Provide { decl, .. } => {
+                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy);
+                return Err(Error::InvalidPolicyExport {
+                    policy: policy.to_string().into(),
+                    message: format!(
+                        "must resolve to an `http` provide with profile `policy`, got `{decl}`"
+                    )
+                    .into(),
+                    src,
+                    span,
+                    related: policy_endpoint_related_spans(svc, policy, &endpoint),
+                });
+            }
+            ResolvedPolicyEndpoint::Slot { .. } => {
+                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy);
+                return Err(Error::InvalidPolicyExport {
+                    policy: policy.to_string().into(),
+                    message: "must resolve to a provide, not a slot".into(),
+                    src,
+                    span,
+                    related: policy_endpoint_related_spans(svc, policy, &endpoint),
+                });
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn resolve_policy_export(
+    svc: &ResolveService,
+    node: &ResolvedNode,
+    export_name: &str,
+) -> Result<ResolvedPolicyEndpoint, ()> {
+    let manifest = svc
+        .store
+        .get(&node.digest)
+        .expect("resolved policy manifest should be in the digest store");
+    let Some(target) = manifest.exports().get(export_name) else {
+        return Err(());
+    };
+
+    match target {
+        amber_manifest::ExportTarget::SelfProvide(provide_name) => {
+            let provide_decl = manifest
+                .provides()
+                .get(provide_name)
+                .expect("manifest invariant: exported provide exists");
+            Ok(ResolvedPolicyEndpoint::Provide {
+                name: provide_name.to_string(),
+                decl: provide_decl.decl.clone(),
+                resolved_url: node.resolved_url.clone(),
+            })
+        }
+        amber_manifest::ExportTarget::SelfSlot(slot_name) => {
+            manifest
+                .slots()
+                .get(slot_name)
+                .expect("manifest invariant: exported slot exists");
+            Ok(ResolvedPolicyEndpoint::Slot {
+                name: slot_name.to_string(),
+                resolved_url: node.resolved_url.clone(),
+            })
+        }
+        amber_manifest::ExportTarget::ChildExport { child, export } => {
+            let child_node = node
+                .children
+                .get(child.as_str())
+                .expect("manifest invariant: exported child exists");
+            resolve_policy_export(svc, child_node, export.as_str())
+        }
+        _ => Err(()),
+    }
+}
+
 fn child_manifest_decl_site(
     svc: &ResolveService,
-    realm_url: &Url,
+    manifest_url: &Url,
     child_name: &str,
 ) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
     svc.store
-        .diagnostic_source(realm_url)
+        .diagnostic_source(manifest_url)
         .map_or((None, None), |(src, spans)| {
             let span = spans
                 .components
@@ -530,11 +702,11 @@ fn child_manifest_decl_site(
 
 fn use_manifest_decl_site(
     svc: &ResolveService,
-    realm_url: &Url,
+    manifest_url: &Url,
     use_name: &str,
 ) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
     svc.store
-        .diagnostic_source(realm_url)
+        .diagnostic_source(manifest_url)
         .map_or((None, None), |(src, spans)| {
             let span = spans
                 .uses
@@ -545,9 +717,65 @@ fn use_manifest_decl_site(
         })
 }
 
+fn policy_ref_decl_site(
+    svc: &ResolveService,
+    manifest_url: &Url,
+    policy: &PolicyRef,
+) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
+    let policy_ref = policy.to_string();
+    svc.store
+        .diagnostic_source(manifest_url)
+        .map_or((None, None), |(src, spans)| {
+            let span = spans
+                .policies
+                .iter()
+                .find(|candidate| candidate.value.as_deref() == Some(policy_ref.as_str()))
+                .map(|candidate| candidate.whole)
+                .unwrap_or((0usize, 0usize).into());
+            (Some(src), Some(span))
+        })
+}
+
+fn policy_endpoint_related_spans(
+    svc: &ResolveService,
+    policy: &PolicyRef,
+    endpoint: &ResolvedPolicyEndpoint,
+) -> Vec<RelatedManifestSpan> {
+    let (resolved_url, name, label) = match endpoint {
+        ResolvedPolicyEndpoint::Provide {
+            resolved_url, name, ..
+        } => (resolved_url, name, "resolved provide declared here"),
+        ResolvedPolicyEndpoint::Slot {
+            resolved_url, name, ..
+        } => (resolved_url, name, "resolved slot declared here"),
+    };
+
+    let Some(stored) = svc.store.get_source(resolved_url) else {
+        return Vec::new();
+    };
+    let span = match endpoint {
+        ResolvedPolicyEndpoint::Provide { .. } => stored
+            .spans
+            .provides
+            .get(name.as_str())
+            .map(|provide| provide.capability.name),
+        ResolvedPolicyEndpoint::Slot { .. } => {
+            stored.spans.slots.get(name.as_str()).map(|slot| slot.name)
+        }
+    }
+    .unwrap_or((0usize, 0usize).into());
+
+    vec![RelatedManifestSpan {
+        message: format!("policy `{policy}` resolves here"),
+        src: NamedSource::new(display_url(resolved_url), stored.source).with_language("json5"),
+        span,
+        label: label.to_string(),
+    }]
+}
+
 fn wrap_child_manifest_resolution_error(
     svc: &ResolveService,
-    realm_url: Option<&Url>,
+    manifest_url: Option<&Url>,
     child_name: &str,
     declared_ref: &ManifestRef,
     err: Error,
@@ -559,13 +787,13 @@ fn wrap_child_manifest_resolution_error(
         return Error::Resolver(resolver_err);
     }
 
-    let Some(realm_url) = realm_url else {
+    let Some(manifest_url) = manifest_url else {
         return Error::Resolver(resolver_err);
     };
-    let (src, span) = child_manifest_decl_site(svc, realm_url, child_name);
+    let (src, span) = child_manifest_decl_site(svc, manifest_url, child_name);
 
     Error::ManifestRefResolution {
-        realm_path: display_url(realm_url).into(),
+        manifest_path: display_url(manifest_url).into(),
         child: child_name.into(),
         reference: declared_ref.url.as_str().into(),
         message: resolver_error_message(&resolver_err).into(),
@@ -596,7 +824,7 @@ async fn resolve_child_templates(
     svc: &Arc<ResolveService>,
     env: &Arc<ResolveEnv>,
     manifest: &Manifest,
-    realm_url: &Url,
+    manifest_url: &Url,
     parent_features: &BTreeSet<ExperimentalFeature>,
     stack: &[Url],
     path_set: &HashSet<ManifestDigest>,
@@ -604,13 +832,14 @@ async fn resolve_child_templates(
     let mut out = BTreeMap::new();
 
     for (template_name, decl) in manifest.child_templates() {
-        let refs = resolve_child_template_manifest_refs(realm_url, template_name.as_str(), decl)?;
+        let refs =
+            resolve_child_template_manifest_refs(manifest_url, template_name.as_str(), decl)?;
         let mut manifests = Vec::with_capacity(refs.len());
         for reference in refs {
             let child_ctx = ResolveContext {
                 svc: Arc::clone(svc),
                 env: Arc::clone(env),
-                base_url: Some(realm_url.clone()),
+                base_url: Some(manifest_url.clone()),
                 stack: stack.to_vec(),
                 path_set: path_set.clone(),
             };
@@ -623,7 +852,7 @@ async fn resolve_child_templates(
             .await?;
             validate_child_experimental_features(
                 svc,
-                realm_url,
+                manifest_url,
                 template_name.as_str(),
                 parent_features,
                 root.digest,
@@ -649,7 +878,7 @@ async fn resolve_child_templates(
 }
 
 fn resolve_child_template_manifest_refs(
-    realm_url: &Url,
+    manifest_url: &Url,
     template_name: &str,
     decl: &ChildTemplateDecl,
 ) -> Result<Vec<ManifestRef>, Error> {
@@ -657,14 +886,16 @@ fn resolve_child_template_manifest_refs(
         None => Ok(Vec::new()),
         Some(ChildTemplateManifestDecl::One(reference)) => {
             Ok(vec![resolve_manifest_ref_for_template(
-                realm_url,
+                manifest_url,
                 template_name,
                 reference,
             )?])
         }
         Some(ChildTemplateManifestDecl::Many(refs)) => refs
             .iter()
-            .map(|reference| resolve_manifest_ref_for_template(realm_url, template_name, reference))
+            .map(|reference| {
+                resolve_manifest_ref_for_template(manifest_url, template_name, reference)
+            })
             .collect(),
         Some(_) => {
             unreachable!("manifest validation handles unknown child-template manifest forms")
@@ -673,16 +904,16 @@ fn resolve_child_template_manifest_refs(
 }
 
 fn resolve_manifest_ref_for_template(
-    realm_url: &Url,
+    manifest_url: &Url,
     template_name: &str,
     reference: &ManifestRef,
 ) -> Result<ManifestRef, Error> {
     if !reference.url.is_relative() {
         return Ok(reference.clone());
     }
-    if realm_url.scheme() != "file" {
+    if manifest_url.scheme() != "file" {
         return Err(Error::ManifestRefResolution {
-            realm_path: display_url(realm_url).into(),
+            manifest_path: display_url(manifest_url).into(),
             child: template_name.into(),
             reference: reference.url.as_str().into(),
             message: "relative child template manifest references require a file:// owning \
@@ -693,9 +924,9 @@ fn resolve_manifest_ref_for_template(
         });
     }
     reference
-        .resolve_against(realm_url)
+        .resolve_against(manifest_url)
         .map_err(|err| Error::ManifestRefResolution {
-            realm_path: display_url(realm_url).into(),
+            manifest_path: display_url(manifest_url).into(),
             child: template_name.into(),
             reference: reference.url.as_str().into(),
             message: err.to_string().into(),
@@ -706,7 +937,7 @@ fn resolve_manifest_ref_for_template(
 
 fn validate_use_root_slots(
     svc: &ResolveService,
-    realm_url: &Url,
+    manifest_url: &Url,
     use_name: &str,
     digest: ManifestDigest,
     use_url: &Url,
@@ -725,7 +956,7 @@ fn validate_use_root_slots(
         return Ok(());
     }
 
-    let (src, span) = use_manifest_decl_site(svc, realm_url, use_name);
+    let (src, span) = use_manifest_decl_site(svc, manifest_url, use_name);
     let mut related = Vec::new();
     if let Some(stored) = svc.store.get_source(use_url) {
         for slot_name in &required_slots {
@@ -756,7 +987,7 @@ fn validate_use_root_slots(
 
 fn validate_child_experimental_features(
     svc: &ResolveService,
-    realm_url: &Url,
+    manifest_url: &Url,
     child_name: &str,
     parent_features: &BTreeSet<ExperimentalFeature>,
     child_digest: ManifestDigest,
@@ -778,7 +1009,7 @@ fn validate_child_experimental_features(
 
     let (src, span) =
         svc.store
-            .diagnostic_source(realm_url)
+            .diagnostic_source(manifest_url)
             .map_or((None, None), |(src, spans)| {
                 let span = spans
                     .components
@@ -817,7 +1048,7 @@ fn compute_environment(
     svc: &ResolveService,
     base_env: &Arc<ResolveEnv>,
     manifest: &Manifest,
-    realm_url: &Url,
+    manifest_url: &Url,
     env_name: &str,
     env_cache: &mut HashMap<String, Arc<ResolveEnv>>,
 ) -> Result<Arc<ResolveEnv>, Error> {
@@ -831,7 +1062,7 @@ fn compute_environment(
         .expect("environment names are validated in Manifest");
 
     let parent_env = if let Some(ext) = env_decl.extends.as_deref() {
-        compute_environment(svc, base_env, manifest, realm_url, ext, env_cache)?
+        compute_environment(svc, base_env, manifest, manifest_url, ext, env_cache)?
     } else {
         Arc::clone(base_env)
     };
@@ -841,7 +1072,7 @@ fn compute_environment(
         let Some(r) = svc.registry.get(resolver_name.as_str()) else {
             let (src, span) =
                 svc.store
-                    .diagnostic_source(realm_url)
+                    .diagnostic_source(manifest_url)
                     .map_or((None, None), |(src, spans)| {
                         let env = spans.environments.get(env_name);
                         let span = env
@@ -856,7 +1087,7 @@ fn compute_environment(
                         (Some(src), Some(span))
                     });
             return Err(Error::UnknownResolver {
-                realm_url: Box::new(realm_url.clone()),
+                manifest_url: Box::new(manifest_url.clone()),
                 environment: env_name.into(),
                 resolver: resolver_name.as_str().into(),
                 src,

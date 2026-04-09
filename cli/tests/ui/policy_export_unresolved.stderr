@@ -1,0 +1,14 @@
+Error: compiler::policy_export_unresolved
+
+  × check failed
+  ╰─▶ policy `#wrapper.rewrite` could not resolve export `rewrite` from use
+      `#wrapper`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/policy_export_unresolved.json5:7:14]
+ 6 │   },
+ 7 │   policies: ["#wrapper.rewrite"],
+   ·              ─────────┬────────
+   ·                       ╰── policy referenced here
+ 8 │ }
+   ╰────
+  help: Ensure the used manifest exports this capability and that any child
+        export chain resolves to a real export.
