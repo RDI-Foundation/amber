@@ -312,8 +312,16 @@ jobs:
             needs_prebuilt_images: false
             test_filters: |
               framework_component_direct_create_destroy_live
-              framework_component_open_template_frozen_source_replay_live
+              framework_component_bounded_template_frozen_source_replay_live
               framework_component_destroy_of_provider_keeps_consumer_live
+          - shard_name: dynamic-capabilities
+            timeout_minutes: 60
+            needs_direct: true
+            needs_kind: false
+            needs_qemu: false
+            needs_prebuilt_images: false
+            test_filters: |
+              dynamic_capabilities_
           - shard_name: framework-docker
             timeout_minutes: 60
             needs_direct: false
