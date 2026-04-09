@@ -581,13 +581,13 @@ fn resolve_policies(
     uses: &BTreeMap<String, ResolvedNode>,
 ) -> Result<Vec<ResolvedPolicy>, Error> {
     let mut resolved = Vec::with_capacity(manifest.policies().len());
-    for policy in manifest.policies() {
+    for (policy_index, policy) in manifest.policies().iter().enumerate() {
         let use_node = uses
             .get(policy.alias.as_str())
             .expect("policy aliases are validated before resolution");
         let endpoint =
             resolve_policy_export(svc, use_node, policy.export.as_str()).map_err(|()| {
-                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy);
+                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy_index);
                 Error::PolicyExportUnresolved {
                     policy: policy.to_string().into(),
                     use_name: policy.alias.clone().into(),
@@ -608,7 +608,7 @@ fn resolve_policies(
                 });
             }
             ResolvedPolicyEndpoint::Provide { decl, .. } => {
-                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy);
+                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy_index);
                 return Err(Error::InvalidPolicyExport {
                     policy: policy.to_string().into(),
                     message: format!(
@@ -621,7 +621,7 @@ fn resolve_policies(
                 });
             }
             ResolvedPolicyEndpoint::Slot { .. } => {
-                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy);
+                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy_index);
                 return Err(Error::InvalidPolicyExport {
                     policy: policy.to_string().into(),
                     message: "must resolve to a provide, not a slot".into(),
@@ -720,16 +720,14 @@ fn use_manifest_decl_site(
 fn policy_ref_decl_site(
     svc: &ResolveService,
     manifest_url: &Url,
-    policy: &PolicyRef,
+    policy_index: usize,
 ) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
-    let policy_ref = policy.to_string();
     svc.store
         .diagnostic_source(manifest_url)
         .map_or((None, None), |(src, spans)| {
             let span = spans
                 .policies
-                .iter()
-                .find(|candidate| candidate.value.as_deref() == Some(policy_ref.as_str()))
+                .get(policy_index)
                 .map(|candidate| candidate.whole)
                 .unwrap_or((0usize, 0usize).into());
             (Some(src), Some(span))

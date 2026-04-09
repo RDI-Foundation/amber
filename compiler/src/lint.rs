@@ -674,6 +674,28 @@ pub fn lint_manifest(
         }
     }
 
+    let policy_referenced_uses: BTreeSet<_> = manifest
+        .policies()
+        .iter()
+        .map(|policy| policy.alias.as_str())
+        .collect();
+
+    for use_name in manifest.uses().keys() {
+        if !policy_referenced_uses.contains(use_name.as_str()) {
+            let span = spans
+                .uses
+                .get(use_name.as_str())
+                .map(|s| s.name)
+                .unwrap_or((0usize, 0usize).into());
+            lints.push(ManifestLint::UnusedUse {
+                name: use_name.clone(),
+                component: component.clone(),
+                src: src.clone(),
+                span,
+            });
+        }
+    }
+
     for (env_name, env) in manifest.environments() {
         let mut seen = BTreeSet::new();
         for (idx, resolver) in env.resolvers.iter().enumerate() {
@@ -1337,6 +1359,47 @@ mod tests {
                 .iter()
                 .any(|lint| matches!(lint, crate::lint::ManifestLint::UnusedProgram { .. }))
         );
+    }
+
+    #[test]
+    fn unused_use_is_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["policies"],
+          use: {
+            wrapper: "./wrapper.json5",
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedUse { name, .. } if name == "wrapper"
+        )));
+    }
+
+    #[test]
+    fn use_referenced_by_policy_is_not_linted() {
+        let input = r##"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["policies"],
+          use: {
+            wrapper: "./wrapper.json5",
+          },
+          policies: ["#wrapper.rewrite"],
+        }
+        "##;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedUse { name, .. } if name == "wrapper"
+        )));
     }
 
     #[test]
