@@ -757,7 +757,7 @@ fn kubernetes_templates_dynamic_caps_sidecar_control_env() {
         "{component_deploy}"
     );
     assert!(
-        component_deploy.contains("http://127.0.0.1:20000"),
+        component_deploy.contains("http://127.0.0.1:19000"),
         "{component_deploy}"
     );
     assert!(

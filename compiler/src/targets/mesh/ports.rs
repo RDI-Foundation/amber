@@ -11,6 +11,7 @@ use super::plan::{
 };
 use crate::targets::program_config::EndpointPlan;
 
+const LOCAL_INTERNAL_PORT_BASE: u16 = 19000;
 const LOCAL_SLOT_PORT_BASE: u16 = 20000;
 
 #[derive(Clone, Debug, Default)]
@@ -88,7 +89,8 @@ impl<T> Hash for BindingIdentity<T> {
 
 struct ComponentRoutePortAllocator {
     reserved: HashSet<u16>,
-    next: u16,
+    internal_next: u16,
+    slot_next: u16,
     slot_ports: BTreeMap<String, Vec<u16>>,
 }
 
@@ -101,7 +103,8 @@ impl ComponentRoutePortAllocator {
 
         Self {
             reserved,
-            next: LOCAL_SLOT_PORT_BASE,
+            internal_next: LOCAL_INTERNAL_PORT_BASE,
+            slot_next: LOCAL_SLOT_PORT_BASE,
             slot_ports: BTreeMap::new(),
         }
     }
@@ -112,8 +115,8 @@ impl ComponentRoutePortAllocator {
         component_id: ComponentId,
         slot_name: &str,
     ) -> Result<u16, MeshError> {
-        while self.reserved.contains(&self.next) {
-            self.next = self.next.checked_add(1).ok_or_else(|| {
+        while self.reserved.contains(&self.slot_next) {
+            self.slot_next = self.slot_next.checked_add(1).ok_or_else(|| {
                 MeshError::new(format!(
                     "ran out of local slot ports allocating for {}",
                     component_label(scenario, component_id)
@@ -121,13 +124,13 @@ impl ComponentRoutePortAllocator {
             })?;
         }
 
-        let port = self.next;
+        let port = self.slot_next;
         self.reserved.insert(port);
         self.slot_ports
             .entry(slot_name.to_string())
             .or_default()
             .push(port);
-        self.next = self.next.checked_add(1).ok_or_else(|| {
+        self.slot_next = self.slot_next.checked_add(1).ok_or_else(|| {
             MeshError::new(format!(
                 "ran out of local slot ports allocating for {}",
                 component_label(scenario, component_id)
@@ -142,18 +145,24 @@ impl ComponentRoutePortAllocator {
         component_id: ComponentId,
         purpose: &str,
     ) -> Result<u16, MeshError> {
-        while self.reserved.contains(&self.next) {
-            self.next = self.next.checked_add(1).ok_or_else(|| {
+        while self.reserved.contains(&self.internal_next) {
+            self.internal_next = self.internal_next.checked_add(1).ok_or_else(|| {
                 MeshError::new(format!(
                     "ran out of local reserved ports allocating {purpose} for {}",
                     component_label(scenario, component_id)
                 ))
             })?;
         }
+        if self.internal_next >= LOCAL_SLOT_PORT_BASE {
+            return Err(MeshError::new(format!(
+                "ran out of local internal ports allocating {purpose} for {}",
+                component_label(scenario, component_id)
+            )));
+        }
 
-        let port = self.next;
+        let port = self.internal_next;
         self.reserved.insert(port);
-        self.next = self.next.checked_add(1).ok_or_else(|| {
+        self.internal_next = self.internal_next.checked_add(1).ok_or_else(|| {
             MeshError::new(format!(
                 "ran out of local reserved ports allocating {purpose} for {}",
                 component_label(scenario, component_id)
@@ -414,8 +423,8 @@ mod tests {
             panic!("expected component binding");
         };
 
-        assert_eq!(route_ports.component_binding_port(first), Some(20001));
-        assert_eq!(route_ports.component_binding_port(second), Some(20002));
+        assert_eq!(route_ports.component_binding_port(first), Some(20000));
+        assert_eq!(route_ports.component_binding_port(second), Some(20001));
         assert_eq!(route_ports.slot_port(ComponentId(0), "upstream"), None);
     }
 
@@ -526,9 +535,9 @@ mod tests {
             panic!("expected component binding");
         };
 
-        assert_eq!(route_ports.framework_binding_port(first), Some(20002));
-        assert_eq!(route_ports.external_binding_port(second), Some(20003));
-        assert_eq!(route_ports.component_binding_port(third), Some(20004));
+        assert_eq!(route_ports.framework_binding_port(first), Some(20001));
+        assert_eq!(route_ports.external_binding_port(second), Some(20002));
+        assert_eq!(route_ports.component_binding_port(third), Some(20003));
         assert_eq!(route_ports.slot_port(ComponentId(1), "upstream"), None);
     }
 }

@@ -475,8 +475,8 @@ mod tests {
         };
         assert_eq!(values.len(), 2);
         assert_ne!(values[0].url, values[1].url);
-        assert_eq!(values[0].url, "http://127.0.0.1:20001");
-        assert_eq!(values[1].url, "http://127.0.0.1:20002");
+        assert_eq!(values[0].url, "http://127.0.0.1:20000");
+        assert_eq!(values[1].url, "http://127.0.0.1:20001");
     }
 
     #[test]
@@ -584,9 +584,9 @@ mod tests {
                 .map(|value| value.url.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "tcp://127.0.0.1:20001",
+                "tcp://127.0.0.1:20000",
+                "http://127.0.0.1:20001",
                 "http://127.0.0.1:20002",
-                "http://127.0.0.1:20003",
             ]
         );
     }
@@ -644,6 +644,6 @@ mod tests {
         let SlotValue::One(value) = slot_value else {
             panic!("expected singular slot value, got {slot_value:?}");
         };
-        assert_eq!(value.url, "http://127.0.0.1:20001");
+        assert_eq!(value.url, "http://127.0.0.1:20000");
     }
 }
