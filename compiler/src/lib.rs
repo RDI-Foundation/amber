@@ -27,7 +27,9 @@ mod targets;
 pub mod bundle;
 pub mod reporter;
 
-pub use frontend::{DigestStore, ResolveOptions, ResolvedNode, ResolvedTree, ResolverRegistry};
+pub use frontend::{
+    DigestStore, ResolveOptions, ResolvedNode, ResolvedPolicy, ResolvedTree, ResolverRegistry,
+};
 pub use linker::{ComponentProvenance, Provenance};
 
 #[derive(Clone, Debug, Default)]

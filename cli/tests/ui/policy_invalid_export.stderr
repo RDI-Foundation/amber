@@ -1,0 +1,23 @@
+Error: compiler::invalid_policy_export
+
+  × check failed
+  ╰─▶ policy `#wrapper.rewrite` must resolve to a provide, not a slot
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/policy_invalid_export.json5:7:14]
+ 6 │   },
+ 7 │   policies: ["#wrapper.rewrite"],
+   ·              ─────────┬────────
+   ·                       ╰── policy referenced here
+ 8 │ }
+   ╰────
+  help: Policy refs must resolve to an exported `http` provide with profile
+        `policy`.
+
+Advice: 
+  ☞ policy `#wrapper.rewrite` resolves here
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/policy_invalid_export_wrapper.json5:4:5]
+ 3 │   slots: {
+ 4 │     rewrite: { kind: "http", profile: "policy", optional: true },
+   ·     ───┬───
+   ·        ╰── resolved slot declared here
+ 5 │   },
+   ╰────
