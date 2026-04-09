@@ -388,6 +388,11 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
             );
             for passthrough in &component.sidecar.env_passthrough {
                 if let Ok(value) = env::var(passthrough) {
+                    #[cfg(target_os = "linux")]
+                    let value = rewrite_sidecar_env_passthrough_for_slirp(
+                        passthrough.as_str(),
+                        value.as_str(),
+                    );
                     env.insert(passthrough.clone(), value);
                 }
             }
@@ -1210,6 +1215,36 @@ pub(crate) fn rewrite_peer_addr_for_slirp_gateway(peer_addr: &str) -> String {
     }
 
     SocketAddr::from((Ipv4Addr::new(10, 0, 2, 2), addr.port())).to_string()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn rewrite_sidecar_env_passthrough_for_slirp(name: &str, value: &str) -> String {
+    if name != amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV {
+        return value.to_string();
+    }
+    rewrite_loopback_url_for_slirp_gateway(value)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn rewrite_loopback_url_for_slirp_gateway(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return value.to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return value.to_string();
+    };
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|addr| addr.is_loopback())
+            .unwrap_or(false);
+    if !is_loopback {
+        return value.to_string();
+    }
+    if url.set_host(Some("10.0.2.2")).is_err() {
+        return value.to_string();
+    }
+    url.to_string()
 }
 
 pub(crate) fn read_mesh_config_public(path: &Path) -> Result<MeshConfigPublic> {

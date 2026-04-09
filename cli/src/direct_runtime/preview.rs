@@ -228,6 +228,9 @@ pub(crate) fn build_direct_site_launch_preview(
         );
         for passthrough in &component.sidecar.env_passthrough {
             if let Ok(value) = env::var(passthrough) {
+                #[cfg(target_os = "linux")]
+                let value =
+                    rewrite_sidecar_env_passthrough_for_slirp(passthrough.as_str(), value.as_str());
                 env.insert(passthrough.clone(), value);
             }
         }
