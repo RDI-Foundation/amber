@@ -135,7 +135,7 @@ Current values:
 
 * `"docker"`
 * `"kvm"`
-* `"policies"` - required for the `use` and `policies` top-level sections
+* `"governance"` - required for the `use` and `policies` top-level sections
 
 Rules:
 

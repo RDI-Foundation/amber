@@ -576,7 +576,7 @@ async fn experimental_features_are_checked_for_use_edges() {
             r#"
             {{
               manifest_version: "0.1.0",
-              experimental_features: ["policies"],
+              experimental_features: ["governance"],
               use: {{
                 wrapper: "{used}",
               }},

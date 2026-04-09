@@ -510,7 +510,7 @@ async fn resolve_tree_keeps_use_entries_out_of_component_tree() {
             r##"
             {{
               manifest_version: "0.1.0",
-              experimental_features: ["policies"],
+              experimental_features: ["governance"],
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -571,7 +571,7 @@ async fn used_manifest_must_not_require_root_slots() {
             r##"
             {{
               manifest_version: "0.1.0",
-              experimental_features: ["policies"],
+              experimental_features: ["governance"],
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -630,7 +630,7 @@ async fn resolve_tree_resolves_policy_exports_from_use_entries() {
             r##"
             {{
               manifest_version: "0.1.0",
-              experimental_features: ["policies"],
+              experimental_features: ["governance"],
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -705,7 +705,7 @@ async fn resolve_tree_follows_child_exports_for_policies() {
             r##"
             {{
               manifest_version: "0.1.0",
-              experimental_features: ["policies"],
+              experimental_features: ["governance"],
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -748,7 +748,7 @@ async fn policy_ref_requires_resolvable_export() {
             r##"
             {{
               manifest_version: "0.1.0",
-              experimental_features: ["policies"],
+              experimental_features: ["governance"],
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -809,7 +809,7 @@ async fn policy_ref_requires_http_policy_provide() {
             r##"
             {{
               manifest_version: "0.1.0",
-              experimental_features: ["policies"],
+              experimental_features: ["governance"],
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -866,7 +866,7 @@ async fn policy_ref_rejects_slot_exports() {
             r##"
             {{
               manifest_version: "0.1.0",
-              experimental_features: ["policies"],
+              experimental_features: ["governance"],
               use: {{
                 wrapper: "{wrapper}",
               }},

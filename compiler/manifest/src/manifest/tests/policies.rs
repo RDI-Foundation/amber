@@ -5,7 +5,7 @@ fn use_entries_and_policies_parse() {
     let manifest: Manifest = r##"
         {
           manifest_version: "0.1.0",
-          experimental_features: ["policies"],
+          experimental_features: ["governance"],
           use: {
             wrapper: "https://example.com/wrapper.json5",
             membrane: { manifest: "https://example.com/membrane.json5", config: { level: "info" } },
@@ -29,7 +29,7 @@ fn policy_ref_must_use_hash_alias_export_syntax() {
     let err = r##"
         {
           manifest_version: "0.1.0",
-          experimental_features: ["policies"],
+          experimental_features: ["governance"],
           use: {
             wrapper: "https://example.com/wrapper.json5",
           },
@@ -52,7 +52,7 @@ fn policy_ref_alias_must_exist_in_use_map() {
         r##"
         {
           manifest_version: "0.1.0",
-          experimental_features: ["policies"],
+          experimental_features: ["governance"],
           use: {
             wrapper: "https://example.com/wrapper.json5",
           },
@@ -87,7 +87,7 @@ fn use_requires_policies_experimental_feature() {
     match err {
         Error::SectionRequiresFeature { section, feature } => {
             assert_eq!(section, "use");
-            assert_eq!(feature, "policies");
+            assert_eq!(feature, "governance");
         }
         other => panic!("expected SectionRequiresFeature error, got: {other}"),
     }
@@ -109,7 +109,7 @@ fn policies_require_policies_experimental_feature() {
     match err {
         Error::SectionRequiresFeature { section, feature } => {
             assert_eq!(section, "policies");
-            assert_eq!(feature, "policies");
+            assert_eq!(feature, "governance");
         }
         other => panic!("expected SectionRequiresFeature error, got: {other}"),
     }
@@ -121,7 +121,7 @@ fn use_names_must_not_contain_dots() {
         r#"
         {
           manifest_version: "0.1.0",
-          experimental_features: ["policies"],
+          experimental_features: ["governance"],
           use: {
             "wrap.per": "https://example.com/wrapper.json5",
           },
@@ -146,7 +146,7 @@ fn use_environment_reference_must_exist() {
         r#"
         {
           manifest_version: "0.1.0",
-          experimental_features: ["policies"],
+          experimental_features: ["governance"],
           use: {
             wrapper: {
               manifest: "https://example.com/wrapper.json5",
