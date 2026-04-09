@@ -32,11 +32,16 @@ use amber_mesh::{
         TemplateExportsDescription, TemplateLimits, TemplateListResponse,
         TemplateManifestDescription, TemplateMode, TemplateResolveRequest, TemplateSummary,
     },
+    dynamic_caps::{
+        DescriptorIr, DynamicCapabilitiesSnapshotIr, GrantSnapshotIr, HeldEntryDetail,
+        HeldEntryKind, HeldEntryState, HeldEntrySummary, RootAuthoritySelectorIr,
+    },
     framework_cap_instance_id, router_dynamic_export_route_id, router_export_route_id,
 };
 use amber_proxy::{
-    clear_external_slot_with_retry, register_export_peer_with_retry,
-    register_external_slot_with_retry, unregister_export_peer_with_retry,
+    apply_route_overlay_with_retry, clear_external_slot_with_retry,
+    register_export_peer_with_retry, register_external_slot_with_retry,
+    unregister_export_peer_with_retry,
 };
 use amber_resolver::{Backend, RemoteResolver, Resolution, Resolver};
 use amber_scenario::{
@@ -60,15 +65,17 @@ use tokio::{net::TcpListener, signal, sync::Mutex};
 
 use crate::mixed_run::{
     BridgeProxyHandle, BridgeProxyKey, DesiredExportPeerOverlay, DesiredExternalSlotOverlay,
-    LaunchedSite, SiteActuatorPlan, SiteReceipt, clear_desired_overlay_for_consumer,
-    clear_desired_overlay_for_provider, host_service_bind_addr_for_consumer,
-    host_service_host_for_consumer, launched_site_from_receipt,
+    LaunchedSite, LiveComponentRuntimeMetadata, SiteActuatorPlan, SiteReceipt,
+    clear_desired_overlay_for_consumer, clear_desired_overlay_for_provider,
+    collect_live_component_runtime_metadata, host_service_bind_addr_for_consumer,
+    host_service_host_for_consumer, launched_site_from_receipt, parse_control_endpoint,
     project_kubernetes_dynamic_child_artifact_files, read_json as read_run_json,
     resolve_link_external_url_for_output, site_actuator_child_root_for_site, site_state_path,
     stop_bridge_proxies, update_desired_overlay_for_consumer, update_desired_overlay_for_provider,
 };
 
 mod api;
+mod dynamic_caps;
 mod http;
 mod orchestration;
 mod planner;

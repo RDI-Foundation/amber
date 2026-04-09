@@ -270,6 +270,7 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
         identity: outside_identity,
         mesh_listen,
         control_listen: None,
+        dynamic_caps_listen: None,
         control_allow: None,
         peers: peers.into_values().collect(),
         inbound,

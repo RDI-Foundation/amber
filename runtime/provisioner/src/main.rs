@@ -716,6 +716,7 @@ mod tests {
             },
             mesh_listen: "0.0.0.0:23001".parse::<SocketAddr>().unwrap(),
             control_listen: None,
+            dynamic_caps_listen: None,
             control_allow: None,
             peers: Vec::new(),
             inbound: Vec::new(),

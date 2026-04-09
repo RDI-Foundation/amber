@@ -78,6 +78,34 @@ fn test_site_state(
     }
 }
 
+fn test_site_actuator_plan(
+    kind: SiteKind,
+    artifact_dir: &Path,
+    site_state_root: &Path,
+) -> SiteActuatorPlan {
+    SiteActuatorPlan {
+        schema: "amber.run.site_actuator_plan".to_string(),
+        version: 1,
+        run_id: "run-test".to_string(),
+        mesh_scope: "test-scope".to_string(),
+        run_root: site_state_root.display().to_string(),
+        site_id: "direct_local".to_string(),
+        kind,
+        router_identity_id: "/site/direct_local/router".to_string(),
+        artifact_dir: artifact_dir.display().to_string(),
+        site_state_root: site_state_root.display().to_string(),
+        listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        storage_root: None,
+        runtime_root: None,
+        router_mesh_port: None,
+        compose_project: None,
+        kubernetes_namespace: None,
+        context: None,
+        observability_endpoint: None,
+        launch_env: BTreeMap::new(),
+    }
+}
+
 #[test]
 fn forwarded_endpoint_ready_accepts_open_connection() {
     let listener =
@@ -179,6 +207,44 @@ fn desired_link_overlays_are_owned_per_overlay_id() {
     assert!(desired.export_peer_overlays.contains_key("provider-b"));
 }
 
+#[test]
+fn site_router_control_endpoint_prefers_manager_state_for_local_sites() {
+    let temp = tempdir().expect("tempdir");
+    let artifact_dir = temp.path().join("artifact");
+    let site_state_root = temp.path().join("state");
+    fs::create_dir_all(&artifact_dir).expect("artifact dir should exist");
+    fs::create_dir_all(&site_state_root).expect("site state dir should exist");
+    let manager_state_path = site_state_root.join("manager-state.json");
+
+    for kind in [SiteKind::Direct, SiteKind::Vm] {
+        write_json(
+            &manager_state_path,
+            &test_site_state(
+                "run-test",
+                "direct_local",
+                kind,
+                &artifact_dir,
+                Some("unix:///tmp/router-from-manager.sock"),
+                Some("127.0.0.1:24000"),
+            ),
+        )
+        .expect("manager state should be written");
+
+        let endpoint = site_router_control_endpoint(&test_site_actuator_plan(
+            kind,
+            &artifact_dir,
+            &site_state_root,
+        ))
+        .expect("router control endpoint should resolve");
+
+        assert_eq!(
+            endpoint.to_string(),
+            "unix:///tmp/router-from-manager.sock",
+            "local site actuator should use the live manager-state endpoint for {kind:?}",
+        );
+    }
+}
+
 fn test_local_mesh_config(path: &Path, protocol: MeshProtocol, port: u16) -> Result<()> {
     write_json(
         path,
@@ -190,6 +256,7 @@ fn test_local_mesh_config(path: &Path, protocol: MeshProtocol, port: u16) -> Res
             },
             mesh_listen: SocketAddr::from(([127, 0, 0, 1], 24000)),
             control_listen: Some(SocketAddr::from(([127, 0, 0, 1], 24100))),
+            dynamic_caps_listen: None,
             control_allow: None,
             peers: Vec::new(),
             inbound: vec![InboundRoute {
@@ -381,6 +448,7 @@ fn prepare_dynamic_compose_child_artifact_keeps_only_child_owned_services() {
                     },
                     mesh_listen: SocketAddr::from(([0, 0, 0, 0], 23000)),
                     control_listen: None,
+                    dynamic_caps_listen: None,
                     control_allow: None,
                     peers: vec![amber_mesh::MeshPeerTemplate {
                         id: "/site/compose_local/router".to_string(),
@@ -411,6 +479,7 @@ fn prepare_dynamic_compose_child_artifact_keeps_only_child_owned_services() {
                     },
                     mesh_listen: SocketAddr::from(([0, 0, 0, 0], 23000)),
                     control_listen: None,
+                    dynamic_caps_listen: None,
                     control_allow: None,
                     peers: vec![amber_mesh::MeshPeerTemplate {
                         id: "/site/compose_local/router".to_string(),
@@ -441,6 +510,7 @@ fn prepare_dynamic_compose_child_artifact_keeps_only_child_owned_services() {
                     },
                     mesh_listen: SocketAddr::from(([0, 0, 0, 0], 24000)),
                     control_listen: None,
+                    dynamic_caps_listen: None,
                     control_allow: None,
                     peers: vec![
                         amber_mesh::MeshPeerTemplate {
@@ -822,6 +892,7 @@ fn prepare_dynamic_compose_child_artifact_rewrites_same_site_static_provider_inp
                     },
                     mesh_listen: SocketAddr::from(([0, 0, 0, 0], 23000)),
                     control_listen: None,
+                    dynamic_caps_listen: None,
                     control_allow: None,
                     peers: vec![amber_mesh::MeshPeerTemplate {
                         id: "/site/compose_local/router".to_string(),
@@ -852,6 +923,7 @@ fn prepare_dynamic_compose_child_artifact_rewrites_same_site_static_provider_inp
                     },
                     mesh_listen: SocketAddr::from(([0, 0, 0, 0], 23000)),
                     control_listen: None,
+                    dynamic_caps_listen: None,
                     control_allow: None,
                     peers: vec![amber_mesh::MeshPeerTemplate {
                         id: "/provider".to_string(),
@@ -885,6 +957,7 @@ fn prepare_dynamic_compose_child_artifact_rewrites_same_site_static_provider_inp
                     },
                     mesh_listen: SocketAddr::from(([0, 0, 0, 0], 24000)),
                     control_listen: None,
+                    dynamic_caps_listen: None,
                     control_allow: None,
                     peers: vec![amber_mesh::MeshPeerTemplate {
                         id: "/provider".to_string(),
@@ -1197,6 +1270,7 @@ fn direct_startup_route_overlay_does_not_require_materialized_child_mesh_files()
                         },
                         mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
                         control_listen: None,
+                        dynamic_caps_listen: None,
                         control_allow: None,
                         peers: vec![amber_mesh::MeshPeerTemplate {
                             id: "/site/direct_local/router".to_string(),
@@ -1230,6 +1304,7 @@ fn direct_startup_route_overlay_does_not_require_materialized_child_mesh_files()
                         },
                         mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
                         control_listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                        dynamic_caps_listen: None,
                         control_allow: None,
                         peers: Vec::new(),
                         inbound: Vec::new(),
@@ -1318,6 +1393,7 @@ fn filter_dynamic_mesh_provision_plan_keeps_only_child_owned_router_routes() {
                         },
                         mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
                         control_listen: None,
+                        dynamic_caps_listen: None,
                         control_allow: None,
                         peers: vec![amber_mesh::MeshPeerTemplate {
                             id: "/site/vm_local/router".to_string(),
@@ -1348,6 +1424,7 @@ fn filter_dynamic_mesh_provision_plan_keeps_only_child_owned_router_routes() {
                         },
                         mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
                         control_listen: None,
+                        dynamic_caps_listen: None,
                         control_allow: None,
                         peers: vec![amber_mesh::MeshPeerTemplate {
                             id: "/site/vm_local/router".to_string(),
@@ -1382,6 +1459,7 @@ fn filter_dynamic_mesh_provision_plan_keeps_only_child_owned_router_routes() {
                         },
                         mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
                         control_listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                        dynamic_caps_listen: None,
                         control_allow: None,
                         peers: vec![
                             amber_mesh::MeshPeerTemplate {
@@ -1542,6 +1620,7 @@ fn ensure_dynamic_proxy_export_component_routes_in_artifact_adds_provider_route(
                     },
                     mesh_listen: SocketAddr::from(([127, 0, 0, 1], 23000)),
                     control_listen: None,
+                    dynamic_caps_listen: None,
                     control_allow: None,
                     peers: Vec::new(),
                     inbound: Vec::new(),
@@ -1669,6 +1748,7 @@ fn child_router_overlay_payload_synthesizes_dynamic_proxy_export_routes_for_dire
                         },
                         mesh_listen: SocketAddr::from(([127, 0, 0, 1], 23000)),
                         control_listen: None,
+                        dynamic_caps_listen: None,
                         control_allow: None,
                         peers: vec![amber_mesh::MeshPeerTemplate {
                             id: "/site/direct_local/router".to_string(),
@@ -1702,6 +1782,7 @@ fn child_router_overlay_payload_synthesizes_dynamic_proxy_export_routes_for_dire
                         },
                         mesh_listen: SocketAddr::from(([127, 0, 0, 1], 24000)),
                         control_listen: Some(SocketAddr::from(([127, 0, 0, 1], 24100))),
+                        dynamic_caps_listen: None,
                         control_allow: None,
                         peers: vec![amber_mesh::MeshPeerTemplate {
                             id: "/job/root".to_string(),
@@ -1758,6 +1839,7 @@ fn child_router_overlay_payload_synthesizes_dynamic_proxy_export_routes_for_dire
             },
             mesh_listen: SocketAddr::from(([127, 0, 0, 1], 26000)),
             control_listen: None,
+            dynamic_caps_listen: None,
             control_allow: None,
             peers: Vec::new(),
             inbound: Vec::new(),
@@ -1846,6 +1928,7 @@ fn prepare_dynamic_kubernetes_child_artifact_keeps_router_overlay_local() {
                     },
                     mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
                     control_listen: None,
+                    dynamic_caps_listen: None,
                     control_allow: None,
                     peers: vec![amber_mesh::MeshPeerTemplate {
                         id: "/site/kind_local/router".to_string(),
@@ -1877,6 +1960,7 @@ fn prepare_dynamic_kubernetes_child_artifact_keeps_router_overlay_local() {
                     },
                     mesh_listen: SocketAddr::from(([127, 0, 0, 1], 23007)),
                     control_listen: None,
+                    dynamic_caps_listen: None,
                     control_allow: None,
                     peers: vec![amber_mesh::MeshPeerTemplate {
                         id: "/site/kind_local/router".to_string(),
@@ -1908,6 +1992,7 @@ fn prepare_dynamic_kubernetes_child_artifact_keeps_router_overlay_local() {
                     },
                     mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
                     control_listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                    dynamic_caps_listen: None,
                     control_allow: None,
                     peers: vec![
                         amber_mesh::MeshPeerTemplate {
@@ -2358,6 +2443,7 @@ fn kubernetes_peer_addrs_are_derived_from_mesh_secret_names() {
                 },
                 mesh_listen: SocketAddr::from(([127, 0, 0, 1], 23000)),
                 control_listen: None,
+                dynamic_caps_listen: None,
                 control_allow: None,
                 peers: Vec::new(),
                 inbound: Vec::new(),
@@ -2410,6 +2496,7 @@ fn kubernetes_dynamic_route_overlay_uses_runtime_plan_with_router_target() {
             },
             mesh_listen: SocketAddr::from(([127, 0, 0, 1], 23000)),
             control_listen: None,
+            dynamic_caps_listen: None,
             control_allow: None,
             peers: Vec::new(),
             inbound: Vec::new(),
@@ -2442,6 +2529,7 @@ fn kubernetes_dynamic_route_overlay_uses_runtime_plan_with_router_target() {
                     },
                     mesh_listen: SocketAddr::from(([127, 0, 0, 1], 23001)),
                     control_listen: None,
+                    dynamic_caps_listen: None,
                     control_allow: None,
                     peers: Vec::new(),
                     inbound: Vec::new(),

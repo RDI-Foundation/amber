@@ -700,3 +700,110 @@ fn kubernetes_emits_otelcol_and_wires_otel_env() {
         "{component_deploy}"
     );
 }
+
+#[test]
+fn kubernetes_templates_dynamic_caps_sidecar_control_env() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let worker_path = dir.path().join("worker.json5");
+
+    fs::write(
+        &root_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          components: { worker: "./worker.json5" }
+        }
+        "##,
+    )
+    .expect("write root manifest");
+
+    fs::write(
+        &worker_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "sleep 3600"]
+          }
+        }
+        "#,
+    )
+    .expect("write worker manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+        .expect("compile scenario");
+    let artifact = render_artifact(&output);
+
+    let component_deploy = artifact
+        .files
+        .iter()
+        .find_map(|(path, content)| {
+            let path = path.to_string_lossy();
+            (path.starts_with("03-deployments/") && path.ends_with("worker.yaml"))
+                .then_some(content)
+        })
+        .expect("worker deployment");
+    assert!(
+        component_deploy.contains("AMBER_DYNAMIC_CAPS_API_URL"),
+        "{component_deploy}"
+    );
+    assert!(
+        component_deploy.contains("http://127.0.0.1:19000"),
+        "{component_deploy}"
+    );
+    assert!(
+        component_deploy.contains("amber-component-sidecar-env"),
+        "{component_deploy}"
+    );
+
+    let sidecar_env = artifact
+        .files
+        .get(&PathBuf::from(super::COMPONENT_SIDECAR_ENV_FILE))
+        .expect("component sidecar env template");
+    assert!(
+        sidecar_env.contains("AMBER_DYNAMIC_CAPS_CONTROL_URL="),
+        "{sidecar_env}"
+    );
+    assert!(
+        sidecar_env.contains("AMBER_DYNAMIC_CAPS_CONTROL_AUTH_TOKEN="),
+        "{sidecar_env}"
+    );
+    assert!(
+        sidecar_env.contains("AMBER_DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64="),
+        "{sidecar_env}"
+    );
+
+    let kustomization = artifact
+        .files
+        .get(&PathBuf::from("kustomization.yaml"))
+        .expect("kustomization");
+    assert!(
+        kustomization.contains("name: amber-component-sidecar-env"),
+        "{kustomization}"
+    );
+    assert!(
+        kustomization.contains(super::COMPONENT_SIDECAR_ENV_FILE),
+        "{kustomization}"
+    );
+    assert!(
+        !kustomization.contains(&format!(
+            "resources:\n- {}",
+            super::COMPONENT_SIDECAR_ENV_FILE
+        )),
+        "{kustomization}"
+    );
+    assert!(
+        !kustomization.contains(&format!("\n- {}\n", super::COMPONENT_SIDECAR_ENV_FILE)),
+        "kustomization resources must not treat the sidecar env template as a manifest: \
+         {kustomization}"
+    );
+}

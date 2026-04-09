@@ -3,7 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
+use amber_mesh::{
+    DYNAMIC_CAPS_API_URL_ENV, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput,
+};
 use amber_scenario::{ComponentId, ProgramMount, Scenario};
 use amber_template::{ProgramArgTemplate, TemplatePart, TemplateSpec};
 use base64::Engine as _;
@@ -122,6 +124,8 @@ pub struct DirectSidecarPlan {
     pub mesh_port: u16,
     pub mesh_config_path: String,
     pub mesh_identity_path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_passthrough: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -315,6 +319,7 @@ pub(crate) fn emit_direct_artifact(
         storage_plan: &storage_plan,
         component_names: &component_names,
         mesh_ports_by_component: &mesh_ports_by_component,
+        mesh_config_plan: &mesh_config_plan,
         compiled,
         program_components,
     })?;
@@ -398,6 +403,7 @@ struct DirectComponentPlanInputs<'a> {
     storage_plan: &'a StoragePlan,
     component_names: &'a HashMap<ComponentId, DirectComponentNames>,
     mesh_ports_by_component: &'a HashMap<ComponentId, u16>,
+    mesh_config_plan: &'a crate::targets::mesh::mesh_config::MeshConfigPlan,
     compiled: &'a CompiledScenario,
     program_components: &'a [ComponentId],
 }
@@ -412,6 +418,7 @@ fn build_component_plans(
         storage_plan,
         component_names,
         mesh_ports_by_component,
+        mesh_config_plan,
         compiled,
         program_components,
     } = inputs;
@@ -444,6 +451,17 @@ fn build_component_plans(
                 component.moniker.as_str()
             ))
         })?;
+        let dynamic_caps_port = mesh_config_plan
+            .component_configs
+            .get(id)
+            .and_then(|config| config.dynamic_caps_listen)
+            .map(|addr| addr.port())
+            .ok_or_else(|| {
+                MeshError::new(format!(
+                    "internal error: missing dynamic caps listen port for {}",
+                    component.moniker.as_str()
+                ))
+            })?;
         let depends_on = mesh_plan
             .strong_deps()
             .get(id)
@@ -469,6 +487,7 @@ fn build_component_plans(
                 mesh_port,
                 mesh_config_path: mesh_config_relative_path(&names.mesh_dir),
                 mesh_identity_path: mesh_identity_relative_path(&names.mesh_dir),
+                env_passthrough: mesh_config_plan.component_sidecar_env_passthrough.clone(),
             },
             program: DirectProgramPlan {
                 log_name: format!("{}-program", names.base),
@@ -476,11 +495,42 @@ fn build_component_plans(
                 storage_mounts: direct_storage_mounts(
                     storage_plan.mounts_by_component.get(id).map(Vec::as_slice),
                 ),
-                execution,
+                execution: inject_direct_dynamic_caps_env(execution, dynamic_caps_port),
             },
         });
     }
     Ok(out)
+}
+
+fn inject_direct_dynamic_caps_env(
+    execution: DirectProgramExecutionPlan,
+    dynamic_caps_port: u16,
+) -> DirectProgramExecutionPlan {
+    match execution {
+        DirectProgramExecutionPlan::Direct {
+            entrypoint,
+            mut env,
+        } => {
+            env.insert(
+                DYNAMIC_CAPS_API_URL_ENV.to_string(),
+                format!("http://127.0.0.1:{dynamic_caps_port}"),
+            );
+            DirectProgramExecutionPlan::Direct { entrypoint, env }
+        }
+        DirectProgramExecutionPlan::HelperRunner {
+            entrypoint_b64,
+            env_b64,
+            template_spec_b64,
+            runtime_config,
+            mount_spec_b64,
+        } => DirectProgramExecutionPlan::HelperRunner {
+            entrypoint_b64,
+            env_b64,
+            template_spec_b64,
+            runtime_config,
+            mount_spec_b64,
+        },
+    }
 }
 
 fn direct_storage_mounts(

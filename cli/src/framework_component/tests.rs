@@ -1,7 +1,13 @@
 use std::fs;
 
 use amber_compiler::run_plan::build_run_plan;
-use amber_mesh::component_protocol::BindingInput;
+use amber_mesh::{
+    component_protocol::BindingInput,
+    dynamic_caps::{
+        self as mesh_dynamic_caps, DynamicCapabilitiesSnapshotIr, DynamicCapabilityRefClaims,
+        HeldEntryKind, HeldEntryState, RootAuthoritySelectorIr,
+    },
+};
 use tempfile::TempDir;
 use url::Url;
 
@@ -150,14 +156,15 @@ async fn compile_control_state(root_path: &Path) -> FrameworkControlState {
     compile_control_state_with_placement(root_path, None).await
 }
 
-async fn compile_control_state_from_ir(
+async fn compile_control_state_from_ir_with_run_id(
     scenario_ir: ScenarioIr,
     placement: Option<&PlacementFile>,
+    run_id: &str,
 ) -> FrameworkControlState {
     let compiled = CompiledScenario::from_ir(scenario_ir).expect("fixture should load from ir");
     let run_plan =
         build_run_plan(&compiled, placement).expect("fixture should produce replay run plan");
-    build_control_state("test-run", &run_plan).expect("fixture should build replay state")
+    build_control_state(run_id, &run_plan).expect("fixture should build replay state")
 }
 
 #[derive(Deserialize)]
@@ -166,25 +173,358 @@ struct SnapshotPlacementFixture {
     defaults: PlacementDefaults,
     #[serde(default)]
     assignments: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dynamic_capabilities: Option<DynamicCapabilitiesSnapshotIr>,
 }
 
 fn placement_from_snapshot(snapshot: &SnapshotResponse) -> PlacementFile {
     let placement: SnapshotPlacementFixture =
         serde_json::from_value(snapshot.placement.clone()).expect("snapshot placement");
+    let dynamic_capabilities = if snapshot.dynamic_capabilities.is_null() {
+        placement.dynamic_capabilities
+    } else {
+        Some(
+            serde_json::from_value(snapshot.dynamic_capabilities.clone())
+                .expect("snapshot dynamic capabilities"),
+        )
+    };
     PlacementFile {
         schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
         version: amber_compiler::run_plan::PLACEMENT_VERSION,
         sites: placement.offered_sites,
         defaults: placement.defaults,
         components: placement.assignments,
+        dynamic_capabilities,
     }
 }
 
 async fn compile_control_state_from_snapshot(snapshot: &SnapshotResponse) -> FrameworkControlState {
+    compile_control_state_from_snapshot_with_run_id(snapshot, "test-run").await
+}
+
+async fn compile_control_state_from_snapshot_with_run_id(
+    snapshot: &SnapshotResponse,
+    run_id: &str,
+) -> FrameworkControlState {
     let scenario_ir: ScenarioIr =
         serde_json::from_value(snapshot.scenario.clone()).expect("snapshot scenario");
     let placement = placement_from_snapshot(snapshot);
-    compile_control_state_from_ir(scenario_ir, Some(&placement)).await
+    compile_control_state_from_ir_with_run_id(scenario_ir, Some(&placement), run_id).await
+}
+
+fn held_entries_for(
+    state: &FrameworkControlState,
+    holder_component_id: &str,
+) -> Vec<mesh_dynamic_caps::HeldEntrySummary> {
+    super::dynamic_caps::live_held_entries(state, holder_component_id)
+        .expect("held entries should resolve")
+}
+
+fn root_held_id_for(state: &FrameworkControlState, holder_component_id: &str) -> String {
+    let held = held_entries_for(state, holder_component_id);
+    held.clone()
+        .into_iter()
+        .find(|entry| entry.entry_kind == HeldEntryKind::RootAuthority)
+        .map(|entry| entry.held_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "holder `{holder_component_id}` should have a root authority; held entries: \
+                 {held:?}"
+            )
+        })
+}
+
+fn delegated_entry_for(
+    state: &FrameworkControlState,
+    holder_component_id: &str,
+    grant_id: &str,
+) -> mesh_dynamic_caps::HeldEntryDetail {
+    super::dynamic_caps::held_entry_detail(
+        state,
+        holder_component_id,
+        &super::dynamic_caps::held_id_for_grant(grant_id),
+    )
+    .expect("delegated held entry should resolve")
+}
+
+async fn compile_dynamic_caps_binding_state() -> FrameworkControlState {
+    fn path_program() -> amber_scenario::Program {
+        serde_json::from_value(serde_json::json!({
+            "path": "/usr/bin/env",
+            "args": ["python3", "-c", "print('ok')"]
+        }))
+        .expect("path program should parse")
+    }
+
+    fn http_provider_program(port: u16) -> amber_scenario::Program {
+        serde_json::from_value(serde_json::json!({
+            "path": "/usr/bin/env",
+            "args": ["python3", "-c", "print('ok')"],
+            "network": {
+                "endpoints": [
+                    { "name": "http", "port": port, "protocol": "http" }
+                ]
+            }
+        }))
+        .expect("provider program should parse")
+    }
+
+    fn http_slot() -> SlotDecl {
+        serde_json::from_value(serde_json::json!({ "kind": "http" }))
+            .expect("slot decl should parse")
+    }
+
+    fn http_provide() -> amber_manifest::ProvideDecl {
+        serde_json::from_value(serde_json::json!({ "kind": "http", "endpoint": "http" }))
+            .expect("provide decl should parse")
+    }
+
+    fn component(
+        id: usize,
+        moniker: &str,
+        parent: Option<usize>,
+        children: Vec<usize>,
+        program: Option<amber_scenario::Program>,
+        slots: BTreeMap<String, SlotDecl>,
+        provides: BTreeMap<String, amber_manifest::ProvideDecl>,
+    ) -> ComponentIr {
+        ComponentIr {
+            id,
+            moniker: moniker.to_string(),
+            parent,
+            children,
+            resolved_url: None,
+            digest: amber_manifest::ManifestDigest::new([id as u8; 32]),
+            config: None,
+            config_schema: None,
+            program,
+            slots,
+            provides,
+            exports: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            child_templates: BTreeMap::new(),
+            metadata: None,
+        }
+    }
+
+    let scenario = ScenarioIr {
+        schema: amber_scenario::SCENARIO_IR_SCHEMA.to_string(),
+        version: amber_scenario::SCENARIO_IR_VERSION,
+        root: 0,
+        components: vec![
+            component(
+                0,
+                "/",
+                None,
+                vec![1, 2, 3, 4, 5, 6],
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            component(
+                1,
+                "/provider",
+                Some(0),
+                Vec::new(),
+                Some(http_provider_program(8080)),
+                BTreeMap::new(),
+                BTreeMap::from([("http".to_string(), http_provide())]),
+            ),
+            component(
+                2,
+                "/alice",
+                Some(0),
+                Vec::new(),
+                Some(path_program()),
+                BTreeMap::from([("upstream".to_string(), http_slot())]),
+                BTreeMap::new(),
+            ),
+            component(
+                3,
+                "/bob",
+                Some(0),
+                Vec::new(),
+                Some(path_program()),
+                BTreeMap::from([("upstream".to_string(), http_slot())]),
+                BTreeMap::new(),
+            ),
+            component(
+                4,
+                "/carol",
+                Some(0),
+                Vec::new(),
+                Some(path_program()),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            component(
+                5,
+                "/dave",
+                Some(0),
+                Vec::new(),
+                Some(path_program()),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            component(
+                6,
+                "/eve",
+                Some(0),
+                Vec::new(),
+                Some(path_program()),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+        ],
+        bindings: vec![
+            BindingIr {
+                name: None,
+                from: BindingFromIr::Component {
+                    component: 1,
+                    provide: "http".to_string(),
+                },
+                to: amber_scenario::ir::SlotRefIr {
+                    component: 2,
+                    slot: "upstream".to_string(),
+                },
+                weak: false,
+            },
+            BindingIr {
+                name: None,
+                from: BindingFromIr::Component {
+                    component: 1,
+                    provide: "http".to_string(),
+                },
+                to: amber_scenario::ir::SlotRefIr {
+                    component: 3,
+                    slot: "upstream".to_string(),
+                },
+                weak: false,
+            },
+        ],
+        exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
+    };
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([(
+            "direct_local".to_string(),
+            SiteDefinition {
+                kind: SiteKind::Direct,
+                context: None,
+            },
+        )]),
+        defaults: PlacementDefaults {
+            path: Some("direct_local".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::new(),
+        dynamic_capabilities: None,
+    };
+    compile_control_state_from_ir_with_run_id(scenario, Some(&placement), "test-run").await
+}
+
+async fn compile_dynamic_caps_external_root_state() -> FrameworkControlState {
+    let program: amber_scenario::Program = serde_json::from_value(serde_json::json!({
+        "path": "/usr/bin/env",
+        "args": ["python3", "-c", "print('ok')"]
+    }))
+    .expect("path program should parse");
+    let http_slot: SlotDecl = serde_json::from_value(serde_json::json!({ "kind": "http" }))
+        .expect("slot decl should parse");
+    let scenario = ScenarioIr {
+        schema: amber_scenario::SCENARIO_IR_SCHEMA.to_string(),
+        version: amber_scenario::SCENARIO_IR_VERSION,
+        root: 0,
+        components: vec![
+            ComponentIr {
+                id: 0,
+                moniker: "/".to_string(),
+                parent: None,
+                children: vec![1, 2],
+                resolved_url: None,
+                digest: amber_manifest::ManifestDigest::new([0; 32]),
+                config: None,
+                config_schema: None,
+                program: None,
+                slots: BTreeMap::from([("catalog_api".to_string(), http_slot.clone())]),
+                provides: BTreeMap::new(),
+                exports: BTreeMap::new(),
+                resources: BTreeMap::new(),
+                child_templates: BTreeMap::new(),
+                metadata: None,
+            },
+            ComponentIr {
+                id: 1,
+                moniker: "/alice".to_string(),
+                parent: Some(0),
+                children: Vec::new(),
+                resolved_url: None,
+                digest: amber_manifest::ManifestDigest::new([1; 32]),
+                config: None,
+                config_schema: None,
+                program: Some(program.clone()),
+                slots: BTreeMap::from([("catalog_api".to_string(), http_slot)]),
+                provides: BTreeMap::new(),
+                exports: BTreeMap::new(),
+                resources: BTreeMap::new(),
+                child_templates: BTreeMap::new(),
+                metadata: None,
+            },
+            ComponentIr {
+                id: 2,
+                moniker: "/bob".to_string(),
+                parent: Some(0),
+                children: Vec::new(),
+                resolved_url: None,
+                digest: amber_manifest::ManifestDigest::new([2; 32]),
+                config: None,
+                config_schema: None,
+                program: Some(program),
+                slots: BTreeMap::new(),
+                provides: BTreeMap::new(),
+                exports: BTreeMap::new(),
+                resources: BTreeMap::new(),
+                child_templates: BTreeMap::new(),
+                metadata: None,
+            },
+        ],
+        bindings: vec![BindingIr {
+            name: None,
+            from: BindingFromIr::External {
+                slot: amber_scenario::ir::SlotRefIr {
+                    component: 0,
+                    slot: "catalog_api".to_string(),
+                },
+            },
+            to: amber_scenario::ir::SlotRefIr {
+                component: 1,
+                slot: "catalog_api".to_string(),
+            },
+            weak: true,
+        }],
+        exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
+    };
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([(
+            "direct_local".to_string(),
+            SiteDefinition {
+                kind: SiteKind::Direct,
+                context: None,
+            },
+        )]),
+        defaults: PlacementDefaults {
+            path: Some("direct_local".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::new(),
+        dynamic_capabilities: None,
+    };
+    compile_control_state_from_ir_with_run_id(scenario, Some(&placement), "test-run").await
 }
 
 #[tokio::test]
@@ -280,6 +620,7 @@ async fn same_site_dynamic_child_output_bindings_reuse_provider_component_routes
             ..PlacementDefaults::default()
         },
         components: BTreeMap::new(),
+        dynamic_capabilities: None,
     };
     let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
@@ -436,6 +777,7 @@ async fn same_site_static_child_export_bindings_reuse_provider_component_routes(
             ..PlacementDefaults::default()
         },
         components: BTreeMap::new(),
+        dynamic_capabilities: None,
     };
     let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
@@ -1020,6 +1362,7 @@ async fn create_snapshot_and_destroy_exact_child() {
             ..PlacementDefaults::default()
         },
         components: BTreeMap::from([("/job-b".to_string(), "direct_b".to_string())]),
+        dynamic_capabilities: None,
     };
 
     let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -2095,6 +2438,7 @@ fn shared_cross_site_link_is_retained_while_another_child_still_needs_it() {
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
         },
+        run_links: Vec::new(),
         placement: FrozenPlacementState {
             offered_sites: BTreeMap::new(),
             defaults: PlacementDefaults::default(),
@@ -2110,6 +2454,14 @@ fn shared_cross_site_link_is_retained_while_another_child_still_needs_it() {
         next_child_id: 2,
         next_tx_id: 0,
         next_component_id: 0,
+        dynamic_capability_signing_seed_b64: mesh_dynamic_caps::signing_seed_b64(
+            &mesh_dynamic_caps::signing_key_from_seed(
+                mesh_dynamic_caps::generate_dynamic_capability_signing_seed(),
+            ),
+        ),
+        next_dynamic_capability_grant_id: 0,
+        dynamic_capability_grants: BTreeMap::new(),
+        dynamic_capability_journal: Vec::new(),
         capability_instances: BTreeMap::new(),
         journal: Vec::new(),
         live_children: vec![first, second],
@@ -2333,6 +2685,7 @@ async fn snapshot_is_stable_across_dynamic_create_order() {
             ("/job-a".to_string(), "direct_a".to_string()),
             ("/job-b".to_string(), "direct_b".to_string()),
         ]),
+        dynamic_capabilities: None,
     };
     let mut state_a = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let mut state_b = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -2459,6 +2812,7 @@ async fn create_rejects_unoffered_backend_without_committing_child_state() {
             ..PlacementDefaults::default()
         },
         components: BTreeMap::new(),
+        dynamic_capabilities: None,
     };
     let err = build_run_plan(&compiled, Some(&placement))
         .expect_err("run planning should reject future direct children without a direct site");
@@ -2570,6 +2924,7 @@ async fn destroy_retracted_tears_down_sites_concurrently() {
             ..PlacementDefaults::default()
         },
         components: BTreeMap::new(),
+        dynamic_capabilities: None,
     };
 
     let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -2699,6 +3054,7 @@ async fn create_committed_hidden_publishes_independent_sites_concurrently() {
             ..PlacementDefaults::default()
         },
         components: BTreeMap::new(),
+        dynamic_capabilities: None,
     };
 
     let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -2844,6 +3200,7 @@ async fn concurrent_distinct_creates_commit_both_children() {
             ..PlacementDefaults::default()
         },
         components: BTreeMap::new(),
+        dynamic_capabilities: None,
     };
     let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
@@ -2978,6 +3335,7 @@ async fn prepare_child_record_uses_frozen_dynamic_placement_assignments() {
             ..PlacementDefaults::default()
         },
         components: BTreeMap::from([("/job".to_string(), "kind_local".to_string())]),
+        dynamic_capabilities: None,
     };
 
     let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -3206,6 +3564,7 @@ async fn prepare_child_record_preserves_cross_backend_matrix_assignments() {
             ),
             ("/job-compose/vm_helper".to_string(), "vm_local".to_string()),
         ]),
+        dynamic_capabilities: None,
     };
 
     let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -3900,6 +4259,7 @@ async fn recover_control_state_surfaces_create_prepared_rollback_failures() {
             ..PlacementDefaults::default()
         },
         components: BTreeMap::new(),
+        dynamic_capabilities: None,
     };
     let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
@@ -4063,4 +4423,581 @@ async fn recover_control_state_completes_destroy_retracted_children() {
         recovered.journal.last().map(|entry| entry.state),
         Some(ChildState::DestroyCommitted)
     );
+}
+
+#[tokio::test]
+async fn dynamic_capabilities_derive_distinct_binding_roots_per_live_holder() {
+    let state = compile_dynamic_caps_binding_state().await;
+    let live = decode_live_scenario(&state).expect("live scenario should decode");
+    let roots = super::dynamic_caps::derive_root_authorities(&state).expect("roots should derive");
+    assert!(
+        roots.values().any(|root| {
+            root.selector
+                == RootAuthoritySelectorIr::Binding {
+                    consumer_component_id: "components./alice".to_string(),
+                    slot_name: "upstream".to_string(),
+                    provider_component_id: "components./provider".to_string(),
+                    provider_capability_name: "http".to_string(),
+                }
+        }),
+        "alice should hold a binding-derived root authority; live components: {live:#?}; roots: \
+         {roots:#?}"
+    );
+    assert!(
+        roots.values().any(|root| {
+            root.selector
+                == RootAuthoritySelectorIr::Binding {
+                    consumer_component_id: "components./bob".to_string(),
+                    slot_name: "upstream".to_string(),
+                    provider_component_id: "components./provider".to_string(),
+                    provider_capability_name: "http".to_string(),
+                }
+        }),
+        "bob should hold an independent binding-derived root authority; live components: \
+         {live:#?}; roots: {roots:#?}"
+    );
+}
+
+#[tokio::test]
+async fn dynamic_capabilities_derive_external_slot_roots_for_cross_site_bindings() {
+    let mut state = compile_dynamic_caps_binding_state().await;
+    let external_slot_name = "amber_link_test".to_string();
+    state.run_links = vec![RunLink {
+        provider_site: "direct_a".to_string(),
+        consumer_site: "direct_b".to_string(),
+        provider_component: "/provider".to_string(),
+        provide: "http".to_string(),
+        consumer_component: "/alice".to_string(),
+        slot: "upstream".to_string(),
+        weak: false,
+        protocol: NetworkProtocol::Http,
+        export_name: "amber_export_test".to_string(),
+        external_slot_name: external_slot_name.clone(),
+    }];
+    let roots = super::dynamic_caps::derive_root_authorities(&state).expect("roots should derive");
+
+    assert!(
+        roots.values().any(|root| {
+            root.selector
+                == RootAuthoritySelectorIr::ExternalSlotBinding {
+                    consumer_component_id: "components./alice".to_string(),
+                    slot_name: "upstream".to_string(),
+                    external_slot_component_id: "components./provider".to_string(),
+                    external_slot_name: external_slot_name.clone(),
+                }
+        }),
+        "cross-site binding should derive an external-slot-backed root authority; run links: \
+         {:#?}; roots: {roots:#?}",
+        state.run_links,
+    );
+}
+
+#[tokio::test]
+async fn dynamic_capabilities_grant_graph_obeys_distinct_idempotent_noop_and_revocation_rules() {
+    let mut state = compile_dynamic_caps_binding_state().await;
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &state,
+        "components./alice",
+        &root_held_id_for(&state, "components./alice"),
+    )
+    .expect("alice root source should resolve");
+
+    let first = super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./carol",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("first share should succeed");
+    let second = super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./carol",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("second distinct share should succeed");
+    let (grant_a, ref_a) = match first {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, r#ref } => {
+            (grant_id, r#ref)
+        }
+        other => panic!("unexpected first share outcome: {other:?}"),
+    };
+    let grant_b = match second {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } => grant_id,
+        other => panic!("unexpected second share outcome: {other:?}"),
+    };
+    assert_ne!(
+        grant_a, grant_b,
+        "shares without idempotency must stay distinct"
+    );
+
+    let idempotent_created = super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./dave",
+        Some("share-dave"),
+        &serde_json::Value::Null,
+    )
+    .expect("idempotent create should succeed");
+    let (grant_c, ref_c) = match idempotent_created {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, r#ref } => {
+            (grant_id, r#ref)
+        }
+        other => panic!("unexpected idempotent create outcome: {other:?}"),
+    };
+    let idempotent_repeat = super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./dave",
+        Some("share-dave"),
+        &serde_json::Value::Null,
+    )
+    .expect("idempotent repeat should succeed");
+    match idempotent_repeat {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Deduplicated { grant_id, r#ref } => {
+            assert_eq!(grant_id, grant_c);
+            assert_eq!(r#ref, ref_c);
+        }
+        other => panic!("unexpected idempotent repeat outcome: {other:?}"),
+    }
+
+    match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./alice",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("self share should resolve as a no-op")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Noop { reason } => {
+            assert_eq!(reason, "recipient_already_has_authority");
+        }
+        other => panic!("unexpected self-share outcome: {other:?}"),
+    }
+
+    let grant_d = match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./carol",
+        &super::dynamic_caps::DynamicCapabilitySourceKey::Grant(grant_a.clone()),
+        "components./eve",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("re-share without prior materialization should succeed")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } => grant_id,
+        other => panic!("unexpected re-share outcome: {other:?}"),
+    };
+
+    match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./carol",
+        &super::dynamic_caps::DynamicCapabilitySourceKey::Grant(grant_a.clone()),
+        "components./alice",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("share back to an ancestor should become a no-op")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Noop { reason } => {
+            assert_eq!(reason, "recipient_already_has_authority");
+        }
+        other => panic!("unexpected ancestor-share outcome: {other:?}"),
+    }
+
+    let revoked = super::dynamic_caps::revoke_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &super::dynamic_caps::DynamicCapabilitySourceKey::Grant(grant_a.clone()),
+    )
+    .expect("ancestor revoke should succeed");
+    assert_eq!(
+        revoked.revoked_grant_ids,
+        vec![grant_a.clone(), grant_d.clone()],
+        "revocation must remove the target subtree only"
+    );
+    assert_eq!(
+        delegated_entry_for(&state, "components./carol", &grant_a)
+            .summary
+            .state,
+        HeldEntryState::Revoked
+    );
+    assert_eq!(
+        delegated_entry_for(&state, "components./eve", &grant_d)
+            .summary
+            .state,
+        HeldEntryState::Revoked
+    );
+    assert_eq!(
+        delegated_entry_for(&state, "components./carol", &grant_b)
+            .summary
+            .state,
+        HeldEntryState::Live,
+        "independent sibling grant must remain live"
+    );
+    assert_eq!(
+        delegated_entry_for(&state, "components./dave", &grant_c)
+            .summary
+            .state,
+        HeldEntryState::Live,
+        "independent idempotent branch must remain live"
+    );
+
+    let grant_e = match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./carol",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("reacquisition after revoke should create a fresh grant")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } => grant_id,
+        other => panic!("unexpected reacquisition outcome: {other:?}"),
+    };
+    assert_ne!(
+        grant_e, grant_a,
+        "reacquisition must not resurrect the dead grant"
+    );
+    assert_eq!(
+        delegated_entry_for(&state, "components./carol", &grant_a)
+            .summary
+            .state,
+        HeldEntryState::Revoked
+    );
+    assert_eq!(
+        delegated_entry_for(&state, "components./carol", &grant_e)
+            .summary
+            .state,
+        HeldEntryState::Live
+    );
+
+    let inspect = super::dynamic_caps::inspect_dynamic_ref(&state, "components./carol", &ref_a)
+        .expect_err("revoked refs must fail inspection");
+    assert_eq!(inspect.code, ProtocolErrorCode::RevokedRef);
+}
+
+#[tokio::test]
+async fn dynamic_capabilities_external_root_revokes_descendants_without_killing_root() {
+    let mut state = compile_dynamic_caps_external_root_state().await;
+    let alice_root_held_id = root_held_id_for(&state, "components./alice");
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &state,
+        "components./alice",
+        &alice_root_held_id,
+    )
+    .expect("external root source should resolve");
+    let grant_id = match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./bob",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("external root share should succeed")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } => grant_id,
+        other => panic!("unexpected external-root share outcome: {other:?}"),
+    };
+
+    super::dynamic_caps::revoke_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &super::dynamic_caps::DynamicCapabilitySourceKey::Grant(grant_id.clone()),
+    )
+    .expect("external-root descendant revoke should succeed");
+
+    let root_detail =
+        super::dynamic_caps::held_entry_detail(&state, "components./alice", &alice_root_held_id)
+            .expect("external root should remain inspectable");
+    assert_eq!(root_detail.summary.entry_kind, HeldEntryKind::RootAuthority);
+    assert_eq!(root_detail.summary.state, HeldEntryState::Live);
+    assert_eq!(
+        delegated_entry_for(&state, "components./bob", &grant_id)
+            .summary
+            .state,
+        HeldEntryState::Revoked
+    );
+}
+
+#[tokio::test]
+async fn dynamic_capabilities_reconcile_revokes_descendants_in_same_pass() {
+    let mut state = compile_dynamic_caps_binding_state().await;
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &state,
+        "components./alice",
+        &root_held_id_for(&state, "components./alice"),
+    )
+    .expect("alice root source should resolve");
+    let grant_to_carol = match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./carol",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("share to carol should succeed")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } => grant_id,
+        other => panic!("unexpected share outcome: {other:?}"),
+    };
+    let grant_to_eve = match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./carol",
+        &super::dynamic_caps::DynamicCapabilitySourceKey::Grant(grant_to_carol.clone()),
+        "components./eve",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("share to eve should succeed")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } => grant_id,
+        other => panic!("unexpected re-share outcome: {other:?}"),
+    };
+
+    let carol = state
+        .base_scenario
+        .components
+        .iter_mut()
+        .find(|component| component.moniker == "/carol")
+        .expect("carol component should exist");
+    carol.program = None;
+
+    super::dynamic_caps::reconcile_dynamic_capability_grants(&mut state)
+        .expect("reconcile should succeed");
+
+    assert_eq!(
+        delegated_entry_for(&state, "components./carol", &grant_to_carol)
+            .summary
+            .state,
+        HeldEntryState::Revoked
+    );
+    let eve_entry = delegated_entry_for(&state, "components./eve", &grant_to_eve);
+    assert_eq!(eve_entry.summary.state, HeldEntryState::Revoked);
+    assert_eq!(
+        eve_entry.revocation_reason.as_deref(),
+        Some("ancestor_revoked"),
+        "descendants should be revoked in the same reconcile pass as their dead ancestor"
+    );
+}
+
+#[tokio::test]
+async fn dynamic_capabilities_snapshot_replay_restores_live_grants_and_rejects_old_refs() {
+    let mut state = compile_dynamic_caps_binding_state().await;
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &state,
+        "components./alice",
+        &root_held_id_for(&state, "components./alice"),
+    )
+    .expect("alice root source should resolve");
+    let (grant_id, old_ref) = match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./carol",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("share should succeed")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, r#ref } => {
+            (grant_id, r#ref)
+        }
+        other => panic!("unexpected share outcome: {other:?}"),
+    };
+
+    let snapshot = snapshot(&state, state.base_scenario.root).expect("snapshot should build");
+    assert!(
+        snapshot.dynamic_capabilities.is_object(),
+        "snapshot must include the dynamic capabilities artifact"
+    );
+
+    let replayed = compile_control_state_from_snapshot_with_run_id(&snapshot, "replay-run").await;
+    let replayed_held = held_entries_for(&replayed, "components./carol");
+    assert!(
+        replayed_held
+            .iter()
+            .any(|entry| entry.entry_kind == HeldEntryKind::DelegatedGrant
+                && entry.state == HeldEntryState::Live),
+        "replay must rebuild holder inventory for live delegated grants"
+    );
+
+    let old_ref_error =
+        super::dynamic_caps::inspect_dynamic_ref(&replayed, "components./carol", &old_ref)
+            .expect_err("old-run refs must fail after replay");
+    assert_eq!(old_ref_error.code, ProtocolErrorCode::MalformedRef);
+    assert!(
+        old_ref_error.message.contains("different run"),
+        "old source-run refs should be rejected by run id"
+    );
+
+    assert_eq!(
+        delegated_entry_for(&state, "components./carol", &grant_id)
+            .summary
+            .state,
+        HeldEntryState::Live,
+        "source state should remain live before replay-specific invalidation checks"
+    );
+}
+
+#[tokio::test]
+async fn dynamic_capabilities_snapshot_replay_restores_descendants_independent_of_order() {
+    let mut state = compile_dynamic_caps_binding_state().await;
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &state,
+        "components./alice",
+        &root_held_id_for(&state, "components./alice"),
+    )
+    .expect("alice root source should resolve");
+    let grant_to_carol = match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./carol",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("share to carol should succeed")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } => grant_id,
+        other => panic!("unexpected share outcome: {other:?}"),
+    };
+    match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./carol",
+        &super::dynamic_caps::DynamicCapabilitySourceKey::Grant(grant_to_carol.clone()),
+        "components./bob",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("share to bob should succeed")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { .. } => {}
+        other => panic!("unexpected re-share outcome: {other:?}"),
+    };
+
+    let snapshot = snapshot(&state, state.base_scenario.root).expect("snapshot should build");
+    let replayed = compile_control_state_from_snapshot_with_run_id(&snapshot, "replay-run").await;
+
+    let replayed_bob = held_entries_for(&replayed, "components./bob");
+    assert!(
+        replayed_bob
+            .iter()
+            .any(|entry| entry.entry_kind == HeldEntryKind::DelegatedGrant
+                && entry.state == HeldEntryState::Live),
+        "replay should restore descendant grants even when child holders sort before parents"
+    );
+    let replayed_grants = replayed
+        .dynamic_capability_grants
+        .values()
+        .filter(|grant| grant.live)
+        .collect::<Vec<_>>();
+    let replayed_parent = replayed_grants
+        .iter()
+        .find(|grant| grant.holder_component_id == "components./carol")
+        .expect("replayed parent grant should exist");
+    let replayed_child = replayed_grants
+        .iter()
+        .find(|grant| grant.holder_component_id == "components./bob")
+        .expect("replayed child grant should exist");
+    assert_eq!(
+        replayed_child.parent_grant_id.as_deref(),
+        Some(replayed_parent.grant_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn dynamic_capabilities_materialization_resolution_reports_revoked_refs() {
+    let mut state = compile_dynamic_caps_binding_state().await;
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &state,
+        "components./alice",
+        &root_held_id_for(&state, "components./alice"),
+    )
+    .expect("alice root source should resolve");
+    let grant_id = match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./carol",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("share should succeed")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } => grant_id,
+        other => panic!("unexpected share outcome: {other:?}"),
+    };
+    super::dynamic_caps::revoke_dynamic_capability(
+        &mut state,
+        "components./carol",
+        &super::dynamic_caps::DynamicCapabilitySourceKey::Grant(grant_id.clone()),
+    )
+    .expect("self revoke should succeed");
+
+    let err = super::dynamic_caps::resolve_dynamic_materialization_source(
+        &state,
+        "components./carol",
+        &super::dynamic_caps::DynamicCapabilitySourceKey::Grant(grant_id),
+    )
+    .expect_err("revoked materialization sources must fail");
+    assert_eq!(err.code, ProtocolErrorCode::RevokedRef);
+}
+
+#[tokio::test]
+async fn dynamic_capabilities_inspect_ref_rejects_unsupported_token_versions() {
+    let mut state = compile_dynamic_caps_binding_state().await;
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &state,
+        "components./alice",
+        &root_held_id_for(&state, "components./alice"),
+    )
+    .expect("alice root source should resolve");
+    let grant_id = match super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./carol",
+        None,
+        &serde_json::Value::Null,
+    )
+    .expect("share should succeed")
+    {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } => grant_id,
+        other => panic!("unexpected share outcome: {other:?}"),
+    };
+    let signing_key =
+        mesh_dynamic_caps::signing_key_from_seed_b64(&state.dynamic_capability_signing_seed_b64)
+            .expect("test signing key should decode");
+    let unsupported_ref = mesh_dynamic_caps::build_dynamic_capability_ref_url(
+        DynamicCapabilityRefClaims {
+            version: mesh_dynamic_caps::DYNAMIC_CAPS_REF_VERSION + 1,
+            run_id: state.run_id.clone(),
+            grant_id,
+            holder_component_id: "components./carol".to_string(),
+            descriptor_hint: Some("provider.http".to_string()),
+        },
+        &signing_key,
+        "/",
+        None,
+        None,
+    )
+    .expect("unsupported-version ref should build");
+
+    let err =
+        super::dynamic_caps::inspect_dynamic_ref(&state, "components./carol", &unsupported_ref)
+            .expect_err("unsupported ref versions must be rejected");
+    assert_eq!(err.code, ProtocolErrorCode::MalformedRef);
+    assert!(err.message.contains("unsupported"));
 }

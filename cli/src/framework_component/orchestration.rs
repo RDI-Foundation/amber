@@ -1,3 +1,5 @@
+use amber_mesh::{InboundRoute, InboundTarget, MeshPeer};
+
 use super::{http::*, planner::*, state::*, *};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,6 +60,18 @@ impl ProtocolApiError {
             ProtocolErrorCode::PrepareFailed | ProtocolErrorCode::PublishFailed => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            ProtocolErrorCode::UnknownSource
+            | ProtocolErrorCode::UnknownRef
+            | ProtocolErrorCode::UnknownHandle => StatusCode::NOT_FOUND,
+            ProtocolErrorCode::IdempotencyConflict | ProtocolErrorCode::AlreadyRevoked => {
+                StatusCode::CONFLICT
+            }
+            ProtocolErrorCode::CallerLacksAuthority | ProtocolErrorCode::RecipientMismatch => {
+                StatusCode::FORBIDDEN
+            }
+            ProtocolErrorCode::OriginUnavailable | ProtocolErrorCode::PathEstablishmentFailed => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             ProtocolErrorCode::ManifestRequired
             | ProtocolErrorCode::ManifestNotAllowed
             | ProtocolErrorCode::InvalidManifestRef
@@ -68,7 +82,16 @@ impl ProtocolApiError {
             | ProtocolErrorCode::BindingTypeMismatch
             | ProtocolErrorCode::PlacementUnsatisfied
             | ProtocolErrorCode::SiteNotActive
-            | ProtocolErrorCode::ScopeNotAllowed => StatusCode::BAD_REQUEST,
+            | ProtocolErrorCode::ScopeNotAllowed
+            | ProtocolErrorCode::AmbiguousSource
+            | ProtocolErrorCode::RevokedSource
+            | ProtocolErrorCode::UnknownRecipientIdentity
+            | ProtocolErrorCode::RecipientNotLive
+            | ProtocolErrorCode::MandatoryNoop
+            | ProtocolErrorCode::AuthorityPathUnavailable
+            | ProtocolErrorCode::MalformedRef
+            | ProtocolErrorCode::RevokedRef
+            | ProtocolErrorCode::HandleNotDynamic => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -113,6 +136,10 @@ pub(super) fn site_state_root_for(app: &ControlStateApp, site_id: &str) -> PathB
 
 pub(super) fn site_actuator_plan_path_for_site(app: &ControlStateApp, site_id: &str) -> PathBuf {
     site_state_root_for(app, site_id).join("site-actuator-plan.json")
+}
+
+pub(super) fn framework_ccs_plan_path_for_site(app: &ControlStateApp, site_id: &str) -> PathBuf {
+    site_state_root_for(app, site_id).join("framework-ccs-plan.json")
 }
 
 pub(super) fn site_actuator_base_url(plan: &SiteActuatorPlan) -> String {
@@ -227,6 +254,385 @@ pub(super) fn load_site_actuator_plan(
             ProtocolErrorCode::SiteNotActive,
             &format!("site `{site_id}` actuator plan is unavailable: {err}"),
         )
+    })
+}
+
+pub(super) fn load_framework_ccs_plan(
+    app: &ControlStateApp,
+    site_id: &str,
+) -> std::result::Result<FrameworkCcsPlan, ProtocolErrorResponse> {
+    let path = framework_ccs_plan_path_for_site(app, site_id);
+    read_json(&path, "framework CCS plan").map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::SiteNotActive,
+            &format!("site `{site_id}` framework CCS plan is unavailable: {err}"),
+        )
+    })
+}
+
+pub(super) fn framework_ccs_base_url(plan: &FrameworkCcsPlan) -> String {
+    format!("http://{}", plan.listen_addr)
+}
+
+pub(super) fn load_site_actuator_plan_at(
+    site_state_root: &Path,
+) -> std::result::Result<SiteActuatorPlan, ProtocolErrorResponse> {
+    read_json(
+        &site_state_root.join("site-actuator-plan.json"),
+        "site actuator plan",
+    )
+    .map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::SiteNotActive,
+            &format!(
+                "site actuator plan under `{}` is unavailable: {err}",
+                site_state_root.display()
+            ),
+        )
+    })
+}
+
+pub(super) fn load_site_manager_state_at(
+    site_state_root: &Path,
+) -> std::result::Result<SiteManagerStateView, ProtocolErrorResponse> {
+    read_run_json(
+        &site_state_root.join("manager-state.json"),
+        "site manager state",
+    )
+    .map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::SiteNotActive,
+            &format!(
+                "site manager state under `{}` is unavailable: {err}",
+                site_state_root.display()
+            ),
+        )
+    })
+}
+
+pub(super) async fn publish_dynamic_capability_origin(
+    app: &ControlStateApp,
+    site_id: &str,
+    request: &dynamic_caps::PublishDynamicCapabilityOriginRequest,
+) -> std::result::Result<dynamic_caps::PublishDynamicCapabilityOriginResponse, ProtocolErrorResponse>
+{
+    let plan = load_framework_ccs_plan(app, site_id)?;
+    let url = format!(
+        "{}/v1/internal/dynamic-caps/origins/publish",
+        framework_ccs_base_url(&plan).trim_end_matches('/')
+    );
+    let response = app
+        .client
+        .post(url)
+        .header(FRAMEWORK_AUTH_HEADER, app.control_state_auth_token.as_ref())
+        .json(request)
+        .send()
+        .await
+        .map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "failed to reach framework CCS on site `{site_id}` while publishing dynamic \
+                     capability origin: {err}"
+                ),
+            )
+        })?;
+    if response.status().is_success() {
+        return response.json().await.map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "framework CCS on site `{site_id}` returned invalid JSON while publishing \
+                     dynamic capability origin: {err}"
+                ),
+            )
+        });
+    }
+    let status = response.status();
+    let body = response.bytes().await.map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::OriginUnavailable,
+            &format!(
+                "failed to read framework CCS error response on site `{site_id}` while publishing \
+                 dynamic capability origin: {err}"
+            ),
+        )
+    })?;
+    if let Ok(protocol_error) = serde_json::from_slice::<ProtocolErrorResponse>(&body) {
+        return Err(protocol_error);
+    }
+    Err(protocol_error(
+        ProtocolErrorCode::OriginUnavailable,
+        &format!(
+            "framework CCS on site `{site_id}` returned {status} while publishing dynamic \
+             capability origin"
+        ),
+    ))
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DynamicCapabilityRuntimeEndpoint {
+    pub(super) site_id: String,
+    pub(super) runtime: LiveComponentRuntimeMetadata,
+}
+
+pub(super) fn dynamic_capability_component_runtime_endpoint(
+    app: &ControlStateApp,
+    state: &FrameworkControlState,
+    logical_component_id: &str,
+) -> std::result::Result<DynamicCapabilityRuntimeEndpoint, ProtocolErrorResponse> {
+    let moniker = dynamic_caps::moniker_from_logical_component_id(logical_component_id)?;
+    let assignments = live_assignment_map(state);
+    let site_id = assignments.get(moniker).ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::OriginUnavailable,
+            &format!("live component `{logical_component_id}` is not assigned to a live site"),
+        )
+    })?;
+    let site_plan = load_site_actuator_plan(app, site_id)?;
+    let runtime = collect_live_component_runtime_metadata(&site_plan)
+        .map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "failed to resolve live runtime metadata for component \
+                     `{logical_component_id}` on site `{site_id}`: {err}"
+                ),
+            )
+        })?
+        .remove(moniker)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "live runtime metadata for component `{logical_component_id}` is unavailable \
+                     on site `{site_id}`"
+                ),
+            )
+        })?;
+    Ok(DynamicCapabilityRuntimeEndpoint {
+        site_id: site_id.clone(),
+        runtime,
+    })
+}
+
+pub(super) fn dynamic_capability_origin_route_surface(
+    runtime: &LiveComponentRuntimeMetadata,
+    route_id: &str,
+    root_authority_selector: &RootAuthoritySelectorIr,
+    allowed_issuers: Vec<String>,
+) -> std::result::Result<(InboundRoute, String, MeshProtocol), ProtocolErrorResponse> {
+    match root_authority_selector {
+        RootAuthoritySelectorIr::SelfProvide { provide_name, .. } => {
+            let static_route = runtime
+                .mesh_config
+                .inbound
+                .iter()
+                .find(|route| {
+                    route.capability == *provide_name
+                        && matches!(route.target, InboundTarget::Local { .. })
+                })
+                .ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::OriginUnavailable,
+                        &format!(
+                            "live self-provide origin route `{}` is unavailable for component `{}`",
+                            provide_name, runtime.moniker
+                        ),
+                    )
+                })?;
+            let mut route = static_route.clone();
+            route.route_id = route_id.to_string();
+            route.allowed_issuers = allowed_issuers;
+            Ok((
+                route,
+                static_route.capability.clone(),
+                static_route.protocol,
+            ))
+        }
+        RootAuthoritySelectorIr::Binding {
+            slot_name,
+            provider_capability_name,
+            ..
+        }
+        | RootAuthoritySelectorIr::ExternalSlotBinding {
+            slot_name,
+            external_slot_name: provider_capability_name,
+            ..
+        } => {
+            let route = amber_mesh::dynamic_caps::exact_root_outbound_route(
+                runtime.mesh_config.outbound.iter(),
+                root_authority_selector,
+            )
+            .map_err(|err| match err {
+                amber_mesh::dynamic_caps::ExactRootRouteError::InvalidLogicalComponentId => {
+                    protocol_error(
+                        ProtocolErrorCode::OriginUnavailable,
+                        &format!(
+                            "dynamic capability root selector is malformed for component `{}`",
+                            runtime.moniker
+                        ),
+                    )
+                }
+                amber_mesh::dynamic_caps::ExactRootRouteError::NotFound => protocol_error(
+                    ProtocolErrorCode::OriginUnavailable,
+                    &format!(
+                        "live slot origin `{slot_name}` backed by capability \
+                         `{provider_capability_name}` is unavailable for component `{}`",
+                        runtime.moniker
+                    ),
+                ),
+                amber_mesh::dynamic_caps::ExactRootRouteError::Ambiguous => protocol_error(
+                    ProtocolErrorCode::AuthorityPathUnavailable,
+                    &format!(
+                        "slot `{slot_name}` on component `{}` resolves to multiple outbound \
+                         routes for capability `{provider_capability_name}`",
+                        runtime.moniker
+                    ),
+                ),
+            })?
+            .expect("self-provide roots should be handled before outbound route resolution");
+            Ok((
+                InboundRoute {
+                    route_id: route_id.to_string(),
+                    capability: route.capability.clone(),
+                    capability_kind: route.capability_kind.clone(),
+                    capability_profile: route.capability_profile.clone(),
+                    protocol: route.protocol,
+                    http_plugins: Vec::new(),
+                    target: InboundTarget::Local {
+                        port: route.listen_port,
+                    },
+                    allowed_issuers,
+                },
+                route.capability.clone(),
+                route.protocol,
+            ))
+        }
+    }
+}
+
+pub(super) fn dynamic_capability_allowed_mesh_peers(
+    allowed_peers: &[dynamic_caps::DynamicCapabilityAllowedPeer],
+) -> std::result::Result<Vec<MeshPeer>, ProtocolErrorResponse> {
+    allowed_peers
+        .iter()
+        .map(|peer| {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(peer.peer_key_b64.as_bytes())
+                .map_err(|err| {
+                    protocol_error(
+                        ProtocolErrorCode::PathEstablishmentFailed,
+                        &format!("dynamic capability peer key is invalid: {err}"),
+                    )
+                })?;
+            let public_key: [u8; 32] = decoded.as_slice().try_into().map_err(|_| {
+                protocol_error(
+                    ProtocolErrorCode::PathEstablishmentFailed,
+                    "dynamic capability peer key must be exactly 32 bytes",
+                )
+            })?;
+            Ok(MeshPeer {
+                id: peer.peer_id.clone(),
+                public_key,
+            })
+        })
+        .collect()
+}
+
+pub(super) async fn publish_dynamic_capability_origin_local(
+    app: &CcsApp,
+    request: dynamic_caps::PublishDynamicCapabilityOriginRequest,
+) -> std::result::Result<dynamic_caps::PublishDynamicCapabilityOriginResponse, ProtocolApiError> {
+    let site_plan = load_site_actuator_plan_at(&app.site_state_root)?;
+    let holder_component_id = match &request.root_authority_selector {
+        RootAuthoritySelectorIr::SelfProvide { component_id, .. } => component_id.clone(),
+        RootAuthoritySelectorIr::Binding {
+            consumer_component_id,
+            ..
+        }
+        | RootAuthoritySelectorIr::ExternalSlotBinding {
+            consumer_component_id,
+            ..
+        } => consumer_component_id.clone(),
+    };
+    let holder_moniker = dynamic_caps::moniker_from_logical_component_id(&holder_component_id)?;
+    let runtime = collect_live_component_runtime_metadata(&site_plan)
+        .map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "failed to collect live runtime metadata on site `{}`: {err}",
+                    site_plan.site_id
+                ),
+            )
+        })?
+        .remove(holder_moniker)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "live runtime metadata for root holder `{holder_component_id}` is unavailable \
+                     on site `{}`",
+                    site_plan.site_id
+                ),
+            )
+        })?;
+    let manager_state = load_site_manager_state_at(&app.site_state_root)?;
+    let router_control = manager_state.router_control.ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::OriginUnavailable,
+            &format!(
+                "site `{}` router control endpoint is unavailable",
+                site_plan.site_id
+            ),
+        )
+    })?;
+    let endpoint = parse_control_endpoint(&router_control).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::OriginUnavailable,
+            &format!(
+                "site `{}` router control endpoint is invalid: {err}",
+                site_plan.site_id
+            ),
+        )
+    })?;
+    let allowed_issuers = request
+        .allowed_peers
+        .iter()
+        .map(|peer| peer.peer_id.clone())
+        .collect::<Vec<_>>();
+    let (route, capability, protocol) = dynamic_capability_origin_route_surface(
+        &runtime,
+        &request.route_id,
+        &request.root_authority_selector,
+        allowed_issuers,
+    )?;
+    let peers = dynamic_capability_allowed_mesh_peers(&request.allowed_peers)?;
+    apply_route_overlay_with_retry(
+        &endpoint,
+        &request.overlay_id,
+        &peers,
+        &[route],
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|err| {
+        ProtocolApiError::from(protocol_error(
+            ProtocolErrorCode::PathEstablishmentFailed,
+            &format!(
+                "failed to publish dynamic capability origin overlay `{}` on site `{}`: {err}",
+                request.overlay_id, site_plan.site_id
+            ),
+        ))
+    })?;
+    Ok(dynamic_caps::PublishDynamicCapabilityOriginResponse {
+        capability,
+        protocol: match protocol {
+            MeshProtocol::Http => "http",
+            MeshProtocol::Tcp => "tcp",
+        }
+        .to_string(),
     })
 }
 

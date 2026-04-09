@@ -386,6 +386,11 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                     .display()
                     .to_string(),
             );
+            for passthrough in &component.sidecar.env_passthrough {
+                if let Ok(value) = env::var(passthrough) {
+                    env.insert(passthrough.clone(), value);
+                }
+            }
             let work_dir = runtime_root.join(&component.program.work_dir);
             fs::create_dir_all(&work_dir)
                 .into_diagnostic()
@@ -667,21 +672,11 @@ pub(crate) fn direct_storage_root(
 }
 
 pub(crate) fn direct_current_control_socket_path(plan_root: &Path) -> PathBuf {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    plan_root.hash(&mut hasher);
-    let suffix = hasher.finish();
-    env::temp_dir()
-        .join("amber-direct-control")
-        .join(format!("current-{suffix:016x}.sock"))
+    amber_mesh::stable_temp_socket_path("amber-direct-control", "current", plan_root)
 }
 
 pub(crate) fn direct_runtime_control_socket_path(runtime_root: &Path) -> PathBuf {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    runtime_root.hash(&mut hasher);
-    let suffix = hasher.finish();
-    env::temp_dir()
-        .join("amber-direct-control")
-        .join(format!("runtime-{suffix:016x}.sock"))
+    amber_mesh::stable_temp_socket_path("amber-direct-control", "runtime", runtime_root)
 }
 
 #[cfg(unix)]
@@ -773,6 +768,8 @@ pub(crate) struct DirectRuntimeState {
     #[serde(default)]
     pub(crate) slot_route_ports_by_component: BTreeMap<usize, BTreeMap<String, Vec<u16>>>,
     #[serde(default)]
+    pub(crate) dynamic_caps_port_by_component: BTreeMap<usize, u16>,
+    #[serde(default)]
     pub(crate) component_mesh_port_by_id: BTreeMap<usize, u16>,
     #[serde(default)]
     pub(crate) router_mesh_port: Option<u16>,
@@ -832,6 +829,13 @@ pub(crate) fn assign_direct_runtime_ports_with_existing(
             ));
         }
         config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
+        if let Some(dynamic_caps_listen) = config.dynamic_caps_listen.as_mut() {
+            let port = allocate_direct_runtime_port(&mut reserved, None)?;
+            *dynamic_caps_listen = SocketAddr::new(dynamic_caps_listen.ip(), port);
+            state
+                .dynamic_caps_port_by_component
+                .insert(component.id, port);
+        }
 
         let mut slot_route_ports: BTreeMap<String, Vec<(u16, u16)>> = BTreeMap::new();
         for route in &mut config.outbound {

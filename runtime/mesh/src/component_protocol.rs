@@ -236,6 +236,7 @@ pub enum ChildState {
 pub struct SnapshotResponse {
     pub scenario: Value,
     pub placement: Value,
+    pub dynamic_capabilities: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +270,24 @@ pub enum ProtocolErrorCode {
     ControlStateUnavailable,
     PrepareFailed,
     PublishFailed,
+    AmbiguousSource,
+    UnknownSource,
+    RevokedSource,
+    UnknownRecipientIdentity,
+    RecipientNotLive,
+    MandatoryNoop,
+    AuthorityPathUnavailable,
+    IdempotencyConflict,
+    MalformedRef,
+    UnknownRef,
+    RevokedRef,
+    RecipientMismatch,
+    OriginUnavailable,
+    PathEstablishmentFailed,
+    CallerLacksAuthority,
+    AlreadyRevoked,
+    UnknownHandle,
+    HandleNotDynamic,
 }
 
 #[cfg(test)]
@@ -543,6 +562,7 @@ mod tests {
         let snapshot = SnapshotResponse {
             scenario: serde_json::json!({ "version": "5" }),
             placement: serde_json::json!({ "sites": {} }),
+            dynamic_capabilities: serde_json::json!({ "version": 1, "grants": [] }),
         };
         let error = ProtocolErrorResponse {
             code: ProtocolErrorCode::NameConflict,
@@ -554,7 +574,11 @@ mod tests {
             serde_json::to_value(&snapshot).expect("serialize snapshot response"),
             serde_json::json!({
                 "scenario": { "version": "5" },
-                "placement": { "sites": {} }
+                "placement": { "sites": {} },
+                "dynamic_capabilities": {
+                    "version": 1,
+                    "grants": []
+                }
             })
         );
         assert_eq!(

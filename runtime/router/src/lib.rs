@@ -65,6 +65,7 @@ use url::Url;
 
 mod a2a;
 pub mod control;
+mod dynamic_caps;
 mod external;
 mod http_forward;
 mod http_observability;
@@ -72,7 +73,9 @@ mod http_observability;
 mod tests;
 mod transport;
 
-use self::{control::*, external::*, http_forward::*, http_observability::*, transport::*};
+use self::{
+    control::*, dynamic_caps::*, external::*, http_forward::*, http_observability::*, transport::*,
+};
 
 #[derive(Debug, Error)]
 pub enum RouterError {
@@ -296,6 +299,7 @@ struct LocalHttpProxyState {
     route_id: Arc<str>,
     peer_id: Arc<str>,
     labels: HttpExchangeLabels,
+    dynamic_caps: Option<Arc<DynamicCapsRuntime>>,
 }
 
 const AMBER_ROUTE_ID_HEADER: &str = "x-amber-route-id";
@@ -316,6 +320,7 @@ struct OutboundHttpProxyState {
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     route_id: Arc<str>,
     labels: HttpExchangeLabels,
+    dynamic_caps: Option<Arc<DynamicCapsRuntime>>,
 }
 
 type HttpClient = Client<HttpsConnector<HttpConnector<ExternalHttpResolver>>, BoxBody>;
@@ -792,9 +797,19 @@ async fn proxy_local_http_request(
             .map(Arc::as_ref)
             .filter(|plugin| plugin.matches(&parts.0))
             .collect();
-        let request_body_collect = matching_plugins
-            .iter()
-            .any(|plugin| plugin.request_body_mode(&parts.0) == BodyMode::Collect);
+        let auto_materialize_request = state.dynamic_caps.is_some()
+            && state.labels.capability_kind.as_deref() == Some("a2a")
+            && a2a::is_json_content_type(
+                parts
+                    .0
+                    .headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+            );
+        let request_body_collect = auto_materialize_request
+            || matching_plugins
+                .iter()
+                .any(|plugin| plugin.request_body_mode(&parts.0) == BodyMode::Collect);
         let response_body_collect = matching_plugins
             .iter()
             .any(|plugin| plugin.response_body_mode(&parts.0) == BodyMode::Collect);
@@ -839,6 +854,27 @@ async fn proxy_local_http_request(
             let mut rewritten = false;
             for plugin in &matching_plugins {
                 rewritten |= plugin.rewrite_request(&ctx, &mut parts.0, &mut body);
+            }
+            if let Some(dynamic_caps) = state.dynamic_caps.as_ref()
+                && auto_materialize_request
+            {
+                match dynamic_caps
+                    .rewrite_dynamic_refs_in_a2a_body(&mut body)
+                    .await
+                {
+                    Ok(dynamic_rewritten) => {
+                        rewritten |= dynamic_rewritten;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "amber.internal",
+                            code = ?err.code,
+                            message = %err.message,
+                            "dynamic capability auto-materialization failed on inbound request"
+                        );
+                        return protocol_response(&err);
+                    }
+                }
             }
             if rewritten {
                 strip_request_body_validators(&mut parts.0.headers);
@@ -1190,6 +1226,7 @@ async fn proxy_local_http_to_noise(
     stream: tokio::net::TcpStream,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     labels: HttpExchangeLabels,
+    dynamic_caps: Option<Arc<DynamicCapsRuntime>>,
 ) -> Result<(), RouterError> {
     let (local, remote) = duplex(64 * 1024);
     let mut noise_session = session.clone();
@@ -1213,6 +1250,7 @@ async fn proxy_local_http_to_noise(
         plugins,
         route_id,
         labels,
+        dynamic_caps,
     };
 
     let service = ServiceBuilder::new()
@@ -1274,6 +1312,9 @@ async fn proxy_http_request_to_noise(
             .map(Arc::as_ref)
             .filter(|plugin| plugin.matches(&parts.0))
             .collect();
+        let auto_materialize_response = state.dynamic_caps.is_some()
+            && flow == RewriteFlow::Outbound
+            && state.labels.capability_kind.as_deref() == Some("a2a");
         let request_body_collect = matching_plugins
             .iter()
             .any(|plugin| plugin.request_body_mode(&parts.0) == BodyMode::Collect);
@@ -1410,7 +1451,7 @@ async fn proxy_http_request_to_noise(
         };
 
         let mut request_parts = parts.0;
-        if response_body_collect || !matching_plugins.is_empty() {
+        if response_body_collect || auto_materialize_response || !matching_plugins.is_empty() {
             request_parts.headers.remove(header::ACCEPT_ENCODING);
         }
         let host_header = outgoing_host_header(&request_parts.uri, &request_parts.headers);
@@ -1443,7 +1484,15 @@ async fn proxy_http_request_to_noise(
             }
         };
 
-        if response_body_collect {
+        let auto_materialize_response = auto_materialize_response
+            && a2a::is_json_content_type(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+            );
+
+        if response_body_collect || auto_materialize_response {
             let (mut response_parts, response_body) = response.into_parts();
             let mut body = match response_body.collect().await {
                 Ok(collected) => collected.to_bytes().to_vec(),
@@ -1478,6 +1527,27 @@ async fn proxy_http_request_to_noise(
             let mut rewritten = false;
             for plugin in &matching_plugins {
                 rewritten |= plugin.rewrite_response(&ctx, &mut response_parts, &mut body);
+            }
+            if let Some(dynamic_caps) = state.dynamic_caps.as_ref()
+                && auto_materialize_response
+            {
+                match dynamic_caps
+                    .rewrite_dynamic_refs_in_a2a_body(&mut body)
+                    .await
+                {
+                    Ok(dynamic_rewritten) => {
+                        rewritten |= dynamic_rewritten;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "amber.internal",
+                            code = ?err.code,
+                            message = %err.message,
+                            "dynamic capability auto-materialization failed on outbound response"
+                        );
+                        return protocol_response(&err);
+                    }
+                }
             }
 
             sanitize_response_headers(&mut response_parts.headers);

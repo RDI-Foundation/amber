@@ -9,8 +9,8 @@ use std::{
 use amber_config as rc;
 use amber_manifest::span_for_json_pointer;
 use amber_mesh::{
-    MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProtocol, MeshProvisionOutput,
-    router_export_route_id,
+    DYNAMIC_CAPS_API_URL_ENV, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProtocol,
+    MeshProvisionOutput, router_export_route_id,
 };
 use amber_scenario::{ComponentId, ProgramMount, Scenario};
 use base64::Engine as _;
@@ -73,6 +73,8 @@ const PROVISIONER_ROLE_BINDING_NAME: &str = "amber-provisioner";
 const PROVISIONER_PLAN_KEY: &str = "mesh-plan.json";
 const PROVISIONER_JOB_BACKOFF_LIMIT: u32 = 6;
 const ROUTER_EXTERNAL_SECRET_NAME: &str = "amber-router-external";
+const COMPONENT_SIDECAR_ENV_SECRET_NAME: &str = "amber-component-sidecar-env";
+const COMPONENT_SIDECAR_ENV_FILE: &str = "component-sidecar.env";
 const COMPONENT_MESH_PORT_BASE: u16 = 23000;
 const ROUTER_MESH_PORT_BASE: u16 = 24000;
 const ROUTER_CONTROL_PORT_BASE: u16 = 24100;
@@ -535,6 +537,12 @@ pub(crate) fn emit_kubernetes_artifact(
     let program_plans = &config_plan.program_plans;
 
     let router_env_passthrough = &mesh_config_plan.router_env_passthrough;
+    let component_sidecar_env_passthrough = mesh_config_plan
+        .component_sidecar_env_passthrough
+        .iter()
+        .filter(|env_var| env_var.as_str() != SCENARIO_RUN_ID_ENV)
+        .cloned()
+        .collect::<Vec<_>>();
     let mut router_container_ports: Vec<ContainerPort> = Vec::new();
     let mut router_service_ports: Vec<ServicePort> = Vec::new();
 
@@ -630,6 +638,25 @@ pub(crate) fn emit_kubernetes_artifact(
         }
         files.insert(PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE), env_content);
     }
+    if !component_sidecar_env_passthrough.is_empty() {
+        kustomization.secret_generator.push(SecretGenerator {
+            name: COMPONENT_SIDECAR_ENV_SECRET_NAME.to_string(),
+            namespace: None,
+            env_files: vec![COMPONENT_SIDECAR_ENV_FILE.to_string()],
+            literals: Vec::new(),
+            options: Some(GeneratorOptions {
+                disable_name_suffix_hash: Some(true),
+            }),
+        });
+
+        let mut env_content = String::new();
+        env_content
+            .push_str("# Component sidecar control env - filled by `amber run` when available\n");
+        for env_var in &component_sidecar_env_passthrough {
+            env_content.push_str(&format!("{env_var}=\n"));
+        }
+        files.insert(PathBuf::from(COMPONENT_SIDECAR_ENV_FILE), env_content);
+    }
 
     // Note: Per-component ConfigMaps/Secrets are not generated because:
     // - Helper-free execution: all config must already be fully static.
@@ -721,6 +748,11 @@ pub(crate) fn emit_kubernetes_artifact(
         )
         .map_err(|e| ReporterError::new(e.to_string()))?;
         let needs_helper_for_component = runtime_plan.needs_helper;
+        let dynamic_caps_api_url = mesh_config_plan
+            .component_configs
+            .get(id)
+            .and_then(|cfg| cfg.dynamic_caps_listen)
+            .map(|listen| format!("http://127.0.0.1:{}", listen.port()));
 
         let mut ports: Vec<ContainerPort> = Vec::new();
         for endpoint in endpoint_plan.component_endpoints(*id) {
@@ -738,6 +770,9 @@ pub(crate) fn emit_kubernetes_artifact(
                 let container_env: Vec<EnvVar> =
                     env.iter().map(|(k, v)| EnvVar::literal(k, v)).collect();
                 let mut container_env = container_env;
+                if let Some(url) = dynamic_caps_api_url.as_deref() {
+                    container_env.push(EnvVar::literal(DYNAMIC_CAPS_API_URL_ENV, url));
+                }
                 let scenario_scope = mesh_config_plan
                     .component_configs
                     .get(id)
@@ -804,6 +839,9 @@ pub(crate) fn emit_kubernetes_artifact(
                 if let Some(mount_spec_b64) = mount_spec_b64 {
                     container_env.push(EnvVar::literal("AMBER_MOUNT_SPEC_B64", mount_spec_b64));
                 }
+                if let Some(url) = dynamic_caps_api_url.as_deref() {
+                    container_env.push(EnvVar::literal(DYNAMIC_CAPS_API_URL_ENV, url));
+                }
                 let scenario_scope = mesh_config_plan
                     .component_configs
                     .get(id)
@@ -855,6 +893,16 @@ pub(crate) fn emit_kubernetes_artifact(
         {
             sidecar_env.push(EnvVar::literal("AMBER_SCENARIO_SCOPE", scope));
         }
+        let mut sidecar_env_from = Vec::new();
+        if !component_sidecar_env_passthrough.is_empty() {
+            sidecar_env_from.push(EnvFromSource {
+                config_map_ref: None,
+                secret_ref: Some(LocalObjectReference {
+                    name: COMPONENT_SIDECAR_ENV_SECRET_NAME.to_string(),
+                    optional: Some(true),
+                }),
+            });
+        }
 
         let sidecar = harden_non_root_internal_container(Container {
             name: "sidecar".to_string(),
@@ -862,7 +910,7 @@ pub(crate) fn emit_kubernetes_artifact(
             command: Vec::new(),
             args: Vec::new(),
             env: sidecar_env,
-            env_from: Vec::new(),
+            env_from: sidecar_env_from,
             ports: vec![ContainerPort {
                 name: "mesh".to_string(),
                 container_port: mesh_port,
@@ -1599,6 +1647,7 @@ pub(crate) fn emit_kubernetes_artifact(
         if path == &PathBuf::from("root-config.env")
             || path == &PathBuf::from("root-config-secret.env")
             || path == &PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE)
+            || path == &PathBuf::from(COMPONENT_SIDECAR_ENV_FILE)
             || path == &PathBuf::from(PROXY_METADATA_FILENAME)
             || path == &PathBuf::from(GENERATED_README_FILENAME)
         {

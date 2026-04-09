@@ -68,10 +68,6 @@ pub(super) fn materialize_launch_bundle(
         let site_state_root = state_root.join(site_id);
         let mut framework_env = BTreeMap::new();
         let framework_ccs_plan_path = if let Some(control_state) = framework_control_state.as_ref()
-            && run_plan
-                .dynamic_enabled_sites
-                .iter()
-                .any(|active| active == site_id)
         {
             let port = reserve_loopback_port()?;
             let listen_addr =
@@ -84,10 +80,23 @@ pub(super) fn materialize_launch_bundle(
                 amber_mesh::FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV.to_string(),
                 control_state.router_auth_token.clone(),
             );
+            framework_env.insert(
+                amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV.to_string(),
+                control_state.receipt.url.clone(),
+            );
+            framework_env.insert(
+                amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV.to_string(),
+                control_state.control_state_auth_token.clone(),
+            );
+            framework_env.insert(
+                amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV.to_string(),
+                control_state.dynamic_caps_token_verify_key_b64.clone(),
+            );
             let plan_path = site_state_root.join("framework-ccs-plan.json");
             crate::framework_component::write_framework_ccs_plan(
                 &plan_path,
                 site_id,
+                &site_state_root,
                 listen_addr,
                 control_state.receipt.url.as_str(),
                 &control_state.router_auth_token,
@@ -213,10 +222,6 @@ fn materialize_framework_control_state(
     run_id: &str,
 ) -> Result<Option<MaterializedFrameworkControlState>> {
     let control_state = crate::framework_component::build_control_state(run_id, run_plan)?;
-    if control_state.capability_instances.is_empty() {
-        return Ok(None);
-    }
-
     let root = state_root.join("framework-component");
     let state_path = root.join("control-state.json");
     crate::framework_component::write_control_state(&state_path, &control_state)?;
@@ -238,6 +243,16 @@ fn materialize_framework_control_state(
         &run_plan.mesh_scope,
         &control_state_auth_token,
     )?;
+    let dynamic_caps_token_verify_key_b64 = amber_mesh::dynamic_caps::verify_key_b64(
+        &amber_mesh::dynamic_caps::signing_key_from_seed_b64(
+            &control_state.dynamic_capability_signing_seed_b64,
+        )
+        .map_err(|err| {
+            miette::miette!(
+                "framework control-state dynamic capability signing seed is invalid: {err}"
+            )
+        })?,
+    );
 
     Ok(Some(MaterializedFrameworkControlState {
         plan_path,
@@ -247,6 +262,7 @@ fn materialize_framework_control_state(
         },
         router_auth_token,
         control_state_auth_token,
+        dynamic_caps_token_verify_key_b64,
     }))
 }
 

@@ -376,6 +376,10 @@ pub(crate) fn snapshot(
             "defaults": state.placement.defaults,
             "assignments": assignments,
         }),
+        dynamic_capabilities: serde_json::to_value(dynamic_caps::dynamic_capability_snapshot(
+            state,
+        )?)
+        .expect("dynamic capability snapshot should serialize"),
     })
 }
 

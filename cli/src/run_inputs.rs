@@ -665,6 +665,7 @@ mod tests {
             )]),
             placement_components: BTreeMap::new(),
             assignments: BTreeMap::new(),
+            dynamic_capabilities: None,
             sites: BTreeMap::from([(
                 "direct_local".to_string(),
                 empty_site(

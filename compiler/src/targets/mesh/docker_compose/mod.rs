@@ -7,7 +7,9 @@ use std::{
 };
 
 use amber_config as rc;
-use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
+use amber_mesh::{
+    DYNAMIC_CAPS_API_URL_ENV, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput,
+};
 use amber_scenario::{ComponentId, ProgramMount, Scenario};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -742,6 +744,12 @@ fn render_docker_compose_inner(
             format!("AMBER_ROUTER_CONFIG_PATH={}", mesh_config_path()),
             format!("AMBER_ROUTER_IDENTITY_PATH={}", mesh_identity_path()),
         ];
+        sidecar_env_entries.extend(
+            mesh_config_plan
+                .component_sidecar_env_passthrough
+                .iter()
+                .cloned(),
+        );
         push_router_observability_env(&mut sidecar_env_entries);
         sidecar_service.environment = Some(Environment::List(sidecar_env_entries));
         sidecar_service
@@ -810,6 +818,11 @@ fn render_docker_compose_inner(
             .component_configs
             .get(id)
             .and_then(|config| config.identity.mesh_scope.as_deref());
+        let dynamic_caps_api_url = mesh_config_plan
+            .component_configs
+            .get(id)
+            .and_then(|config| config.dynamic_caps_listen)
+            .map(|listen| format!("http://127.0.0.1:{}", listen.port()));
         let mount_specs = config_plan.mount_specs.get(id).map(Vec::as_slice);
         let docker_mount_paths = docker_mount_paths_by_component.get(id);
         let has_docker_mount = docker_mount_paths.is_some_and(|paths| !paths.is_empty());
@@ -859,6 +872,9 @@ fn render_docker_compose_inner(
                     .iter()
                     .map(|(k, v)| (k.clone(), escape_compose_interpolation(v).into_owned()))
                     .collect::<BTreeMap<_, _>>();
+                if let Some(url) = dynamic_caps_api_url.as_ref() {
+                    env_map.insert(DYNAMIC_CAPS_API_URL_ENV.to_string(), url.clone());
+                }
                 push_program_observability_env_map(&mut env_map, &label, scenario_scope);
                 if !env_map.is_empty() {
                     program_service.environment = Some(Environment::Map(env_map));
@@ -905,6 +921,9 @@ fn render_docker_compose_inner(
                 }
                 if let Some(mount_spec_b64) = mount_spec_b64 {
                     env_entries.push(format!("AMBER_MOUNT_SPEC_B64={mount_spec_b64}"));
+                }
+                if let Some(url) = dynamic_caps_api_url.as_ref() {
+                    env_entries.push(format!("{DYNAMIC_CAPS_API_URL_ENV}={url}"));
                 }
                 if let Some(paths) = docker_mount_paths {
                     let local_proxy_port =

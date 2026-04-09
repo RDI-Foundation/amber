@@ -2,10 +2,12 @@ use std::collections::{BTreeSet, HashMap};
 
 use amber_manifest::{CapabilityKind, NetworkProtocol};
 use amber_mesh::{
-    FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV, FRAMEWORK_COMPONENT_CCS_URL_ENV, HttpRoutePlugin,
-    InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate, MeshPeerTemplate,
-    MeshProtocol, OutboundRoute, component_route_id, framework_cap_instance_id,
-    router_export_route_id, router_external_route_id,
+    DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV, DYNAMIC_CAPS_CONTROL_URL_ENV,
+    DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV,
+    FRAMEWORK_COMPONENT_CCS_URL_ENV, HttpRoutePlugin, InboundRoute, InboundTarget,
+    MeshConfigTemplate, MeshIdentityTemplate, MeshPeerTemplate, MeshProtocol, OutboundRoute,
+    component_route_id, framework_cap_instance_id, router_export_route_id,
+    router_external_route_id, telemetry::SCENARIO_RUN_ID_ENV,
 };
 use amber_scenario::{ComponentId, Scenario};
 use base64::Engine as _;
@@ -49,6 +51,7 @@ pub(crate) struct MeshConfigPlan {
     pub(crate) component_configs: HashMap<ComponentId, MeshConfigTemplate>,
     pub(crate) router_config: Option<MeshConfigTemplate>,
     pub(crate) router_env_passthrough: Vec<String>,
+    pub(crate) component_sidecar_env_passthrough: Vec<String>,
 }
 
 pub(crate) struct MeshConfigBuildInput<'a, Addressing: MeshAddressing + ?Sized> {
@@ -183,6 +186,20 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
     }
 
     let mut component_configs: HashMap<ComponentId, MeshConfigTemplate> = HashMap::new();
+    let mut component_sidecar_env_passthrough = Vec::new();
+    push_env_passthrough_once(&mut component_sidecar_env_passthrough, SCENARIO_RUN_ID_ENV);
+    push_env_passthrough_once(
+        &mut component_sidecar_env_passthrough,
+        DYNAMIC_CAPS_CONTROL_URL_ENV,
+    );
+    push_env_passthrough_once(
+        &mut component_sidecar_env_passthrough,
+        DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV,
+    );
+    push_env_passthrough_once(
+        &mut component_sidecar_env_passthrough,
+        DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
+    );
     for &id in mesh_plan.program_components() {
         let identity = identities_by_component
             .get(&id)
@@ -381,12 +398,18 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         let mesh_listen = format!("{}:{mesh_port}", options.component_mesh_listen_addr)
             .parse()
             .expect("mesh listen");
+        let dynamic_caps_listen = route_ports.dynamic_caps_port(id).map(|port| {
+            format!("{}:{port}", options.component_mesh_listen_addr)
+                .parse()
+                .expect("dynamic caps listen")
+        });
         let config_peers = required_peers(&identity.id, &inbound, &outbound);
 
         let config = MeshConfigTemplate {
             identity,
             mesh_listen,
             control_listen: None,
+            dynamic_caps_listen,
             control_allow: None,
             peers: config_peers,
             inbound,
@@ -535,6 +558,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             identity: router_identity,
             mesh_listen,
             control_listen,
+            dynamic_caps_listen: None,
             control_allow: None,
             peers: config_peers,
             inbound,
@@ -549,15 +573,13 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         component_configs,
         router_config,
         router_env_passthrough,
+        component_sidecar_env_passthrough,
     })
 }
 
-fn push_env_passthrough_once(router_env_passthrough: &mut Vec<String>, env_var: &str) {
-    if !router_env_passthrough
-        .iter()
-        .any(|existing| existing == env_var)
-    {
-        router_env_passthrough.push(env_var.to_string());
+fn push_env_passthrough_once(env_passthrough: &mut Vec<String>, env_var: &str) {
+    if !env_passthrough.iter().any(|existing| existing == env_var) {
+        env_passthrough.push(env_var.to_string());
     }
 }
 

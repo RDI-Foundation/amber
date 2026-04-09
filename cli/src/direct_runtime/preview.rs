@@ -11,6 +11,10 @@ pub(crate) fn component_program_spec(
     let source_dir = component_source_dir(component)?;
     let work_dir = runtime_root.join(&component.program.work_dir);
     let mut writable_dirs = vec![work_dir.clone()];
+    let dynamic_caps_api_url = runtime_state
+        .dynamic_caps_port_by_component
+        .get(&component.id)
+        .map(|port| format!("http://127.0.0.1:{port}"));
     #[cfg(target_os = "linux")]
     let read_only_mounts = component_program_read_only_mounts(component, source_dir.as_deref())?;
     let bind_mounts = direct_storage_bind_mounts(storage_root, component)?;
@@ -19,11 +23,18 @@ pub(crate) fn component_program_spec(
             let (program, args) = split_entrypoint(entrypoint)?;
             let program =
                 ensure_absolute_direct_program_path(&program, component.moniker.as_str())?;
+            let mut env = env.clone();
+            if let Some(url) = dynamic_caps_api_url.as_ref() {
+                env.insert(
+                    amber_mesh::DYNAMIC_CAPS_API_URL_ENV.to_string(),
+                    url.clone(),
+                );
+            }
             Ok(ProcessSpec {
                 name: component.program.log_name.clone(),
                 program,
                 args,
-                env: env.clone(),
+                env,
                 work_dir,
                 sandbox: ProcessSandbox::Sandboxed,
                 drop_all_caps: false,
@@ -63,6 +74,12 @@ pub(crate) fn component_program_spec(
                 append_runtime_config_env(&mut env, payload)?;
             }
             append_runtime_template_context_env(&mut env, &runtime_template_context)?;
+            if let Some(url) = dynamic_caps_api_url.as_ref() {
+                env.insert(
+                    amber_mesh::DYNAMIC_CAPS_API_URL_ENV.to_string(),
+                    url.clone(),
+                );
+            }
             if let Some(b64) = mount_spec_b64 {
                 writable_dirs.extend(decode_mount_parent_dirs(
                     b64,
@@ -209,6 +226,11 @@ pub(crate) fn build_direct_site_launch_preview(
                 .display()
                 .to_string(),
         );
+        for passthrough in &component.sidecar.env_passthrough {
+            if let Ok(value) = env::var(passthrough) {
+                env.insert(passthrough.clone(), value);
+            }
+        }
         processes.push(direct_process_preview(
             ProcessSpec {
                 name: component.sidecar.log_name.clone(),

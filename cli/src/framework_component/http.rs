@@ -27,6 +27,30 @@ pub(crate) async fn run_framework_control_state(plan_path: PathBuf) -> Result<()
             "/v1/control-state/children/{child}/destroy",
             post(control_destroy_child),
         )
+        .route(
+            "/v1/control-state/dynamic-caps/held",
+            post(control_dynamic_held_list),
+        )
+        .route(
+            "/v1/control-state/dynamic-caps/held/detail",
+            post(control_dynamic_held_detail),
+        )
+        .route(
+            "/v1/control-state/dynamic-caps/share",
+            post(control_dynamic_share),
+        )
+        .route(
+            "/v1/control-state/dynamic-caps/inspect-ref",
+            post(control_dynamic_inspect_ref),
+        )
+        .route(
+            "/v1/control-state/dynamic-caps/revoke",
+            post(control_dynamic_revoke),
+        )
+        .route(
+            "/v1/control-state/dynamic-caps/resolve-origin",
+            post(control_dynamic_resolve_origin),
+        )
         .with_state(app_state.clone());
     let listener = TcpListener::bind(plan.listen_addr)
         .await
@@ -75,8 +99,13 @@ pub(crate) async fn run_framework_ccs(plan_path: PathBuf) -> Result<()> {
             get(ccs_describe_child).delete(ccs_destroy_child),
         )
         .route("/v1/snapshot", post(ccs_snapshot))
+        .route(
+            "/v1/internal/dynamic-caps/origins/publish",
+            post(ccs_publish_dynamic_capability_origin),
+        )
         .with_state(CcsApp {
             client: ReqwestClient::new(),
+            site_state_root: PathBuf::from(&plan.site_state_root),
             control_state_url: Arc::<str>::from(plan.control_state_url),
             router_auth_token: Arc::<str>::from(plan.router_auth_token),
             control_state_auth_token: Arc::<str>::from(plan.control_state_auth_token),
@@ -144,6 +173,237 @@ pub(super) async fn control_destroy_child(
     };
     execute_destroy_child(&app, authority_realm_id, &child).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn control_dynamic_held_list(
+    State(app): State<ControlStateApp>,
+    headers: HeaderMap,
+    Json(request): Json<dynamic_caps::ControlDynamicHeldListRequest>,
+) -> std::result::Result<Json<amber_mesh::dynamic_caps::HeldListResponse>, ProtocolApiError> {
+    authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
+    let held = {
+        let state = app.control_state.lock().await;
+        dynamic_caps::live_held_entries(&state, &request.holder_component_id)?
+    };
+    Ok(Json(amber_mesh::dynamic_caps::HeldListResponse { held }))
+}
+
+pub(super) async fn control_dynamic_held_detail(
+    State(app): State<ControlStateApp>,
+    headers: HeaderMap,
+    Json(request): Json<dynamic_caps::ControlDynamicHeldDetailRequest>,
+) -> std::result::Result<Json<HeldEntryDetail>, ProtocolApiError> {
+    authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
+    let detail = {
+        let state = app.control_state.lock().await;
+        dynamic_caps::held_entry_detail(&state, &request.holder_component_id, &request.held_id)?
+    };
+    Ok(Json(detail))
+}
+
+pub(super) async fn control_dynamic_share(
+    State(app): State<ControlStateApp>,
+    headers: HeaderMap,
+    Json(request): Json<dynamic_caps::ControlDynamicShareRequest>,
+) -> std::result::Result<Json<amber_mesh::dynamic_caps::ShareResponse>, ProtocolApiError> {
+    authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
+    let response = {
+        let mut state = app.control_state.lock().await;
+        persist_control_state_update(
+            &mut state,
+            &app.state_path,
+            "dynamic capability share",
+            |state| {
+                let outcome = dynamic_caps::share_dynamic_capability(
+                    state,
+                    &request.caller_component_id,
+                    &dynamic_caps::source_key_from_control_request(&request.source),
+                    &request.recipient_component_id,
+                    request.idempotency_key.as_deref(),
+                    &request.options,
+                )?;
+                Ok(match outcome {
+                    dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, r#ref } => {
+                        amber_mesh::dynamic_caps::ShareResponse {
+                            outcome: "created".to_string(),
+                            reason: None,
+                            grant_id: Some(grant_id),
+                            r#ref: Some(r#ref),
+                        }
+                    }
+                    dynamic_caps::DynamicCapabilityShareOutcome::Deduplicated {
+                        grant_id,
+                        r#ref,
+                    } => amber_mesh::dynamic_caps::ShareResponse {
+                        outcome: "deduplicated".to_string(),
+                        reason: None,
+                        grant_id: Some(grant_id),
+                        r#ref: Some(r#ref),
+                    },
+                    dynamic_caps::DynamicCapabilityShareOutcome::Noop { reason } => {
+                        amber_mesh::dynamic_caps::ShareResponse {
+                            outcome: "noop".to_string(),
+                            reason: Some(reason),
+                            grant_id: None,
+                            r#ref: None,
+                        }
+                    }
+                })
+            },
+        )?
+    };
+    Ok(Json(response))
+}
+
+pub(super) async fn control_dynamic_inspect_ref(
+    State(app): State<ControlStateApp>,
+    headers: HeaderMap,
+    Json(request): Json<dynamic_caps::ControlDynamicInspectRefRequest>,
+) -> std::result::Result<Json<amber_mesh::dynamic_caps::InspectRefResponse>, ProtocolApiError> {
+    authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
+    let response = {
+        let state = app.control_state.lock().await;
+        dynamic_caps::inspect_dynamic_ref(&state, &request.holder_component_id, &request.r#ref)?
+    };
+    Ok(Json(response))
+}
+
+pub(super) async fn control_dynamic_revoke(
+    State(app): State<ControlStateApp>,
+    headers: HeaderMap,
+    Json(request): Json<dynamic_caps::ControlDynamicRevokeRequest>,
+) -> std::result::Result<Json<amber_mesh::dynamic_caps::RevokeResponse>, ProtocolApiError> {
+    authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
+    {
+        let mut state = app.control_state.lock().await;
+        persist_control_state_update(
+            &mut state,
+            &app.state_path,
+            "dynamic capability revoke",
+            |state| {
+                dynamic_caps::revoke_dynamic_capability(
+                    state,
+                    &request.caller_component_id,
+                    &dynamic_caps::source_key_from_control_request(&request.target),
+                )?;
+                Ok(())
+            },
+        )?;
+    }
+    Ok(Json(amber_mesh::dynamic_caps::RevokeResponse {
+        outcome: "revoked".to_string(),
+    }))
+}
+
+pub(super) async fn control_dynamic_resolve_origin(
+    State(app): State<ControlStateApp>,
+    headers: HeaderMap,
+    Json(request): Json<dynamic_caps::ControlDynamicResolveOriginRequest>,
+) -> std::result::Result<Json<dynamic_caps::ControlDynamicResolveOriginResponse>, ProtocolApiError>
+{
+    authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
+    let state = app.control_state.lock().await.clone();
+    let source_key = dynamic_caps::source_key_from_control_request(&request.source);
+    let resolved_source = dynamic_caps::resolve_dynamic_materialization_source(
+        &state,
+        &request.holder_component_id,
+        &source_key,
+    )?;
+    let roots = dynamic_caps::derive_root_authorities(&state)?;
+    let root = roots
+        .get(&dynamic_caps::root_authority_key(
+            &resolved_source.root_authority_selector,
+        ))
+        .ok_or_else(|| {
+            ProtocolApiError::from(protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                "dynamic capability root authority is no longer live",
+            ))
+        })?;
+    let holder_runtime =
+        dynamic_capability_component_runtime_endpoint(&app, &state, &request.holder_component_id)?;
+    let origin_runtime =
+        dynamic_capability_component_runtime_endpoint(&app, &state, &root.holder_component_id)?;
+    let origin_site_id = origin_runtime.site_id.clone();
+    let origin_manager_state = load_site_manager_state(&app, &origin_site_id)?;
+    let origin_peer_id = origin_manager_state
+        .router_identity_id
+        .clone()
+        .ok_or_else(|| {
+            ProtocolApiError::from(protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "site `{origin_site_id}` does not expose a live router identity for dynamic \
+                     capability publication"
+                ),
+            ))
+        })?;
+    let origin_peer_key_b64 = origin_manager_state
+        .router_public_key_b64
+        .clone()
+        .ok_or_else(|| {
+            ProtocolApiError::from(protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "site `{origin_site_id}` does not expose a live router public key for dynamic \
+                     capability publication"
+                ),
+            ))
+        })?;
+    let origin_peer_addr = origin_manager_state
+        .router_mesh_addr
+        .clone()
+        .ok_or_else(|| {
+            ProtocolApiError::from(protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "site `{origin_site_id}` does not expose a live router mesh address for \
+                     dynamic capability publication"
+                ),
+            ))
+        })?;
+    let overlay_suffix = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "holder_component_id": request.holder_component_id,
+            "root_authority_selector": resolved_source.root_authority_selector.clone(),
+        }))
+        .expect("dynamic capability origin overlay key should serialize"),
+    );
+    let overlay_id = format!("dynamic-cap-origin-{overlay_suffix}");
+    let route_id = format!("dynamic-cap-origin-route-{overlay_suffix}");
+    let publish = publish_dynamic_capability_origin(
+        &app,
+        &origin_site_id,
+        &dynamic_caps::PublishDynamicCapabilityOriginRequest {
+            overlay_id,
+            route_id: route_id.clone(),
+            root_authority_selector: resolved_source.root_authority_selector.clone(),
+            allowed_peers: vec![dynamic_caps::DynamicCapabilityAllowedPeer {
+                peer_id: holder_runtime.runtime.mesh_config.identity.id.clone(),
+                peer_key_b64: base64::engine::general_purpose::STANDARD
+                    .encode(holder_runtime.runtime.mesh_config.identity.public_key),
+            }],
+        },
+    )
+    .await?;
+    let held_id = match &source_key {
+        dynamic_caps::DynamicCapabilitySourceKey::RootAuthority(selector) => {
+            dynamic_caps::held_id_for_root(selector)
+        }
+        dynamic_caps::DynamicCapabilitySourceKey::Grant(grant_id) => {
+            dynamic_caps::held_id_for_grant(grant_id)
+        }
+    };
+    Ok(Json(dynamic_caps::ControlDynamicResolveOriginResponse {
+        held_id,
+        descriptor: resolved_source.descriptor,
+        origin_route_id: route_id,
+        origin_capability: publish.capability,
+        origin_protocol: publish.protocol,
+        origin_peer_id,
+        origin_peer_key_b64,
+        origin_peer_addr,
+    }))
 }
 
 pub(super) async fn ccs_list_templates(
@@ -217,6 +477,18 @@ pub(super) async fn ccs_snapshot(
 ) -> std::result::Result<Json<SnapshotResponse>, ProtocolApiError> {
     let (_, record, state) = authorize_request(&app, &headers).await?;
     Ok(Json(snapshot(&state, record.authority_realm_id)?))
+}
+
+pub(super) async fn ccs_publish_dynamic_capability_origin(
+    State(app): State<CcsApp>,
+    headers: HeaderMap,
+    Json(request): Json<dynamic_caps::PublishDynamicCapabilityOriginRequest>,
+) -> std::result::Result<Json<dynamic_caps::PublishDynamicCapabilityOriginResponse>, ProtocolApiError>
+{
+    authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
+    Ok(Json(
+        publish_dynamic_capability_origin_local(&app, request).await?,
+    ))
 }
 
 pub(super) async fn ccs_destroy_child(

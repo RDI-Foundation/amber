@@ -11,12 +11,14 @@ use super::plan::{
 };
 use crate::targets::program_config::EndpointPlan;
 
+const LOCAL_INTERNAL_PORT_BASE: u16 = 19000;
 const LOCAL_SLOT_PORT_BASE: u16 = 20000;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LocalRoutePorts {
     slot_ports_by_component: HashMap<ComponentId, BTreeMap<String, u16>>,
     reserved_ports_by_component: HashMap<ComponentId, Vec<u16>>,
+    dynamic_caps_ports_by_component: HashMap<ComponentId, u16>,
     component_binding_ports: HashMap<BindingIdentity<ResolvedComponentBinding>, u16>,
     external_binding_ports: HashMap<BindingIdentity<ResolvedExternalBinding>, u16>,
     framework_binding_ports: HashMap<BindingIdentity<ResolvedFrameworkBinding>, u16>,
@@ -35,6 +37,12 @@ impl LocalRoutePorts {
             .get(&component)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub(crate) fn dynamic_caps_port(&self, component: ComponentId) -> Option<u16> {
+        self.dynamic_caps_ports_by_component
+            .get(&component)
+            .copied()
     }
 
     pub(crate) fn component_binding_port(&self, binding: &ResolvedComponentBinding) -> Option<u16> {
@@ -81,7 +89,8 @@ impl<T> Hash for BindingIdentity<T> {
 
 struct ComponentRoutePortAllocator {
     reserved: HashSet<u16>,
-    next: u16,
+    internal_next: u16,
+    slot_next: u16,
     slot_ports: BTreeMap<String, Vec<u16>>,
 }
 
@@ -94,7 +103,8 @@ impl ComponentRoutePortAllocator {
 
         Self {
             reserved,
-            next: LOCAL_SLOT_PORT_BASE,
+            internal_next: LOCAL_INTERNAL_PORT_BASE,
+            slot_next: LOCAL_SLOT_PORT_BASE,
             slot_ports: BTreeMap::new(),
         }
     }
@@ -105,8 +115,8 @@ impl ComponentRoutePortAllocator {
         component_id: ComponentId,
         slot_name: &str,
     ) -> Result<u16, MeshError> {
-        while self.reserved.contains(&self.next) {
-            self.next = self.next.checked_add(1).ok_or_else(|| {
+        while self.reserved.contains(&self.slot_next) {
+            self.slot_next = self.slot_next.checked_add(1).ok_or_else(|| {
                 MeshError::new(format!(
                     "ran out of local slot ports allocating for {}",
                     component_label(scenario, component_id)
@@ -114,15 +124,47 @@ impl ComponentRoutePortAllocator {
             })?;
         }
 
-        let port = self.next;
+        let port = self.slot_next;
         self.reserved.insert(port);
         self.slot_ports
             .entry(slot_name.to_string())
             .or_default()
             .push(port);
-        self.next = self.next.checked_add(1).ok_or_else(|| {
+        self.slot_next = self.slot_next.checked_add(1).ok_or_else(|| {
             MeshError::new(format!(
                 "ran out of local slot ports allocating for {}",
+                component_label(scenario, component_id)
+            ))
+        })?;
+        Ok(port)
+    }
+
+    fn allocate_reserved(
+        &mut self,
+        scenario: &Scenario,
+        component_id: ComponentId,
+        purpose: &str,
+    ) -> Result<u16, MeshError> {
+        while self.reserved.contains(&self.internal_next) {
+            self.internal_next = self.internal_next.checked_add(1).ok_or_else(|| {
+                MeshError::new(format!(
+                    "ran out of local reserved ports allocating {purpose} for {}",
+                    component_label(scenario, component_id)
+                ))
+            })?;
+        }
+        if self.internal_next >= LOCAL_SLOT_PORT_BASE {
+            return Err(MeshError::new(format!(
+                "ran out of local internal ports allocating {purpose} for {}",
+                component_label(scenario, component_id)
+            )));
+        }
+
+        let port = self.internal_next;
+        self.reserved.insert(port);
+        self.internal_next = self.internal_next.checked_add(1).ok_or_else(|| {
+            MeshError::new(format!(
+                "ran out of local reserved ports allocating {purpose} for {}",
                 component_label(scenario, component_id)
             ))
         })?;
@@ -155,6 +197,7 @@ pub(crate) fn allocate_local_route_ports(
 
     for id in mesh_plan.program_components() {
         let mut allocator = ComponentRoutePortAllocator::new(endpoint_plan, *id);
+        let dynamic_caps_port = allocator.allocate_reserved(scenario, *id, "dynamic caps api")?;
 
         for binding in mesh_plan.bindings_for_consumer(*id) {
             let port = allocator.allocate(scenario, *id, binding.slot())?;
@@ -175,6 +218,8 @@ pub(crate) fn allocate_local_route_ports(
         }
 
         let (reserved_ports, slot_ports) = allocator.finish();
+        out.dynamic_caps_ports_by_component
+            .insert(*id, dynamic_caps_port);
         out.reserved_ports_by_component.insert(*id, reserved_ports);
         out.slot_ports_by_component.insert(*id, slot_ports);
     }
@@ -191,6 +236,9 @@ pub(crate) fn placeholder_local_route_ports(
 
     for id in mesh_plan.program_components() {
         let mut allocator = ComponentRoutePortAllocator::new(endpoint_plan, *id);
+        let dynamic_caps_port = allocator
+            .allocate_reserved(scenario, *id, "dynamic caps api")
+            .expect("dynamic caps api port allocation should not overflow");
 
         for binding in mesh_plan.bindings_for_consumer(*id) {
             let port = allocator
@@ -213,6 +261,8 @@ pub(crate) fn placeholder_local_route_ports(
         }
 
         let (reserved, slot_ports) = allocator.finish();
+        out.dynamic_caps_ports_by_component
+            .insert(*id, dynamic_caps_port);
         out.reserved_ports_by_component.insert(*id, reserved);
         out.slot_ports_by_component.insert(*id, slot_ports);
     }

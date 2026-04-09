@@ -809,7 +809,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         .expect("client outbound route missing");
     assert_eq!(outbound.listen_port, 20000);
 
-    // Slot URL should be rendered with local proxy port base (20000).
+    // Slot URL should start at the local slot port base.
     assert_eq!(
         env_value(service(&compose, "c2-client"), "URL").as_deref(),
         Some("http://127.0.0.1:20000")

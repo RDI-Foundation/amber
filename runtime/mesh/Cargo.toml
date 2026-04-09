@@ -13,6 +13,7 @@ sha2 = "0.10.9"
 thiserror = { workspace = true }
 tracing-error = "0.2.1"
 tracing-subscriber = { workspace = true, features = ["json"] }
+url = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
