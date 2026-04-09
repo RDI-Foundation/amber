@@ -1623,7 +1623,16 @@ fn ensure_dynamic_proxy_export_component_routes_in_artifact_adds_provider_route(
                     dynamic_caps_listen: None,
                     control_allow: None,
                     peers: Vec::new(),
-                    inbound: Vec::new(),
+                    inbound: vec![InboundRoute {
+                        route_id: component_route_id("/job/root", "admin", MeshProtocol::Http),
+                        capability: "admin".to_string(),
+                        capability_kind: Some("http".to_string()),
+                        capability_profile: None,
+                        protocol: MeshProtocol::Http,
+                        http_plugins: Vec::new(),
+                        target: InboundTarget::Local { port: 9090 },
+                        allowed_issuers: Vec::new(),
+                    }],
                     outbound: Vec::new(),
                     transport: TransportConfig::NoiseIk {},
                 },
@@ -1664,23 +1673,31 @@ fn ensure_dynamic_proxy_export_component_routes_in_artifact_adds_provider_route(
             .collect::<Vec<_>>(),
         vec!["/site/direct_local/router"]
     );
-    assert_eq!(
-        component
-            .config
-            .inbound
-            .iter()
-            .map(|route| route.route_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["component:/job/root:http:http"]
+    let admin_route = component
+        .config
+        .inbound
+        .iter()
+        .find(|route| route.capability == "admin")
+        .expect("existing local admin route should remain");
+    assert!(
+        admin_route.allowed_issuers.is_empty(),
+        "rewriting a dynamic export must not broaden unrelated local routes",
     );
+    let provider_route = component
+        .config
+        .inbound
+        .iter()
+        .find(|route| route.capability == "http")
+        .expect("dynamic export provider route should be added");
     assert_eq!(
-        component.config.inbound[0].allowed_issuers,
+        provider_route.allowed_issuers,
         vec!["/site/direct_local/router".to_string()]
     );
 }
 
 #[test]
-fn ensure_router_access_to_component_local_routes_in_artifact_adds_router_trust() {
+fn ensure_dynamic_proxy_export_component_routes_in_artifact_leaves_local_routes_closed_without_exports()
+ {
     let temp = tempdir().expect("tempdir should be created");
     let artifact_root = temp.path();
     write_json(
@@ -1742,7 +1759,7 @@ fn ensure_router_access_to_component_local_routes_in_artifact_adds_router_trust(
         &BTreeMap::new(),
         "/site/direct_local/router",
     )
-    .expect("router trust should be projected into component local routes");
+    .expect("empty dynamic exports should leave existing routes unchanged");
 
     let filtered: MeshProvisionPlan = read_json(
         &artifact_root.join("mesh-provision-plan.json"),
@@ -1754,23 +1771,49 @@ fn ensure_router_access_to_component_local_routes_in_artifact_adds_router_trust(
         .iter()
         .find(|target| matches!(target.kind, MeshProvisionTargetKind::Component))
         .expect("component target should remain");
-    assert_eq!(
-        component
-            .config
-            .peers
-            .iter()
-            .map(|peer| peer.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["/site/direct_local/router"]
+    assert!(
+        component.config.peers.is_empty(),
+        "the router should not be peered when there are no dynamic exports to expose",
     );
     assert_eq!(
         component.config.inbound[0].allowed_issuers,
-        vec!["/site/direct_local/router".to_string()]
+        Vec::<String>::new()
     );
     assert!(
         component.config.inbound[1].allowed_issuers.is_empty(),
-        "only local component routes should be opened to the site router"
+        "non-local routes should also remain unchanged"
     );
+}
+
+#[test]
+fn compose_component_mesh_peer_addr_uses_service_name() {
+    let temp = tempdir().expect("tempdir should be created");
+    let addr = compose_component_mesh_peer_addr(
+        temp.path(),
+        "/provider",
+        &MeshProvisionOutput::Filesystem {
+            dir: "mesh/components/c4-provider-net".to_string(),
+        },
+        23000,
+    )
+    .expect("compose peer addr should resolve");
+    assert_eq!(addr, "c4-provider-net:23000");
+}
+
+#[test]
+fn kubernetes_component_mesh_peer_addr_uses_service_name() {
+    let temp = tempdir().expect("tempdir should be created");
+    let addr = kubernetes_component_mesh_peer_addr(
+        temp.path(),
+        "/provider",
+        &MeshProvisionOutput::KubernetesSecret {
+            name: "c4-provider-net-mesh".to_string(),
+            namespace: Some("ns".to_string()),
+        },
+        23000,
+    )
+    .expect("kubernetes peer addr should resolve");
+    assert_eq!(addr, "c4-provider-net:23000");
 }
 
 #[test]

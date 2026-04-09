@@ -2060,7 +2060,7 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
     fs::remove_file(&beta_path).expect("beta source should be removable before replay");
     fs::remove_file(&beta_leaf_path).expect("beta leaf source should be removable before replay");
 
-    let replayed = compile_control_state_from_snapshot(&snapshot_response).await;
+    let mut replayed = compile_control_state_from_snapshot(&snapshot_response).await;
     let replay_state_path = dir.path().join("replay-control-state.json");
     write_control_state(&replay_state_path, &replayed).expect("replay state should write");
     let replay_root_authority = replayed.base_scenario.root;
@@ -2081,6 +2081,13 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
             .iter()
             .any(|child| child.name == "job-open" && child.state == ChildState::Live),
         "replay should rebuild authoritative live child records",
+    );
+    assert!(
+        Scenario::try_from(replayed.base_scenario.clone())
+            .expect("replayed base scenario")
+            .components_iter()
+            .any(|(_, component)| component.moniker.as_str() == "/job-open"),
+        "replay should treat the resumed child as part of the authoritative base scenario",
     );
 
     let replay_scenario = decode_live_scenario(&replayed).expect("replayed scenario");
@@ -2140,6 +2147,33 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
             .as_str()
             == beta_key,
         "resolve should continue to use the admitted manifest ref"
+    );
+
+    destroy_child(
+        &mut replayed,
+        replay_root_authority,
+        "job-open",
+        &replay_state_path,
+    )
+    .await
+    .expect("destroy should succeed after replay");
+    assert!(
+        replayed.live_children.is_empty(),
+        "destroy after replay should remove the child record",
+    );
+    assert!(
+        !decode_live_scenario(&replayed)
+            .expect("live scenario after replayed destroy")
+            .components_iter()
+            .any(|(_, component)| component.moniker.as_str() == "/job-open"),
+        "destroy after replay must fully remove the resumed child from the live graph",
+    );
+    assert!(
+        !Scenario::try_from(replayed.base_scenario.clone())
+            .expect("base scenario after replayed destroy")
+            .components_iter()
+            .any(|(_, component)| component.moniker.as_str() == "/job-open"),
+        "destroy after replay must also remove the child from the authoritative base scenario",
     );
 }
 

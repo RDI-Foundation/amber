@@ -667,6 +667,15 @@ impl LinuxVmHarness {
         let workspace_root = workspace_root();
         let base_image = host_cloud_image_path();
         ensure_host_cloud_image_exists(&base_image)?;
+        let base_image_name = base_image
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "invalid Linux VM base image path {}; missing file name",
+                    base_image.display()
+                )
+            })?;
         run_checked(
             Command::new("/usr/bin/tar")
                 .current_dir(&workspace_root)
@@ -675,6 +684,7 @@ impl LinuxVmHarness {
                 .arg(&archive)
                 .arg("--exclude=./target")
                 .arg("--exclude=./.git")
+                .arg(format!("--exclude=./{base_image_name}"))
                 .arg("--exclude=._*")
                 .arg("--exclude=*/._*")
                 .arg("."),

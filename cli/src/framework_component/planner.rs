@@ -1206,6 +1206,15 @@ pub(super) fn move_pending_create_to_live(
         })?;
     let mut record = state.pending_creates.remove(index);
     record.child.state = ChildState::Live;
+    add_child_fragment_to_base_scenario(
+        state,
+        record.child.fragment.as_ref().ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("child id {child_id} is missing its live fragment"),
+            )
+        })?,
+    )?;
     state.live_children.push(record.child);
     Ok(())
 }
@@ -1275,13 +1284,16 @@ pub(super) fn remove_child_record(
 ) -> std::result::Result<(), ProtocolErrorResponse> {
     match child_record_location(state, child_id)? {
         ChildRecordLocation::Live(index) => {
-            state.live_children.remove(index);
+            let child = state.live_children.remove(index);
+            remove_child_fragment_from_base_scenario(state, child.fragment.as_ref());
         }
         ChildRecordLocation::PendingCreate(index) => {
-            state.pending_creates.remove(index);
+            let child = state.pending_creates.remove(index).child;
+            remove_child_fragment_from_base_scenario(state, child.fragment.as_ref());
         }
         ChildRecordLocation::PendingDestroy(index) => {
-            state.pending_destroys.remove(index);
+            let child = state.pending_destroys.remove(index).child;
+            remove_child_fragment_from_base_scenario(state, child.fragment.as_ref());
         }
     }
     Ok(())
@@ -2169,38 +2181,8 @@ pub(super) fn scenario_with_fragment(
     current_live_scenario_ir: &ScenarioIr,
     fragment: &LiveScenarioFragment,
 ) -> std::result::Result<Scenario, ProtocolErrorResponse> {
-    let mut scenario_ir = current_live_scenario_ir.clone();
-    scenario_ir.components.extend(fragment.components.clone());
-    scenario_ir.bindings.extend(
-        fragment
-            .bindings
-            .iter()
-            .map(|binding| binding.binding.clone()),
-    );
-    for component in &mut scenario_ir.components {
-        component.children.clear();
-    }
-    let parent_edges = scenario_ir
-        .components
-        .iter()
-        .filter_map(|component| component.parent.map(|parent| (parent, component.id)))
-        .collect::<Vec<_>>();
-    for (parent, child) in parent_edges {
-        let parent_component = scenario_ir
-            .components
-            .iter_mut()
-            .find(|component| component.id == parent)
-            .ok_or_else(|| {
-                protocol_error(
-                    ProtocolErrorCode::ControlStateUnavailable,
-                    &format!(
-                        "live fragment references missing parent component id {parent} for child \
-                         {child}"
-                    ),
-                )
-            })?;
-        parent_component.children.push(child);
-    }
+    let scenario_ir =
+        scenario_ir_with_fragments(current_live_scenario_ir, std::iter::once(fragment))?;
     Scenario::try_from(scenario_ir).map_err(|err| {
         protocol_error(
             ProtocolErrorCode::ControlStateUnavailable,
@@ -2209,29 +2191,26 @@ pub(super) fn scenario_with_fragment(
     })
 }
 
-pub(super) fn live_scenario_ir(
-    state: &FrameworkControlState,
+pub(super) fn scenario_ir_with_fragments<'a>(
+    base_scenario: &ScenarioIr,
+    fragments: impl IntoIterator<Item = &'a LiveScenarioFragment>,
 ) -> std::result::Result<ScenarioIr, ProtocolErrorResponse> {
-    let mut components = state
-        .base_scenario
+    let mut components = base_scenario
         .components
         .iter()
         .cloned()
         .map(|component| (component.id, component))
         .collect::<BTreeMap<_, _>>();
-    let mut bindings = state.base_scenario.bindings.clone();
+    let mut bindings = base_scenario.bindings.clone();
+    let mut seen_binding_keys = bindings
+        .iter()
+        .map(binding_identity_key)
+        .collect::<BTreeSet<_>>();
 
-    for child in visible_child_records(state) {
-        let Some(fragment) = child.fragment.as_ref() else {
-            continue;
-        };
+    for fragment in fragments {
         for component in &fragment.components {
             components.insert(component.id, component.clone());
         }
-        let mut seen_binding_keys = bindings
-            .iter()
-            .map(binding_identity_key)
-            .collect::<BTreeSet<_>>();
         for binding in &fragment.bindings {
             let key = binding_identity_key(&binding.binding);
             if seen_binding_keys.insert(key) {
@@ -2278,14 +2257,90 @@ pub(super) fn live_scenario_ir(
     }
 
     Ok(ScenarioIr {
-        schema: state.base_scenario.schema.clone(),
-        version: state.base_scenario.version,
-        root: state.base_scenario.root,
+        schema: base_scenario.schema.clone(),
+        version: base_scenario.version,
+        root: base_scenario.root,
         components: components.into_values().collect(),
         bindings,
-        exports: state.base_scenario.exports.clone(),
-        manifest_catalog: state.base_scenario.manifest_catalog.clone(),
+        exports: base_scenario.exports.clone(),
+        manifest_catalog: base_scenario.manifest_catalog.clone(),
     })
+}
+
+fn strip_scenario_ir_fragment(
+    mut scenario_ir: ScenarioIr,
+    fragment: &LiveScenarioFragment,
+) -> ScenarioIr {
+    let fragment_component_ids = fragment
+        .components
+        .iter()
+        .map(|component| component.id)
+        .collect::<BTreeSet<_>>();
+    if fragment_component_ids.is_empty() {
+        return scenario_ir;
+    }
+
+    scenario_ir
+        .components
+        .retain(|component| !fragment_component_ids.contains(&component.id));
+    scenario_ir
+        .bindings
+        .retain(|binding| !binding_references_any_component(binding, &fragment_component_ids));
+    for component in &mut scenario_ir.components {
+        component.children.clear();
+    }
+    let parent_edges = scenario_ir
+        .components
+        .iter()
+        .filter_map(|component| component.parent.map(|parent| (parent, component.id)))
+        .collect::<Vec<_>>();
+    for (parent, child) in parent_edges {
+        if let Some(parent_component) = scenario_ir
+            .components
+            .iter_mut()
+            .find(|component| component.id == parent)
+        {
+            parent_component.children.push(child);
+        }
+    }
+    scenario_ir
+}
+
+fn binding_references_any_component(binding: &BindingIr, component_ids: &BTreeSet<usize>) -> bool {
+    component_ids.contains(&binding.to.component)
+        || match &binding.from {
+            BindingFromIr::Component { component, .. }
+            | BindingFromIr::Resource { component, .. } => component_ids.contains(component),
+            BindingFromIr::Framework {
+                authority_realm, ..
+            } => component_ids.contains(authority_realm),
+            BindingFromIr::External { slot } => component_ids.contains(&slot.component),
+        }
+}
+
+pub(super) fn add_child_fragment_to_base_scenario(
+    state: &mut FrameworkControlState,
+    fragment: &LiveScenarioFragment,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    state.base_scenario =
+        scenario_ir_with_fragments(&state.base_scenario, std::iter::once(fragment))?;
+    Ok(())
+}
+
+pub(super) fn remove_child_fragment_from_base_scenario(
+    state: &mut FrameworkControlState,
+    fragment: Option<&LiveScenarioFragment>,
+) {
+    let Some(fragment) = fragment else {
+        return;
+    };
+    state.base_scenario = strip_scenario_ir_fragment(state.base_scenario.clone(), fragment);
+}
+
+pub(super) fn live_scenario_ir(
+    state: &FrameworkControlState,
+) -> std::result::Result<ScenarioIr, ProtocolErrorResponse> {
+    Ok(state.base_scenario.clone())
 }
 
 pub(super) fn decode_live_scenario(
