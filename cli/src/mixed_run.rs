@@ -422,6 +422,7 @@ struct SiteActuatorState {
 #[derive(Clone, Debug)]
 pub(crate) struct LiveComponentRuntimeMetadata {
     pub(crate) moniker: String,
+    pub(crate) host_mesh_addr: String,
     pub(crate) mesh_config: MeshConfigPublic,
 }
 
@@ -2276,14 +2277,55 @@ fn ensure_dynamic_proxy_export_component_routes(
     Ok(())
 }
 
+fn ensure_router_access_to_component_local_routes(
+    mesh_plan: &mut MeshProvisionPlan,
+    router_identity_id: &str,
+) {
+    for component_target in mesh_plan
+        .targets
+        .iter_mut()
+        .filter(|target| matches!(target.kind, MeshProvisionTargetKind::Component))
+    {
+        let mut updated_local_route = false;
+        for route in &mut component_target.config.inbound {
+            if route.protocol != MeshProtocol::Http
+                || !matches!(route.target, InboundTarget::Local { .. })
+            {
+                continue;
+            }
+            updated_local_route = true;
+            if !route
+                .allowed_issuers
+                .iter()
+                .any(|issuer| issuer == router_identity_id)
+            {
+                route.allowed_issuers.push(router_identity_id.to_string());
+                route.allowed_issuers.sort();
+                route.allowed_issuers.dedup();
+            }
+        }
+        if updated_local_route
+            && !component_target
+                .config
+                .peers
+                .iter()
+                .any(|peer| peer.id == router_identity_id)
+        {
+            component_target
+                .config
+                .peers
+                .push(amber_mesh::MeshPeerTemplate {
+                    id: router_identity_id.to_string(),
+                });
+        }
+    }
+}
+
 fn ensure_dynamic_proxy_export_component_routes_in_artifact(
     artifact_root: &Path,
     proxy_exports: &BTreeMap<String, DynamicProxyExportRecord>,
     router_identity_id: &str,
 ) -> Result<()> {
-    if proxy_exports.is_empty() {
-        return Ok(());
-    }
     let plan_path = artifact_root.join("mesh-provision-plan.json");
     let mut mesh_plan: MeshProvisionPlan = read_json(&plan_path, "mesh provision plan")?;
     ensure_dynamic_proxy_export_component_routes(
@@ -2291,6 +2333,7 @@ fn ensure_dynamic_proxy_export_component_routes_in_artifact(
         proxy_exports,
         router_identity_id,
     )?;
+    ensure_router_access_to_component_local_routes(&mut mesh_plan, router_identity_id);
     write_json(&plan_path, &mesh_plan)
 }
 
@@ -2842,6 +2885,107 @@ pub(crate) fn collect_live_component_runtime_metadata(
     Ok(components)
 }
 
+pub(crate) fn load_live_site_router_mesh_config(
+    plan: &SiteActuatorPlan,
+) -> Result<MeshConfigPublic> {
+    let artifact_root = Path::new(&plan.artifact_dir);
+    match plan.kind {
+        SiteKind::Direct => {
+            let runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
+                miette::miette!("direct site `{}` is missing its runtime root", plan.site_id)
+            })?);
+            let direct_plan: DirectPlan =
+                read_json(&artifact_root.join("direct-plan.json"), "direct plan")?;
+            let router = direct_plan.router.ok_or_else(|| {
+                miette::miette!("direct site `{}` is missing its router plan", plan.site_id)
+            })?;
+            read_json(&runtime_root.join(&router.mesh_config_path), "mesh config")
+        }
+        SiteKind::Vm => {
+            let runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
+                miette::miette!("vm site `{}` is missing its runtime root", plan.site_id)
+            })?);
+            let vm_plan: VmPlan = read_json(&artifact_root.join("vm-plan.json"), "vm plan")?;
+            let router = vm_plan.router.ok_or_else(|| {
+                miette::miette!("vm site `{}` is missing its router plan", plan.site_id)
+            })?;
+            read_json(&runtime_root.join(&router.mesh_config_path), "mesh config")
+        }
+        SiteKind::Compose => {
+            let mesh_plan = if artifact_root.join("mesh-provision-plan.json").is_file() {
+                read_json(
+                    &artifact_root.join("mesh-provision-plan.json"),
+                    "mesh provision plan",
+                )?
+            } else {
+                read_embedded_compose_mesh_provision_plan(artifact_root)?
+            };
+            let target = mesh_plan
+                .targets
+                .iter()
+                .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "compose site `{}` is missing a router mesh target",
+                        plan.site_id
+                    )
+                })?;
+            let MeshProvisionOutput::Filesystem { dir } = &target.output else {
+                return Err(miette::miette!(
+                    "compose site `{}` has non-filesystem mesh output for router {}",
+                    plan.site_id,
+                    target.config.identity.id
+                ));
+            };
+            if Path::new(dir).is_absolute() {
+                let compose_project = plan.compose_project.as_deref().ok_or_else(|| {
+                    miette::miette!(
+                        "compose site `{}` is missing its compose project",
+                        plan.site_id
+                    )
+                })?;
+                let service_name = Path::new(dir)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "compose site `{}` has invalid router mesh output {}",
+                            plan.site_id,
+                            dir
+                        )
+                    })?;
+                read_compose_volume_mesh_config(compose_project, service_name)
+            } else {
+                read_json(
+                    &artifact_root.join(dir).join(MESH_CONFIG_FILENAME),
+                    "mesh config",
+                )
+            }
+        }
+        SiteKind::Kubernetes => {
+            let mesh_plan = read_kubernetes_runtime_mesh_provision_plan(artifact_root)?;
+            let target = mesh_plan
+                .targets
+                .iter()
+                .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "kubernetes site `{}` is missing a router mesh target",
+                        plan.site_id
+                    )
+                })?;
+            let MeshProvisionOutput::KubernetesSecret { name, namespace } = &target.output else {
+                return Err(miette::miette!(
+                    "kubernetes site `{}` has non-secret mesh output for router {}",
+                    plan.site_id,
+                    target.config.identity.id
+                ));
+            };
+            load_kubernetes_mesh_config_public(plan, name, namespace.as_deref())
+        }
+    }
+}
+
 fn collect_direct_artifact_runtime_metadata(
     artifact_root: &Path,
     runtime_root: &Path,
@@ -2857,7 +3001,7 @@ fn collect_direct_artifact_runtime_metadata(
             &runtime_root.join(&component.sidecar.mesh_config_path),
             "mesh config",
         )?;
-        state
+        let mesh_port = state
             .component_mesh_port_by_id
             .get(&component.id)
             .copied()
@@ -2871,6 +3015,7 @@ fn collect_direct_artifact_runtime_metadata(
             component.moniker.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: component.moniker.clone(),
+                host_mesh_addr: format!("127.0.0.1:{mesh_port}"),
                 mesh_config,
             },
         );
@@ -2890,7 +3035,7 @@ fn collect_vm_artifact_runtime_metadata(
             &runtime_root.join(&component.mesh_config_path),
             "mesh config",
         )?;
-        state
+        let mesh_port = state
             .component_mesh_port_by_id
             .get(&component.id)
             .copied()
@@ -2904,6 +3049,7 @@ fn collect_vm_artifact_runtime_metadata(
             component.moniker.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: component.moniker.clone(),
+                host_mesh_addr: format!("127.0.0.1:{mesh_port}"),
                 mesh_config,
             },
         );
@@ -2965,6 +3111,7 @@ fn collect_compose_artifact_runtime_metadata(
             target.config.identity.id.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: target.config.identity.id.clone(),
+                host_mesh_addr: mesh_config.mesh_listen.to_string(),
                 mesh_config,
             },
         );
@@ -2997,11 +3144,13 @@ fn collect_kubernetes_artifact_runtime_metadata(
                 name
             )
         })?;
+        let mesh_config = load_kubernetes_mesh_config_public(plan, name, namespace.as_deref())?;
         components.insert(
             target.config.identity.id.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: target.config.identity.id.clone(),
-                mesh_config: load_kubernetes_mesh_config_public(plan, name, namespace.as_deref())?,
+                host_mesh_addr: mesh_config.mesh_listen.to_string(),
+                mesh_config,
             },
         );
     }
@@ -3065,6 +3214,7 @@ fn prepare_dynamic_compose_child_artifact(
         &site_plan.proxy_exports,
         &plan.router_identity_id,
     )?;
+    ensure_router_access_to_component_local_routes(&mut mesh_plan, &plan.router_identity_id);
     rewrite_dynamic_routed_inputs(
         &mut mesh_plan,
         &site_plan.routed_inputs,
@@ -3583,6 +3733,7 @@ fn prepare_dynamic_kubernetes_child_artifact(
         &site_plan.proxy_exports,
         &plan.router_identity_id,
     )?;
+    ensure_router_access_to_component_local_routes(&mut provision_plan, &plan.router_identity_id);
     rewrite_dynamic_routed_inputs(
         &mut provision_plan,
         &site_plan.routed_inputs,

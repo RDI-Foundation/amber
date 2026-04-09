@@ -228,6 +228,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             let Some(endpoint) = endpoint else {
                 continue;
             };
+            let protocol = mesh_protocol(endpoint.protocol)?;
 
             let mut issuers: BTreeSet<String> = BTreeSet::new();
             if let Some(consumers) = consumers_by_provider.get(&(id, provide_name.clone())) {
@@ -245,11 +246,15 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             {
                 issuers.insert(router_identity.id.clone());
             }
+            if protocol == MeshProtocol::Http
+                && let Some(router_identity) = router_identity.as_ref()
+            {
+                issuers.insert(router_identity.id.clone());
+            }
             if issuers.is_empty() {
                 continue;
             }
 
-            let protocol = mesh_protocol(endpoint.protocol)?;
             inbound.push(InboundRoute {
                 route_id: component_route_id(&identity.id, provide_name, protocol),
                 capability: provide_name.clone(),

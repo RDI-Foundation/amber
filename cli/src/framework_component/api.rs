@@ -363,11 +363,21 @@ pub(crate) fn snapshot(
     live_scenario_ir
         .manifest_catalog
         .retain(|key, _| required_catalog_keys.contains(key));
-    normalize_scenario_ir_order(&mut live_scenario_ir);
+    let component_id_map = normalize_scenario_ir_order(&mut live_scenario_ir);
+    let monikers_by_component_id = live_scenario_ir
+        .components
+        .iter()
+        .map(|component| (component.id, component.moniker.clone()))
+        .collect::<BTreeMap<_, _>>();
     let mut assignments = state.placement.assignments.clone();
     for child in visible_child_records(state) {
         assignments.extend(child.assignments.clone());
     }
+    let framework_children = framework_child_snapshot_records_with_component_map(
+        state,
+        &component_id_map,
+        &monikers_by_component_id,
+    )?;
     Ok(SnapshotResponse {
         scenario: serde_json::to_value(&live_scenario_ir)
             .expect("live scenario snapshot should serialize"),
@@ -375,6 +385,7 @@ pub(crate) fn snapshot(
             "offered_sites": state.placement.offered_sites,
             "defaults": state.placement.defaults,
             "assignments": assignments,
+            "framework_children": framework_children,
         }),
         dynamic_capabilities: serde_json::to_value(dynamic_caps::dynamic_capability_snapshot(
             state,
@@ -389,7 +400,6 @@ pub(super) struct ResolvedTemplateBinding {
     pub(super) slot_decl: amber_manifest::SlotDecl,
     pub(super) sources: Vec<ResolvedBindingSource>,
     pub(super) source_child_id: Option<u64>,
-    pub(super) dynamic_child_output: Option<DynamicChildOutputSource>,
 }
 
 #[derive(Clone)]
@@ -398,13 +408,4 @@ pub(super) struct SyntheticSourceRecord {
     pub(super) actual_source: BindingFrom,
     pub(super) source_child_id: Option<u64>,
     pub(super) weak: bool,
-}
-
-#[derive(Clone)]
-pub(super) struct DynamicChildOutputSource {
-    pub(super) provider_component: String,
-    pub(super) provide: String,
-    pub(super) protocol: String,
-    pub(super) capability_kind: String,
-    pub(super) capability_profile: Option<String>,
 }

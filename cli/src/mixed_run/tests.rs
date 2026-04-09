@@ -1680,6 +1680,100 @@ fn ensure_dynamic_proxy_export_component_routes_in_artifact_adds_provider_route(
 }
 
 #[test]
+fn ensure_router_access_to_component_local_routes_in_artifact_adds_router_trust() {
+    let temp = tempdir().expect("tempdir should be created");
+    let artifact_root = temp.path();
+    write_json(
+        &artifact_root.join("mesh-provision-plan.json"),
+        &MeshProvisionPlan {
+            version: "2".to_string(),
+            identity_seed: None,
+            existing_peer_identities: Vec::new(),
+            targets: vec![amber_mesh::MeshProvisionTarget {
+                kind: MeshProvisionTargetKind::Component,
+                config: amber_mesh::MeshConfigTemplate {
+                    identity: amber_mesh::MeshIdentityTemplate {
+                        id: "/job/root".to_string(),
+                        mesh_scope: Some("scope".to_string()),
+                    },
+                    mesh_listen: SocketAddr::from(([127, 0, 0, 1], 23000)),
+                    control_listen: None,
+                    dynamic_caps_listen: Some(SocketAddr::from(([127, 0, 0, 1], 19000))),
+                    control_allow: None,
+                    peers: Vec::new(),
+                    inbound: vec![
+                        InboundRoute {
+                            route_id: component_route_id("/job/root", "http", MeshProtocol::Http),
+                            capability: "http".to_string(),
+                            capability_kind: Some("http".to_string()),
+                            capability_profile: None,
+                            protocol: MeshProtocol::Http,
+                            http_plugins: Vec::new(),
+                            target: InboundTarget::Local { port: 8080 },
+                            allowed_issuers: Vec::new(),
+                        },
+                        InboundRoute {
+                            route_id: "external".to_string(),
+                            capability: "external".to_string(),
+                            capability_kind: Some("http".to_string()),
+                            capability_profile: None,
+                            protocol: MeshProtocol::Http,
+                            http_plugins: Vec::new(),
+                            target: InboundTarget::External {
+                                url_env: "UPSTREAM".to_string(),
+                                optional: false,
+                            },
+                            allowed_issuers: Vec::new(),
+                        },
+                    ],
+                    outbound: Vec::new(),
+                    transport: TransportConfig::NoiseIk {},
+                },
+                output: MeshProvisionOutput::Filesystem {
+                    dir: "mesh/components/c8-root".to_string(),
+                },
+            }],
+        },
+    )
+    .expect("mesh provision plan should be written");
+
+    ensure_dynamic_proxy_export_component_routes_in_artifact(
+        artifact_root,
+        &BTreeMap::new(),
+        "/site/direct_local/router",
+    )
+    .expect("router trust should be projected into component local routes");
+
+    let filtered: MeshProvisionPlan = read_json(
+        &artifact_root.join("mesh-provision-plan.json"),
+        "mesh provision plan",
+    )
+    .expect("mesh provision plan should be readable");
+    let component = filtered
+        .targets
+        .iter()
+        .find(|target| matches!(target.kind, MeshProvisionTargetKind::Component))
+        .expect("component target should remain");
+    assert_eq!(
+        component
+            .config
+            .peers
+            .iter()
+            .map(|peer| peer.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/site/direct_local/router"]
+    );
+    assert_eq!(
+        component.config.inbound[0].allowed_issuers,
+        vec!["/site/direct_local/router".to_string()]
+    );
+    assert!(
+        component.config.inbound[1].allowed_issuers.is_empty(),
+        "only local component routes should be opened to the site router"
+    );
+}
+
+#[test]
 fn add_dynamic_proxy_export_overlay_routes_rewrites_existing_export_route() {
     let mut inbound_routes = vec![InboundRoute {
         route_id: router_dynamic_export_route_id("/job/root", "http", MeshProtocol::Http),
@@ -2807,6 +2901,34 @@ fn bridge_proxy_external_url_uses_consumer_aware_host() {
             host_service_host_for_consumer(SiteKind::Kubernetes)
         )
     );
+}
+
+#[test]
+fn router_mesh_addr_for_container_consumers_uses_projected_host() {
+    assert_eq!(
+        router_mesh_addr_for_consumer(SiteKind::Direct, SiteKind::Compose, "127.0.0.1:24000")
+            .expect("compose consumer router addr should be valid"),
+        "host.docker.internal:24000"
+    );
+    assert_eq!(
+        router_mesh_addr_for_consumer(SiteKind::Direct, SiteKind::Kubernetes, "127.0.0.1:25000")
+            .expect("kubernetes consumer router addr should be valid"),
+        format!(
+            "{}:25000",
+            container_host_for_consumer(SiteKind::Direct, SiteKind::Kubernetes)
+        )
+    );
+}
+
+#[test]
+fn router_mesh_addr_for_local_consumers_preserves_existing_port() {
+    let rewritten =
+        router_mesh_addr_for_consumer(SiteKind::Direct, SiteKind::Direct, "127.0.0.1:26000")
+            .expect("local consumer router addr should be valid");
+    #[cfg(target_os = "linux")]
+    assert_eq!(rewritten, "10.0.2.2:26000");
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(rewritten, "127.0.0.1:26000");
 }
 
 #[test]

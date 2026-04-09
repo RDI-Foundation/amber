@@ -68,9 +68,10 @@ use crate::mixed_run::{
     LaunchedSite, LiveComponentRuntimeMetadata, SiteActuatorPlan, SiteReceipt,
     clear_desired_overlay_for_consumer, clear_desired_overlay_for_provider,
     collect_live_component_runtime_metadata, host_service_bind_addr_for_consumer,
-    host_service_host_for_consumer, launched_site_from_receipt, parse_control_endpoint,
-    project_kubernetes_dynamic_child_artifact_files, read_json as read_run_json,
-    resolve_link_external_url_for_output, site_actuator_child_root_for_site, site_state_path,
+    host_service_host_for_consumer, launched_site_from_receipt, load_live_site_router_mesh_config,
+    parse_control_endpoint, project_kubernetes_dynamic_child_artifact_files,
+    read_json as read_run_json, resolve_link_external_url_for_output,
+    router_mesh_addr_for_consumer, site_actuator_child_root_for_site, site_state_path,
     stop_bridge_proxies, update_desired_overlay_for_consumer, update_desired_overlay_for_provider,
 };
 

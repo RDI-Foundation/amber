@@ -2,6 +2,8 @@ use std::fs;
 
 use amber_compiler::run_plan::build_run_plan;
 use amber_mesh::{
+    InboundRoute, InboundTarget, MeshConfigPublic, MeshIdentityPublic, MeshPeer, MeshProtocol,
+    OutboundRoute, TransportConfig,
     component_protocol::BindingInput,
     dynamic_caps::{
         self as mesh_dynamic_caps, DynamicCapabilitiesSnapshotIr, DynamicCapabilityRefClaims,
@@ -175,6 +177,8 @@ struct SnapshotPlacementFixture {
     assignments: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dynamic_capabilities: Option<DynamicCapabilitiesSnapshotIr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    framework_children: Option<serde_json::Value>,
 }
 
 fn placement_from_snapshot(snapshot: &SnapshotResponse) -> PlacementFile {
@@ -195,6 +199,7 @@ fn placement_from_snapshot(snapshot: &SnapshotResponse) -> PlacementFile {
         defaults: placement.defaults,
         components: placement.assignments,
         dynamic_capabilities,
+        framework_children: placement.framework_children,
     }
 }
 
@@ -421,8 +426,392 @@ async fn compile_dynamic_caps_binding_state() -> FrameworkControlState {
         },
         components: BTreeMap::new(),
         dynamic_capabilities: None,
+        framework_children: None,
     };
     compile_control_state_from_ir_with_run_id(scenario, Some(&placement), "test-run").await
+}
+
+fn test_live_component_runtime(
+    moniker: &str,
+    peer_id: &str,
+    host_mesh_addr: &str,
+    inbound: Vec<InboundRoute>,
+    outbound: Vec<OutboundRoute>,
+) -> LiveComponentRuntimeMetadata {
+    LiveComponentRuntimeMetadata {
+        moniker: moniker.to_string(),
+        host_mesh_addr: host_mesh_addr.to_string(),
+        mesh_config: MeshConfigPublic {
+            identity: MeshIdentityPublic {
+                id: peer_id.to_string(),
+                public_key: [7; 32],
+                mesh_scope: None,
+            },
+            mesh_listen: "127.0.0.1:0".parse().expect("mesh listen addr"),
+            control_listen: None,
+            dynamic_caps_listen: None,
+            control_allow: None,
+            peers: Vec::new(),
+            inbound,
+            outbound,
+            transport: TransportConfig::NoiseIk {},
+        },
+    }
+}
+
+fn test_live_site_router(inbound: Vec<InboundRoute>) -> MeshConfigPublic {
+    MeshConfigPublic {
+        identity: MeshIdentityPublic {
+            id: "/router".to_string(),
+            public_key: [11; 32],
+            mesh_scope: None,
+        },
+        mesh_listen: "127.0.0.1:0".parse().expect("mesh listen addr"),
+        control_listen: None,
+        dynamic_caps_listen: None,
+        control_allow: None,
+        peers: Vec::new(),
+        inbound,
+        outbound: Vec::new(),
+        transport: TransportConfig::NoiseIk {},
+    }
+}
+
+#[test]
+fn dynamic_capability_origin_self_provide_routes_via_component_mesh() {
+    let runtime = test_live_component_runtime(
+        "/provider",
+        "/provider",
+        "127.0.0.1:24001",
+        vec![InboundRoute {
+            route_id: "provider-route".to_string(),
+            capability: "provider.api".to_string(),
+            capability_kind: Some("http".to_string()),
+            capability_profile: None,
+            protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
+            target: InboundTarget::Local { port: 20000 },
+            allowed_issuers: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    let site_components = BTreeMap::from([(runtime.moniker.clone(), runtime.clone())]);
+    let site_router = test_live_site_router(Vec::new());
+
+    let (route, capability, protocol) = dynamic_capability_origin_route_surface(
+        &runtime,
+        &site_components,
+        &site_router,
+        SiteKind::Direct,
+        "dynamic-origin",
+        &RootAuthoritySelectorIr::SelfProvide {
+            component_id: "/provider".to_string(),
+            provide_name: "provider.api".to_string(),
+        },
+        vec!["peer-consumer".to_string()],
+    )
+    .expect("self-provide origin surface should resolve");
+
+    assert_eq!(capability, "provider.api");
+    assert_eq!(protocol, MeshProtocol::Http);
+    assert_eq!(route.route_id, "dynamic-origin");
+    assert_eq!(route.allowed_issuers, vec!["peer-consumer".to_string()]);
+    assert_eq!(route.http_plugins, Vec::new());
+    assert_eq!(
+        route.target,
+        InboundTarget::MeshForward {
+            peer_addr: "127.0.0.1:24001".to_string(),
+            peer_id: "/provider".to_string(),
+            route_id: "provider-route".to_string(),
+            capability: "provider.api".to_string(),
+        }
+    );
+}
+
+#[test]
+fn dynamic_capability_origin_binding_routes_same_site_provider_via_mesh() {
+    let holder_runtime = test_live_component_runtime(
+        "/consumer",
+        "/consumer",
+        "127.0.0.1:24002",
+        Vec::new(),
+        vec![OutboundRoute {
+            route_id: "provider-route".to_string(),
+            slot: "provider".to_string(),
+            capability_kind: Some("http".to_string()),
+            capability_profile: None,
+            listen_port: 20000,
+            listen_addr: None,
+            protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
+            peer_addr: "10.0.2.2:24099".to_string(),
+            peer_id: "/provider".to_string(),
+            capability: "provider.api".to_string(),
+        }],
+    );
+    let provider_runtime = test_live_component_runtime(
+        "/provider",
+        "/provider",
+        "127.0.0.1:24001",
+        Vec::new(),
+        Vec::new(),
+    );
+    let site_components = BTreeMap::from([
+        (holder_runtime.moniker.clone(), holder_runtime.clone()),
+        (provider_runtime.moniker.clone(), provider_runtime.clone()),
+    ]);
+    let site_router = test_live_site_router(Vec::new());
+
+    let (route, capability, protocol) = dynamic_capability_origin_route_surface(
+        &holder_runtime,
+        &site_components,
+        &site_router,
+        SiteKind::Direct,
+        "dynamic-origin",
+        &RootAuthoritySelectorIr::Binding {
+            consumer_component_id: "components./consumer".to_string(),
+            slot_name: "provider".to_string(),
+            provider_component_id: "components./provider".to_string(),
+            provider_capability_name: "provider.api".to_string(),
+        },
+        vec!["peer-consumer".to_string()],
+    )
+    .expect("binding origin surface should resolve");
+
+    assert_eq!(capability, "provider.api");
+    assert_eq!(protocol, MeshProtocol::Http);
+    assert_eq!(
+        route.target,
+        InboundTarget::MeshForward {
+            peer_addr: "127.0.0.1:24001".to_string(),
+            peer_id: "/provider".to_string(),
+            route_id: "provider-route".to_string(),
+            capability: "provider.api".to_string(),
+        }
+    );
+}
+
+#[test]
+fn dynamic_capability_origin_external_slot_routes_via_router_external_target() {
+    let runtime = test_live_component_runtime(
+        "/consumer",
+        "/consumer",
+        "127.0.0.1:24002",
+        Vec::new(),
+        vec![OutboundRoute {
+            route_id: "router:external:catalog_api:http".to_string(),
+            slot: "catalog_api".to_string(),
+            capability_kind: Some("http".to_string()),
+            capability_profile: Some("debug-external".to_string()),
+            listen_port: 20000,
+            listen_addr: None,
+            protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
+            peer_addr: "10.0.2.2:24077".to_string(),
+            peer_id: "/router".to_string(),
+            capability: "catalog_api".to_string(),
+        }],
+    );
+    let site_components = BTreeMap::from([(runtime.moniker.clone(), runtime.clone())]);
+    let site_router = test_live_site_router(vec![InboundRoute {
+        route_id: "router:external:catalog_api:http".to_string(),
+        capability: "catalog_api".to_string(),
+        capability_kind: Some("http".to_string()),
+        capability_profile: Some("debug-external".to_string()),
+        protocol: MeshProtocol::Http,
+        http_plugins: Vec::new(),
+        target: InboundTarget::External {
+            url_env: "AMBER_EXTERNAL_SLOT_CATALOG_API_URL".to_string(),
+            optional: false,
+        },
+        allowed_issuers: vec!["/consumer".to_string()],
+    }]);
+
+    let (route, capability, protocol) = dynamic_capability_origin_route_surface(
+        &runtime,
+        &site_components,
+        &site_router,
+        SiteKind::Direct,
+        "dynamic-origin",
+        &RootAuthoritySelectorIr::ExternalSlotBinding {
+            consumer_component_id: "components./consumer".to_string(),
+            slot_name: "catalog_api".to_string(),
+            external_slot_component_id: "components./".to_string(),
+            external_slot_name: "catalog_api".to_string(),
+        },
+        vec!["peer-consumer".to_string()],
+    )
+    .expect("external slot origin surface should resolve");
+
+    assert_eq!(capability, "catalog_api");
+    assert_eq!(protocol, MeshProtocol::Http);
+    assert_eq!(route.route_id, "router:external:catalog_api:http");
+    assert_eq!(route.allowed_issuers, vec!["peer-consumer".to_string()]);
+    assert_eq!(
+        route.target,
+        InboundTarget::External {
+            url_env: "AMBER_EXTERNAL_SLOT_CATALOG_API_URL".to_string(),
+            optional: false,
+        }
+    );
+}
+
+#[test]
+fn dynamic_capability_origin_binding_rewrites_linux_slirp_peer_addr_for_host_router() {
+    let runtime = test_live_component_runtime(
+        "/consumer",
+        "/consumer",
+        "127.0.0.1:24002",
+        Vec::new(),
+        vec![OutboundRoute {
+            route_id: "remote-route".to_string(),
+            slot: "provider".to_string(),
+            capability_kind: Some("http".to_string()),
+            capability_profile: None,
+            listen_port: 20000,
+            listen_addr: None,
+            protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
+            peer_addr: "10.0.2.2:24077".to_string(),
+            peer_id: "/remote".to_string(),
+            capability: "provider.api".to_string(),
+        }],
+    );
+    let site_components = BTreeMap::from([(runtime.moniker.clone(), runtime.clone())]);
+    let site_router = test_live_site_router(Vec::new());
+
+    let (route, _, _) = dynamic_capability_origin_route_surface(
+        &runtime,
+        &site_components,
+        &site_router,
+        SiteKind::Direct,
+        "dynamic-origin",
+        &RootAuthoritySelectorIr::Binding {
+            consumer_component_id: "components./consumer".to_string(),
+            slot_name: "provider".to_string(),
+            provider_component_id: "components./remote".to_string(),
+            provider_capability_name: "provider.api".to_string(),
+        },
+        vec!["peer-consumer".to_string()],
+    )
+    .expect("binding origin surface should resolve");
+
+    let InboundTarget::MeshForward { peer_addr, .. } = route.target else {
+        panic!("dynamic origin route should forward through mesh");
+    };
+    #[cfg(target_os = "linux")]
+    assert_eq!(peer_addr, "127.0.0.1:24077");
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(peer_addr, "10.0.2.2:24077");
+}
+
+#[test]
+fn dynamic_capability_origin_target_mesh_peer_uses_self_identity_for_self_provide() {
+    let runtime = test_live_component_runtime(
+        "/provider",
+        "/provider",
+        "127.0.0.1:24001",
+        vec![InboundRoute {
+            route_id: "provider-route".to_string(),
+            capability: "provider.api".to_string(),
+            capability_kind: Some("http".to_string()),
+            capability_profile: None,
+            protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
+            target: InboundTarget::Local { port: 20000 },
+            allowed_issuers: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    let site_components = BTreeMap::from([(runtime.moniker.clone(), runtime.clone())]);
+    let site_router = test_live_site_router(Vec::new());
+    let (route, _, _) = dynamic_capability_origin_route_surface(
+        &runtime,
+        &site_components,
+        &site_router,
+        SiteKind::Direct,
+        "dynamic-origin",
+        &RootAuthoritySelectorIr::SelfProvide {
+            component_id: "/provider".to_string(),
+            provide_name: "provider.api".to_string(),
+        },
+        vec!["peer-consumer".to_string()],
+    )
+    .expect("self-provide origin surface should resolve");
+
+    let peer = dynamic_capability_origin_target_mesh_peer(&runtime, &site_components, &route)
+        .expect("self-provide target peer should resolve")
+        .expect("mesh-forward targets should expose a peer");
+
+    assert_eq!(peer.id, "/provider");
+    assert_eq!(peer.public_key, [7; 32]);
+}
+
+#[test]
+fn dynamic_capability_origin_target_mesh_peer_uses_runtime_peer_catalog_for_binding() {
+    let provider_identity = MeshIdentityPublic {
+        id: "/provider".to_string(),
+        public_key: [9; 32],
+        mesh_scope: None,
+    };
+    let runtime = LiveComponentRuntimeMetadata {
+        moniker: "/consumer".to_string(),
+        host_mesh_addr: "127.0.0.1:24002".to_string(),
+        mesh_config: MeshConfigPublic {
+            identity: MeshIdentityPublic {
+                id: "/consumer".to_string(),
+                public_key: [7; 32],
+                mesh_scope: None,
+            },
+            mesh_listen: "127.0.0.1:0".parse().expect("mesh listen addr"),
+            control_listen: None,
+            dynamic_caps_listen: None,
+            control_allow: None,
+            peers: vec![MeshPeer {
+                id: provider_identity.id.clone(),
+                public_key: provider_identity.public_key,
+            }],
+            inbound: Vec::new(),
+            outbound: vec![OutboundRoute {
+                route_id: "provider-route".to_string(),
+                slot: "provider".to_string(),
+                capability_kind: Some("http".to_string()),
+                capability_profile: None,
+                listen_port: 20000,
+                listen_addr: None,
+                protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
+                peer_addr: "10.0.2.2:24099".to_string(),
+                peer_id: "/provider".to_string(),
+                capability: "provider.api".to_string(),
+            }],
+            transport: TransportConfig::NoiseIk {},
+        },
+    };
+    let site_components = BTreeMap::from([(runtime.moniker.clone(), runtime.clone())]);
+    let site_router = test_live_site_router(Vec::new());
+    let (route, _, _) = dynamic_capability_origin_route_surface(
+        &runtime,
+        &site_components,
+        &site_router,
+        SiteKind::Direct,
+        "dynamic-origin",
+        &RootAuthoritySelectorIr::Binding {
+            consumer_component_id: "components./consumer".to_string(),
+            slot_name: "provider".to_string(),
+            provider_component_id: "components./provider".to_string(),
+            provider_capability_name: "provider.api".to_string(),
+        },
+        vec!["peer-consumer".to_string()],
+    )
+    .expect("binding origin surface should resolve");
+
+    let peer = dynamic_capability_origin_target_mesh_peer(&runtime, &site_components, &route)
+        .expect("binding target peer should resolve")
+        .expect("mesh-forward targets should expose a peer");
+
+    assert_eq!(peer.id, provider_identity.id);
+    assert_eq!(peer.public_key, provider_identity.public_key);
 }
 
 async fn compile_dynamic_caps_external_root_state() -> FrameworkControlState {
@@ -523,6 +912,7 @@ async fn compile_dynamic_caps_external_root_state() -> FrameworkControlState {
         },
         components: BTreeMap::new(),
         dynamic_capabilities: None,
+        framework_children: None,
     };
     compile_control_state_from_ir_with_run_id(scenario, Some(&placement), "test-run").await
 }
@@ -621,6 +1011,7 @@ async fn same_site_dynamic_child_output_bindings_reuse_provider_component_routes
         },
         components: BTreeMap::new(),
         dynamic_capabilities: None,
+        framework_children: None,
     };
     let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
@@ -778,6 +1169,7 @@ async fn same_site_static_child_export_bindings_reuse_provider_component_routes(
         },
         components: BTreeMap::new(),
         dynamic_capabilities: None,
+        framework_children: None,
     };
     let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
@@ -947,6 +1339,7 @@ fn empty_live_child(
         template_name: Some("worker".to_string()),
         selected_manifest_catalog_key: None,
         fragment: None,
+        input_bindings: Vec::new(),
         assignments: BTreeMap::new(),
         site_plans: Vec::new(),
         overlay_ids: Vec::new(),
@@ -1363,6 +1756,7 @@ async fn create_snapshot_and_destroy_exact_child() {
         },
         components: BTreeMap::from([("/job-b".to_string(), "direct_b".to_string())]),
         dynamic_capabilities: None,
+        framework_children: None,
     };
 
     let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -1670,8 +2064,34 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
     let replay_state_path = dir.path().join("replay-control-state.json");
     write_control_state(&replay_state_path, &replayed).expect("replay state should write");
     let replay_root_authority = replayed.base_scenario.root;
+    assert_eq!(replayed.live_children.len(), 1);
+    assert_eq!(replayed.live_children[0].name, "job-open");
+    assert_eq!(replayed.live_children[0].state, ChildState::Live);
+    assert!(
+        replayed.live_children[0].fragment.is_some(),
+        "replay should restore the child fragment as authoritative semantic state",
+    );
+    assert!(
+        !replayed.live_children[0].site_plans.is_empty(),
+        "replay should rebuild derived site plans from the restored child fragment",
+    );
+    assert!(
+        list_children(&replayed, replay_root_authority)
+            .children
+            .iter()
+            .any(|child| child.name == "job-open" && child.state == ChildState::Live),
+        "replay should rebuild authoritative live child records",
+    );
 
     let replay_scenario = decode_live_scenario(&replayed).expect("replayed scenario");
+    assert_eq!(
+        replay_scenario
+            .components_iter()
+            .filter(|(_, component)| component.moniker.as_str() == "/job-open")
+            .count(),
+        1,
+        "replay should not duplicate live child fragments into the snapshot scenario",
+    );
     let replay_child = replay_scenario
         .components_iter()
         .find(|(_, component)| component.moniker.as_str() == "/job-open")
@@ -2686,6 +3106,7 @@ async fn snapshot_is_stable_across_dynamic_create_order() {
             ("/job-b".to_string(), "direct_b".to_string()),
         ]),
         dynamic_capabilities: None,
+        framework_children: None,
     };
     let mut state_a = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let mut state_b = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -2813,6 +3234,7 @@ async fn create_rejects_unoffered_backend_without_committing_child_state() {
         },
         components: BTreeMap::new(),
         dynamic_capabilities: None,
+        framework_children: None,
     };
     let err = build_run_plan(&compiled, Some(&placement))
         .expect_err("run planning should reject future direct children without a direct site");
@@ -2925,6 +3347,7 @@ async fn destroy_retracted_tears_down_sites_concurrently() {
         },
         components: BTreeMap::new(),
         dynamic_capabilities: None,
+        framework_children: None,
     };
 
     let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -2946,6 +3369,7 @@ async fn destroy_retracted_tears_down_sites_concurrently() {
                 template_name: Some("fixture".to_string()),
                 selected_manifest_catalog_key: None,
                 fragment: None,
+                input_bindings: Vec::new(),
                 assignments: BTreeMap::new(),
                 site_plans: vec![
                     DynamicSitePlanRecord {
@@ -3055,6 +3479,7 @@ async fn create_committed_hidden_publishes_independent_sites_concurrently() {
         },
         components: BTreeMap::new(),
         dynamic_capabilities: None,
+        framework_children: None,
     };
 
     let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -3076,6 +3501,7 @@ async fn create_committed_hidden_publishes_independent_sites_concurrently() {
                 template_name: Some("fixture".to_string()),
                 selected_manifest_catalog_key: None,
                 fragment: None,
+                input_bindings: Vec::new(),
                 assignments: BTreeMap::new(),
                 site_plans: vec![
                     DynamicSitePlanRecord {
@@ -3201,6 +3627,7 @@ async fn concurrent_distinct_creates_commit_both_children() {
         },
         components: BTreeMap::new(),
         dynamic_capabilities: None,
+        framework_children: None,
     };
     let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
@@ -3336,6 +3763,7 @@ async fn prepare_child_record_uses_frozen_dynamic_placement_assignments() {
         },
         components: BTreeMap::from([("/job".to_string(), "kind_local".to_string())]),
         dynamic_capabilities: None,
+        framework_children: None,
     };
 
     let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -3565,6 +3993,7 @@ async fn prepare_child_record_preserves_cross_backend_matrix_assignments() {
             ("/job-compose/vm_helper".to_string(), "vm_local".to_string()),
         ]),
         dynamic_capabilities: None,
+        framework_children: None,
     };
 
     let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
@@ -4260,6 +4689,7 @@ async fn recover_control_state_surfaces_create_prepared_rollback_failures() {
         },
         components: BTreeMap::new(),
         dynamic_capabilities: None,
+        framework_children: None,
     };
     let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
@@ -4276,6 +4706,7 @@ async fn recover_control_state_surfaces_create_prepared_rollback_failures() {
             template_name: Some("worker".to_string()),
             selected_manifest_catalog_key: None,
             fragment: None,
+            input_bindings: Vec::new(),
             assignments: BTreeMap::new(),
             site_plans: vec![DynamicSitePlanRecord {
                 site_id: "direct_local".to_string(),
@@ -4357,6 +4788,93 @@ async fn recover_control_state_promotes_create_committed_hidden_children_to_live
         recovered.journal.last().map(|entry| entry.state),
         Some(ChildState::Live)
     );
+}
+
+#[tokio::test]
+async fn recover_control_state_does_not_republish_live_children() {
+    let dir = TempDir::new().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    write_file(
+        &root_path,
+        r#"
+            {
+              manifest_version: "0.3.0",
+              program: { path: "/bin/echo", args: ["root"] },
+            }
+            "#,
+    );
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([(
+            "direct_local".to_string(),
+            SiteDefinition {
+                kind: SiteKind::Direct,
+                context: None,
+            },
+        )]),
+        defaults: PlacementDefaults {
+            path: Some("direct_local".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::new(),
+        dynamic_capabilities: None,
+        framework_children: None,
+    };
+    let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+    let state_path = dir.path().join("control-state.json");
+    let root_authority = state.base_scenario.root;
+    state.live_children.push(LiveChildRecord {
+        child_id: 1,
+        authority_realm_id: root_authority,
+        name: "live".to_string(),
+        state: ChildState::Live,
+        template_name: Some("worker".to_string()),
+        selected_manifest_catalog_key: None,
+        fragment: None,
+        input_bindings: Vec::new(),
+        assignments: BTreeMap::new(),
+        site_plans: vec![DynamicSitePlanRecord {
+            site_id: "direct_local".to_string(),
+            kind: SiteKind::Direct,
+            router_identity_id: "/site/direct_local/router".to_string(),
+            component_ids: Vec::new(),
+            assigned_components: Vec::new(),
+            artifact_files: BTreeMap::new(),
+            desired_artifact_files: BTreeMap::new(),
+            proxy_exports: BTreeMap::new(),
+            routed_inputs: Vec::new(),
+        }],
+        overlay_ids: Vec::new(),
+        overlays: Vec::new(),
+        outputs: BTreeMap::new(),
+    });
+    write_control_state(&state_path, &state).expect("state should write");
+    let app = test_control_state_app(&dir, state, state_path);
+    let (actuators, mut publish_starts, _barrier) =
+        install_barrier_publish_site_actuator(&app).await;
+
+    recover_control_state(&app)
+        .await
+        .expect("recovery should leave live children alone");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), publish_starts.recv())
+            .await
+            .is_err(),
+        "live recovery should not call publish again",
+    );
+    let recovered = app.control_state.lock().await.clone();
+    assert_eq!(recovered.live_children.len(), 1);
+    assert_eq!(recovered.live_children[0].name, "live");
+    assert_eq!(recovered.live_children[0].state, ChildState::Live);
+    assert!(
+        recovered.journal.is_empty(),
+        "live recovery should not append synthetic journal entries",
+    );
+    for actuator in actuators {
+        actuator.abort();
+    }
 }
 
 #[tokio::test]

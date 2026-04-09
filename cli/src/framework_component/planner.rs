@@ -74,6 +74,7 @@ pub(super) async fn prepare_child_record(
         template_name: Some(request.template.clone()),
         selected_manifest_catalog_key: Some(selected_manifest_catalog_key),
         fragment: Some(fragment),
+        input_bindings: child_input_binding_records(&live_scenario, &resolved_bindings),
         assignments: BTreeMap::new(),
         site_plans: Vec::new(),
         overlay_ids: Vec::new(),
@@ -82,18 +83,42 @@ pub(super) async fn prepare_child_record(
     };
 
     let fragment = child.fragment.as_ref().expect("fragment set");
+    let combined_scenario = scenario_with_fragment(&current_live_scenario_ir, fragment)?;
+    rebuild_live_child_runtime_metadata(
+        state,
+        &combined_scenario,
+        &live_assignment_map(state),
+        &mut child,
+    )?;
+    Ok(child)
+}
+
+pub(super) fn rebuild_live_child_runtime_metadata(
+    state: &FrameworkControlState,
+    scenario: &Scenario,
+    existing_assignments: &BTreeMap<String, String>,
+    child: &mut LiveChildRecord,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let fragment = child.fragment.as_ref().ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "dynamic child `{}` is missing its authoritative live fragment",
+                child.name
+            ),
+        )
+    })?;
     let fragment_component_ids = fragment
         .components
         .iter()
         .map(|component| ComponentId(component.id))
         .collect::<BTreeSet<_>>();
-    let combined_scenario = scenario_with_fragment(&current_live_scenario_ir, fragment)?;
     let planned = plan_dynamic_fragment(
-        &combined_scenario,
+        scenario,
         &fragment_component_ids,
         &placement_file_from_state(state),
         &run_plan_activation_from_state(state),
-        &live_assignment_map(state),
+        existing_assignments,
     )
     .map_err(|err| {
         protocol_error(
@@ -103,28 +128,22 @@ pub(super) async fn prepare_child_record(
     })?;
     child.assignments = planned.assignments;
     child.overlays = dynamic_overlay_records(&planned.incident_links, fragment);
-    let mut live_assignments = live_assignment_map(state);
+    let mut live_assignments = existing_assignments.clone();
     live_assignments.extend(child.assignments.clone());
-    let routed_inputs = dynamic_input_route_records(
-        &combined_scenario,
-        &live_assignments,
-        fragment,
-        &resolved_bindings,
-    );
     child.site_plans = dynamic_site_plans(
         &planned.site_plans,
         &child.assignments,
         fragment,
         &child.outputs,
         &child.overlays,
-        &routed_inputs,
+        &dynamic_input_route_records(&live_assignments, fragment, &child.input_bindings),
     )?;
     child.overlay_ids = child
         .overlays
         .iter()
         .map(|overlay| overlay.overlay_id.clone())
         .collect();
-    Ok(child)
+    Ok(())
 }
 
 pub(super) fn remove_incident_bindings_from_survivors(
@@ -944,7 +963,6 @@ pub(super) fn resolve_template_bindings(
                 slot_decl,
                 sources: candidate.sources.clone(),
                 source_child_id: candidate.source_child_id,
-                dynamic_child_output: candidate.dynamic_child_output.clone(),
             }))
         })
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -1428,11 +1446,37 @@ pub(super) fn dynamic_site_plans(
     Ok(site_plans)
 }
 
-pub(super) fn dynamic_input_route_records(
+pub(super) fn child_input_binding_records(
     scenario: &Scenario,
+    resolved_bindings: &[ResolvedTemplateBinding],
+) -> Vec<ChildInputBindingRecord> {
+    resolved_bindings
+        .iter()
+        .map(|binding| ChildInputBindingRecord {
+            slot: binding.slot_name.clone(),
+            decl: binding.slot_decl.decl.clone(),
+            sources: binding
+                .sources
+                .iter()
+                .map(|source| ChildInputBindingSourceRecord {
+                    from: BindingFromIr::from(&source.from),
+                    component_moniker: match &source.from {
+                        BindingFrom::Component(ProvideRef { component, .. }) => {
+                            Some(scenario.component(*component).moniker.to_string())
+                        }
+                        _ => None,
+                    },
+                    weak: source.weak,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+pub(super) fn dynamic_input_route_records(
     assignments: &BTreeMap<String, String>,
     fragment: &LiveScenarioFragment,
-    resolved_bindings: &[ResolvedTemplateBinding],
+    input_bindings: &[ChildInputBindingRecord],
 ) -> Vec<DynamicInputRouteRecord> {
     let Some(root_component) = fragment
         .components
@@ -1449,47 +1493,34 @@ pub(super) fn dynamic_input_route_records(
         .iter()
         .map(|component| component.moniker.as_str())
         .collect::<BTreeSet<_>>();
-    resolved_bindings
+    input_bindings
         .iter()
         .filter_map(|binding| {
-            let component_source = binding.dynamic_child_output.clone().or_else(|| {
-                let ResolvedBindingSource {
-                    from: BindingFrom::Component(ProvideRef { component, name }),
-                    ..
-                } = binding.sources.first()?.clone()
-                else {
-                    return None;
-                };
-                if binding.sources.len() != 1 {
-                    return None;
-                }
-                let provider_component = scenario.component(component).moniker.to_string();
-                let protocol = match binding.slot_decl.decl.kind.transport() {
-                    CapabilityTransport::Http => "http",
-                    CapabilityTransport::NonNetwork => return None,
-                    _ => return None,
-                };
-                Some(DynamicChildOutputSource {
-                    provider_component,
-                    provide: name,
-                    protocol: protocol.to_string(),
-                    capability_kind: binding.slot_decl.decl.kind.to_string(),
-                    capability_profile: binding.slot_decl.decl.profile.clone(),
-                })
-            })?;
-            let provider_site = assignments.get(component_source.provider_component.as_str())?;
-            if fragment_components.contains(component_source.provider_component.as_str()) {
+            let [source] = binding.sources.as_slice() else {
+                return None;
+            };
+            let BindingFromIr::Component { provide, .. } = &source.from else {
+                return None;
+            };
+            let provider_component = source.component_moniker.as_ref()?;
+            if fragment_components.contains(provider_component.as_str()) {
                 return None;
             }
+            let provider_site = assignments.get(provider_component.as_str())?;
+            let protocol = match binding.decl.kind.transport() {
+                CapabilityTransport::Http => "http",
+                CapabilityTransport::NonNetwork => return None,
+                _ => return None,
+            };
             (provider_site == child_site).then(|| DynamicInputRouteRecord {
                 component: root_component.moniker.clone(),
-                slot: binding.slot_name.clone(),
-                provider_component: component_source.provider_component,
-                protocol: component_source.protocol,
-                capability_kind: component_source.capability_kind,
-                capability_profile: component_source.capability_profile,
+                slot: binding.slot.clone(),
+                provider_component: provider_component.clone(),
+                protocol: protocol.to_string(),
+                capability_kind: binding.decl.kind.to_string(),
+                capability_profile: binding.decl.profile.clone(),
                 target: DynamicInputRouteTarget::ComponentProvide {
-                    provide: component_source.provide,
+                    provide: provide.clone(),
                 },
             })
         })
@@ -2078,7 +2109,6 @@ pub(super) struct BindableSourceCandidate {
     pub(super) decl: CapabilityDecl,
     pub(super) sources: Vec<ResolvedBindingSource>,
     pub(super) source_child_id: Option<u64>,
-    pub(super) dynamic_child_output: Option<DynamicChildOutputSource>,
 }
 
 pub(super) fn placement_file_from_state(state: &FrameworkControlState) -> PlacementFile {
@@ -2093,6 +2123,7 @@ pub(super) fn placement_file_from_state(state: &FrameworkControlState) -> Placem
         defaults: state.placement.defaults.clone(),
         components,
         dynamic_capabilities: None,
+        framework_children: None,
     }
 }
 
@@ -2197,12 +2228,16 @@ pub(super) fn live_scenario_ir(
         for component in &fragment.components {
             components.insert(component.id, component.clone());
         }
-        bindings.extend(
-            fragment
-                .bindings
-                .iter()
-                .map(|binding| binding.binding.clone()),
-        );
+        let mut seen_binding_keys = bindings
+            .iter()
+            .map(binding_identity_key)
+            .collect::<BTreeSet<_>>();
+        for binding in &fragment.bindings {
+            let key = binding_identity_key(&binding.binding);
+            if seen_binding_keys.insert(key) {
+                bindings.push(binding.binding.clone());
+            }
+        }
     }
 
     for component in components.values_mut() {
@@ -2264,7 +2299,7 @@ pub(super) fn decode_live_scenario(
     })
 }
 
-pub(super) fn normalize_scenario_ir_order(scenario_ir: &mut ScenarioIr) {
+pub(super) fn normalize_scenario_ir_order(scenario_ir: &mut ScenarioIr) -> BTreeMap<usize, usize> {
     scenario_ir.components.sort_by(|left, right| {
         left.moniker
             .cmp(&right.moniker)
@@ -2344,6 +2379,7 @@ pub(super) fn normalize_scenario_ir_order(scenario_ir: &mut ScenarioIr) {
     scenario_ir
         .exports
         .sort_by(|left, right| left.name.cmp(&right.name));
+    id_map
 }
 
 pub(super) fn binding_sort_key(binding: &BindingIr, monikers: &BTreeMap<usize, String>) -> String {
@@ -2381,6 +2417,10 @@ pub(super) fn binding_sort_key(binding: &BindingIr, monikers: &BTreeMap<usize, S
         source,
         binding.weak
     )
+}
+
+pub(super) fn binding_identity_key(binding: &BindingIr) -> String {
+    serde_json::to_string(binding).expect("binding identity should serialize")
 }
 
 pub(super) fn live_child_component_owner(
@@ -2430,7 +2470,6 @@ pub(super) fn bindable_source_candidates(
             decl: slot.decl.clone(),
             sources: slot_binding_sources(scenario, authority_realm, name),
             source_child_id: None,
-            dynamic_child_output: None,
         });
     }
 
@@ -2450,7 +2489,6 @@ pub(super) fn bindable_source_candidates(
                     weak: false,
                 }],
                 source_child_id: None,
-                dynamic_child_output: None,
             }),
     );
     out.extend(
@@ -2469,7 +2507,6 @@ pub(super) fn bindable_source_candidates(
                     weak: false,
                 }],
                 source_child_id: None,
-                dynamic_child_output: None,
             }),
     );
     out.extend(static_child_export_candidates(
@@ -2489,7 +2526,6 @@ pub(super) fn bindable_source_candidates(
                 decl: output.decl.clone(),
                 sources: output_sources_from_record(output)?,
                 source_child_id: Some(child.child_id),
-                dynamic_child_output: dynamic_child_output_source(child, output),
             });
         }
     }
@@ -2521,7 +2557,6 @@ pub(super) fn bindable_source_candidates(
                                 weak: true,
                             }],
                             source_child_id: None,
-                            dynamic_child_output: None,
                         })
                 }),
         );
@@ -2595,7 +2630,6 @@ pub(super) fn static_child_export_candidates(
                 decl: resolved.decl,
                 sources: resolved.sources,
                 source_child_id: None,
-                dynamic_child_output: None,
             });
         }
     }
@@ -2774,36 +2808,6 @@ pub(super) fn child_alias<'a>(parent_moniker: &str, child_moniker: &'a str) -> O
             .strip_prefix('/')?
     };
     remainder.split('/').find(|segment| !segment.is_empty())
-}
-
-pub(super) fn dynamic_child_output_source(
-    child: &LiveChildRecord,
-    output: &OutputHandleRecord,
-) -> Option<DynamicChildOutputSource> {
-    let BindingFromIr::Component { component, provide } = output.sources.first()?.from.clone()
-    else {
-        return None;
-    };
-    let provider_component = child
-        .fragment
-        .as_ref()?
-        .components
-        .iter()
-        .find(|candidate| candidate.id == component)?
-        .moniker
-        .clone();
-    let protocol = match output.decl.kind.transport() {
-        CapabilityTransport::Http => "http",
-        CapabilityTransport::NonNetwork => return None,
-        _ => return None,
-    };
-    Some(DynamicChildOutputSource {
-        provider_component,
-        provide,
-        protocol: protocol.to_string(),
-        capability_kind: output.decl.kind.to_string(),
-        capability_profile: output.decl.profile.clone(),
-    })
 }
 
 pub(super) fn find_bindable_source<'a>(

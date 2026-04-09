@@ -322,9 +322,11 @@ pub(super) async fn control_dynamic_resolve_origin(
         })?;
     let holder_runtime =
         dynamic_capability_component_runtime_endpoint(&app, &state, &request.holder_component_id)?;
+    let holder_plan = load_site_actuator_plan(&app, &holder_runtime.site_id)?;
     let origin_runtime =
         dynamic_capability_component_runtime_endpoint(&app, &state, &root.holder_component_id)?;
     let origin_site_id = origin_runtime.site_id.clone();
+    let origin_plan = load_site_actuator_plan(&app, &origin_site_id)?;
     let origin_manager_state = load_site_manager_state(&app, &origin_site_id)?;
     let origin_peer_id = origin_manager_state
         .router_identity_id
@@ -352,7 +354,7 @@ pub(super) async fn control_dynamic_resolve_origin(
         })?;
     let origin_peer_addr = origin_manager_state
         .router_mesh_addr
-        .clone()
+        .as_deref()
         .ok_or_else(|| {
             ProtocolApiError::from(protocol_error(
                 ProtocolErrorCode::OriginUnavailable,
@@ -361,6 +363,18 @@ pub(super) async fn control_dynamic_resolve_origin(
                      dynamic capability publication"
                 ),
             ))
+        })
+        .and_then(|router_mesh_addr| {
+            router_mesh_addr_for_consumer(origin_plan.kind, holder_plan.kind, router_mesh_addr)
+                .map_err(|err| {
+                    ProtocolApiError::from(protocol_error(
+                        ProtocolErrorCode::OriginUnavailable,
+                        &format!(
+                            "site `{origin_site_id}` exposes an invalid live router mesh address \
+                             for dynamic capability publication: {err}"
+                        ),
+                    ))
+                })
         })?;
     let overlay_suffix = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({
@@ -397,7 +411,7 @@ pub(super) async fn control_dynamic_resolve_origin(
     Ok(Json(dynamic_caps::ControlDynamicResolveOriginResponse {
         held_id,
         descriptor: resolved_source.descriptor,
-        origin_route_id: route_id,
+        origin_route_id: publish.route_id,
         origin_capability: publish.capability,
         origin_protocol: publish.protocol,
         origin_peer_id,

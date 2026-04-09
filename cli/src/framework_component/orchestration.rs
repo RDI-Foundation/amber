@@ -1,4 +1,7 @@
-use amber_mesh::{InboundRoute, InboundTarget, MeshPeer};
+use amber_mesh::{
+    InboundRoute, InboundTarget, MeshConfigPublic, MeshPeer, OutboundRoute,
+    router_external_route_id,
+};
 
 use super::{http::*, planner::*, state::*, *};
 
@@ -418,6 +421,9 @@ pub(super) fn dynamic_capability_component_runtime_endpoint(
 
 pub(super) fn dynamic_capability_origin_route_surface(
     runtime: &LiveComponentRuntimeMetadata,
+    site_components: &BTreeMap<String, LiveComponentRuntimeMetadata>,
+    site_router: &MeshConfigPublic,
+    site_kind: SiteKind,
     route_id: &str,
     root_authority_selector: &RootAuthoritySelectorIr,
     allowed_issuers: Vec<String>,
@@ -441,9 +447,21 @@ pub(super) fn dynamic_capability_origin_route_surface(
                         ),
                     )
                 })?;
-            let mut route = static_route.clone();
-            route.route_id = route_id.to_string();
-            route.allowed_issuers = allowed_issuers;
+            let route = InboundRoute {
+                route_id: route_id.to_string(),
+                capability: static_route.capability.clone(),
+                capability_kind: static_route.capability_kind.clone(),
+                capability_profile: static_route.capability_profile.clone(),
+                protocol: static_route.protocol,
+                http_plugins: static_route.http_plugins.clone(),
+                target: InboundTarget::MeshForward {
+                    peer_addr: runtime.host_mesh_addr.clone(),
+                    peer_id: runtime.mesh_config.identity.id.clone(),
+                    route_id: static_route.route_id.clone(),
+                    capability: static_route.capability.clone(),
+                },
+                allowed_issuers,
+            };
             Ok((
                 route,
                 static_route.capability.clone(),
@@ -453,11 +471,6 @@ pub(super) fn dynamic_capability_origin_route_surface(
         RootAuthoritySelectorIr::Binding {
             slot_name,
             provider_capability_name,
-            ..
-        }
-        | RootAuthoritySelectorIr::ExternalSlotBinding {
-            slot_name,
-            external_slot_name: provider_capability_name,
             ..
         } => {
             let route = amber_mesh::dynamic_caps::exact_root_outbound_route(
@@ -492,6 +505,8 @@ pub(super) fn dynamic_capability_origin_route_surface(
                 ),
             })?
             .expect("self-provide roots should be handled before outbound route resolution");
+            let peer_addr =
+                dynamic_capability_origin_mesh_peer_addr(site_components, site_kind, route);
             Ok((
                 InboundRoute {
                     route_id: route_id.to_string(),
@@ -500,8 +515,11 @@ pub(super) fn dynamic_capability_origin_route_surface(
                     capability_profile: route.capability_profile.clone(),
                     protocol: route.protocol,
                     http_plugins: Vec::new(),
-                    target: InboundTarget::Local {
-                        port: route.listen_port,
+                    target: InboundTarget::MeshForward {
+                        peer_addr,
+                        peer_id: route.peer_id.clone(),
+                        route_id: route.route_id.clone(),
+                        capability: route.capability.clone(),
                     },
                     allowed_issuers,
                 },
@@ -509,6 +527,101 @@ pub(super) fn dynamic_capability_origin_route_surface(
                 route.protocol,
             ))
         }
+        RootAuthoritySelectorIr::ExternalSlotBinding {
+            external_slot_name, ..
+        } => {
+            let static_route_id = router_external_route_id(external_slot_name);
+            let static_route = site_router
+                .inbound
+                .iter()
+                .find(|route| {
+                    route.route_id == static_route_id
+                        && route.capability == *external_slot_name
+                        && matches!(route.target, InboundTarget::External { .. })
+                })
+                .ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::OriginUnavailable,
+                        &format!(
+                            "live external slot origin `{external_slot_name}` is unavailable for \
+                             component `{}`",
+                            runtime.moniker
+                        ),
+                    )
+                })?;
+            let mut route = static_route.clone();
+            route.allowed_issuers = allowed_issuers;
+            Ok((
+                route,
+                static_route.capability.clone(),
+                static_route.protocol,
+            ))
+        }
+    }
+}
+
+fn dynamic_capability_origin_mesh_peer_addr(
+    site_components: &BTreeMap<String, LiveComponentRuntimeMetadata>,
+    site_kind: SiteKind,
+    route: &OutboundRoute,
+) -> String {
+    if let Some(peer_runtime) = site_components
+        .values()
+        .find(|component| component.mesh_config.identity.id == route.peer_id)
+    {
+        return peer_runtime.host_mesh_addr.clone();
+    }
+    if matches!(site_kind, SiteKind::Direct | SiteKind::Vm) {
+        #[cfg(target_os = "linux")]
+        if let Ok(addr) = route.peer_addr.parse::<SocketAddr>()
+            && addr.ip() == Ipv4Addr::new(10, 0, 2, 2)
+        {
+            return SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port())).to_string();
+        }
+    }
+    route.peer_addr.clone()
+}
+
+pub(super) fn dynamic_capability_origin_target_mesh_peer(
+    runtime: &LiveComponentRuntimeMetadata,
+    site_components: &BTreeMap<String, LiveComponentRuntimeMetadata>,
+    route: &InboundRoute,
+) -> std::result::Result<Option<MeshPeer>, ProtocolErrorResponse> {
+    let InboundTarget::MeshForward { peer_id, .. } = &route.target else {
+        return Ok(None);
+    };
+    if peer_id == &runtime.mesh_config.identity.id {
+        return Ok(Some(MeshPeer {
+            id: runtime.mesh_config.identity.id.clone(),
+            public_key: runtime.mesh_config.identity.public_key,
+        }));
+    }
+    if let Some(peer) = runtime
+        .mesh_config
+        .peers
+        .iter()
+        .find(|peer| peer.id == *peer_id)
+    {
+        return Ok(Some(peer.clone()));
+    }
+    if let Some(peer_runtime) = site_components
+        .values()
+        .find(|component| component.mesh_config.identity.id == *peer_id)
+    {
+        return Ok(Some(MeshPeer {
+            id: peer_runtime.mesh_config.identity.id.clone(),
+            public_key: peer_runtime.mesh_config.identity.public_key,
+        }));
+    }
+    Err(protocol_error(
+        ProtocolErrorCode::OriginUnavailable,
+        &format!("dynamic capability origin target peer `{peer_id}` is unavailable"),
+    ))
+}
+
+fn push_unique_mesh_peer(peers: &mut Vec<MeshPeer>, peer: MeshPeer) {
+    if peers.iter().all(|existing| existing.id != peer.id) {
+        peers.push(peer);
     }
 }
 
@@ -557,8 +670,8 @@ pub(super) async fn publish_dynamic_capability_origin_local(
         } => consumer_component_id.clone(),
     };
     let holder_moniker = dynamic_caps::moniker_from_logical_component_id(&holder_component_id)?;
-    let runtime = collect_live_component_runtime_metadata(&site_plan)
-        .map_err(|err| {
+    let mut site_components =
+        collect_live_component_runtime_metadata(&site_plan).map_err(|err| {
             protocol_error(
                 ProtocolErrorCode::OriginUnavailable,
                 &format!(
@@ -566,18 +679,26 @@ pub(super) async fn publish_dynamic_capability_origin_local(
                     site_plan.site_id
                 ),
             )
-        })?
-        .remove(holder_moniker)
-        .ok_or_else(|| {
-            protocol_error(
-                ProtocolErrorCode::OriginUnavailable,
-                &format!(
-                    "live runtime metadata for root holder `{holder_component_id}` is unavailable \
-                     on site `{}`",
-                    site_plan.site_id
-                ),
-            )
         })?;
+    let site_router = load_live_site_router_mesh_config(&site_plan).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::OriginUnavailable,
+            &format!(
+                "failed to collect live router metadata on site `{}`: {err}",
+                site_plan.site_id
+            ),
+        )
+    })?;
+    let runtime = site_components.remove(holder_moniker).ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::OriginUnavailable,
+            &format!(
+                "live runtime metadata for root holder `{holder_component_id}` is unavailable on \
+                 site `{}`",
+                site_plan.site_id
+            ),
+        )
+    })?;
     let manager_state = load_site_manager_state_at(&app.site_state_root)?;
     let router_control = manager_state.router_control.ok_or_else(|| {
         protocol_error(
@@ -604,11 +725,20 @@ pub(super) async fn publish_dynamic_capability_origin_local(
         .collect::<Vec<_>>();
     let (route, capability, protocol) = dynamic_capability_origin_route_surface(
         &runtime,
+        &site_components,
+        &site_router,
+        site_plan.kind,
         &request.route_id,
         &request.root_authority_selector,
         allowed_issuers,
     )?;
-    let peers = dynamic_capability_allowed_mesh_peers(&request.allowed_peers)?;
+    let published_route_id = route.route_id.clone();
+    let mut peers = dynamic_capability_allowed_mesh_peers(&request.allowed_peers)?;
+    if let Some(target_peer) =
+        dynamic_capability_origin_target_mesh_peer(&runtime, &site_components, &route)?
+    {
+        push_unique_mesh_peer(&mut peers, target_peer);
+    }
     apply_route_overlay_with_retry(
         &endpoint,
         &request.overlay_id,
@@ -627,6 +757,7 @@ pub(super) async fn publish_dynamic_capability_origin_local(
         ))
     })?;
     Ok(dynamic_caps::PublishDynamicCapabilityOriginResponse {
+        route_id: published_route_id,
         capability,
         protocol: match protocol {
             MeshProtocol::Http => "http",
@@ -705,6 +836,28 @@ pub(super) async fn publish_child_on_site(
         "publish child",
     )
     .await
+}
+
+fn site_actuator_child_needs_prepare(err: &ProtocolErrorResponse, child_id: u64) -> bool {
+    err.code == ProtocolErrorCode::PublishFailed
+        && err
+            .message
+            .contains(&format!("site actuator child {child_id} is not prepared"))
+}
+
+pub(super) async fn publish_child_on_site_with_prepare_retry(
+    app: &ControlStateApp,
+    child_id: u64,
+    site_plan: &DynamicSitePlanRecord,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    match publish_child_on_site(app, child_id, site_plan).await {
+        Ok(()) => Ok(()),
+        Err(err) if site_actuator_child_needs_prepare(&err, child_id) => {
+            prepare_child_on_site(app, child_id, site_plan).await?;
+            publish_child_on_site(app, child_id, site_plan).await
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub(super) async fn rollback_child_on_site(
@@ -1278,7 +1431,7 @@ pub(super) async fn continue_create_committed_hidden(
                 .clone();
             let site_id = site_id.clone();
             publish_tasks.spawn(async move {
-                publish_child_on_site(&app, child_id, &site_plan)
+                publish_child_on_site_with_prepare_retry(&app, child_id, &site_plan)
                     .await
                     .map(|_| site_id)
             });
@@ -1629,9 +1782,8 @@ pub(super) async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
                     .map_err(|err| miette::miette!(err.message))?;
             }
             ChildState::Live => {
-                continue_create_committed_hidden(app, child.child_id)
-                    .await
-                    .map_err(|err| miette::miette!(err.message))?;
+                // Live children have already completed publication. Replaying that publish step
+                // on control-state startup can duplicate an already materialized child runtime.
             }
             ChildState::DestroyRequested => {
                 continue_destroy_requested(app, child.child_id)

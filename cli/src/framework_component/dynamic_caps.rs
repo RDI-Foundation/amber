@@ -145,6 +145,7 @@ pub(crate) struct PublishDynamicCapabilityOriginRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PublishDynamicCapabilityOriginResponse {
+    pub(crate) route_id: String,
     pub(crate) capability: String,
     pub(crate) protocol: String,
 }

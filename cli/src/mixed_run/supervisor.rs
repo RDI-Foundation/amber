@@ -1909,6 +1909,37 @@ pub(crate) fn host_service_bind_addr_for_consumer(
     host_proxy_bind_addr(consumer_needs_host_wide_listener(consumer_kind), port)
 }
 
+pub(crate) fn router_mesh_addr_for_consumer(
+    provider_kind: SiteKind,
+    consumer_kind: SiteKind,
+    router_mesh_addr: &str,
+) -> Result<String> {
+    match consumer_kind {
+        SiteKind::Compose | SiteKind::Kubernetes => {
+            let addr = router_mesh_addr
+                .parse::<SocketAddr>()
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("invalid live router mesh address `{router_mesh_addr}`")
+                })?;
+            let host = container_host_for_consumer(provider_kind, consumer_kind);
+            Ok(format!("{host}:{}", addr.port()))
+        }
+        SiteKind::Direct | SiteKind::Vm => {
+            #[cfg(target_os = "linux")]
+            {
+                Ok(crate::direct_runtime::rewrite_peer_addr_for_slirp_gateway(
+                    router_mesh_addr,
+                ))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Ok(router_mesh_addr.to_string())
+            }
+        }
+    }
+}
+
 pub(super) fn host_proxy_bind_addr(needs_host_wide_listener: bool, port: u16) -> SocketAddr {
     if needs_host_wide_listener {
         SocketAddr::from(([0, 0, 0, 0], port))

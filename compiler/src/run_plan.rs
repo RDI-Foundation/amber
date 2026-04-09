@@ -16,6 +16,7 @@ use amber_scenario::{
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::Digest as _;
 use thiserror::Error;
 use url::Url;
@@ -60,6 +61,8 @@ pub struct RunPlan {
     pub assignments: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_capabilities: Option<DynamicCapabilitiesSnapshotIr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework_children: Option<Value>,
     pub sites: BTreeMap<String, RunSitePlan>,
     pub links: Vec<RunLink>,
     pub startup_waves: Vec<Vec<String>>,
@@ -142,6 +145,8 @@ pub struct PlacementFile {
     pub components: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_capabilities: Option<DynamicCapabilitiesSnapshotIr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework_children: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,6 +479,7 @@ pub fn build_run_plan_with_activation(
         assignments,
         dynamic_capabilities: placement
             .and_then(|placement| placement.dynamic_capabilities.clone()),
+        framework_children: placement.and_then(|placement| placement.framework_children.clone()),
         sites,
         links,
         startup_waves,
@@ -523,6 +529,7 @@ pub fn build_homogeneous_export_run_plan(
         },
         components: BTreeMap::new(),
         dynamic_capabilities: None,
+        framework_children: None,
     };
     build_run_plan(compiled, Some(&placement))
 }

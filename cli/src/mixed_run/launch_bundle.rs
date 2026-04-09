@@ -922,11 +922,6 @@ pub(crate) async fn run_run_plan_with_id(
         observability,
         site_launch_env,
     )?;
-    let framework_control_state_receipt = start_materialized_framework_control_state(
-        &run_root,
-        launch_bundle.framework_control_state.as_ref(),
-    )
-    .await?;
     let observability_receipt =
         start_materialized_observability(&run_root, launch_bundle.observability.as_ref()).await?;
     init_manager_telemetry(
@@ -945,6 +940,7 @@ pub(crate) async fn run_run_plan_with_id(
         ],
     );
 
+    let mut framework_control_state_receipt = None;
     let mut launched_by_site = BTreeMap::<String, LaunchedSite>::new();
     let mut started_site_receipts = BTreeMap::<String, SiteReceipt>::new();
     let mut supervisor_children = BTreeMap::<String, SupervisorChild>::new();
@@ -1005,6 +1001,12 @@ pub(crate) async fn run_run_plan_with_id(
                 sleep(delay).await;
             }
         }
+
+        framework_control_state_receipt = start_materialized_framework_control_state(
+            &run_root,
+            launch_bundle.framework_control_state.as_ref(),
+        )
+        .await?;
 
         write_commit_marker(&run_root)?;
         emit_manager_event(
