@@ -20,7 +20,7 @@ fn experimental_features_parse() {
     let manifest: Manifest = r#"
         {
           manifest_version: "0.1.0",
-          experimental_features: ["docker", "policies"],
+          experimental_features: ["docker", "governance"],
         }
         "#
     .parse()
@@ -34,7 +34,7 @@ fn experimental_features_parse() {
     assert!(
         manifest
             .experimental_features()
-            .contains(&ExperimentalFeature::Policies)
+            .contains(&ExperimentalFeature::Governance)
     );
 }
 

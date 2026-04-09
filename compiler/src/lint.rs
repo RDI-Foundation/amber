@@ -1366,7 +1366,7 @@ mod tests {
         let input = r#"
         {
           manifest_version: "0.1.0",
-          experimental_features: ["policies"],
+          experimental_features: ["governance"],
           use: {
             wrapper: "./wrapper.json5",
           },
@@ -1386,7 +1386,7 @@ mod tests {
         let input = r##"
         {
           manifest_version: "0.1.0",
-          experimental_features: ["policies"],
+          experimental_features: ["governance"],
           use: {
             wrapper: "./wrapper.json5",
           },

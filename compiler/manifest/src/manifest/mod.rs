@@ -84,7 +84,7 @@ pub struct RawManifest {
 pub enum ExperimentalFeature {
     Docker,
     Kvm,
-    Policies,
+    Governance,
 }
 
 impl fmt::Display for ExperimentalFeature {
@@ -92,7 +92,7 @@ impl fmt::Display for ExperimentalFeature {
         match self {
             ExperimentalFeature::Docker => f.write_str("docker"),
             ExperimentalFeature::Kvm => f.write_str("kvm"),
-            ExperimentalFeature::Policies => f.write_str("policies"),
+            ExperimentalFeature::Governance => f.write_str("governance"),
         }
     }
 }
@@ -914,12 +914,16 @@ impl RawManifest {
         validate_program_syntax_manifest_version(&manifest_version, program.as_ref())?;
 
         if !r#use.is_empty() {
-            require_section_feature("use", ExperimentalFeature::Policies, &experimental_features)?;
+            require_section_feature(
+                "use",
+                ExperimentalFeature::Governance,
+                &experimental_features,
+            )?;
         }
         if !policies.is_empty() {
             require_section_feature(
                 "policies",
-                ExperimentalFeature::Policies,
+                ExperimentalFeature::Governance,
                 &experimental_features,
             )?;
         }
