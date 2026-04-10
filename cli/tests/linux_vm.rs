@@ -89,6 +89,18 @@ impl ProvisionProfile {
                      if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then\n\
                        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n\
                      fi\n\
+                     if ! rustup toolchain list | grep -q '^nightly-2025-10-30'; then\n\
+                       for attempt in 1 2 3 4 5; do\n\
+                         if rustup toolchain install nightly-2025-10-30 --profile minimal \\\n\
+                           --component rustfmt --component clippy; then\n\
+                           break\n\
+                         fi\n\
+                         if [ \"$attempt\" -eq 5 ]; then\n\
+                           exit 1\n\
+                         fi\n\
+                         sleep \"$((attempt * 2))\"\n\
+                       done\n\
+                     fi\n\
                      sudo systemctl enable --now docker\n\
                      sudo usermod -aG docker {user}\n\
                      if ! command -v kind >/dev/null 2>&1 || ! kind --version | grep -q '{kind_version}'; then\n\
@@ -655,6 +667,15 @@ impl LinuxVmHarness {
         let workspace_root = workspace_root();
         let base_image = host_cloud_image_path();
         ensure_host_cloud_image_exists(&base_image)?;
+        let base_image_name = base_image
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "invalid Linux VM base image path {}; missing file name",
+                    base_image.display()
+                )
+            })?;
         run_checked(
             Command::new("/usr/bin/tar")
                 .current_dir(&workspace_root)
@@ -663,6 +684,7 @@ impl LinuxVmHarness {
                 .arg(&archive)
                 .arg("--exclude=./target")
                 .arg("--exclude=./.git")
+                .arg(format!("--exclude=./{base_image_name}"))
                 .arg("--exclude=._*")
                 .arg("--exclude=*/._*")
                 .arg("."),
@@ -770,11 +792,14 @@ impl LinuxVmHarness {
              -name 'mixed-run-*' | sort | tail -n 1)\"\nif [ -z \"$latest\" ]; \
              then\nlatest=\"$(find \"$outputs\" -maxdepth 1 -type d | sort | tail -n 1)\"\nfi\nif \
              [ -z \"$latest\" ]; then\nexit 0\nfi\necho \"latest guest test output: \
-             $latest\"\nfind \"$latest\" -maxdepth 3 -type f | sort\nwhile IFS= read -r path; \
-             do\necho \"----- $path -----\"\nsed -n '1,220p' \"$path\"\ndone < <(find \
-             \"$latest/state\" -maxdepth 2 -type f \\( -name 'manager-state.json' -o -name \
-             'supervisor.log' -o -name 'port-forward.log' -o -name 'site.log' \\) 2>/dev/null | \
-             sort)\n"
+             $latest\"\nfind \"$latest\" -maxdepth 3 -type f | sort\nfor state_root in \
+             \"$latest/state\" \"$latest/replay-state\"; do\nif [ ! -d \"$state_root\" ]; \
+             then\ncontinue\nfi\necho \"===== state root: $state_root =====\"\nwhile IFS= read -r \
+             path; do\necho \"----- $path -----\"\nsed -n '1,220p' \"$path\"\ndone < <(find \
+             \"$state_root\" -type f \\( -name 'manager-state.json' -o -name \
+             'direct-runtime-state.json' -o -name 'vm-runtime-state.json' -o -name \
+             'supervisor.log' -o -name 'port-forward.log' -o -name 'site.log' -o -name \
+             'control-state.log' \\) 2>/dev/null | sort)\ndone\n"
         );
         self.ssh_output(&script)
             .ok()
@@ -947,6 +972,37 @@ fn linux_vm_runs_mixed_run_tests() {
             inside the guest"]
 fn linux_vm_runs_framework_component_live_tests() {
     run_linux_guest_mixed_run_filter("framework_component_").unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability live tests \
+            inside the guest"]
+fn linux_vm_runs_dynamic_capability_live_tests() {
+    run_linux_guest_mixed_run_filter("dynamic_capabilities_").unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability manual \
+            materialization live test inside the guest"]
+fn linux_vm_runs_dynamic_capabilities_manual_materialization_live() {
+    run_linux_guest_mixed_run_test("dynamic_capabilities_manual_materialization_live")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability external \
+            slot root share live test inside the guest"]
+fn linux_vm_runs_dynamic_capabilities_external_slot_root_share_live() {
+    run_linux_guest_mixed_run_test("dynamic_capabilities_external_slot_root_share_live")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability snapshot \
+            replay dynamic child live test inside the guest"]
+fn linux_vm_runs_dynamic_capabilities_snapshot_replay_dynamic_child_live() {
+    run_linux_guest_mixed_run_test("dynamic_capabilities_snapshot_replay_dynamic_child_live")
+        .unwrap_or_else(|err| panic!("{err}"));
 }
 
 #[test]

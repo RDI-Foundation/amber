@@ -821,6 +821,43 @@ fn rewrite_peer_addr_for_slirp_gateway_rewrites_loopback_only() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn rewrite_loopback_url_for_slirp_gateway_rewrites_loopback_only() {
+    assert_eq!(
+        rewrite_loopback_url_for_slirp_gateway("http://127.0.0.1:23000/base?x=1"),
+        "http://10.0.2.2:23000/base?x=1"
+    );
+    assert_eq!(
+        rewrite_loopback_url_for_slirp_gateway("http://localhost:24000"),
+        "http://10.0.2.2:24000/"
+    );
+    assert_eq!(
+        rewrite_loopback_url_for_slirp_gateway("http://192.168.1.10:25000/path"),
+        "http://192.168.1.10:25000/path"
+    );
+    assert_eq!(
+        rewrite_loopback_url_for_slirp_gateway("not-a-url"),
+        "not-a-url"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rewrite_sidecar_env_passthrough_for_slirp_rewrites_only_dynamic_caps_control_url() {
+    assert_eq!(
+        rewrite_sidecar_env_passthrough_for_slirp(
+            amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV,
+            "http://127.0.0.1:25000/v1/control-state"
+        ),
+        "http://10.0.2.2:25000/v1/control-state"
+    );
+    assert_eq!(
+        rewrite_sidecar_env_passthrough_for_slirp("UNRELATED_ENV", "http://127.0.0.1:25000"),
+        "http://127.0.0.1:25000"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn slirp4netns_add_hostfwd_payload_uses_guest_default_address() {
     let payload = slirp4netns_add_hostfwd_payload(23000);
     assert_eq!(payload["execute"], "add_hostfwd");

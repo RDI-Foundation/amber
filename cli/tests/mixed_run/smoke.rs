@@ -745,6 +745,54 @@ fn framework_control_state_path(run: &RunHandle) -> PathBuf {
         .join("control-state.json")
 }
 
+fn framework_control_state_plan_path(run: &RunHandle) -> PathBuf {
+    run.run_root
+        .join("state")
+        .join("framework-component")
+        .join("control-state-plan.json")
+}
+
+fn framework_control_state_post(run: &RunHandle, path: &str, payload: &Value) -> (u16, String) {
+    let plan = read_json(&framework_control_state_plan_path(run));
+    let listen_addr = plan["listen_addr"]
+        .as_str()
+        .expect("framework control-state plan should publish listen_addr");
+    let auth_token = plan["auth_token"]
+        .as_str()
+        .expect("framework control-state plan should publish auth token");
+    let body = serde_json::to_string(payload).expect("request body should serialize");
+    let output = std::process::Command::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("30.000")
+        .arg("-X")
+        .arg("POST")
+        .arg("-H")
+        .arg("content-type: application/json")
+        .arg("-H")
+        .arg(format!("x-amber-framework-auth: {auth_token}"))
+        .arg("--data")
+        .arg(body)
+        .arg("-o")
+        .arg("-")
+        .arg("-w")
+        .arg("\n%{http_code}")
+        .arg(format!("http://{listen_addr}{path}"))
+        .output()
+        .expect("framework control-state request should complete");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (body, status) = stdout
+        .rsplit_once('\n')
+        .expect("framework control-state response should include HTTP status");
+    (
+        status
+            .trim()
+            .parse()
+            .expect("framework control-state status should parse"),
+        body.trim().to_string(),
+    )
+}
+
 fn wait_for_live_child(control_state_path: &Path, name: &str) -> u64 {
     wait_for_condition(
         Duration::from_secs(60),
@@ -1385,6 +1433,10 @@ fn write_snapshot_run_inputs(root: &Path, snapshot: &Value) -> (PathBuf, PathBuf
                 .cloned()
                 .unwrap_or_else(|| json!({})),
             "dynamic_capabilities": snapshot["dynamic_capabilities"],
+            "framework_children": snapshot["placement"]
+                .get("framework_children")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         }),
     );
     (scenario_path, placement_path)
@@ -5775,43 +5827,105 @@ fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
         },
         "replayed child `job-replay` in the replayed scenario graph",
     );
-    wait_for_condition(
-        Duration::from_secs(60),
-        || {
-            http_get(child_port, "/id")
-                .is_some_and(|(status, body)| status == 200 && body == "child")
-        },
-        "replayed child `job-replay` HTTP endpoint",
+    wait_for_live_child(&replay_control_state, "job-replay");
+    let replay_held = response_json_from(
+        framework_control_state_post(
+            &replay_run,
+            "/v1/control-state/dynamic-caps/held",
+            &json!({
+                "holder_component_id": "components./job-replay"
+            }),
+        ),
+        "replay child held list",
     );
-
-    let replay_held = app_get_json(child_port, "/held");
     let replay_grant = delegated_held_id_from_component(&replay_held, "components./provider");
-    let (replay_materialize_status, replay_materialize_body) = app_post_json(
-        child_port,
-        "/materialize",
-        &json!({ "held_id": replay_grant }),
+
+    let replay_provider_root = held_id_with_kind(
+        &app_get_json(replay_provider_proxy_port, "/held"),
+        "root_authority",
     );
-    let replay_materialized = response_json(
-        replay_materialize_status,
-        &replay_materialize_body,
-        "replay child materialization",
+    let replay_share = response_json_from(
+        app_post_json(
+            replay_provider_proxy_port,
+            "/share",
+            &json!({
+                "source_kind": "held_id",
+                "value": replay_provider_root,
+                "recipient": "components./job-replay"
+            }),
+        ),
+        "share to replayed child",
     );
-    let replay_handle = replay_materialized["url"]
+    assert!(
+        matches!(
+            replay_share["outcome"].as_str(),
+            Some("created" | "deduplicated")
+        ),
+        "replay share should create or deduplicate a live grant: {replay_share}"
+    );
+    let replay_ref = replay_share["ref"]
         .as_str()
-        .expect("replay child materialization should return a url");
-    let (replay_call_status, replay_call_body) = app_post_json(
-        child_port,
-        "/call-url",
-        &json!({ "url": replay_handle, "suffix": "/id" }),
+        .expect("replay share should return a ref");
+    let replay_grant_id = replay_share["grant_id"]
+        .as_str()
+        .expect("replay share should return a grant id");
+
+    let replay_ref_detail = response_json_from(
+        framework_control_state_post(
+            &replay_run,
+            "/v1/control-state/dynamic-caps/inspect-ref",
+            &json!({
+                "holder_component_id": "components./job-replay",
+                "ref": replay_ref
+            }),
+        ),
+        "replay child ref inspection",
+    );
+    assert_eq!(replay_ref_detail["state"], "live");
+    assert_eq!(
+        replay_ref_detail["holder_component_id"],
+        "components./job-replay"
+    );
+    assert_eq!(replay_ref_detail["grant_id"], replay_grant_id);
+    let replay_shared_held_id = replay_ref_detail["held_id"]
+        .as_str()
+        .expect("replay ref inspection should return a held id")
+        .to_string();
+
+    let replay_held_detail = response_json_from(
+        framework_control_state_post(
+            &replay_run,
+            "/v1/control-state/dynamic-caps/held/detail",
+            &json!({
+                "holder_component_id": "components./job-replay",
+                "held_id": replay_shared_held_id
+            }),
+        ),
+        "replay child held detail",
+    );
+    assert_eq!(replay_held_detail["held_id"], replay_shared_held_id);
+    assert_eq!(replay_held_detail["state"], "live");
+    assert_eq!(
+        replay_held_detail["sharer_component_id"],
+        "components./provider"
     );
     assert_eq!(
-        replay_call_status, 200,
-        "replayed child should re-materialize the restored grant: {replay_call_body}"
+        replay_held_detail["holder_component_id"],
+        "components./job-replay"
     );
-    assert_eq!(replay_call_body, "provider");
+    assert!(
+        replay_shared_held_id == replay_grant || replay_share["outcome"] == "created",
+        "replay should either reuse the restored grant or create a new live one"
+    );
 
-    let (old_ref_status, old_ref_body) =
-        app_post_json(child_port, "/inspect-ref", &json!({ "ref": old_ref }));
+    let (old_ref_status, old_ref_body) = framework_control_state_post(
+        &replay_run,
+        "/v1/control-state/dynamic-caps/inspect-ref",
+        &json!({
+            "holder_component_id": "components./job-replay",
+            "ref": old_ref
+        }),
+    );
     assert_eq!(
         old_ref_status, 400,
         "old run refs should be rejected after replay"

@@ -44,6 +44,7 @@ use base64::Engine as _;
 use miette::{Context as _, IntoDiagnostic as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpListener as TokioTcpListener,
@@ -422,6 +423,7 @@ struct SiteActuatorState {
 #[derive(Clone, Debug)]
 pub(crate) struct LiveComponentRuntimeMetadata {
     pub(crate) moniker: String,
+    pub(crate) host_mesh_addr: String,
     pub(crate) mesh_config: MeshConfigPublic,
 }
 
@@ -1568,6 +1570,128 @@ fn compose_services_mut<'a>(
         })
 }
 
+fn compose_networks_mut<'a>(
+    document: &'a mut serde_yaml::Value,
+    path: &Path,
+) -> Result<Option<&'a mut serde_yaml::Mapping>> {
+    let Some(root) = document.as_mapping_mut() else {
+        return Err(miette::miette!(
+            "compose file {} is not a mapping",
+            path.display()
+        ));
+    };
+    Ok(root
+        .get_mut(yaml_string("networks"))
+        .and_then(serde_yaml::Value::as_mapping_mut))
+}
+
+fn assign_compose_egress_network_subnets(
+    artifact_dir: &Path,
+    run_id: &str,
+    site_id: &str,
+) -> Result<()> {
+    let compose_path = artifact_dir.join("compose.yaml");
+    if !compose_path.is_file() {
+        return Ok(());
+    }
+
+    let mut document = read_compose_document(&compose_path)?;
+    let Some(networks) = compose_networks_mut(&mut document, &compose_path)? else {
+        return Ok(());
+    };
+
+    let mut used_subnets = networks
+        .values()
+        .filter_map(compose_network_subnet)
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let mut changed = false;
+
+    for (name, network) in networks.iter_mut() {
+        let Some(name) = name.as_str() else {
+            continue;
+        };
+        if !name.starts_with("amber_egress_") || compose_network_subnet(network).is_some() {
+            continue;
+        }
+        let subnet = next_compose_egress_subnet(run_id, site_id, name, &used_subnets);
+        set_compose_network_subnet(network, &subnet)?;
+        used_subnets.insert(subnet);
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    let rendered = serde_yaml::to_string(&document)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to serialize {}", compose_path.display()))?;
+    fs::write(&compose_path, rendered)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", compose_path.display()))
+}
+
+fn compose_network_subnet(network: &serde_yaml::Value) -> Option<&str> {
+    network
+        .as_mapping()
+        .and_then(|mapping| mapping.get(yaml_string("ipam")))
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|ipam| ipam.get(yaml_string("config")))
+        .and_then(serde_yaml::Value::as_sequence)
+        .and_then(|configs| configs.first())
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|config| config.get(yaml_string("subnet")))
+        .and_then(serde_yaml::Value::as_str)
+}
+
+fn set_compose_network_subnet(network: &mut serde_yaml::Value, subnet: &str) -> Result<()> {
+    let Some(mapping) = network.as_mapping_mut() else {
+        return Err(miette::miette!(
+            "compose network definition is not a mapping"
+        ));
+    };
+    mapping.insert(
+        yaml_string("ipam"),
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([(
+            yaml_string("config"),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(
+                serde_yaml::Mapping::from_iter([(yaml_string("subnet"), yaml_string(subnet))]),
+            )]),
+        )])),
+    );
+    Ok(())
+}
+
+fn next_compose_egress_subnet(
+    run_id: &str,
+    site_id: &str,
+    network_name: &str,
+    used_subnets: &BTreeSet<String>,
+) -> String {
+    let digest = Sha256::digest(format!("{run_id}:{site_id}:{network_name}"));
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&digest[..4]);
+    let base = u32::from_be_bytes(bytes) % COMPOSE_EGRESS_SUBNET_COUNT;
+    for offset in 0..COMPOSE_EGRESS_SUBNET_COUNT {
+        let candidate =
+            compose_egress_subnet_from_index((base + offset) % COMPOSE_EGRESS_SUBNET_COUNT);
+        if !used_subnets.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("compose egress subnet pool exhausted")
+}
+
+const COMPOSE_EGRESS_SUBNET_COUNT: u32 = 1 << 18;
+
+fn compose_egress_subnet_from_index(index: u32) -> String {
+    let second_octet = 64 + ((index >> 12) & 0x3f);
+    let third_octet = (index >> 4) & 0xff;
+    let fourth_octet = (index & 0x0f) << 4;
+    format!("100.{second_octet}.{third_octet}.{fourth_octet}/28")
+}
+
 fn compose_service_names(document: &serde_yaml::Value, path: &Path) -> Result<BTreeSet<String>> {
     Ok(compose_services(document, path)?
         .keys()
@@ -2281,9 +2405,6 @@ fn ensure_dynamic_proxy_export_component_routes_in_artifact(
     proxy_exports: &BTreeMap<String, DynamicProxyExportRecord>,
     router_identity_id: &str,
 ) -> Result<()> {
-    if proxy_exports.is_empty() {
-        return Ok(());
-    }
     let plan_path = artifact_root.join("mesh-provision-plan.json");
     let mut mesh_plan: MeshProvisionPlan = read_json(&plan_path, "mesh provision plan")?;
     ensure_dynamic_proxy_export_component_routes(
@@ -2400,6 +2521,57 @@ fn build_dynamic_compose_mesh_plan(
     })
 }
 
+fn compose_component_mesh_peer_addr(
+    artifact_root: &Path,
+    component_id: &str,
+    output: &MeshProvisionOutput,
+    mesh_port: u16,
+) -> Result<String> {
+    let MeshProvisionOutput::Filesystem { dir } = output else {
+        return Err(miette::miette!(
+            "compose artifact {} component {} does not use filesystem mesh output",
+            artifact_root.display(),
+            component_id
+        ));
+    };
+    let service_name = Path::new(dir)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            miette::miette!(
+                "compose artifact {} component {} has invalid mesh output dir {}",
+                artifact_root.display(),
+                component_id,
+                dir
+            )
+        })?;
+    Ok(format!("{service_name}:{mesh_port}"))
+}
+
+fn kubernetes_component_mesh_peer_addr(
+    artifact_root: &Path,
+    component_id: &str,
+    output: &MeshProvisionOutput,
+    mesh_port: u16,
+) -> Result<String> {
+    let MeshProvisionOutput::KubernetesSecret { name, .. } = output else {
+        return Err(miette::miette!(
+            "kubernetes artifact {} component {} does not use a kubernetes secret mesh output",
+            artifact_root.display(),
+            component_id
+        ));
+    };
+    let service_name = name.strip_suffix("-mesh").ok_or_else(|| {
+        miette::miette!(
+            "kubernetes artifact {} component {} uses invalid mesh secret name {}",
+            artifact_root.display(),
+            component_id,
+            name
+        )
+    })?;
+    Ok(format!("{service_name}:{mesh_port}"))
+}
+
 fn build_dynamic_compose_route_overlay_payload(
     artifact_root: &Path,
     assigned_components: &[String],
@@ -2439,25 +2611,14 @@ fn build_dynamic_compose_route_overlay_payload(
         .iter()
         .filter(|target| matches!(target.kind, MeshProvisionTargetKind::Component))
         .map(|target| {
-            let MeshProvisionOutput::Filesystem { dir } = &target.output else {
-                return Err(miette::miette!(
-                    "compose component {} does not use filesystem mesh output",
-                    target.config.identity.id
-                ));
-            };
-            let service_name = Path::new(dir)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| {
-                    miette::miette!(
-                        "compose component {} has invalid mesh output dir {}",
-                        target.config.identity.id,
-                        dir
-                    )
-                })?;
             Ok((
                 target.config.identity.id.clone(),
-                format!("{service_name}:{}", target.config.mesh_listen.port()),
+                compose_component_mesh_peer_addr(
+                    artifact_root,
+                    &target.config.identity.id,
+                    &target.output,
+                    target.config.mesh_listen.port(),
+                )?,
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
@@ -2842,6 +3003,107 @@ pub(crate) fn collect_live_component_runtime_metadata(
     Ok(components)
 }
 
+pub(crate) fn load_live_site_router_mesh_config(
+    plan: &SiteActuatorPlan,
+) -> Result<MeshConfigPublic> {
+    let artifact_root = Path::new(&plan.artifact_dir);
+    match plan.kind {
+        SiteKind::Direct => {
+            let runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
+                miette::miette!("direct site `{}` is missing its runtime root", plan.site_id)
+            })?);
+            let direct_plan: DirectPlan =
+                read_json(&artifact_root.join("direct-plan.json"), "direct plan")?;
+            let router = direct_plan.router.ok_or_else(|| {
+                miette::miette!("direct site `{}` is missing its router plan", plan.site_id)
+            })?;
+            read_json(&runtime_root.join(&router.mesh_config_path), "mesh config")
+        }
+        SiteKind::Vm => {
+            let runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
+                miette::miette!("vm site `{}` is missing its runtime root", plan.site_id)
+            })?);
+            let vm_plan: VmPlan = read_json(&artifact_root.join("vm-plan.json"), "vm plan")?;
+            let router = vm_plan.router.ok_or_else(|| {
+                miette::miette!("vm site `{}` is missing its router plan", plan.site_id)
+            })?;
+            read_json(&runtime_root.join(&router.mesh_config_path), "mesh config")
+        }
+        SiteKind::Compose => {
+            let mesh_plan = if artifact_root.join("mesh-provision-plan.json").is_file() {
+                read_json(
+                    &artifact_root.join("mesh-provision-plan.json"),
+                    "mesh provision plan",
+                )?
+            } else {
+                read_embedded_compose_mesh_provision_plan(artifact_root)?
+            };
+            let target = mesh_plan
+                .targets
+                .iter()
+                .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "compose site `{}` is missing a router mesh target",
+                        plan.site_id
+                    )
+                })?;
+            let MeshProvisionOutput::Filesystem { dir } = &target.output else {
+                return Err(miette::miette!(
+                    "compose site `{}` has non-filesystem mesh output for router {}",
+                    plan.site_id,
+                    target.config.identity.id
+                ));
+            };
+            if Path::new(dir).is_absolute() {
+                let compose_project = plan.compose_project.as_deref().ok_or_else(|| {
+                    miette::miette!(
+                        "compose site `{}` is missing its compose project",
+                        plan.site_id
+                    )
+                })?;
+                let service_name = Path::new(dir)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "compose site `{}` has invalid router mesh output {}",
+                            plan.site_id,
+                            dir
+                        )
+                    })?;
+                read_compose_volume_mesh_config(compose_project, service_name)
+            } else {
+                read_json(
+                    &artifact_root.join(dir).join(MESH_CONFIG_FILENAME),
+                    "mesh config",
+                )
+            }
+        }
+        SiteKind::Kubernetes => {
+            let mesh_plan = read_kubernetes_runtime_mesh_provision_plan(artifact_root)?;
+            let target = mesh_plan
+                .targets
+                .iter()
+                .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "kubernetes site `{}` is missing a router mesh target",
+                        plan.site_id
+                    )
+                })?;
+            let MeshProvisionOutput::KubernetesSecret { name, namespace } = &target.output else {
+                return Err(miette::miette!(
+                    "kubernetes site `{}` has non-secret mesh output for router {}",
+                    plan.site_id,
+                    target.config.identity.id
+                ));
+            };
+            load_kubernetes_mesh_config_public(plan, name, namespace.as_deref())
+        }
+    }
+}
+
 fn collect_direct_artifact_runtime_metadata(
     artifact_root: &Path,
     runtime_root: &Path,
@@ -2857,7 +3119,7 @@ fn collect_direct_artifact_runtime_metadata(
             &runtime_root.join(&component.sidecar.mesh_config_path),
             "mesh config",
         )?;
-        state
+        let mesh_port = state
             .component_mesh_port_by_id
             .get(&component.id)
             .copied()
@@ -2871,6 +3133,7 @@ fn collect_direct_artifact_runtime_metadata(
             component.moniker.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: component.moniker.clone(),
+                host_mesh_addr: format!("127.0.0.1:{mesh_port}"),
                 mesh_config,
             },
         );
@@ -2890,7 +3153,7 @@ fn collect_vm_artifact_runtime_metadata(
             &runtime_root.join(&component.mesh_config_path),
             "mesh config",
         )?;
-        state
+        let mesh_port = state
             .component_mesh_port_by_id
             .get(&component.id)
             .copied()
@@ -2904,6 +3167,7 @@ fn collect_vm_artifact_runtime_metadata(
             component.moniker.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: component.moniker.clone(),
+                host_mesh_addr: format!("127.0.0.1:{mesh_port}"),
                 mesh_config,
             },
         );
@@ -2965,6 +3229,12 @@ fn collect_compose_artifact_runtime_metadata(
             target.config.identity.id.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: target.config.identity.id.clone(),
+                host_mesh_addr: compose_component_mesh_peer_addr(
+                    artifact_root,
+                    &target.config.identity.id,
+                    &target.output,
+                    mesh_config.mesh_listen.port(),
+                )?,
                 mesh_config,
             },
         );
@@ -2997,11 +3267,18 @@ fn collect_kubernetes_artifact_runtime_metadata(
                 name
             )
         })?;
+        let mesh_config = load_kubernetes_mesh_config_public(plan, name, namespace.as_deref())?;
         components.insert(
             target.config.identity.id.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: target.config.identity.id.clone(),
-                mesh_config: load_kubernetes_mesh_config_public(plan, name, namespace.as_deref())?,
+                host_mesh_addr: kubernetes_component_mesh_peer_addr(
+                    artifact_root,
+                    &target.config.identity.id,
+                    &target.output,
+                    mesh_config.mesh_listen.port(),
+                )?,
+                mesh_config,
             },
         );
     }
@@ -3615,25 +3892,14 @@ fn kubernetes_peer_addrs_for_artifact(artifact_root: &Path) -> Result<BTreeMap<S
         .iter()
         .filter(|target| matches!(target.kind, MeshProvisionTargetKind::Component))
         .map(|target| {
-            let MeshProvisionOutput::KubernetesSecret { name, .. } = &target.output else {
-                return Err(miette::miette!(
-                    "kubernetes artifact {} component {} does not use a kubernetes secret mesh \
-                     output",
-                    artifact_root.display(),
-                    target.config.identity.id
-                ));
-            };
-            let service_name = name.strip_suffix("-mesh").ok_or_else(|| {
-                miette::miette!(
-                    "kubernetes artifact {} component {} uses invalid mesh secret name {}",
-                    artifact_root.display(),
-                    target.config.identity.id,
-                    name
-                )
-            })?;
             Ok((
                 target.config.identity.id.clone(),
-                format!("{service_name}:{}", target.config.mesh_listen.port()),
+                kubernetes_component_mesh_peer_addr(
+                    artifact_root,
+                    &target.config.identity.id,
+                    &target.output,
+                    target.config.mesh_listen.port(),
+                )?,
             ))
         })
         .collect()
@@ -3959,25 +4225,12 @@ fn dynamic_proxy_export_kubernetes_peer_addr(
                 export.component
             )
         })?;
-    let MeshProvisionOutput::KubernetesSecret { name, .. } = &component_target.output else {
-        return Err(miette::miette!(
-            "dynamic proxy export provider {} does not use a kubernetes secret mesh output in {}",
-            export.component,
-            artifact_root.display()
-        ));
-    };
-    let service_name = name.strip_suffix("-mesh").ok_or_else(|| {
-        miette::miette!(
-            "dynamic proxy export provider {} uses invalid mesh secret name {} in {}",
-            export.component,
-            name,
-            artifact_root.display()
-        )
-    })?;
-    Ok(format!(
-        "{service_name}:{}",
-        component_target.config.mesh_listen.port()
-    ))
+    kubernetes_component_mesh_peer_addr(
+        artifact_root,
+        &export.component,
+        &component_target.output,
+        component_target.config.mesh_listen.port(),
+    )
 }
 
 fn project_dynamic_child_mesh_scope(artifact_root: &Path, mesh_scope: Option<&str>) -> Result<()> {
@@ -4867,6 +5120,8 @@ async fn actuator_prepare_child(
     }
     patch_site_artifacts(
         &artifact_root,
+        &app.plan.run_id,
+        &app.plan.site_id,
         site_plan.kind,
         &app.plan.launch_env,
         app.plan.observability_endpoint.as_deref(),
@@ -6408,6 +6663,8 @@ fn prepare_kubernetes_artifact_for_apply(
         prepare_kubernetes_artifact_namespace(&plan.run_id, &plan.site_id, artifact_dir)?;
     patch_site_artifacts(
         artifact_dir,
+        &plan.run_id,
+        &plan.site_id,
         plan.kind,
         &plan.launch_env,
         plan.observability_endpoint.as_deref(),

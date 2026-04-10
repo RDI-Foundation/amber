@@ -50,10 +50,15 @@ pub(super) fn materialize_site_artifacts(
 
 pub(super) fn patch_site_artifacts(
     artifact_dir: &Path,
+    run_id: &str,
+    site_id: &str,
     kind: SiteKind,
     launch_env: &BTreeMap<String, String>,
     observability_endpoint: Option<&str>,
 ) -> Result<()> {
+    if matches!(kind, SiteKind::Compose) {
+        assign_compose_egress_network_subnets(artifact_dir, run_id, site_id)?;
+    }
     if matches!(kind, SiteKind::Kubernetes) {
         for env_file_name in [
             DEFAULT_EXTERNAL_ENV_FILE,
@@ -1907,6 +1912,37 @@ pub(crate) fn host_service_bind_addr_for_consumer(
     port: u16,
 ) -> SocketAddr {
     host_proxy_bind_addr(consumer_needs_host_wide_listener(consumer_kind), port)
+}
+
+pub(crate) fn router_mesh_addr_for_consumer(
+    provider_kind: SiteKind,
+    consumer_kind: SiteKind,
+    router_mesh_addr: &str,
+) -> Result<String> {
+    match consumer_kind {
+        SiteKind::Compose | SiteKind::Kubernetes => {
+            let addr = router_mesh_addr
+                .parse::<SocketAddr>()
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("invalid live router mesh address `{router_mesh_addr}`")
+                })?;
+            let host = container_host_for_consumer(provider_kind, consumer_kind);
+            Ok(format!("{host}:{}", addr.port()))
+        }
+        SiteKind::Direct | SiteKind::Vm => {
+            #[cfg(target_os = "linux")]
+            {
+                Ok(crate::direct_runtime::rewrite_peer_addr_for_slirp_gateway(
+                    router_mesh_addr,
+                ))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Ok(router_mesh_addr.to_string())
+            }
+        }
+    }
 }
 
 pub(super) fn host_proxy_bind_addr(needs_host_wide_listener: bool, port: u16) -> SocketAddr {

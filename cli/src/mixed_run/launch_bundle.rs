@@ -108,6 +108,8 @@ pub(super) fn materialize_launch_bundle(
         };
         patch_site_artifacts(
             &artifact_dir,
+            run_id,
+            site_id,
             site_plan.site.kind,
             &merge_env_maps(runtime_env, &framework_env),
             observability_endpoint,
@@ -841,6 +843,8 @@ pub(super) fn prepare_site_launch(
     let artifact_env = merge_env_maps(runtime_env, external_env);
     patch_site_artifacts(
         &site.artifact_dir,
+        &site.base_supervisor_plan.run_id,
+        &site.base_supervisor_plan.site_id,
         site.site_plan.site.kind,
         &artifact_env,
         site.base_supervisor_plan.observability_endpoint.as_deref(),
@@ -922,11 +926,6 @@ pub(crate) async fn run_run_plan_with_id(
         observability,
         site_launch_env,
     )?;
-    let framework_control_state_receipt = start_materialized_framework_control_state(
-        &run_root,
-        launch_bundle.framework_control_state.as_ref(),
-    )
-    .await?;
     let observability_receipt =
         start_materialized_observability(&run_root, launch_bundle.observability.as_ref()).await?;
     init_manager_telemetry(
@@ -945,6 +944,7 @@ pub(crate) async fn run_run_plan_with_id(
         ],
     );
 
+    let mut framework_control_state_receipt = None;
     let mut launched_by_site = BTreeMap::<String, LaunchedSite>::new();
     let mut started_site_receipts = BTreeMap::<String, SiteReceipt>::new();
     let mut supervisor_children = BTreeMap::<String, SupervisorChild>::new();
@@ -1005,6 +1005,12 @@ pub(crate) async fn run_run_plan_with_id(
                 sleep(delay).await;
             }
         }
+
+        framework_control_state_receipt = start_materialized_framework_control_state(
+            &run_root,
+            launch_bundle.framework_control_state.as_ref(),
+        )
+        .await?;
 
         write_commit_marker(&run_root)?;
         emit_manager_event(

@@ -59,6 +59,8 @@ pub(crate) struct LiveChildRecord {
     pub(crate) selected_manifest_catalog_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) fragment: Option<LiveScenarioFragment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) input_bindings: Vec<ChildInputBindingRecord>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) assignments: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -182,6 +184,23 @@ pub(crate) struct OutputHandleRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ChildInputBindingRecord {
+    pub(crate) slot: String,
+    pub(crate) decl: CapabilityDecl,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) sources: Vec<ChildInputBindingSourceRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ChildInputBindingSourceRecord {
+    pub(crate) from: BindingFromIr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) component_moniker: Option<String>,
+    #[serde(default)]
+    pub(crate) weak: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ControlJournalEntry {
     pub(crate) tx_id: u64,
     pub(crate) child_id: u64,
@@ -300,6 +319,7 @@ pub(crate) fn build_control_state(
         pending_creates: Vec::new(),
         pending_destroys: Vec::new(),
     };
+    restore_framework_children_from_snapshot(&mut state, run_plan.framework_children.as_ref())?;
     refresh_capability_instances(&mut state)?;
     dynamic_caps::restore_dynamic_capabilities_from_snapshot(
         &mut state,
@@ -309,6 +329,451 @@ pub(crate) fn build_control_state(
     dynamic_caps::reconcile_dynamic_capability_grants(&mut state)
         .map_err(|err| miette::miette!(err.message.clone()))?;
     Ok(state)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct FrameworkChildSnapshotRecord {
+    pub(super) child: FrameworkChildSnapshotState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) tx_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct FrameworkChildSnapshotState {
+    pub(super) child_id: u64,
+    pub(super) authority_realm_id: usize,
+    pub(super) name: String,
+    pub(super) state: ChildState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) template_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) selected_manifest_catalog_key: Option<String>,
+    pub(super) fragment: LiveScenarioFragment,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) input_bindings: Vec<ChildInputBindingRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) assignments: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) outputs: BTreeMap<String, OutputHandleRecord>,
+}
+
+pub(super) fn framework_child_snapshot_records_with_component_map(
+    state: &FrameworkControlState,
+    component_id_map: &BTreeMap<usize, usize>,
+    monikers_by_component_id: &BTreeMap<usize, String>,
+) -> std::result::Result<Vec<FrameworkChildSnapshotRecord>, ProtocolErrorResponse> {
+    let mut snapshot_children = visible_child_records(state)
+        .map(|child| {
+            let remapped_authority = component_id_map
+                .get(&child.authority_realm_id)
+                .copied()
+                .unwrap_or(child.authority_realm_id);
+            let authority_moniker = monikers_by_component_id
+                .get(&remapped_authority)
+                .cloned()
+                .or_else(|| authority_moniker_for_child(state, child))
+                .ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!(
+                            "dynamic child `{}` references missing authority realm {}",
+                            child.name, child.authority_realm_id
+                        ),
+                    )
+                })?;
+            Ok((authority_moniker, child.clone()))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    snapshot_children.sort_by(
+        |(left_authority, left_child), (right_authority, right_child)| {
+            left_authority
+                .cmp(right_authority)
+                .then(left_child.name.cmp(&right_child.name))
+                .then(
+                    child_state_snapshot_sort_key(left_child.state)
+                        .cmp(&child_state_snapshot_sort_key(right_child.state)),
+                )
+                .then(left_child.child_id.cmp(&right_child.child_id))
+        },
+    );
+
+    let child_id_map = snapshot_children
+        .iter()
+        .enumerate()
+        .map(|(index, (_, child))| (child.child_id, index as u64 + 1))
+        .collect::<BTreeMap<_, _>>();
+    let tx_id_map = snapshot_children
+        .iter()
+        .filter(|(_, child)| child.state == ChildState::DestroyRequested)
+        .enumerate()
+        .map(|(index, (_, child))| (child.child_id, index as u64 + 1))
+        .collect::<BTreeMap<_, _>>();
+
+    snapshot_children
+        .into_iter()
+        .map(|(_, child)| {
+            let child_id = *child_id_map.get(&child.child_id).ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "dynamic child `{}` is missing from snapshot id normalization",
+                        child.name
+                    ),
+                )
+            })?;
+            let authority_realm_id = remap_component_id(
+                child.authority_realm_id,
+                component_id_map,
+                &format!("snapshot authority realm for child `{}`", child.name),
+            )?;
+            let fragment = remap_live_fragment_for_snapshot(
+                child.fragment.as_ref().ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!(
+                            "dynamic child `{}` is missing the live fragment required for snapshot",
+                            child.name
+                        ),
+                    )
+                })?,
+                component_id_map,
+                &child_id_map,
+                monikers_by_component_id,
+            )?;
+            let outputs = child
+                .outputs
+                .iter()
+                .map(|(output_name, output)| {
+                    Ok((
+                        output_name.clone(),
+                        remap_output_handle_for_snapshot(
+                            output_name,
+                            &child.name,
+                            child_id,
+                            output,
+                            component_id_map,
+                        )?,
+                    ))
+                })
+                .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+            let input_bindings = child
+                .input_bindings
+                .iter()
+                .cloned()
+                .map(|mut input_binding| {
+                    input_binding.sources = input_binding
+                        .sources
+                        .into_iter()
+                        .map(|mut source| {
+                            remap_binding_source_for_snapshot(
+                                &mut source.from,
+                                component_id_map,
+                                "snapshot child input binding source",
+                            )?;
+                            Ok(source)
+                        })
+                        .collect::<std::result::Result<Vec<_>, ProtocolErrorResponse>>()?;
+                    Ok(input_binding)
+                })
+                .collect::<std::result::Result<Vec<_>, ProtocolErrorResponse>>()?;
+            Ok(FrameworkChildSnapshotRecord {
+                tx_id: (child.state == ChildState::DestroyRequested).then(|| {
+                    *tx_id_map.get(&child.child_id).expect(
+                        "destroy-requested snapshot child should keep a normalized transaction",
+                    )
+                }),
+                child: FrameworkChildSnapshotState {
+                    child_id,
+                    authority_realm_id,
+                    name: child.name,
+                    state: child.state,
+                    template_name: child.template_name,
+                    selected_manifest_catalog_key: child.selected_manifest_catalog_key,
+                    fragment,
+                    input_bindings,
+                    assignments: child.assignments,
+                    outputs,
+                },
+            })
+        })
+        .collect()
+}
+
+pub(super) fn restore_framework_children_from_snapshot(
+    state: &mut FrameworkControlState,
+    snapshot: Option<&serde_json::Value>,
+) -> Result<()> {
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    if snapshot.is_null() {
+        return Ok(());
+    }
+    let records: Vec<FrameworkChildSnapshotRecord> = serde_json::from_value(snapshot.clone())
+        .into_diagnostic()
+        .map_err(|err| miette::miette!("failed to decode framework child snapshot: {err}"))?;
+    let scenario = decode_base_scenario(state).map_err(|err| miette::miette!(err.message))?;
+    let mut snapshot_assignments = state.placement.assignments.clone();
+    for record in &records {
+        snapshot_assignments.extend(record.child.assignments.clone());
+    }
+    for record in records {
+        let FrameworkChildSnapshotRecord { child, tx_id } = record;
+        let mut child = LiveChildRecord {
+            child_id: child.child_id,
+            authority_realm_id: child.authority_realm_id,
+            name: child.name,
+            state: child.state,
+            template_name: child.template_name,
+            selected_manifest_catalog_key: child.selected_manifest_catalog_key,
+            fragment: Some(child.fragment),
+            input_bindings: child.input_bindings,
+            assignments: child.assignments,
+            site_plans: Vec::new(),
+            overlay_ids: Vec::new(),
+            overlays: Vec::new(),
+            outputs: child.outputs,
+        };
+        rebuild_live_child_runtime_metadata(state, &scenario, &snapshot_assignments, &mut child)
+            .map_err(|err| miette::miette!(err.message))?;
+        state.next_child_id = state.next_child_id.max(child.child_id);
+        match child.state {
+            ChildState::Live => state.live_children.push(child),
+            ChildState::DestroyRequested => {
+                let tx_id = tx_id.ok_or_else(|| {
+                    miette::miette!(
+                        "framework child snapshot is missing a transaction for child `{}`",
+                        child.name
+                    )
+                })?;
+                state.next_tx_id = state.next_tx_id.max(tx_id);
+                state
+                    .pending_destroys
+                    .push(PendingDestroyRecord { tx_id, child });
+            }
+            state => {
+                return Err(miette::miette!(
+                    "framework child snapshot contains unsupported child state `{state:?}`"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn child_state_snapshot_sort_key(state: ChildState) -> u8 {
+    match state {
+        ChildState::Live => 0,
+        ChildState::DestroyRequested => 1,
+        ChildState::CreateRequested => 2,
+        ChildState::CreatePrepared => 3,
+        ChildState::CreateCommittedHidden => 4,
+        ChildState::CreateAborted => 5,
+        ChildState::DestroyRetracted => 6,
+        ChildState::DestroyCommitted => 7,
+    }
+}
+
+fn authority_moniker_for_child(
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
+) -> Option<String> {
+    child
+        .fragment
+        .as_ref()
+        .and_then(|fragment| {
+            fragment
+                .components
+                .iter()
+                .find(|component| component.id == fragment.root_component_id)
+                .and_then(|component| authority_moniker_for_root(component.moniker.as_str()))
+        })
+        .or_else(|| {
+            state
+                .base_scenario
+                .components
+                .iter()
+                .find(|component| component.id == child.authority_realm_id)
+                .map(|component| component.moniker.clone())
+        })
+}
+
+fn authority_moniker_for_root(moniker: &str) -> Option<String> {
+    if moniker == "/" {
+        return None;
+    }
+    let (parent, _) = moniker.rsplit_once('/')?;
+    Some(if parent.is_empty() {
+        "/".to_string()
+    } else {
+        parent.to_string()
+    })
+}
+
+fn remap_component_id(
+    component_id: usize,
+    component_id_map: &BTreeMap<usize, usize>,
+    context: &str,
+) -> std::result::Result<usize, ProtocolErrorResponse> {
+    component_id_map.get(&component_id).copied().ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("{context} references missing component id {component_id}"),
+        )
+    })
+}
+
+fn remap_binding_source_for_snapshot(
+    source: &mut BindingFromIr,
+    component_id_map: &BTreeMap<usize, usize>,
+    context: &str,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    match source {
+        BindingFromIr::Component { component, .. } | BindingFromIr::Resource { component, .. } => {
+            *component = remap_component_id(*component, component_id_map, context)?;
+        }
+        BindingFromIr::Framework {
+            authority_realm, ..
+        } => {
+            *authority_realm = remap_component_id(*authority_realm, component_id_map, context)?;
+        }
+        BindingFromIr::External { slot } => {
+            slot.component = remap_component_id(slot.component, component_id_map, context)?;
+        }
+    }
+    Ok(())
+}
+
+fn remap_binding_for_snapshot(
+    binding: &mut BindingIr,
+    component_id_map: &BTreeMap<usize, usize>,
+    context: &str,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    remap_binding_source_for_snapshot(&mut binding.from, component_id_map, context)?;
+    binding.to.component = remap_component_id(binding.to.component, component_id_map, context)?;
+    Ok(())
+}
+
+fn remap_live_fragment_for_snapshot(
+    fragment: &LiveScenarioFragment,
+    component_id_map: &BTreeMap<usize, usize>,
+    child_id_map: &BTreeMap<u64, u64>,
+    monikers_by_component_id: &BTreeMap<usize, String>,
+) -> std::result::Result<LiveScenarioFragment, ProtocolErrorResponse> {
+    let mut components = fragment
+        .components
+        .iter()
+        .cloned()
+        .map(|mut component| {
+            component.id = remap_component_id(
+                component.id,
+                component_id_map,
+                "snapshot child fragment component",
+            )?;
+            component.parent = component
+                .parent
+                .map(|parent| {
+                    remap_component_id(parent, component_id_map, "snapshot child fragment parent")
+                })
+                .transpose()?;
+            for child in &mut component.children {
+                *child =
+                    remap_component_id(*child, component_id_map, "snapshot child fragment edge")?;
+            }
+            Ok(component)
+        })
+        .collect::<std::result::Result<Vec<_>, ProtocolErrorResponse>>()?;
+    components.sort_by(|left, right| {
+        left.moniker
+            .cmp(&right.moniker)
+            .then(left.id.cmp(&right.id))
+    });
+    for component in &mut components {
+        component.children.sort_by(|left, right| {
+            let left_moniker = monikers_by_component_id
+                .get(left)
+                .map(String::as_str)
+                .unwrap_or("/");
+            let right_moniker = monikers_by_component_id
+                .get(right)
+                .map(String::as_str)
+                .unwrap_or("/");
+            left_moniker.cmp(right_moniker)
+        });
+    }
+
+    let mut bindings = fragment
+        .bindings
+        .iter()
+        .cloned()
+        .map(|mut binding| {
+            remap_binding_for_snapshot(
+                &mut binding.binding,
+                component_id_map,
+                "snapshot child binding",
+            )?;
+            binding.source_child_id = binding
+                .source_child_id
+                .map(|source_child_id| {
+                    child_id_map.get(&source_child_id).copied().ok_or_else(|| {
+                        protocol_error(
+                            ProtocolErrorCode::ControlStateUnavailable,
+                            &format!(
+                                "snapshot child binding references missing source child id \
+                                 {source_child_id}"
+                            ),
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok(binding)
+        })
+        .collect::<std::result::Result<Vec<_>, ProtocolErrorResponse>>()?;
+    bindings.sort_by(|left, right| {
+        binding_sort_key(&left.binding, monikers_by_component_id)
+            .cmp(&binding_sort_key(&right.binding, monikers_by_component_id))
+    });
+
+    Ok(LiveScenarioFragment {
+        root_component_id: remap_component_id(
+            fragment.root_component_id,
+            component_id_map,
+            "snapshot child root component",
+        )?,
+        components,
+        bindings,
+    })
+}
+
+fn remap_output_handle_for_snapshot(
+    output_name: &str,
+    child_name: &str,
+    child_id: u64,
+    output: &OutputHandleRecord,
+    component_id_map: &BTreeMap<usize, usize>,
+) -> std::result::Result<OutputHandleRecord, ProtocolErrorResponse> {
+    let sources = output
+        .sources
+        .iter()
+        .cloned()
+        .map(|mut source| {
+            remap_binding_source_for_snapshot(
+                &mut source.from,
+                component_id_map,
+                "snapshot child output source",
+            )?;
+            Ok(source)
+        })
+        .collect::<std::result::Result<Vec<_>, ProtocolErrorResponse>>()?;
+    Ok(OutputHandleRecord {
+        selector: format!("children.{child_name}.exports.{output_name}"),
+        handle: output
+            .handle
+            .as_ref()
+            .map(|_| format!("h_{child_id}_{output_name}")),
+        decl: output.decl.clone(),
+        sources,
+    })
 }
 
 pub(crate) fn generate_framework_auth_token(mesh_scope: &str, purpose: &str) -> String {

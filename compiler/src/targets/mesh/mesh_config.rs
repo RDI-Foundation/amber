@@ -228,6 +228,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             let Some(endpoint) = endpoint else {
                 continue;
             };
+            let protocol = mesh_protocol(endpoint.protocol)?;
 
             let mut issuers: BTreeSet<String> = BTreeSet::new();
             if let Some(consumers) = consumers_by_provider.get(&(id, provide_name.clone())) {
@@ -240,7 +241,10 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                     issuers.insert(consumer_id);
                 }
             }
-            if exported_provides.contains(&(id, provide_name.clone()))
+            let route_backs_live_http_authority =
+                !issuers.is_empty() && matches!(protocol, MeshProtocol::Http);
+            if (route_backs_live_http_authority
+                || exported_provides.contains(&(id, provide_name.clone())))
                 && let Some(router_identity) = router_identity.as_ref()
             {
                 issuers.insert(router_identity.id.clone());
@@ -249,7 +253,6 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 continue;
             }
 
-            let protocol = mesh_protocol(endpoint.protocol)?;
             inbound.push(InboundRoute {
                 route_id: component_route_id(&identity.id, provide_name, protocol),
                 capability: provide_name.clone(),
@@ -638,4 +641,209 @@ fn scenario_mesh_scope(scenario: &Scenario) -> Result<String, MeshError> {
     let digest = scenario_ir_digest(scenario)?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(digest);
     Ok(format!("sha256:{encoded}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Arc,
+    };
+
+    use amber_manifest::{ManifestDigest, ProvideDecl, SlotDecl};
+    use amber_scenario::{Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport};
+    use serde_json::json;
+
+    use super::*;
+    use crate::targets::{
+        mesh::{
+            plan::{
+                EndpointInfo, MeshPlan, ResolvedBinding, ResolvedComponentBinding, ResolvedExport,
+            },
+            ports::allocate_local_route_ports,
+        },
+        program_config::build_endpoint_plan,
+    };
+
+    fn component(id: usize, moniker: &str, program: serde_json::Value) -> Component {
+        Component {
+            id: ComponentId(id),
+            parent: None,
+            moniker: Moniker::from(Arc::<str>::from(moniker)),
+            digest: ManifestDigest::new([id as u8; 32]),
+            config: None,
+            config_schema: None,
+            program: serde_json::from_value(program).ok(),
+            slots: BTreeMap::new(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            child_templates: BTreeMap::new(),
+            children: Vec::new(),
+        }
+    }
+
+    struct StaticAddressing;
+
+    impl MeshAddressing for StaticAddressing {
+        fn mesh_addr_for_component(&self, id: ComponentId) -> Result<String, MeshError> {
+            Ok(format!("component-{}:23000", id.0))
+        }
+
+        fn mesh_addr_for_router(&self) -> Result<String, MeshError> {
+            Ok("router:24000".to_string())
+        }
+    }
+
+    #[test]
+    fn build_mesh_config_plan_limits_router_to_live_http_authorities() {
+        let mut consumer = component(
+            0,
+            "/consumer",
+            json!({
+                "image": "consumer",
+                "entrypoint": ["consumer"],
+            }),
+        );
+        consumer.slots.insert(
+            "admin".to_string(),
+            serde_json::from_value::<SlotDecl>(json!({
+                "kind": "http",
+            }))
+            .expect("slot decl"),
+        );
+
+        let mut provider = component(
+            1,
+            "/provider",
+            json!({
+                "image": "provider",
+                "entrypoint": ["provider"],
+                "network": {
+                    "endpoints": [
+                        { "name": "api", "port": 8080, "protocol": "http" },
+                        { "name": "admin", "port": 8081, "protocol": "http" },
+                        { "name": "debug", "port": 8082, "protocol": "http" }
+                    ]
+                }
+            }),
+        );
+        let provide_api = serde_json::from_value::<ProvideDecl>(json!({
+            "kind": "http",
+            "endpoint": "api",
+        }))
+        .expect("api provide decl");
+        let provide_admin = serde_json::from_value::<ProvideDecl>(json!({
+            "kind": "http",
+            "endpoint": "admin",
+        }))
+        .expect("admin provide decl");
+        let provide_debug = serde_json::from_value::<ProvideDecl>(json!({
+            "kind": "http",
+            "endpoint": "debug",
+        }))
+        .expect("debug provide decl");
+        provider
+            .provides
+            .insert("api".to_string(), provide_api.clone());
+        provider
+            .provides
+            .insert("admin".to_string(), provide_admin.clone());
+        provider.provides.insert("debug".to_string(), provide_debug);
+
+        let scenario = Scenario {
+            root: ComponentId(0),
+            components: vec![Some(consumer), Some(provider)],
+            bindings: Vec::new(),
+            exports: vec![ScenarioExport {
+                name: "api".to_string(),
+                capability: provide_api.decl.clone(),
+                from: ProvideRef {
+                    component: ComponentId(1),
+                    name: "api".to_string(),
+                },
+            }],
+            manifest_catalog: BTreeMap::new(),
+        };
+
+        let mesh_plan = MeshPlan::new(
+            vec![ComponentId(0), ComponentId(1)],
+            vec![ResolvedBinding::Component(ResolvedComponentBinding {
+                provider: ComponentId(1),
+                consumer: ComponentId(0),
+                provide: "admin".to_string(),
+                endpoint: EndpointInfo {
+                    port: 8081,
+                    protocol: NetworkProtocol::Http,
+                },
+                slot: "admin".to_string(),
+                weak: false,
+            })],
+            vec![ResolvedExport {
+                name: "api".to_string(),
+                provider: ComponentId(1),
+                provide: "api".to_string(),
+                endpoint: EndpointInfo {
+                    port: 8080,
+                    protocol: NetworkProtocol::Http,
+                },
+            }],
+            HashMap::new(),
+        );
+
+        let endpoint_plan = build_endpoint_plan(&scenario).expect("endpoint plan");
+        let route_ports = allocate_local_route_ports(&scenario, &endpoint_plan, &mesh_plan)
+            .expect("local route ports");
+        let mesh_ports_by_component =
+            HashMap::from([(ComponentId(0), 23000), (ComponentId(1), 23001)]);
+
+        let plan = build_mesh_config_plan(MeshConfigBuildInput {
+            scenario: &scenario,
+            mesh_plan: &mesh_plan,
+            route_ports: &route_ports,
+            mesh_ports_by_component: &mesh_ports_by_component,
+            router_ports: Some(RouterPorts {
+                mesh: 24000,
+                control: 24100,
+            }),
+            addressing: &StaticAddressing,
+            options: MeshConfigBuildOptions {
+                router_identity_id: "/site/test/router",
+                ..default_mesh_config_build_options()
+            },
+        })
+        .expect("mesh config plan");
+
+        let provider_config = plan
+            .component_configs
+            .get(&ComponentId(1))
+            .expect("provider config");
+        let exported_route = provider_config
+            .inbound
+            .iter()
+            .find(|route| route.capability == "api")
+            .expect("exported api route");
+        assert_eq!(
+            exported_route.allowed_issuers,
+            vec!["/site/test/router".to_string()]
+        );
+
+        let bound_route = provider_config
+            .inbound
+            .iter()
+            .find(|route| route.capability == "admin")
+            .expect("bound admin route");
+        assert_eq!(
+            bound_route.allowed_issuers,
+            vec!["/consumer".to_string(), "/site/test/router".to_string()]
+        );
+        let unused_route = provider_config
+            .inbound
+            .iter()
+            .find(|route| route.capability == "debug");
+        assert!(
+            unused_route.is_none(),
+            "unused local routes must stay closed to the router and should not be emitted",
+        );
+    }
 }

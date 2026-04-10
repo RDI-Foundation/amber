@@ -664,6 +664,9 @@ services:
       - amber-provisioner
     environment:
       - AMBER_SCENARIO_SCOPE=scope
+    networks:
+      amber_mesh: {{}}
+      amber_egress_c8-root-net: {{}}
     volumes:
       - c8-root-net-mesh:/amber/mesh:ro
 configs:
@@ -672,6 +675,13 @@ configs:
 volumes:
   c1-compose-admin-net-mesh: {{}}
   c8-root-net-mesh: {{}}
+networks:
+  amber_mesh:
+    driver: bridge
+    internal: true
+  amber_egress_c8-root-net:
+    driver: bridge
+    internal: false
 x-amber:
   version: "1"
   router:
@@ -708,6 +718,49 @@ x-amber:
         },
     )
     .expect("site manager state should be written");
+
+    supervisor::patch_site_artifacts(
+        &child_artifact,
+        "run-123",
+        "compose_local",
+        SiteKind::Compose,
+        &BTreeMap::new(),
+        None,
+    )
+    .expect("compose child artifact should get explicit egress subnets");
+    let mut patched_document =
+        read_compose_document(&child_artifact.join("compose.yaml")).expect("compose file");
+    let initial_subnet = {
+        let patched_networks =
+            compose_networks_mut(&mut patched_document, &child_artifact.join("compose.yaml"))
+                .expect("compose networks")
+                .expect("compose networks should exist");
+        assert!(
+            compose_network_subnet(
+                patched_networks
+                    .get(yaml_string("amber_mesh"))
+                    .expect("mesh network should exist"),
+            )
+            .is_none(),
+            "mesh network should not get an egress subnet",
+        );
+        compose_network_subnet(
+            patched_networks
+                .get(yaml_string("amber_egress_c8-root-net"))
+                .expect("child egress network should exist"),
+        )
+        .expect("child egress network should get a subnet")
+        .to_string()
+    };
+    supervisor::patch_site_artifacts(
+        &child_artifact,
+        "run-123",
+        "compose_local",
+        SiteKind::Compose,
+        &BTreeMap::new(),
+        None,
+    )
+    .expect("compose subnet assignment should be idempotent");
 
     prepare_dynamic_compose_child_artifact(
         &SiteActuatorPlan {
@@ -788,6 +841,23 @@ x-amber:
     assert!(
         !child_compose_yaml.contains("AMBER_SCENARIO_SCOPE=scope"),
         "dynamic compose artifact should not retain the compiled child scope",
+    );
+    let mut child_network_document =
+        read_compose_document(&child_artifact.join("compose.yaml")).expect("compose file");
+    let child_networks = compose_networks_mut(
+        &mut child_network_document,
+        &child_artifact.join("compose.yaml"),
+    )
+    .expect("compose networks")
+    .expect("compose networks should exist");
+    assert_eq!(
+        compose_network_subnet(
+            child_networks
+                .get(yaml_string("amber_egress_c8-root-net"))
+                .expect("child egress network should remain present"),
+        ),
+        Some(initial_subnet.as_str()),
+        "dynamic compose filtering should preserve the assigned egress subnet",
     );
 
     let metadata = load_dynamic_compose_child_metadata(&child_artifact)
@@ -1623,7 +1693,16 @@ fn ensure_dynamic_proxy_export_component_routes_in_artifact_adds_provider_route(
                     dynamic_caps_listen: None,
                     control_allow: None,
                     peers: Vec::new(),
-                    inbound: Vec::new(),
+                    inbound: vec![InboundRoute {
+                        route_id: component_route_id("/job/root", "admin", MeshProtocol::Http),
+                        capability: "admin".to_string(),
+                        capability_kind: Some("http".to_string()),
+                        capability_profile: None,
+                        protocol: MeshProtocol::Http,
+                        http_plugins: Vec::new(),
+                        target: InboundTarget::Local { port: 9090 },
+                        allowed_issuers: Vec::new(),
+                    }],
                     outbound: Vec::new(),
                     transport: TransportConfig::NoiseIk {},
                 },
@@ -1664,19 +1743,147 @@ fn ensure_dynamic_proxy_export_component_routes_in_artifact_adds_provider_route(
             .collect::<Vec<_>>(),
         vec!["/site/direct_local/router"]
     );
+    let admin_route = component
+        .config
+        .inbound
+        .iter()
+        .find(|route| route.capability == "admin")
+        .expect("existing local admin route should remain");
+    assert!(
+        admin_route.allowed_issuers.is_empty(),
+        "rewriting a dynamic export must not broaden unrelated local routes",
+    );
+    let provider_route = component
+        .config
+        .inbound
+        .iter()
+        .find(|route| route.capability == "http")
+        .expect("dynamic export provider route should be added");
     assert_eq!(
-        component
-            .config
-            .inbound
-            .iter()
-            .map(|route| route.route_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["component:/job/root:http:http"]
+        provider_route.allowed_issuers,
+        vec!["/site/direct_local/router".to_string()]
+    );
+}
+
+#[test]
+fn ensure_dynamic_proxy_export_component_routes_in_artifact_leaves_local_routes_closed_without_exports()
+ {
+    let temp = tempdir().expect("tempdir should be created");
+    let artifact_root = temp.path();
+    write_json(
+        &artifact_root.join("mesh-provision-plan.json"),
+        &MeshProvisionPlan {
+            version: "2".to_string(),
+            identity_seed: None,
+            existing_peer_identities: Vec::new(),
+            targets: vec![amber_mesh::MeshProvisionTarget {
+                kind: MeshProvisionTargetKind::Component,
+                config: amber_mesh::MeshConfigTemplate {
+                    identity: amber_mesh::MeshIdentityTemplate {
+                        id: "/job/root".to_string(),
+                        mesh_scope: Some("scope".to_string()),
+                    },
+                    mesh_listen: SocketAddr::from(([127, 0, 0, 1], 23000)),
+                    control_listen: None,
+                    dynamic_caps_listen: Some(SocketAddr::from(([127, 0, 0, 1], 19000))),
+                    control_allow: None,
+                    peers: Vec::new(),
+                    inbound: vec![
+                        InboundRoute {
+                            route_id: component_route_id("/job/root", "http", MeshProtocol::Http),
+                            capability: "http".to_string(),
+                            capability_kind: Some("http".to_string()),
+                            capability_profile: None,
+                            protocol: MeshProtocol::Http,
+                            http_plugins: Vec::new(),
+                            target: InboundTarget::Local { port: 8080 },
+                            allowed_issuers: Vec::new(),
+                        },
+                        InboundRoute {
+                            route_id: "external".to_string(),
+                            capability: "external".to_string(),
+                            capability_kind: Some("http".to_string()),
+                            capability_profile: None,
+                            protocol: MeshProtocol::Http,
+                            http_plugins: Vec::new(),
+                            target: InboundTarget::External {
+                                url_env: "UPSTREAM".to_string(),
+                                optional: false,
+                            },
+                            allowed_issuers: Vec::new(),
+                        },
+                    ],
+                    outbound: Vec::new(),
+                    transport: TransportConfig::NoiseIk {},
+                },
+                output: MeshProvisionOutput::Filesystem {
+                    dir: "mesh/components/c8-root".to_string(),
+                },
+            }],
+        },
+    )
+    .expect("mesh provision plan should be written");
+
+    ensure_dynamic_proxy_export_component_routes_in_artifact(
+        artifact_root,
+        &BTreeMap::new(),
+        "/site/direct_local/router",
+    )
+    .expect("empty dynamic exports should leave existing routes unchanged");
+
+    let filtered: MeshProvisionPlan = read_json(
+        &artifact_root.join("mesh-provision-plan.json"),
+        "mesh provision plan",
+    )
+    .expect("mesh provision plan should be readable");
+    let component = filtered
+        .targets
+        .iter()
+        .find(|target| matches!(target.kind, MeshProvisionTargetKind::Component))
+        .expect("component target should remain");
+    assert!(
+        component.config.peers.is_empty(),
+        "the router should not be peered when there are no dynamic exports to expose",
     );
     assert_eq!(
         component.config.inbound[0].allowed_issuers,
-        vec!["/site/direct_local/router".to_string()]
+        Vec::<String>::new()
     );
+    assert!(
+        component.config.inbound[1].allowed_issuers.is_empty(),
+        "non-local routes should also remain unchanged"
+    );
+}
+
+#[test]
+fn compose_component_mesh_peer_addr_uses_service_name() {
+    let temp = tempdir().expect("tempdir should be created");
+    let addr = compose_component_mesh_peer_addr(
+        temp.path(),
+        "/provider",
+        &MeshProvisionOutput::Filesystem {
+            dir: "mesh/components/c4-provider-net".to_string(),
+        },
+        23000,
+    )
+    .expect("compose peer addr should resolve");
+    assert_eq!(addr, "c4-provider-net:23000");
+}
+
+#[test]
+fn kubernetes_component_mesh_peer_addr_uses_service_name() {
+    let temp = tempdir().expect("tempdir should be created");
+    let addr = kubernetes_component_mesh_peer_addr(
+        temp.path(),
+        "/provider",
+        &MeshProvisionOutput::KubernetesSecret {
+            name: "c4-provider-net-mesh".to_string(),
+            namespace: Some("ns".to_string()),
+        },
+        23000,
+    )
+    .expect("kubernetes peer addr should resolve");
+    assert_eq!(addr, "c4-provider-net:23000");
 }
 
 #[test]
@@ -2807,6 +3014,34 @@ fn bridge_proxy_external_url_uses_consumer_aware_host() {
             host_service_host_for_consumer(SiteKind::Kubernetes)
         )
     );
+}
+
+#[test]
+fn router_mesh_addr_for_container_consumers_uses_projected_host() {
+    assert_eq!(
+        router_mesh_addr_for_consumer(SiteKind::Direct, SiteKind::Compose, "127.0.0.1:24000")
+            .expect("compose consumer router addr should be valid"),
+        "host.docker.internal:24000"
+    );
+    assert_eq!(
+        router_mesh_addr_for_consumer(SiteKind::Direct, SiteKind::Kubernetes, "127.0.0.1:25000")
+            .expect("kubernetes consumer router addr should be valid"),
+        format!(
+            "{}:25000",
+            container_host_for_consumer(SiteKind::Direct, SiteKind::Kubernetes)
+        )
+    );
+}
+
+#[test]
+fn router_mesh_addr_for_local_consumers_preserves_existing_port() {
+    let rewritten =
+        router_mesh_addr_for_consumer(SiteKind::Direct, SiteKind::Direct, "127.0.0.1:26000")
+            .expect("local consumer router addr should be valid");
+    #[cfg(target_os = "linux")]
+    assert_eq!(rewritten, "10.0.2.2:26000");
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(rewritten, "127.0.0.1:26000");
 }
 
 #[test]
