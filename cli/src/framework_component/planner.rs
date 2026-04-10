@@ -1253,6 +1253,7 @@ pub(super) fn move_live_child_to_pending_destroy(
             )
         })?;
     let mut child = state.live_children.remove(index);
+    remove_child_fragment_from_base_scenario(state, child.fragment.as_ref());
     child.state = ChildState::DestroyRequested;
     state
         .pending_destroys

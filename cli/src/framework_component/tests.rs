@@ -3474,17 +3474,42 @@ async fn destroy_retracted_tears_down_sites_concurrently() {
 async fn create_committed_hidden_publishes_independent_sites_concurrently() {
     let dir = TempDir::new().expect("temp dir");
     let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
     write_file(
-        &root_path,
+        &child_path,
         r#"
             {
               manifest_version: "0.3.0",
               program: {
-                path: "/bin/sh",
-                args: ["-c", "sleep 1"]
-              }
+                path: "/bin/echo",
+                args: ["child"],
+                network: { endpoints: [{ name: "out", port: 8080, protocol: "http" }] }
+              },
+              provides: { out: { kind: "http", endpoint: "out" } },
+              exports: { out: "provides.out" },
             }
             "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r#"
+                {{
+                  manifest_version: "0.3.0",
+                  program: {{
+                    path: "/bin/sh",
+                    args: ["-c", "sleep 1"]
+                  }},
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  child_templates: {{
+                    fixture: {{ manifest: "{child}" }}
+                  }}
+                }}
+                "#,
+            child = file_url(&child_path),
+        ),
     );
 
     let placement = PlacementFile {
@@ -3516,61 +3541,60 @@ async fn create_committed_hidden_publishes_independent_sites_concurrently() {
         framework_children: None,
     };
 
-    let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+    let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
-    write_control_state(&state_path, &state).expect("state should write");
     let root_authority = state.base_scenario.root;
+    let mut child = prepare_child_record(
+        &mut state,
+        root_authority,
+        &CreateChildRequest {
+            template: "fixture".to_string(),
+            name: "job-compose".to_string(),
+            manifest: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        },
+    )
+    .await
+    .expect("child should plan successfully");
+    let child_id = child.child_id;
+    child.state = ChildState::CreateCommittedHidden;
+    child.site_plans = vec![
+        DynamicSitePlanRecord {
+            site_id: "compose_local".to_string(),
+            kind: SiteKind::Compose,
+            router_identity_id: "/site/compose_local/router".to_string(),
+            component_ids: Vec::new(),
+            assigned_components: Vec::new(),
+            artifact_files: BTreeMap::new(),
+            desired_artifact_files: BTreeMap::new(),
+            proxy_exports: BTreeMap::new(),
+            routed_inputs: Vec::new(),
+        },
+        DynamicSitePlanRecord {
+            site_id: "direct_local".to_string(),
+            kind: SiteKind::Direct,
+            router_identity_id: "/site/direct_local/router".to_string(),
+            component_ids: Vec::new(),
+            assigned_components: Vec::new(),
+            artifact_files: BTreeMap::new(),
+            desired_artifact_files: BTreeMap::new(),
+            proxy_exports: BTreeMap::new(),
+            routed_inputs: Vec::new(),
+        },
+    ];
+    write_control_state(&state_path, &state).expect("state should write");
     let app = test_control_state_app(&dir, state, state_path);
     let (actuators, mut publish_starts, barrier) =
         install_barrier_publish_site_actuator(&app).await;
     {
         let mut state = app.control_state.lock().await;
-        state.pending_creates.push(pending_create(
-            1,
-            LiveChildRecord {
-                child_id: 7,
-                authority_realm_id: root_authority,
-                name: "job-compose".to_string(),
-                state: ChildState::CreateCommittedHidden,
-                template_name: Some("fixture".to_string()),
-                selected_manifest_catalog_key: None,
-                fragment: None,
-                input_bindings: Vec::new(),
-                assignments: BTreeMap::new(),
-                site_plans: vec![
-                    DynamicSitePlanRecord {
-                        site_id: "compose_local".to_string(),
-                        kind: SiteKind::Compose,
-                        router_identity_id: "/site/compose_local/router".to_string(),
-                        component_ids: Vec::new(),
-                        assigned_components: Vec::new(),
-                        artifact_files: BTreeMap::new(),
-                        desired_artifact_files: BTreeMap::new(),
-                        proxy_exports: BTreeMap::new(),
-                        routed_inputs: Vec::new(),
-                    },
-                    DynamicSitePlanRecord {
-                        site_id: "direct_local".to_string(),
-                        kind: SiteKind::Direct,
-                        router_identity_id: "/site/direct_local/router".to_string(),
-                        component_ids: Vec::new(),
-                        assigned_components: Vec::new(),
-                        artifact_files: BTreeMap::new(),
-                        desired_artifact_files: BTreeMap::new(),
-                        proxy_exports: BTreeMap::new(),
-                        routed_inputs: Vec::new(),
-                    },
-                ],
-                overlay_ids: Vec::new(),
-                overlays: Vec::new(),
-                outputs: BTreeMap::new(),
-            },
-        ));
+        state.pending_creates.push(pending_create(1, child));
     }
 
     let publish = tokio::spawn({
         let app = app.clone();
-        async move { continue_create_committed_hidden(&app, 7).await }
+        async move { continue_create_committed_hidden(&app, child_id).await }
     });
 
     let first = tokio::time::timeout(Duration::from_secs(5), publish_starts.recv())
@@ -3596,7 +3620,7 @@ async fn create_committed_hidden_publishes_independent_sites_concurrently() {
     let child = recovered
         .live_children
         .iter()
-        .find(|child| child.child_id == 7)
+        .find(|child| child.child_id == child_id)
         .expect("child should remain present");
     assert_eq!(
         child.state,
@@ -4787,17 +4811,24 @@ async fn recover_control_state_surfaces_create_prepared_rollback_failures() {
 
 #[tokio::test]
 async fn recover_control_state_promotes_create_committed_hidden_children_to_live() {
-    let (dir, mut state, state_path) = compile_empty_control_state().await;
+    let (dir, mut state, state_path) = compile_exact_template_control_state().await;
     let root_authority = state.base_scenario.root;
-    state.pending_creates.push(pending_create(
-        1,
-        empty_live_child(
-            root_authority,
-            "hidden",
-            1,
-            ChildState::CreateCommittedHidden,
-        ),
-    ));
+    let mut child = prepare_child_record(
+        &mut state,
+        root_authority,
+        &CreateChildRequest {
+            template: "worker".to_string(),
+            name: "hidden".to_string(),
+            manifest: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        },
+    )
+    .await
+    .expect("child should plan successfully");
+    child.state = ChildState::CreateCommittedHidden;
+    child.site_plans.clear();
+    state.pending_creates.push(pending_create(1, child));
     write_control_state(&state_path, &state).expect("state should write");
     let app = test_control_state_app(&dir, state, state_path);
 

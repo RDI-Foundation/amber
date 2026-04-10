@@ -664,6 +664,9 @@ services:
       - amber-provisioner
     environment:
       - AMBER_SCENARIO_SCOPE=scope
+    networks:
+      amber_mesh: {{}}
+      amber_egress_c8-root-net: {{}}
     volumes:
       - c8-root-net-mesh:/amber/mesh:ro
 configs:
@@ -672,6 +675,13 @@ configs:
 volumes:
   c1-compose-admin-net-mesh: {{}}
   c8-root-net-mesh: {{}}
+networks:
+  amber_mesh:
+    driver: bridge
+    internal: true
+  amber_egress_c8-root-net:
+    driver: bridge
+    internal: false
 x-amber:
   version: "1"
   router:
@@ -708,6 +718,49 @@ x-amber:
         },
     )
     .expect("site manager state should be written");
+
+    supervisor::patch_site_artifacts(
+        &child_artifact,
+        "run-123",
+        "compose_local",
+        SiteKind::Compose,
+        &BTreeMap::new(),
+        None,
+    )
+    .expect("compose child artifact should get explicit egress subnets");
+    let mut patched_document =
+        read_compose_document(&child_artifact.join("compose.yaml")).expect("compose file");
+    let initial_subnet = {
+        let patched_networks =
+            compose_networks_mut(&mut patched_document, &child_artifact.join("compose.yaml"))
+                .expect("compose networks")
+                .expect("compose networks should exist");
+        assert!(
+            compose_network_subnet(
+                patched_networks
+                    .get(yaml_string("amber_mesh"))
+                    .expect("mesh network should exist"),
+            )
+            .is_none(),
+            "mesh network should not get an egress subnet",
+        );
+        compose_network_subnet(
+            patched_networks
+                .get(yaml_string("amber_egress_c8-root-net"))
+                .expect("child egress network should exist"),
+        )
+        .expect("child egress network should get a subnet")
+        .to_string()
+    };
+    supervisor::patch_site_artifacts(
+        &child_artifact,
+        "run-123",
+        "compose_local",
+        SiteKind::Compose,
+        &BTreeMap::new(),
+        None,
+    )
+    .expect("compose subnet assignment should be idempotent");
 
     prepare_dynamic_compose_child_artifact(
         &SiteActuatorPlan {
@@ -788,6 +841,23 @@ x-amber:
     assert!(
         !child_compose_yaml.contains("AMBER_SCENARIO_SCOPE=scope"),
         "dynamic compose artifact should not retain the compiled child scope",
+    );
+    let mut child_network_document =
+        read_compose_document(&child_artifact.join("compose.yaml")).expect("compose file");
+    let child_networks = compose_networks_mut(
+        &mut child_network_document,
+        &child_artifact.join("compose.yaml"),
+    )
+    .expect("compose networks")
+    .expect("compose networks should exist");
+    assert_eq!(
+        compose_network_subnet(
+            child_networks
+                .get(yaml_string("amber_egress_c8-root-net"))
+                .expect("child egress network should remain present"),
+        ),
+        Some(initial_subnet.as_str()),
+        "dynamic compose filtering should preserve the assigned egress subnet",
     );
 
     let metadata = load_dynamic_compose_child_metadata(&child_artifact)

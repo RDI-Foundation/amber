@@ -50,10 +50,15 @@ pub(super) fn materialize_site_artifacts(
 
 pub(super) fn patch_site_artifacts(
     artifact_dir: &Path,
+    run_id: &str,
+    site_id: &str,
     kind: SiteKind,
     launch_env: &BTreeMap<String, String>,
     observability_endpoint: Option<&str>,
 ) -> Result<()> {
+    if matches!(kind, SiteKind::Compose) {
+        assign_compose_egress_network_subnets(artifact_dir, run_id, site_id)?;
+    }
     if matches!(kind, SiteKind::Kubernetes) {
         for env_file_name in [
             DEFAULT_EXTERNAL_ENV_FILE,

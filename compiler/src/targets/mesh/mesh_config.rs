@@ -241,7 +241,10 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                     issuers.insert(consumer_id);
                 }
             }
-            if exported_provides.contains(&(id, provide_name.clone()))
+            let route_backs_live_http_authority =
+                !issuers.is_empty() && matches!(protocol, MeshProtocol::Http);
+            if (route_backs_live_http_authority
+                || exported_provides.contains(&(id, provide_name.clone())))
                 && let Some(router_identity) = router_identity.as_ref()
             {
                 issuers.insert(router_identity.id.clone());
@@ -693,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn build_mesh_config_plan_limits_router_to_exported_http_routes() {
+    fn build_mesh_config_plan_limits_router_to_live_http_authorities() {
         let mut consumer = component(
             0,
             "/consumer",
@@ -719,7 +722,8 @@ mod tests {
                 "network": {
                     "endpoints": [
                         { "name": "api", "port": 8080, "protocol": "http" },
-                        { "name": "admin", "port": 8081, "protocol": "http" }
+                        { "name": "admin", "port": 8081, "protocol": "http" },
+                        { "name": "debug", "port": 8082, "protocol": "http" }
                     ]
                 }
             }),
@@ -734,12 +738,18 @@ mod tests {
             "endpoint": "admin",
         }))
         .expect("admin provide decl");
+        let provide_debug = serde_json::from_value::<ProvideDecl>(json!({
+            "kind": "http",
+            "endpoint": "debug",
+        }))
+        .expect("debug provide decl");
         provider
             .provides
             .insert("api".to_string(), provide_api.clone());
         provider
             .provides
             .insert("admin".to_string(), provide_admin.clone());
+        provider.provides.insert("debug".to_string(), provide_debug);
 
         let scenario = Scenario {
             root: ComponentId(0),
@@ -818,21 +828,22 @@ mod tests {
             vec!["/site/test/router".to_string()]
         );
 
-        let internal_route = provider_config
+        let bound_route = provider_config
             .inbound
             .iter()
             .find(|route| route.capability == "admin")
-            .expect("internal admin route");
+            .expect("bound admin route");
         assert_eq!(
-            internal_route.allowed_issuers,
-            vec!["/consumer".to_string()]
+            bound_route.allowed_issuers,
+            vec!["/consumer".to_string(), "/site/test/router".to_string()]
         );
+        let unused_route = provider_config
+            .inbound
+            .iter()
+            .find(|route| route.capability == "debug");
         assert!(
-            !internal_route
-                .allowed_issuers
-                .iter()
-                .any(|issuer| issuer == "/site/test/router"),
-            "non-exported local routes must not be callable by the router",
+            unused_route.is_none(),
+            "unused local routes must stay closed to the router and should not be emitted",
         );
     }
 }

@@ -108,6 +108,8 @@ pub(super) fn materialize_launch_bundle(
         };
         patch_site_artifacts(
             &artifact_dir,
+            run_id,
+            site_id,
             site_plan.site.kind,
             &merge_env_maps(runtime_env, &framework_env),
             observability_endpoint,
@@ -841,6 +843,8 @@ pub(super) fn prepare_site_launch(
     let artifact_env = merge_env_maps(runtime_env, external_env);
     patch_site_artifacts(
         &site.artifact_dir,
+        &site.base_supervisor_plan.run_id,
+        &site.base_supervisor_plan.site_id,
         site.site_plan.site.kind,
         &artifact_env,
         site.base_supervisor_plan.observability_endpoint.as_deref(),

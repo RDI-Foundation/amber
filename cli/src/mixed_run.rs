@@ -44,6 +44,7 @@ use base64::Engine as _;
 use miette::{Context as _, IntoDiagnostic as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpListener as TokioTcpListener,
@@ -1567,6 +1568,128 @@ fn compose_services_mut<'a>(
                 path.display()
             )
         })
+}
+
+fn compose_networks_mut<'a>(
+    document: &'a mut serde_yaml::Value,
+    path: &Path,
+) -> Result<Option<&'a mut serde_yaml::Mapping>> {
+    let Some(root) = document.as_mapping_mut() else {
+        return Err(miette::miette!(
+            "compose file {} is not a mapping",
+            path.display()
+        ));
+    };
+    Ok(root
+        .get_mut(yaml_string("networks"))
+        .and_then(serde_yaml::Value::as_mapping_mut))
+}
+
+fn assign_compose_egress_network_subnets(
+    artifact_dir: &Path,
+    run_id: &str,
+    site_id: &str,
+) -> Result<()> {
+    let compose_path = artifact_dir.join("compose.yaml");
+    if !compose_path.is_file() {
+        return Ok(());
+    }
+
+    let mut document = read_compose_document(&compose_path)?;
+    let Some(networks) = compose_networks_mut(&mut document, &compose_path)? else {
+        return Ok(());
+    };
+
+    let mut used_subnets = networks
+        .values()
+        .filter_map(compose_network_subnet)
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let mut changed = false;
+
+    for (name, network) in networks.iter_mut() {
+        let Some(name) = name.as_str() else {
+            continue;
+        };
+        if !name.starts_with("amber_egress_") || compose_network_subnet(network).is_some() {
+            continue;
+        }
+        let subnet = next_compose_egress_subnet(run_id, site_id, name, &used_subnets);
+        set_compose_network_subnet(network, &subnet)?;
+        used_subnets.insert(subnet);
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    let rendered = serde_yaml::to_string(&document)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to serialize {}", compose_path.display()))?;
+    fs::write(&compose_path, rendered)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", compose_path.display()))
+}
+
+fn compose_network_subnet(network: &serde_yaml::Value) -> Option<&str> {
+    network
+        .as_mapping()
+        .and_then(|mapping| mapping.get(yaml_string("ipam")))
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|ipam| ipam.get(yaml_string("config")))
+        .and_then(serde_yaml::Value::as_sequence)
+        .and_then(|configs| configs.first())
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|config| config.get(yaml_string("subnet")))
+        .and_then(serde_yaml::Value::as_str)
+}
+
+fn set_compose_network_subnet(network: &mut serde_yaml::Value, subnet: &str) -> Result<()> {
+    let Some(mapping) = network.as_mapping_mut() else {
+        return Err(miette::miette!(
+            "compose network definition is not a mapping"
+        ));
+    };
+    mapping.insert(
+        yaml_string("ipam"),
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([(
+            yaml_string("config"),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(
+                serde_yaml::Mapping::from_iter([(yaml_string("subnet"), yaml_string(subnet))]),
+            )]),
+        )])),
+    );
+    Ok(())
+}
+
+fn next_compose_egress_subnet(
+    run_id: &str,
+    site_id: &str,
+    network_name: &str,
+    used_subnets: &BTreeSet<String>,
+) -> String {
+    let digest = Sha256::digest(format!("{run_id}:{site_id}:{network_name}"));
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&digest[..4]);
+    let base = u32::from_be_bytes(bytes) % COMPOSE_EGRESS_SUBNET_COUNT;
+    for offset in 0..COMPOSE_EGRESS_SUBNET_COUNT {
+        let candidate =
+            compose_egress_subnet_from_index((base + offset) % COMPOSE_EGRESS_SUBNET_COUNT);
+        if !used_subnets.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("compose egress subnet pool exhausted")
+}
+
+const COMPOSE_EGRESS_SUBNET_COUNT: u32 = 1 << 18;
+
+fn compose_egress_subnet_from_index(index: u32) -> String {
+    let second_octet = 64 + ((index >> 12) & 0x3f);
+    let third_octet = (index >> 4) & 0xff;
+    let fourth_octet = (index & 0x0f) << 4;
+    format!("100.{second_octet}.{third_octet}.{fourth_octet}/28")
 }
 
 fn compose_service_names(document: &serde_yaml::Value, path: &Path) -> Result<BTreeSet<String>> {
@@ -4997,6 +5120,8 @@ async fn actuator_prepare_child(
     }
     patch_site_artifacts(
         &artifact_root,
+        &app.plan.run_id,
+        &app.plan.site_id,
         site_plan.kind,
         &app.plan.launch_env,
         app.plan.observability_endpoint.as_deref(),
@@ -6538,6 +6663,8 @@ fn prepare_kubernetes_artifact_for_apply(
         prepare_kubernetes_artifact_namespace(&plan.run_id, &plan.site_id, artifact_dir)?;
     patch_site_artifacts(
         artifact_dir,
+        &plan.run_id,
+        &plan.site_id,
         plan.kind,
         &plan.launch_env,
         plan.observability_endpoint.as_deref(),
