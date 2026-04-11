@@ -78,6 +78,7 @@ use crate::mixed_run::{
 mod api;
 mod dynamic_caps;
 mod http;
+mod mcp;
 mod orchestration;
 mod planner;
 mod state;

@@ -81,7 +81,15 @@ pub(crate) async fn run_framework_control_state(plan_path: PathBuf) -> Result<()
 
 pub(crate) async fn run_framework_ccs(plan_path: PathBuf) -> Result<()> {
     let plan: FrameworkCcsPlan = read_json(plan_path.as_path(), "framework CCS plan")?;
+    let app_state = CcsApp {
+        client: ReqwestClient::new(),
+        site_state_root: PathBuf::from(&plan.site_state_root),
+        control_state_url: Arc::<str>::from(plan.control_state_url),
+        router_auth_token: Arc::<str>::from(plan.router_auth_token),
+        control_state_auth_token: Arc::<str>::from(plan.control_state_auth_token),
+    };
     let app = Router::new()
+        .nest_service("/mcp", mcp::service(app_state.clone()))
         .route("/", get(healthz))
         .route("/healthz", get(healthz))
         .route("/v1/templates", get(ccs_list_templates))
@@ -103,13 +111,7 @@ pub(crate) async fn run_framework_ccs(plan_path: PathBuf) -> Result<()> {
             "/v1/internal/dynamic-caps/origins/publish",
             post(ccs_publish_dynamic_capability_origin),
         )
-        .with_state(CcsApp {
-            client: ReqwestClient::new(),
-            site_state_root: PathBuf::from(&plan.site_state_root),
-            control_state_url: Arc::<str>::from(plan.control_state_url),
-            router_auth_token: Arc::<str>::from(plan.router_auth_token),
-            control_state_auth_token: Arc::<str>::from(plan.control_state_auth_token),
-        });
+        .with_state(app_state);
     let listener = TcpListener::bind(plan.listen_addr)
         .await
         .into_diagnostic()
@@ -424,7 +426,7 @@ pub(super) async fn ccs_list_templates(
     State(app): State<CcsApp>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<TemplateListResponse>, ProtocolApiError> {
-    let (_, record, state) = authorize_request(&app, &headers).await?;
+    let (record, state) = authorize_request(&app, &headers).await?;
     Ok(Json(list_templates(&state, record.authority_realm_id)?))
 }
 
@@ -433,7 +435,7 @@ pub(super) async fn ccs_describe_template(
     headers: HeaderMap,
     AxumPath(template): AxumPath<String>,
 ) -> std::result::Result<Json<TemplateDescribeResponse>, ProtocolApiError> {
-    let (_, record, state) = authorize_request(&app, &headers).await?;
+    let (record, state) = authorize_request(&app, &headers).await?;
     Ok(Json(describe_template(
         &state,
         record.authority_realm_id,
@@ -447,7 +449,7 @@ pub(super) async fn ccs_resolve_template(
     AxumPath(template): AxumPath<String>,
     Json(request): Json<TemplateResolveRequest>,
 ) -> std::result::Result<Json<TemplateDescribeResponse>, ProtocolApiError> {
-    let (_, record, state) = authorize_request(&app, &headers).await?;
+    let (record, state) = authorize_request(&app, &headers).await?;
     Ok(Json(
         resolve_template(&state, record.authority_realm_id, &template, request).await?,
     ))
@@ -457,7 +459,7 @@ pub(super) async fn ccs_list_children(
     State(app): State<CcsApp>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<ChildListResponse>, ProtocolApiError> {
-    let (_, record, state) = authorize_request(&app, &headers).await?;
+    let (record, state) = authorize_request(&app, &headers).await?;
     Ok(Json(list_children(&state, record.authority_realm_id)))
 }
 
@@ -466,7 +468,7 @@ pub(super) async fn ccs_create_child(
     headers: HeaderMap,
     Json(request): Json<CreateChildRequest>,
 ) -> std::result::Result<Json<CreateChildResponse>, ProtocolApiError> {
-    let (_, record, _) = authorize_request(&app, &headers).await?;
+    let (record, _) = authorize_request(&app, &headers).await?;
     Ok(Json(
         forward_create_child(&app, &record.cap_instance_id, request).await?,
     ))
@@ -477,7 +479,7 @@ pub(super) async fn ccs_describe_child(
     headers: HeaderMap,
     AxumPath(child): AxumPath<String>,
 ) -> std::result::Result<Json<ChildDescribeResponse>, ProtocolApiError> {
-    let (_, record, state) = authorize_request(&app, &headers).await?;
+    let (record, state) = authorize_request(&app, &headers).await?;
     Ok(Json(describe_child(
         &state,
         record.authority_realm_id,
@@ -489,7 +491,7 @@ pub(super) async fn ccs_snapshot(
     State(app): State<CcsApp>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<SnapshotResponse>, ProtocolApiError> {
-    let (_, record, state) = authorize_request(&app, &headers).await?;
+    let (record, state) = authorize_request(&app, &headers).await?;
     Ok(Json(snapshot(&state, record.authority_realm_id)?))
 }
 
@@ -510,7 +512,7 @@ pub(super) async fn ccs_destroy_child(
     headers: HeaderMap,
     AxumPath(child): AxumPath<String>,
 ) -> std::result::Result<StatusCode, ProtocolApiError> {
-    let (_, record, _) = authorize_request(&app, &headers).await?;
+    let (record, _) = authorize_request(&app, &headers).await?;
     forward_destroy_child(&app, &record.cap_instance_id, &child).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -518,8 +520,7 @@ pub(super) async fn ccs_destroy_child(
 pub(super) async fn authorize_request(
     app: &CcsApp,
     headers: &HeaderMap,
-) -> std::result::Result<(String, CapabilityInstanceRecord, FrameworkControlState), ProtocolApiError>
-{
+) -> std::result::Result<(CapabilityInstanceRecord, FrameworkControlState), ProtocolApiError> {
     authorize_framework_auth_header(headers, app.router_auth_token.as_ref())?;
     let route_id = required_header(headers, FRAMEWORK_ROUTE_ID_HEADER)?;
     let peer_id = required_header(headers, FRAMEWORK_PEER_ID_HEADER)?;
@@ -527,7 +528,7 @@ pub(super) async fn authorize_request(
     let record = authorize_capability_instance(&state, &route_id, &peer_id)
         .map_err(ProtocolApiError::from)?
         .clone();
-    Ok((peer_id, record, state))
+    Ok((record, state))
 }
 
 pub(super) fn authorize_framework_auth_header(

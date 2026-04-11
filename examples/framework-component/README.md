@@ -16,6 +16,17 @@ The root manifest gives the `admin` component a `framework.component` binding. `
 - provision its own `http` capability to each new child after the child becomes live
 - snapshot the live graph
 
+`framework.component` is available over two transports:
+
+- HTTP under `<CTL_URL>/v1/...`
+- MCP at `<CTL_URL>/mcp`
+
+The MCP surface is:
+
+- `amber.v1.framework_component.inspect` handles the read operations
+- `amber.v1.framework_component.mutate` handles create and destroy
+- `amber://framework-component` and `amber://framework-component/op/{name}` provide on-demand help
+
 The scenario defines three template modes on purpose:
 
 - `exact_worker`: fixed manifest, runtime config still open

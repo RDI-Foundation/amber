@@ -27,7 +27,7 @@ url = { workspace = true, features = ["serde"] }
 axum = { version = "0.8.6", features = ["http1", "json", "tokio"] }
 clap = { version = "4.5.46", features = ["derive"] }
 libc = "0.2.177"
-rmcp = { version = "1.2.0", features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
+rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
 sqlx = { version = "0.8.6", features = ["macros", "migrate", "runtime-tokio-rustls", "sqlite"] }
 tower-http = { version = "0.6.6", features = ["trace"] }
 uuid = { version = "1.18.1", features = ["serde", "v7"] }

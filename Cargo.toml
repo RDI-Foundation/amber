@@ -52,6 +52,7 @@ opentelemetry = "0.31.0"
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "logs"] }
 opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["rt-tokio", "logs"] }
 tracing-opentelemetry = "0.32.1"
+rmcp = "1.4.0"
 
 [profile.release]
 lto = "thin"

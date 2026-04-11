@@ -10,6 +10,9 @@ use amber_mesh::{
         HeldEntryKind, HeldEntryState, RootAuthoritySelectorIr,
     },
 };
+use reqwest::{Client, StatusCode};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use url::Url;
 
@@ -1325,6 +1328,80 @@ async fn compile_exact_template_control_state() -> (TempDir, FrameworkControlSta
     (dir, state, state_path)
 }
 
+async fn compile_framework_binding_control_state() -> (
+    TempDir,
+    FrameworkControlState,
+    PathBuf,
+    CapabilityInstanceRecord,
+) {
+    let dir = TempDir::new().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let admin_path = dir.path().join("admin.json5");
+    let worker_path = dir.path().join("worker.json5");
+    write_file(
+        &admin_path,
+        r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                ctl: { kind: "component" }
+              },
+              program: { path: "/bin/echo", args: ["admin", "${slots.ctl.url}"] }
+            }
+            "#,
+    );
+    write_file(
+        &worker_path,
+        r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/echo",
+                args: ["worker"],
+                network: { endpoints: [{ name: "out", port: 8080, protocol: "http" }] }
+              },
+              provides: { out: { kind: "http", endpoint: "out" } },
+              exports: { out: "provides.out" },
+            }
+            "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  components: {{
+                    admin: "{admin}"
+                  }},
+                  child_templates: {{
+                    worker: {{ manifest: "{worker}" }}
+                  }},
+                  bindings: [
+                    {{ to: "#admin.ctl", from: "framework.component" }}
+                  ],
+                }}
+                "##,
+            admin = file_url(&admin_path),
+            worker = file_url(&worker_path),
+        ),
+    );
+
+    let state = compile_control_state(&root_path).await;
+    let state_path = dir.path().join("control-state.json");
+    write_control_state(&state_path, &state).expect("state should write");
+    let record = state
+        .capability_instances
+        .values()
+        .find(|record| record.recipient_component_moniker == "/admin")
+        .cloned()
+        .expect("admin should receive a framework capability instance");
+    (dir, state, state_path, record)
+}
+
 fn empty_live_child(
     authority_realm_id: usize,
     name: &str,
@@ -1376,6 +1453,401 @@ fn test_control_state_app(
         authority_locks: Arc::new(Mutex::new(BTreeMap::new())),
         bridge_proxies: Arc::new(Mutex::new(BTreeMap::new())),
     }
+}
+
+fn sse_json_rpc_message(body: &str) -> Value {
+    let normalized = body.replace("\r\n", "\n");
+    let payload = normalized
+        .split("\n\n")
+        .filter_map(|event| {
+            let data = event
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!data.is_empty()).then_some(data)
+        })
+        .last()
+        .unwrap_or_else(|| panic!("SSE response did not contain JSON-RPC data: {body}"));
+    serde_json::from_str(&payload)
+        .unwrap_or_else(|err| panic!("parse JSON-RPC payload from SSE: {err}; {payload}"))
+}
+
+async fn spawn_test_router(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("test listener");
+    let addr = listener.local_addr().expect("test listener addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .expect("test server should run");
+    });
+    (format!("http://{addr}"), handle)
+}
+
+struct FrameworkMcpClient {
+    client: Client,
+    endpoint: String,
+    session_id: String,
+    route_id: String,
+    peer_id: String,
+    auth_token: String,
+    next_id: u64,
+}
+
+impl FrameworkMcpClient {
+    async fn connect(base_url: &str, route_id: &str, peer_id: &str, auth_token: &str) -> Self {
+        let client = Client::new();
+        let endpoint = format!("{base_url}/mcp");
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "framework-component-test",
+                    "version": "0.0.0",
+                },
+            },
+        });
+        let response = client
+            .post(&endpoint)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header(FRAMEWORK_AUTH_HEADER, auth_token)
+            .header(FRAMEWORK_ROUTE_ID_HEADER, route_id)
+            .header(FRAMEWORK_PEER_ID_HEADER, peer_id)
+            .json(&initialize)
+            .send()
+            .await
+            .expect("send initialize request");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.text().await.expect("read initialize response");
+        assert_eq!(status, StatusCode::OK, "initialize failed: {body}");
+        let session_id = headers
+            .get("mcp-session-id")
+            .expect("initialize should return MCP session ID")
+            .to_str()
+            .expect("session ID should be valid UTF-8")
+            .to_string();
+        let payload = sse_json_rpc_message(&body);
+        assert!(
+            payload.get("error").is_none(),
+            "initialize returned error: {payload:#?}"
+        );
+        assert_eq!(
+            payload["result"]["protocolVersion"].as_str(),
+            Some("2025-06-18")
+        );
+
+        let notification = client
+            .post(&endpoint)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session_id)
+            .header(FRAMEWORK_AUTH_HEADER, auth_token)
+            .header(FRAMEWORK_ROUTE_ID_HEADER, route_id)
+            .header(FRAMEWORK_PEER_ID_HEADER, peer_id)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            }))
+            .send()
+            .await
+            .expect("send initialized notification");
+        assert_eq!(notification.status(), StatusCode::ACCEPTED);
+
+        Self {
+            client,
+            endpoint,
+            session_id,
+            route_id: route_id.to_string(),
+            peer_id: peer_id.to_string(),
+            auth_token: auth_token.to_string(),
+            next_id: 1,
+        }
+    }
+
+    async fn tools_list(&mut self) -> Vec<Value> {
+        self.request("tools/list", json!({}))
+            .await
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("tools/list should return tools array")
+    }
+
+    async fn resources_list(&mut self) -> Vec<Value> {
+        self.request("resources/list", json!({}))
+            .await
+            .get("resources")
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("resources/list should return resources array")
+    }
+
+    async fn read_resource_text(&mut self, uri: &str) -> String {
+        self.request("resources/read", json!({ "uri": uri }))
+            .await
+            .get("contents")
+            .and_then(Value::as_array)
+            .and_then(|contents| contents.first())
+            .and_then(|content| content.get("text"))
+            .and_then(Value::as_str)
+            .expect("resources/read should return text content")
+            .to_string()
+    }
+
+    async fn call_tool<T: DeserializeOwned>(&mut self, name: &str, arguments: Value) -> T {
+        let result = self
+            .request(
+                "tools/call",
+                json!({
+                    "name": name,
+                    "arguments": arguments,
+                }),
+            )
+            .await;
+        assert_ne!(
+            result.get("isError").and_then(Value::as_bool),
+            Some(true),
+            "tool {name} returned isError: {result:#?}"
+        );
+        serde_json::from_value(
+            result
+                .get("structuredContent")
+                .cloned()
+                .expect("tool result should include structuredContent"),
+        )
+        .unwrap_or_else(|err| panic!("deserialize tool result for {name}: {err}; {result:#?}"))
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &self.session_id)
+            .header(FRAMEWORK_AUTH_HEADER, &self.auth_token)
+            .header(FRAMEWORK_ROUTE_ID_HEADER, &self.route_id)
+            .header(FRAMEWORK_PEER_ID_HEADER, &self.peer_id)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            }))
+            .send()
+            .await
+            .unwrap_or_else(|err| panic!("send MCP request {method}: {err}"));
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|err| panic!("read MCP response for {method}: {err}"));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "MCP request {method} failed with status {status}: {body}"
+        );
+        let payload = sse_json_rpc_message(&body);
+        assert_eq!(payload["id"].as_u64(), Some(id));
+        assert!(
+            payload.get("error").is_none(),
+            "MCP request {method} returned error: {payload:#?}"
+        );
+        payload
+            .get("result")
+            .cloned()
+            .expect("MCP response should include result")
+    }
+}
+
+struct FrameworkMcpHarness {
+    _dir: TempDir,
+    base_url: String,
+    route_id: String,
+    peer_id: String,
+    auth_token: String,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl FrameworkMcpHarness {
+    async fn start(with_actuators: bool) -> Self {
+        let (dir, state, state_path, record) = compile_framework_binding_control_state().await;
+        let app = test_control_state_app(&dir, state, state_path);
+        let mut handles = if with_actuators {
+            install_success_site_actuator(&app).await
+        } else {
+            Vec::new()
+        };
+        let control_router = Router::new()
+            .route(CONTROL_SERVICE_PATH, get(get_control_state))
+            .route("/v1/control-state/children", post(control_create_child))
+            .route(
+                "/v1/control-state/children/{child}/destroy",
+                post(control_destroy_child),
+            )
+            .with_state(app.clone());
+        let (control_state_url, control_handle) = spawn_test_router(control_router).await;
+        handles.push(control_handle);
+
+        let auth_token = "test-router-auth".to_string();
+        let ccs_app = CcsApp {
+            client: ReqwestClient::new(),
+            site_state_root: app.state_root.clone(),
+            control_state_url: Arc::<str>::from(control_state_url),
+            router_auth_token: Arc::<str>::from(auth_token.clone()),
+            control_state_auth_token: app.control_state_auth_token.clone(),
+        };
+        let ccs_router = Router::new().nest_service("/mcp", mcp::service(ccs_app));
+        let (base_url, ccs_handle) = spawn_test_router(ccs_router).await;
+        handles.push(ccs_handle);
+
+        Self {
+            _dir: dir,
+            base_url,
+            route_id: record.cap_instance_id,
+            peer_id: record.recipient_peer_id,
+            auth_token,
+            handles,
+        }
+    }
+
+    async fn connect(&self) -> FrameworkMcpClient {
+        FrameworkMcpClient::connect(
+            &self.base_url,
+            &self.route_id,
+            &self.peer_id,
+            &self.auth_token,
+        )
+        .await
+    }
+}
+
+impl Drop for FrameworkMcpHarness {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn framework_component_mcp_discovers_compact_surface() {
+    let harness = FrameworkMcpHarness::start(false).await;
+    let mut mcp = harness.connect().await;
+
+    let tool_names = mcp
+        .tools_list()
+        .await
+        .into_iter()
+        .filter_map(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_names,
+        vec![
+            "amber.v1.framework_component.inspect".to_string(),
+            "amber.v1.framework_component.mutate".to_string(),
+        ]
+    );
+
+    let resources = mcp.resources_list().await;
+    assert_eq!(resources.len(), 1, "expected one top-level help resource");
+    assert_eq!(
+        resources[0].get("uri").and_then(Value::as_str),
+        Some("amber://framework-component")
+    );
+
+    let help = mcp.read_resource_text("amber://framework-component").await;
+    assert!(
+        help.contains("amber.v1.framework_component.inspect"),
+        "help resource should point callers to the inspect tool"
+    );
+    assert!(
+        help.contains("/mcp"),
+        "help resource should explain the MCP endpoint path"
+    );
+
+    let templates: Value = mcp
+        .call_tool(
+            "amber.v1.framework_component.inspect",
+            json!({ "op": "list_templates" }),
+        )
+        .await;
+    assert_eq!(templates["op"].as_str(), Some("list_templates"));
+    assert_eq!(
+        templates["data"]["templates"][0]["name"].as_str(),
+        Some("worker")
+    );
+}
+
+#[tokio::test]
+async fn framework_component_mcp_creates_and_destroys_children() {
+    let harness = FrameworkMcpHarness::start(true).await;
+    let mut mcp = harness.connect().await;
+
+    let created: Value = mcp
+        .call_tool(
+            "amber.v1.framework_component.mutate",
+            json!({
+                "op": "create_child",
+                "template": "worker",
+                "name": "job",
+            }),
+        )
+        .await;
+    assert_eq!(created["op"].as_str(), Some("create_child"));
+    assert_eq!(created["data"]["child"]["name"].as_str(), Some("job"));
+
+    let listed: Value = mcp
+        .call_tool(
+            "amber.v1.framework_component.inspect",
+            json!({ "op": "list_children" }),
+        )
+        .await;
+    assert_eq!(
+        listed["data"]["children"][0]["name"].as_str(),
+        Some("job"),
+        "created child should become visible over MCP"
+    );
+
+    let destroyed: Value = mcp
+        .call_tool(
+            "amber.v1.framework_component.mutate",
+            json!({
+                "op": "destroy_child",
+                "child": "job",
+            }),
+        )
+        .await;
+    assert_eq!(destroyed["op"].as_str(), Some("destroy_child"));
+    assert_eq!(destroyed["data"]["destroyed"].as_bool(), Some(true));
+
+    let listed_after: Value = mcp
+        .call_tool(
+            "amber.v1.framework_component.inspect",
+            json!({ "op": "list_children" }),
+        )
+        .await;
+    assert!(
+        listed_after["data"]["children"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "destroyed child should be removed from the live list"
+    );
 }
 
 async fn install_success_site_actuator(app: &ControlStateApp) -> Vec<tokio::task::JoinHandle<()>> {

@@ -25,6 +25,7 @@ jsonschema = { workspace = true, default-features = false }
 libc = "0.2.177"
 miette = { workspace = true, features = ["fancy"] }
 reqwest = { workspace = true }
+rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
 regex = "1.11.1"
 rpassword = "7.4.0"
 serde = { workspace = true, features = ["derive"] }
