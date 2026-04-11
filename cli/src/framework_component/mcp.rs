@@ -18,13 +18,16 @@ use rmcp::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    api::*,
+    ccs_api::{
+        self, FrameworkComponentInspectRequest, FrameworkComponentInspectResponse,
+        FrameworkComponentMutateRequest, FrameworkComponentMutateResponse,
+    },
     http::*,
-    orchestration::ProtocolApiError,
+    mcp_common::{McpOperationResponse, json_response, map_protocol_api_error, map_protocol_error},
     planner::CcsApp,
     state::{CapabilityInstanceRecord, FrameworkControlState},
     *,
@@ -70,37 +73,16 @@ impl FrameworkComponentMcp {
             .map_err(map_protocol_api_error)
     }
 
-    fn json_response(
-        &self,
-        op: &'static str,
-        data: impl Serialize,
-    ) -> Result<Json<FrameworkMcpResponse>, McpError> {
-        let data = serde_json::to_value(data).map_err(|err| {
-            McpError::internal_error(
-                format!("failed to serialize framework.component `{op}` result: {err}"),
-                None,
-            )
-        })?;
-        Ok(Json(FrameworkMcpResponse {
-            op: op.to_string(),
-            data,
-        }))
-    }
-
     fn render_help_resource(&self) -> String {
         let mut out = String::from("# framework.component MCP\n\n");
-        out.push_str(
-            "This MCP surface is intentionally compact. Use \
-             `amber.v1.framework_component.inspect` for reads and \
-             `amber.v1.framework_component.mutate` for create or destroy. Read a specific \
-             operation resource only when you need field-level detail.\n\n",
-        );
-        out.push_str("## Transport\n\n");
-        out.push_str(
-            "- Base control URL: the existing `framework.component` slot URL\n- MCP endpoint: \
-             append `/mcp`\n- Existing HTTP routes under `/v1/...` remain unchanged\n\n",
-        );
-        out.push_str("## Inspect operations\n\n");
+        out.push_str("Tools:\n");
+        out.push_str("- `amber.v1.framework_component.inspect`\n");
+        out.push_str("- `amber.v1.framework_component.mutate`\n\n");
+        out.push_str("Transport:\n");
+        out.push_str("- Base control URL: the `framework.component` slot URL\n");
+        out.push_str("- MCP endpoint: append `/mcp`\n");
+        out.push_str("- HTTP routes remain under `/v1/...`\n\n");
+        out.push_str("Inspect operations:\n");
         for op in [
             "list_templates",
             "get_template",
@@ -114,17 +96,13 @@ impl FrameworkComponentMcp {
                 OPERATION_RESOURCE_PREFIX
             ));
         }
-        out.push_str("\n## Mutate operations\n\n");
+        out.push_str("\nMutate operations:\n");
         for op in ["create_child", "destroy_child"] {
             out.push_str(&format!(
                 "- `{op}`: read `{}{op}` for arguments, output shape, and caveats\n",
                 OPERATION_RESOURCE_PREFIX
             ));
         }
-        out.push_str(
-            "\n`get_snapshot` can return a large payload. Prefer narrower reads unless you \
-             specifically need the full live graph snapshot.\n",
-        );
         out
     }
 
@@ -266,12 +244,6 @@ enum MutateArgs {
     },
 }
 
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-struct FrameworkMcpResponse {
-    op: String,
-    data: Value,
-}
-
 #[tool_router]
 impl FrameworkComponentMcp {
     #[tool(
@@ -283,44 +255,50 @@ impl FrameworkComponentMcp {
         &self,
         Parameters(args): Parameters<InspectArgs>,
         context: RequestContext<RoleServer>,
-    ) -> Result<Json<FrameworkMcpResponse>, McpError> {
+    ) -> Result<Json<McpOperationResponse>, McpError> {
         let (record, state) = self.authorize(&context).await?;
-        match args {
-            InspectArgs::ListTemplates => self.json_response(
-                "list_templates",
-                list_templates(&state, record.authority_realm_id).map_err(map_protocol_error)?,
-            ),
-            InspectArgs::GetTemplate { template } => self.json_response(
-                "get_template",
-                describe_template(&state, record.authority_realm_id, &template)
-                    .map_err(map_protocol_error)?,
-            ),
-            InspectArgs::ResolveTemplate { template, manifest } => self.json_response(
-                "resolve_template",
-                resolve_template(
-                    &state,
-                    record.authority_realm_id,
-                    &template,
-                    TemplateResolveRequest {
-                        manifest: manifest.map(ManifestArg::into_manifest_ref).transpose()?,
-                    },
-                )
-                .await
-                .map_err(map_protocol_error)?,
-            ),
-            InspectArgs::ListChildren => self.json_response(
-                "list_children",
-                list_children(&state, record.authority_realm_id),
-            ),
-            InspectArgs::GetChild { child } => self.json_response(
-                "get_child",
-                describe_child(&state, record.authority_realm_id, &child)
-                    .map_err(map_protocol_error)?,
-            ),
-            InspectArgs::GetSnapshot => self.json_response(
-                "get_snapshot",
-                snapshot(&state, record.authority_realm_id).map_err(map_protocol_error)?,
-            ),
+        let response = ccs_api::execute_framework_component_inspect(
+            &state,
+            record.authority_realm_id,
+            match args {
+                InspectArgs::ListTemplates => FrameworkComponentInspectRequest::ListTemplates,
+                InspectArgs::GetTemplate { template } => {
+                    FrameworkComponentInspectRequest::GetTemplate { template }
+                }
+                InspectArgs::ResolveTemplate { template, manifest } => {
+                    FrameworkComponentInspectRequest::ResolveTemplate {
+                        template,
+                        request: TemplateResolveRequest {
+                            manifest: manifest.map(ManifestArg::into_manifest_ref).transpose()?,
+                        },
+                    }
+                }
+                InspectArgs::ListChildren => FrameworkComponentInspectRequest::ListChildren,
+                InspectArgs::GetChild { child } => {
+                    FrameworkComponentInspectRequest::GetChild { child }
+                }
+                InspectArgs::GetSnapshot => FrameworkComponentInspectRequest::GetSnapshot,
+            },
+        )
+        .await
+        .map_err(map_protocol_error)?;
+        match response {
+            FrameworkComponentInspectResponse::ListTemplates(data) => {
+                json_response("list_templates", data)
+            }
+            FrameworkComponentInspectResponse::GetTemplate(data) => {
+                json_response("get_template", data)
+            }
+            FrameworkComponentInspectResponse::ResolveTemplate(data) => {
+                json_response("resolve_template", data)
+            }
+            FrameworkComponentInspectResponse::ListChildren(data) => {
+                json_response("list_children", data)
+            }
+            FrameworkComponentInspectResponse::GetChild(data) => json_response("get_child", data),
+            FrameworkComponentInspectResponse::GetSnapshot(data) => {
+                json_response("get_snapshot", data)
+            }
         }
     }
 
@@ -332,45 +310,41 @@ impl FrameworkComponentMcp {
         &self,
         Parameters(args): Parameters<MutateArgs>,
         context: RequestContext<RoleServer>,
-    ) -> Result<Json<FrameworkMcpResponse>, McpError> {
+    ) -> Result<Json<McpOperationResponse>, McpError> {
         let (record, _) = self.authorize(&context).await?;
-        match args {
-            MutateArgs::CreateChild {
-                template,
-                name,
-                manifest,
-                config,
-                bindings,
-            } => self.json_response(
-                "create_child",
-                forward_create_child(
-                    &self.app,
-                    &record.cap_instance_id,
-                    CreateChildRequest {
-                        template,
-                        name,
-                        manifest: manifest.map(ManifestArg::into_manifest_ref).transpose()?,
-                        config,
-                        bindings: bindings
-                            .into_iter()
-                            .map(|(name, input)| (name, input.into()))
-                            .collect(),
-                    },
-                )
-                .await
-                .map_err(map_protocol_api_error)?,
-            ),
-            MutateArgs::DestroyChild { child } => {
-                forward_destroy_child(&self.app, &record.cap_instance_id, &child)
-                    .await
-                    .map_err(map_protocol_api_error)?;
-                self.json_response(
-                    "destroy_child",
-                    serde_json::json!({
-                        "child": child,
-                        "destroyed": true,
-                    }),
-                )
+        let response = ccs_api::execute_framework_component_mutate(
+            &self.app,
+            &record.cap_instance_id,
+            match args {
+                MutateArgs::CreateChild {
+                    template,
+                    name,
+                    manifest,
+                    config,
+                    bindings,
+                } => FrameworkComponentMutateRequest::CreateChild(CreateChildRequest {
+                    template,
+                    name,
+                    manifest: manifest.map(ManifestArg::into_manifest_ref).transpose()?,
+                    config,
+                    bindings: bindings
+                        .into_iter()
+                        .map(|(name, input)| (name, input.into()))
+                        .collect(),
+                }),
+                MutateArgs::DestroyChild { child } => {
+                    FrameworkComponentMutateRequest::DestroyChild { child }
+                }
+            },
+        )
+        .await
+        .map_err(map_protocol_api_error)?;
+        match response {
+            FrameworkComponentMutateResponse::CreateChild(data) => {
+                json_response("create_child", data)
+            }
+            FrameworkComponentMutateResponse::DestroyChild(data) => {
+                json_response("destroy_child", data)
             }
         }
     }
@@ -462,35 +436,5 @@ impl ServerHandler for FrameworkComponentMcp {
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             text, uri,
         )]))
-    }
-}
-
-fn map_protocol_api_error(error: ProtocolApiError) -> McpError {
-    map_protocol_error(error.0)
-}
-
-fn map_protocol_error(error: ProtocolErrorResponse) -> McpError {
-    let data = Some(
-        serde_json::to_value(&error).expect("framework component protocol errors should serialize"),
-    );
-    match error.code {
-        ProtocolErrorCode::UnknownTemplate
-        | ProtocolErrorCode::UnknownChild
-        | ProtocolErrorCode::BindingSourceNotFound
-        | ProtocolErrorCode::UnknownSource
-        | ProtocolErrorCode::UnknownRef
-        | ProtocolErrorCode::UnknownHandle => McpError::resource_not_found(error.message, data),
-        ProtocolErrorCode::Unauthorized
-        | ProtocolErrorCode::CallerLacksAuthority
-        | ProtocolErrorCode::RecipientMismatch => McpError::invalid_request(error.message, data),
-        ProtocolErrorCode::ControlStateUnavailable
-        | ProtocolErrorCode::PrepareFailed
-        | ProtocolErrorCode::PublishFailed
-        | ProtocolErrorCode::SiteNotActive
-        | ProtocolErrorCode::OriginUnavailable
-        | ProtocolErrorCode::PathEstablishmentFailed => {
-            McpError::internal_error(error.message, data)
-        }
-        _ => McpError::invalid_params(error.message, data),
     }
 }
