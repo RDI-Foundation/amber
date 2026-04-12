@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
+    env, fs,
     io::{self, Write as _},
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -11,12 +11,14 @@ use amber_config::{self as config, CONFIG_ENV_PREFIX};
 use amber_manifest::{CapabilityKind, CapabilityTransport};
 use miette::{Context as _, IntoDiagnostic as _, Result};
 use rpassword::prompt_password;
+use serde_json::Value;
 use url::Url;
 
 use crate::site_proxy_metadata::load_site_proxy_metadata;
 
 const GENERATED_ENV_SAMPLE_FILENAME: &str = "env.example";
 const PROJECT_ENV_FILENAME: &str = ".env";
+pub(crate) const CONFIG_FILE_ENV_PREFIX: &str = "AMBER_CONFIG_FILE_";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RootInputSpec {
@@ -54,6 +56,18 @@ struct ParsedRootInputComment {
     path: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RootInputSource {
+    Literal(String),
+    File(PathBuf),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RunInputLayer {
+    root_inputs: BTreeMap<String, RootInputSource>,
+    external_slots: BTreeMap<String, String>,
+}
+
 pub(crate) fn resolve_manifest_entry_path(path: &Path) -> Result<PathBuf> {
     if !path.is_dir() {
         return Ok(path.to_path_buf());
@@ -81,22 +95,215 @@ pub(crate) fn ambient_run_env() -> BTreeMap<String, String> {
 pub(crate) fn load_run_env(
     project_root: Option<&Path>,
     env_files: &[PathBuf],
+    config_file_overrides: &[String],
+    interface: &RunInterface,
 ) -> Result<BTreeMap<String, String>> {
-    let mut merged = BTreeMap::new();
+    let cwd = env::current_dir().into_diagnostic()?;
+    let mut merged = RunInputLayer::default();
 
     if let Some(project_root) = project_root {
         let env_path = project_env_path(project_root);
         if env_path.is_file() {
-            merge_env_file(&mut merged, &env_path)?;
+            merge_run_input_layer(
+                &mut merged,
+                load_env_file_layer(&env_path, project_root, "project .env")?,
+            );
         }
     }
 
     for env_file in env_files {
-        merge_env_file(&mut merged, env_file)?;
+        let env_dir = env_file.parent().unwrap_or_else(|| Path::new("."));
+        merge_run_input_layer(
+            &mut merged,
+            load_env_file_layer(
+                env_file,
+                env_dir,
+                &format!("env file {}", env_file.display()),
+            )?,
+        );
     }
 
-    merged.extend(ambient_run_env());
-    Ok(merged)
+    merge_run_input_layer(
+        &mut merged,
+        parse_run_input_layer(env::vars(), &cwd, "ambient environment")?,
+    );
+    merge_run_input_layer(
+        &mut merged,
+        parse_cli_config_file_overrides(config_file_overrides, &cwd)?,
+    );
+
+    resolve_run_input_layer(&merged, interface)
+}
+
+fn merge_run_input_layer(target: &mut RunInputLayer, layer: RunInputLayer) {
+    target.root_inputs.extend(layer.root_inputs);
+    target.external_slots.extend(layer.external_slots);
+}
+
+fn load_env_file_layer(path: &Path, base_dir: &Path, label: &str) -> Result<RunInputLayer> {
+    let iter = dotenvy::from_path_iter(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read env file {}", path.display()))?;
+    let mut pairs = Vec::new();
+    for entry in iter {
+        let (key, value) = entry
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to parse env file {}", path.display()))?;
+        pairs.push((key, value));
+    }
+    parse_run_input_layer(pairs, base_dir, label)
+}
+
+fn parse_run_input_layer(
+    entries: impl IntoIterator<Item = (String, String)>,
+    base_dir: &Path,
+    layer_label: &str,
+) -> Result<RunInputLayer> {
+    let mut layer = RunInputLayer::default();
+
+    for (key, value) in entries {
+        if key.starts_with(CONFIG_FILE_ENV_PREFIX) {
+            if value.is_empty() {
+                continue;
+            }
+            let path = config_file_env_var_to_path(&key)?;
+            let resolved = resolve_input_file_path(base_dir, &value);
+            insert_root_input_source(
+                &mut layer.root_inputs,
+                &path,
+                RootInputSource::File(resolved),
+                layer_label,
+            )?;
+            continue;
+        }
+        if key.starts_with(CONFIG_ENV_PREFIX) {
+            let path = config::env_var_to_path(&key)
+                .map_err(|err| miette::miette!("invalid runtime config env var `{key}`: {err}"))?;
+            insert_root_input_source(
+                &mut layer.root_inputs,
+                &path,
+                RootInputSource::Literal(value),
+                layer_label,
+            )?;
+            continue;
+        }
+        if key.starts_with("AMBER_EXTERNAL_SLOT_") {
+            layer.external_slots.insert(key, value);
+        }
+    }
+
+    Ok(layer)
+}
+
+fn parse_cli_config_file_overrides(overrides: &[String], cwd: &Path) -> Result<RunInputLayer> {
+    let mut layer = RunInputLayer::default();
+
+    for override_spec in overrides {
+        let Some((path, raw_file)) = override_spec.split_once('=') else {
+            return Err(miette::miette!(
+                "invalid `--config-file` value `{override_spec}`; expected config.path=FILE"
+            ));
+        };
+        if raw_file.is_empty() {
+            return Err(miette::miette!(
+                "invalid `--config-file` value `{override_spec}`; FILE must not be empty"
+            ));
+        }
+        config::env_var_for_path(path).map_err(|err| {
+            miette::miette!("invalid config path `{path}` in `--config-file`: {err}")
+        })?;
+        layer.root_inputs.insert(
+            path.to_string(),
+            RootInputSource::File(resolve_input_file_path(cwd, raw_file)),
+        );
+    }
+
+    Ok(layer)
+}
+
+fn insert_root_input_source(
+    target: &mut BTreeMap<String, RootInputSource>,
+    path: &str,
+    source: RootInputSource,
+    layer_label: &str,
+) -> Result<()> {
+    if let Some(existing) = target.get(path)
+        && !same_root_input_source_kind(existing, &source)
+    {
+        return Err(miette::miette!(
+            "{layer_label} defines both `AMBER_CONFIG_*` and `AMBER_CONFIG_FILE_*` for \
+             config.{path}"
+        ));
+    }
+    target.insert(path.to_string(), source);
+    Ok(())
+}
+
+fn same_root_input_source_kind(left: &RootInputSource, right: &RootInputSource) -> bool {
+    matches!(
+        (left, right),
+        (RootInputSource::Literal(_), RootInputSource::Literal(_))
+            | (RootInputSource::File(_), RootInputSource::File(_))
+    )
+}
+
+fn resolve_run_input_layer(
+    layer: &RunInputLayer,
+    interface: &RunInterface,
+) -> Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+
+    for input in &interface.root_inputs {
+        let Some(source) = layer.root_inputs.get(&input.path) else {
+            continue;
+        };
+        let value = resolve_root_input_source(&input.path, source)?;
+        env.insert(input.env_var.clone(), value);
+    }
+
+    for slot in &interface.external_slots {
+        if let Some(value) = layer.external_slots.get(&slot.env_var) {
+            env.insert(slot.env_var.clone(), value.clone());
+        }
+    }
+    Ok(env)
+}
+
+fn resolve_root_input_source(path: &str, source: &RootInputSource) -> Result<String> {
+    match source {
+        RootInputSource::Literal(value) => Ok(value.clone()),
+        RootInputSource::File(file_path) => fs::read_to_string(file_path)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to read config file {} for config.{path}",
+                    file_path.display()
+                )
+            }),
+    }
+}
+
+fn resolve_input_file_path(base_dir: &Path, raw: &str) -> PathBuf {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
+}
+
+pub(crate) fn config_file_env_var_for_path(path: &str) -> Result<String> {
+    let env_var = config::env_var_for_path(path)
+        .map_err(|err| miette::miette!("invalid config path `{path}`: {err}"))?;
+    Ok(env_var.replacen(CONFIG_ENV_PREFIX, CONFIG_FILE_ENV_PREFIX, 1))
+}
+
+fn config_file_env_var_to_path(var: &str) -> Result<String> {
+    let rest = var
+        .strip_prefix(CONFIG_FILE_ENV_PREFIX)
+        .ok_or_else(|| miette::miette!("not an AMBER_CONFIG_FILE_* var"))?;
+    config::env_var_to_path(&format!("{CONFIG_ENV_PREFIX}{rest}"))
+        .map_err(|err| miette::miette!("invalid runtime config file env var `{var}`: {err}"))
 }
 
 pub(crate) fn collect_run_interface(run_plan: &RunPlan) -> Result<RunInterface> {
@@ -170,7 +377,7 @@ pub(crate) fn missing_required_root_inputs<'a>(
     interface
         .root_inputs
         .iter()
-        .filter(|input| input.required && env_var_missing(env, &input.env_var))
+        .filter(|input| input.required && root_env_var_missing(env, &input.env_var))
         .collect()
 }
 
@@ -205,7 +412,7 @@ pub(crate) fn select_root_env(
         .iter()
         .filter_map(|input| {
             env.get(&input.env_var)
-                .filter(|value| !value.trim().is_empty())
+                .filter(|value| !value.is_empty())
                 .map(|value| (input.env_var.clone(), value.clone()))
         })
         .collect()
@@ -229,22 +436,55 @@ pub(crate) fn select_external_slot_env(
 pub(crate) fn prompt_for_missing_inputs(
     env: &mut BTreeMap<String, String>,
     interface: &RunInterface,
+    root_schema: Option<&Value>,
+) -> Result<()> {
+    let mut prompt_visible = |prompt: &str| prompt_line(prompt);
+    let mut prompt_secret = |prompt: &str| prompt_password(prompt).into_diagnostic();
+    let mut print_error = |message: &str| {
+        eprintln!("{message}");
+    };
+    prompt_for_missing_inputs_with(
+        env,
+        interface,
+        root_schema,
+        &mut prompt_visible,
+        &mut prompt_secret,
+        &mut print_error,
+    )
+}
+
+fn prompt_for_missing_inputs_with(
+    env: &mut BTreeMap<String, String>,
+    interface: &RunInterface,
+    root_schema: Option<&Value>,
+    prompt_visible: &mut impl FnMut(&str) -> Result<String>,
+    prompt_secret: &mut impl FnMut(&str) -> Result<String>,
+    print_error: &mut impl FnMut(&str),
 ) -> Result<()> {
     for input in &interface.root_inputs {
-        if !input.required || !env_var_missing(env, &input.env_var) {
+        if !input.required || !root_env_var_missing(env, &input.env_var) {
             continue;
         }
         let prompt = format!("config.{}: ", input.path);
-        let value = if input.secret {
-            prompt_password(prompt).into_diagnostic()?
-        } else {
-            prompt_line(&prompt)?
-        };
-        let trimmed = value.trim().to_string();
-        if trimmed.is_empty() {
-            return Err(miette::miette!("config.{} must not be empty", input.path));
+        loop {
+            let value = if input.secret {
+                prompt_secret(&prompt)?
+            } else {
+                prompt_visible(&prompt)?
+            };
+            if value.is_empty() {
+                print_error(&format!("config.{} must not be empty", input.path));
+                continue;
+            }
+            if let Some(schema) = root_schema
+                && let Err(err) = validate_root_input_value(schema, &input.path, &value)
+            {
+                print_error(&format!("invalid value for config.{}: {err}", input.path));
+                continue;
+            }
+            env.insert(input.env_var.clone(), value);
+            break;
         }
-        env.insert(input.env_var.clone(), trimmed);
     }
 
     for slot in missing_promptable_external_slots(env, interface) {
@@ -253,16 +493,26 @@ pub(crate) fn prompt_for_missing_inputs(
         } else {
             format!("slot.{} (optional): ", slot.name)
         };
-        let value = prompt_line(&prompt)?;
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            if slot.required {
-                return Err(miette::miette!("slot.{} must not be empty", slot.name));
+        loop {
+            let value = prompt_visible(&prompt)?;
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                if slot.required {
+                    print_error(&format!("slot.{} must not be empty", slot.name));
+                    continue;
+                }
+                break;
             }
-            continue;
+            match normalize_external_slot_value(slot, trimmed) {
+                Ok(normalized) => {
+                    env.insert(slot.env_var.clone(), normalized);
+                    break;
+                }
+                Err(err) => {
+                    print_error(&err.to_string());
+                }
+            }
         }
-        let normalized = normalize_external_slot_value(slot, trimmed)?;
-        env.insert(slot.env_var.clone(), normalized);
     }
 
     Ok(())
@@ -275,10 +525,7 @@ pub(crate) fn render_resolved_input_lines(
     let mut lines = Vec::new();
 
     for input in &interface.root_inputs {
-        let Some(value) = env
-            .get(&input.env_var)
-            .filter(|value| !value.trim().is_empty())
-        else {
+        let Some(value) = env.get(&input.env_var).filter(|value| !value.is_empty()) else {
             continue;
         };
         lines.push(format!(
@@ -286,6 +533,8 @@ pub(crate) fn render_resolved_input_lines(
             input.path,
             if input.secret {
                 "*".repeat(value.chars().count().max(8))
+            } else if value.contains('\n') || value.chars().count() > 80 {
+                format!("<{} bytes>", value.len())
             } else {
                 value.clone()
             }
@@ -312,16 +561,68 @@ pub(crate) fn render_root_reuse_env(
     let mut out = String::new();
     out.push_str("# Root config captured from a successful amber run\n");
     for input in &interface.root_inputs {
-        if let Some(value) = env
-            .get(&input.env_var)
-            .filter(|value| !value.trim().is_empty())
-        {
+        if let Some(value) = env.get(&input.env_var).filter(|value| !value.is_empty()) {
             out.push_str(&input.env_var);
             out.push('=');
             out.push_str(value);
             out.push('\n');
         }
     }
+    out
+}
+
+pub(crate) fn render_run_env_file(interface: &RunInterface) -> String {
+    let mut out = String::new();
+    out.push_str("# Runtime inputs for `amber run --env-file`.\n");
+    out.push_str(
+        "# Fill in the values you need, then pass this file back to `amber run --env-file`.\n",
+    );
+    if let Some(example) = interface.root_inputs.first() {
+        let file_var = config_file_env_var_for_path(&example.path)
+            .expect("root input path should map to a config file env var");
+        out.push_str(&format!(
+            "# For any root config input below, you can replace `AMBER_CONFIG_` with \
+             `AMBER_CONFIG_FILE_` to load the value from a UTF-8 file instead, for example \
+             `{file_var}=./value.txt`.\n",
+        ));
+    }
+
+    if interface.root_inputs.is_empty() && interface.external_slots.is_empty() {
+        out.push_str("# No env-based runtime inputs are required for this run target.\n");
+        return out;
+    }
+
+    if !interface.root_inputs.is_empty() {
+        out.push_str("\n# Root config inputs\n");
+        for input in &interface.root_inputs {
+            let required = if input.required {
+                "required"
+            } else {
+                "optional"
+            };
+            let secret = if input.secret { "secret" } else { "config" };
+            out.push_str(&format!(
+                "# {required} {secret} config.{}\n{}=\n",
+                input.path, input.env_var
+            ));
+        }
+    }
+
+    if !interface.external_slots.is_empty() {
+        out.push_str("\n# External slot URLs\n");
+        for slot in &interface.external_slots {
+            let required = if slot.required {
+                "required"
+            } else {
+                "optional"
+            };
+            out.push_str(&format!(
+                "# {required} {} slot {}\n{}=\n",
+                slot.kind, slot.name, slot.env_var
+            ));
+        }
+    }
+
     out
 }
 
@@ -442,21 +743,6 @@ pub(crate) fn run_interactive() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
-fn merge_env_file(target: &mut BTreeMap<String, String>, path: &Path) -> Result<()> {
-    for entry in dotenvy::from_path_iter(path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read env file {}", path.display()))?
-    {
-        let (key, value) = entry
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to parse env file {}", path.display()))?;
-        if is_run_env_key(&key) {
-            target.insert(key, value);
-        }
-    }
-    Ok(())
-}
-
 fn merge_root_inputs(target: &mut BTreeMap<String, RootInputSpec>, inputs: Vec<RootInputSpec>) {
     for input in inputs {
         target
@@ -469,7 +755,7 @@ fn merge_root_inputs(target: &mut BTreeMap<String, RootInputSpec>, inputs: Vec<R
     }
 }
 
-fn parse_env_sample(contents: &str) -> Result<Vec<RootInputSpec>> {
+pub(crate) fn parse_env_sample(contents: &str) -> Result<Vec<RootInputSpec>> {
     let mut parsed = Vec::new();
     let mut pending_comment = None;
 
@@ -504,6 +790,14 @@ fn parse_env_sample(contents: &str) -> Result<Vec<RootInputSpec>> {
     Ok(parsed)
 }
 
+fn validate_root_input_value(root_schema: &Value, path: &str, value: &str) -> Result<()> {
+    let leaf_schema = config::schema_lookup_ref(root_schema, path)
+        .map_err(|err| miette::miette!("invalid root config path config.{path}: {err}"))?;
+    config::parse_env_value(value, leaf_schema)
+        .map(|_| ())
+        .map_err(|err| miette::miette!("{err}"))
+}
+
 fn parse_root_input_comment(line: &str) -> Option<ParsedRootInputComment> {
     let line = line.strip_prefix('#')?.trim();
     let (required, rest) = if let Some(rest) = line.strip_prefix("required ") {
@@ -534,8 +828,24 @@ fn prompt_line(prompt: &str) -> Result<String> {
     stdout.write_all(prompt.as_bytes()).into_diagnostic()?;
     stdout.flush().into_diagnostic()?;
     let mut line = String::new();
-    io::stdin().read_line(&mut line).into_diagnostic()?;
-    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    if io::stdin().read_line(&mut line).into_diagnostic()? == 0 {
+        return Err(miette::miette!("end of input"));
+    }
+    Ok(strip_trailing_newline(line))
+}
+
+fn strip_trailing_newline(mut value: String) -> String {
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    value
+}
+
+fn root_env_var_missing(env: &BTreeMap<String, String>, key: &str) -> bool {
+    env.get(key).is_none_or(String::is_empty)
 }
 
 fn env_var_missing(env: &BTreeMap<String, String>, key: &str) -> bool {
@@ -1027,5 +1337,283 @@ mod tests {
                 kind: CapabilityKind::Http,
             }]
         );
+    }
+
+    #[test]
+    fn load_run_env_resolves_file_inputs_relative_to_env_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_file = temp.path().join("auth.json");
+        std::fs::write(&config_file, "{ \"token\": \"demo\" }\n").expect("write config file");
+        let env_file = temp.path().join("runtime.env");
+        std::fs::write(
+            &env_file,
+            "\
+AMBER_CONFIG_FILE_AUTH__JSON=./auth.json\n\
+AMBER_EXTERNAL_SLOT_CATALOG_API_URL=http://127.0.0.1:9100\n",
+        )
+        .expect("write env file");
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "auth.json".to_string(),
+                env_var: "AMBER_CONFIG_AUTH__JSON".to_string(),
+                required: true,
+                secret: false,
+            }],
+            external_slots: vec![ExternalSlotSpec {
+                name: "catalog_api".to_string(),
+                env_var: "AMBER_EXTERNAL_SLOT_CATALOG_API_URL".to_string(),
+                required: true,
+                kind: CapabilityKind::Http,
+            }],
+            ..RunInterface::default()
+        };
+
+        let env = resolve_run_input_layer(
+            &load_env_file_layer(&env_file, temp.path(), "test env file").expect("load env layer"),
+            &interface,
+        )
+        .expect("resolve env");
+        assert_eq!(
+            env.get("AMBER_CONFIG_AUTH__JSON"),
+            Some(&"{ \"token\": \"demo\" }\n".to_string())
+        );
+        assert_eq!(
+            env.get("AMBER_EXTERNAL_SLOT_CATALOG_API_URL"),
+            Some(&"http://127.0.0.1:9100".to_string())
+        );
+        assert!(
+            !env.contains_key("AMBER_CONFIG_FILE_AUTH__JSON"),
+            "resolved env should only contain canonical AMBER_CONFIG_* keys"
+        );
+    }
+
+    #[test]
+    fn load_run_env_rejects_literal_and_file_for_same_path_in_one_layer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_file = temp.path().join("token.txt");
+        std::fs::write(&config_file, "demo").expect("write config file");
+        let env_file = temp.path().join("runtime.env");
+        std::fs::write(
+            &env_file,
+            "\
+AMBER_CONFIG_TOKEN=inline\nAMBER_CONFIG_FILE_TOKEN=./token.txt\n",
+        )
+        .expect("write env file");
+
+        let err = load_env_file_layer(&env_file, temp.path(), "test env file")
+            .expect_err("conflicting env file");
+        assert!(
+            err.to_string()
+                .contains("defines both `AMBER_CONFIG_*` and `AMBER_CONFIG_FILE_*`")
+        );
+    }
+
+    #[test]
+    fn load_run_env_cli_config_file_overrides_earlier_literal_sources() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_file = temp.path().join("token.txt");
+        std::fs::write(&config_file, "from-file").expect("write config file");
+        let env_file = temp.path().join("runtime.env");
+        std::fs::write(&env_file, "AMBER_CONFIG_TOKEN=inline\n").expect("write env file");
+
+        let mut layer =
+            load_env_file_layer(&env_file, temp.path(), "test env file").expect("load env layer");
+        merge_run_input_layer(
+            &mut layer,
+            parse_cli_config_file_overrides(
+                &[format!("token={}", config_file.display())],
+                temp.path(),
+            )
+            .expect("load cli overrides"),
+        );
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "token".to_string(),
+                env_var: "AMBER_CONFIG_TOKEN".to_string(),
+                required: true,
+                secret: false,
+            }],
+            ..RunInterface::default()
+        };
+        let env = resolve_run_input_layer(&layer, &interface).expect("resolve env");
+        assert_eq!(
+            env.get("AMBER_CONFIG_TOKEN"),
+            Some(&"from-file".to_string())
+        );
+    }
+
+    #[test]
+    fn load_run_env_ignores_unselected_file_backed_inputs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env_file = temp.path().join("runtime.env");
+        std::fs::write(
+            &env_file,
+            "\
+AMBER_CONFIG_TOKEN=inline\nAMBER_CONFIG_FILE_UNUSED=./missing.txt\n",
+        )
+        .expect("write env file");
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "token".to_string(),
+                env_var: "AMBER_CONFIG_TOKEN".to_string(),
+                required: true,
+                secret: false,
+            }],
+            ..RunInterface::default()
+        };
+
+        let env = load_run_env(None, &[env_file], &[], &interface).expect("load env");
+        assert_eq!(env.get("AMBER_CONFIG_TOKEN"), Some(&"inline".to_string()));
+        assert!(
+            !env.contains_key("AMBER_CONFIG_UNUSED"),
+            "unselected file-backed inputs should be ignored"
+        );
+    }
+
+    #[test]
+    fn prompt_for_missing_inputs_reprompts_until_root_value_valid() {
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "count".to_string(),
+                env_var: "AMBER_CONFIG_COUNT".to_string(),
+                required: true,
+                secret: false,
+            }],
+            ..RunInterface::default()
+        };
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer" }
+            },
+            "required": ["count"]
+        });
+        let mut env = BTreeMap::new();
+        let mut visible = vec!["abc".to_string(), "42".to_string()].into_iter();
+        let mut secret = std::iter::empty::<String>();
+        let mut errors = Vec::new();
+
+        prompt_for_missing_inputs_with(
+            &mut env,
+            &interface,
+            Some(&root_schema),
+            &mut |_| Ok(visible.next().expect("visible input should exist")),
+            &mut |_| Ok(secret.next().expect("secret input should not be used")),
+            &mut |message| errors.push(message.to_string()),
+        )
+        .expect("prompt should succeed");
+
+        assert_eq!(env.get("AMBER_CONFIG_COUNT"), Some(&"42".to_string()));
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("invalid value for config.count"));
+    }
+
+    #[test]
+    fn prompt_for_missing_inputs_preserves_large_single_line_visible_values() {
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "auth_json".to_string(),
+                env_var: "AMBER_CONFIG_AUTH_JSON".to_string(),
+                required: true,
+                secret: false,
+            }],
+            ..RunInterface::default()
+        };
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "auth_json": { "type": "string" }
+            },
+            "required": ["auth_json"]
+        });
+        let large = format!("{{\"tokens\":\"{}\"}}", "x".repeat(8192));
+        let mut env = BTreeMap::new();
+        let mut visible = vec![large.clone()].into_iter();
+        let mut secret = std::iter::empty::<String>();
+        let mut errors = Vec::new();
+
+        prompt_for_missing_inputs_with(
+            &mut env,
+            &interface,
+            Some(&root_schema),
+            &mut |_| Ok(visible.next().expect("visible input should exist")),
+            &mut |_| Ok(secret.next().expect("secret input should not be used")),
+            &mut |message| errors.push(message.to_string()),
+        )
+        .expect("prompt should succeed");
+
+        assert_eq!(env.get("AMBER_CONFIG_AUTH_JSON"), Some(&large));
+        assert!(
+            errors.is_empty(),
+            "prompt should not reject large single-line visible input"
+        );
+    }
+
+    #[test]
+    fn prompt_for_missing_inputs_preserves_large_single_line_secret_values() {
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "auth_json".to_string(),
+                env_var: "AMBER_CONFIG_AUTH_JSON".to_string(),
+                required: true,
+                secret: true,
+            }],
+            ..RunInterface::default()
+        };
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "auth_json": { "type": "string" }
+            },
+            "required": ["auth_json"]
+        });
+        let large = format!("{{\"tokens\":\"{}\"}}", "x".repeat(8192));
+        let mut env = BTreeMap::new();
+        let mut visible = std::iter::empty::<String>();
+        let mut secret = vec![large.clone()].into_iter();
+        let mut errors = Vec::new();
+
+        prompt_for_missing_inputs_with(
+            &mut env,
+            &interface,
+            Some(&root_schema),
+            &mut |_| Ok(visible.next().expect("visible input should not be used")),
+            &mut |_| Ok(secret.next().expect("secret input should exist")),
+            &mut |message| errors.push(message.to_string()),
+        )
+        .expect("prompt should succeed");
+
+        assert_eq!(env.get("AMBER_CONFIG_AUTH_JSON"), Some(&large));
+        assert!(
+            errors.is_empty(),
+            "prompt should not reject large single-line secret input"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_newline_preserves_other_whitespace() {
+        assert_eq!(strip_trailing_newline("value\n".to_string()), "value");
+        assert_eq!(strip_trailing_newline("value\r\n".to_string()), "value");
+        assert_eq!(
+            strip_trailing_newline("  value \r\n".to_string()),
+            "  value "
+        );
+    }
+
+    #[test]
+    fn render_run_env_file_mentions_file_backed_root_inputs() {
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "auth_json".to_string(),
+                env_var: "AMBER_CONFIG_AUTH_JSON".to_string(),
+                required: true,
+                secret: true,
+            }],
+            ..RunInterface::default()
+        };
+
+        let rendered = render_run_env_file(&interface);
+        assert!(rendered.contains("AMBER_CONFIG_FILE_"));
+        assert!(rendered.contains("AMBER_CONFIG_AUTH_JSON"));
     }
 }

@@ -72,6 +72,7 @@ use miette::{
     Context as _, Diagnostic, GraphicalReportHandler, IntoDiagnostic as _, Result, Severity,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt as _, BufReader},
     process::Command as TokioCommand,
@@ -85,10 +86,10 @@ pub(crate) use self::direct_runtime::*;
 use crate::{
     run_inputs::{
         RunInterface, ambient_run_env, collect_run_interface, load_run_env,
-        missing_required_external_slots, missing_required_root_inputs, project_env_path,
-        prompt_for_missing_inputs, render_resolved_input_lines, render_root_reuse_env,
-        resolve_manifest_entry_path, run_interactive, select_external_slot_env, select_root_env,
-        slot_url_from_socket,
+        missing_required_external_slots, missing_required_root_inputs, parse_env_sample,
+        project_env_path, prompt_for_missing_inputs, render_resolved_input_lines,
+        render_root_reuse_env, render_run_env_file, resolve_manifest_entry_path, run_interactive,
+        select_external_slot_env, select_root_env, slot_url_from_socket,
     },
     run_logs::{RunLogOptions, print_run_logs, print_run_ps, stream_run_logs_until},
     tcp_readiness::wait_for_stable_endpoint,
@@ -235,9 +236,11 @@ This command understands direct/native artifacts from `amber compile --direct`, 
 const RUN_AFTER_HELP: &str = "\
 Examples:
   amber run .
+  amber run . --emit-env-file .env.example
   amber run path/to/root.json5
   amber run path/to/root.json5 --placement local-sites.json
   amber run path/to/root.json5 --env-file dev.env
+  amber run path/to/root.json5 --config-file auth_json=./auth.json
   amber run -Z unstable-options path/to/root.json5 --dry-run --emit-launch-bundle /tmp/amber-launch
   amber run /tmp/amber-run-plan.json
   amber run /tmp/amber-direct
@@ -512,6 +515,18 @@ struct RunArgs {
     /// Load runtime inputs from an env file. Repeat to merge multiple files.
     #[arg(long = "env-file", value_name = "FILE")]
     env_file: Vec<PathBuf>,
+
+    /// Load one root config value from a UTF-8 file. Repeat to set multiple paths.
+    #[arg(long = "config-file", value_name = "CONFIG.PATH=FILE")]
+    config_file: Vec<String>,
+
+    /// Write an annotated env template for this run target and exit. Use `-` for stdout.
+    #[arg(
+        long = "emit-env-file",
+        value_name = "FILE",
+        allow_hyphen_values = true
+    )]
+    emit_env_file: Option<PathBuf>,
 
     /// Start a mixed-site run in detached mode.
     #[arg(long = "detach")]
@@ -1249,9 +1264,30 @@ async fn run(args: RunArgs) -> Result<()> {
             "`--emit-launch-bundle` currently requires `--dry-run`"
         ));
     }
+    if args.emit_env_file.is_some()
+        && (args.detach || args.dry_run || args.emit_launch_bundle.is_some())
+    {
+        return Err(miette::miette!(
+            "`amber run --emit-env-file` only writes an env template and cannot be combined with \
+             `--detach`, `--dry-run`, or `--emit-launch-bundle`"
+        ));
+    }
 
     let placement = load_placement_file(args.placement.as_deref())?;
-    let explicit_env = load_run_env(None, &args.env_file)?;
+    if let Some(output_path) = args.emit_env_file.as_deref() {
+        if let Some(target) = try_load_run_target(&args.output)? {
+            let interface = interface_for_run_target(&target)?;
+            return write_env_file_output(output_path, &render_run_env_file(&interface));
+        }
+
+        let compiled = compile_for_run(&args.output).await?;
+        let run_plan = build_run_plan(&compiled, placement.as_ref())
+            .into_diagnostic()
+            .wrap_err("failed to build mixed-site run plan")?;
+        let interface = collect_run_interface(&run_plan)?;
+        return write_env_file_output(output_path, &render_run_env_file(&interface));
+    }
+
     if let Some(target) = try_load_run_target(&args.output)? {
         return match target.kind {
             RunTargetKind::Direct => {
@@ -1261,6 +1297,9 @@ async fn run(args: RunArgs) -> Result<()> {
                          manifests and run plans"
                     ));
                 }
+                let interface = interface_for_run_target(&target)?;
+                let explicit_env =
+                    load_run_env(None, &args.env_file, &args.config_file, &interface)?;
                 with_scoped_run_env(&explicit_env, || async {
                     run_direct_init(RunDirectInitArgs {
                         plan: target.plan,
@@ -1282,6 +1321,9 @@ async fn run(args: RunArgs) -> Result<()> {
                          manifests and run plans"
                     ));
                 }
+                let interface = interface_for_run_target(&target)?;
+                let explicit_env =
+                    load_run_env(None, &args.env_file, &args.config_file, &interface)?;
                 with_scoped_run_env(&explicit_env, || async {
                     vm_runtime::run_vm_init(
                         target.plan,
@@ -1297,18 +1339,12 @@ async fn run(args: RunArgs) -> Result<()> {
                 .await
             }
             RunTargetKind::MixedRunPlan => {
-                let run_plan_raw = fs::read_to_string(&target.plan)
-                    .into_diagnostic()
-                    .wrap_err_with(|| {
-                        format!("failed to read run plan {}", target.plan.display())
-                    })?;
-                let run_plan: RunPlan = serde_json::from_str(&run_plan_raw).map_err(|err| {
-                    miette::miette!("invalid run plan {}: {err}", target.plan.display())
-                })?;
+                let run_plan = load_run_plan(&target.plan)?;
                 let prepared = prepare_mixed_run_inputs(
                     &run_plan,
                     None,
                     &args.env_file,
+                    &args.config_file,
                     interactive,
                     !args.dry_run,
                 )?;
@@ -1372,6 +1408,7 @@ async fn run(args: RunArgs) -> Result<()> {
         &run_plan,
         project_env_root.as_deref(),
         &args.env_file,
+        &args.config_file,
         interactive,
         !args.dry_run,
     )?;
@@ -1422,6 +1459,50 @@ async fn run(args: RunArgs) -> Result<()> {
         println!("run_id={}", receipt.run_id);
         println!("run_root={}", receipt.run_root);
     })
+}
+
+fn interface_for_run_target(target: &RunTarget) -> Result<RunInterface> {
+    match target.kind {
+        RunTargetKind::MixedRunPlan => {
+            let run_plan = load_run_plan(&target.plan)?;
+            collect_run_interface(&run_plan)
+        }
+        RunTargetKind::Direct | RunTargetKind::Vm => {
+            let artifact_dir = target.plan.parent().ok_or_else(|| {
+                miette::miette!(
+                    "run target {} has no parent directory",
+                    target.plan.display()
+                )
+            })?;
+            let env_example_path = artifact_dir.join("env.example");
+            if !env_example_path.is_file() {
+                return Ok(RunInterface::default());
+            }
+            let contents = fs::read_to_string(&env_example_path)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", env_example_path.display()))?;
+            Ok(RunInterface {
+                root_inputs: parse_env_sample(&contents)?,
+                ..RunInterface::default()
+            })
+        }
+    }
+}
+
+fn load_run_plan(path: &Path) -> Result<RunPlan> {
+    let run_plan_raw = fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read run plan {}", path.display()))?;
+    serde_json::from_str(&run_plan_raw)
+        .map_err(|err| miette::miette!("invalid run plan {}: {err}", path.display()))
+}
+
+fn write_env_file_output(path: &Path, contents: &str) -> Result<()> {
+    if path == Path::new("-") {
+        print!("{contents}");
+        return Ok(());
+    }
+    write_artifact(path, contents.as_bytes())
 }
 
 async fn run_detached(
@@ -1502,16 +1583,32 @@ fn prepare_mixed_run_inputs(
     run_plan: &RunPlan,
     project_env_root: Option<&Path>,
     env_files: &[PathBuf],
+    config_file_overrides: &[String],
     interactive: bool,
     require_complete_inputs: bool,
 ) -> Result<PreparedMixedRunInputs> {
     let interface = collect_run_interface(run_plan)?;
-    let mut env = load_run_env(project_env_root, env_files)?;
+    let root_schema = run_plan_root_schema(run_plan);
+    let mut env = load_run_env(
+        project_env_root,
+        env_files,
+        config_file_overrides,
+        &interface,
+    )?;
     if interactive {
-        prompt_for_missing_inputs(&mut env, &interface)?;
+        prompt_for_missing_inputs(&mut env, &interface, root_schema)?;
     }
 
-    let missing_root = missing_required_root_inputs(&env, &interface);
+    let root_env = select_root_env(&env, &interface);
+    let missing_root = missing_required_root_inputs(&root_env, &interface);
+    if let Some(root_schema) = root_schema {
+        validate_runtime_root_env(root_schema, &root_env)?;
+        if missing_root.is_empty() {
+            config::build_root_config(root_schema, &root_env)
+                .map_err(|err| miette::miette!("invalid runtime root config: {err}"))?;
+        }
+    }
+
     let missing_slots = missing_required_external_slots(&env, &interface);
     if require_complete_inputs && (!missing_root.is_empty() || !missing_slots.is_empty()) {
         let mut message = String::from("missing required runtime inputs:");
@@ -1536,10 +1633,35 @@ fn prepare_mixed_run_inputs(
     }
 
     Ok(PreparedMixedRunInputs {
-        root_env: select_root_env(&env, &interface),
+        root_env,
         external_slot_env: select_external_slot_env(&env, &interface),
         interface,
     })
+}
+
+fn run_plan_root_schema(run_plan: &RunPlan) -> Option<&Value> {
+    let root_id = run_plan.base_scenario.root;
+    run_plan
+        .base_scenario
+        .components
+        .iter()
+        .find(|component| component.id == root_id)
+        .and_then(|component| component.config_schema.as_ref())
+}
+
+fn validate_runtime_root_env(
+    root_schema: &Value,
+    root_env: &BTreeMap<String, String>,
+) -> Result<()> {
+    for (env_var, value) in root_env {
+        let path = config::env_var_to_path(env_var)
+            .map_err(|err| miette::miette!("invalid runtime root input {env_var}: {err}"))?;
+        let leaf_schema = config::schema_lookup_ref(root_schema, &path)
+            .map_err(|err| miette::miette!("invalid runtime root input config.{path}: {err}"))?;
+        config::parse_env_value(value, leaf_schema)
+            .map_err(|err| miette::miette!("invalid runtime root input config.{path}: {err}"))?;
+    }
+    Ok(())
 }
 
 fn merged_env_maps(
