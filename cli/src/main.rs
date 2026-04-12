@@ -18,7 +18,9 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env, fmt, fs,
-    io::Write as _,
+    future::Future,
+    io,
+    io::{IsTerminal as _, Write as _},
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -68,6 +70,12 @@ use amber_template::{ConfigTemplatePayload, MountSpec, RuntimeSlotObject, Runtim
 use amber_template::{ProgramArgTemplate, TemplateSpec};
 use base64::Engine as _;
 use clap::{ArgAction, Args, Parser, Subcommand};
+use crossterm::{
+    cursor::MoveToColumn,
+    execute, queue,
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    terminal::{Clear, ClearType},
+};
 use miette::{
     Context as _, Diagnostic, GraphicalReportHandler, IntoDiagnostic as _, Result, Severity,
 };
@@ -85,10 +93,10 @@ use self::command_support::*;
 pub(crate) use self::direct_runtime::*;
 use crate::{
     run_inputs::{
-        RunInterface, ambient_run_env, collect_run_interface, load_run_env,
-        missing_required_external_slots, missing_required_root_inputs, parse_env_sample,
-        project_env_path, prompt_for_missing_inputs, render_resolved_input_lines,
-        render_root_reuse_env, render_run_env_file, resolve_manifest_entry_path, run_interactive,
+        RunInterface, ambient_run_env, collect_run_interface, is_interactive_input_cancelled,
+        load_run_env, missing_required_external_slots, missing_required_root_inputs,
+        parse_env_sample, project_env_path, prompt_for_missing_inputs, promptable_external_slots,
+        render_run_env_file, resolve_manifest_entry_path, run_interactive,
         select_external_slot_env, select_root_env, slot_url_from_socket,
     },
     run_logs::{RunLogOptions, print_run_logs, print_run_ps, stream_run_logs_until},
@@ -102,6 +110,10 @@ Amber resolves a root manifest or bundle, validates the component graph, and wri
                               you need to inspect or run the scenario.
 
 Use `amber <command> --help` to drill into a specific workflow.";
+
+const ATTACHED_RUN_STARTUP_NOTICE_DELAY: Duration = Duration::from_millis(200);
+const ATTACHED_RUN_STATUS_SPINNER_TICK: Duration = Duration::from_millis(80);
+const ATTACHED_RUN_STATUS_SPINNER_FRAMES: &[&str] = &["-", "\\", "|", "/"];
 
 const CLI_AFTER_HELP: &str = "\
 Common workflows:
@@ -830,6 +842,7 @@ struct PreparedMixedRunInputs {
     interface: RunInterface,
     root_env: BTreeMap<String, String>,
     external_slot_env: BTreeMap<String, String>,
+    prompted_for_inputs: bool,
 }
 
 #[tokio::main]
@@ -887,7 +900,10 @@ async fn main() -> Result<()> {
     };
 
     tokio::task::block_in_place(shutdown_tracer_provider);
-    result
+    match result {
+        Err(err) if is_interactive_input_cancelled(&err) => Ok(()),
+        other => other,
+    }
 }
 
 async fn dashboard(args: DashboardArgs) -> Result<()> {
@@ -1280,8 +1296,14 @@ async fn run(args: RunArgs) -> Result<()> {
     let placement = load_placement_file(args.placement.as_deref())?;
     if let Some(output_path) = args.emit_env_file.as_deref() {
         if let Some(target) = try_load_run_target(&args.output)? {
-            let interface = interface_for_run_target(&target)?;
-            return write_env_file_output(output_path, &render_run_env_file(&interface));
+            let target_interface = interface_for_run_target(&target)?;
+            return write_env_file_output(
+                output_path,
+                &render_run_env_file(
+                    &target_interface.interface,
+                    target_interface.root_schema.as_ref(),
+                ),
+            );
         }
 
         let compiled = compile_for_run(&args.output).await?;
@@ -1289,7 +1311,10 @@ async fn run(args: RunArgs) -> Result<()> {
             .into_diagnostic()
             .wrap_err("failed to build mixed-site run plan")?;
         let interface = collect_run_interface(&run_plan)?;
-        return write_env_file_output(output_path, &render_run_env_file(&interface));
+        return write_env_file_output(
+            output_path,
+            &render_run_env_file(&interface, run_plan_root_schema(&run_plan)),
+        );
     }
 
     if let Some(target) = try_load_run_target(&args.output)? {
@@ -1301,7 +1326,7 @@ async fn run(args: RunArgs) -> Result<()> {
                          manifests and run plans"
                     ));
                 }
-                let interface = interface_for_run_target(&target)?;
+                let interface = interface_for_run_target(&target)?.interface;
                 let explicit_env =
                     load_run_env(None, &args.env_file, &args.config_file, &interface)?;
                 with_scoped_run_env(&explicit_env, || async {
@@ -1325,7 +1350,7 @@ async fn run(args: RunArgs) -> Result<()> {
                          manifests and run plans"
                     ));
                 }
-                let interface = interface_for_run_target(&target)?;
+                let interface = interface_for_run_target(&target)?.interface;
                 let explicit_env =
                     load_run_env(None, &args.env_file, &args.config_file, &interface)?;
                 with_scoped_run_env(&explicit_env, || async {
@@ -1378,7 +1403,6 @@ async fn run(args: RunArgs) -> Result<()> {
                 }
                 if interactive {
                     return run_attached_mixed_run(
-                        &args.output,
                         Some(&target.plan),
                         &run_plan,
                         args.storage_root.as_deref(),
@@ -1442,7 +1466,6 @@ async fn run(args: RunArgs) -> Result<()> {
     }
     if interactive {
         return run_attached_mixed_run(
-            &args.output,
             None,
             &run_plan,
             args.storage_root.as_deref(),
@@ -1465,11 +1488,19 @@ async fn run(args: RunArgs) -> Result<()> {
     })
 }
 
-fn interface_for_run_target(target: &RunTarget) -> Result<RunInterface> {
+struct RunTargetInterface {
+    interface: RunInterface,
+    root_schema: Option<Value>,
+}
+
+fn interface_for_run_target(target: &RunTarget) -> Result<RunTargetInterface> {
     match target.kind {
         RunTargetKind::MixedRunPlan => {
             let run_plan = load_run_plan(&target.plan)?;
-            collect_run_interface(&run_plan)
+            Ok(RunTargetInterface {
+                interface: collect_run_interface(&run_plan)?,
+                root_schema: run_plan_root_schema(&run_plan).cloned(),
+            })
         }
         RunTargetKind::Direct | RunTargetKind::Vm => {
             let artifact_dir = target.plan.parent().ok_or_else(|| {
@@ -1480,14 +1511,20 @@ fn interface_for_run_target(target: &RunTarget) -> Result<RunInterface> {
             })?;
             let env_example_path = artifact_dir.join("env.example");
             if !env_example_path.is_file() {
-                return Ok(RunInterface::default());
+                return Ok(RunTargetInterface {
+                    interface: RunInterface::default(),
+                    root_schema: None,
+                });
             }
             let contents = fs::read_to_string(&env_example_path)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("failed to read {}", env_example_path.display()))?;
-            Ok(RunInterface {
-                root_inputs: parse_env_sample(&contents)?,
-                ..RunInterface::default()
+            Ok(RunTargetInterface {
+                interface: RunInterface {
+                    root_inputs: parse_env_sample(&contents)?,
+                    ..RunInterface::default()
+                },
+                root_schema: None,
             })
         }
     }
@@ -1593,14 +1630,24 @@ fn prepare_mixed_run_inputs(
 ) -> Result<PreparedMixedRunInputs> {
     let interface = collect_run_interface(run_plan)?;
     let root_schema = run_plan_root_schema(run_plan);
+    let prompt_optional_external_slots = env_files.is_empty() && config_file_overrides.is_empty();
     let mut env = load_run_env(
         project_env_root,
         env_files,
         config_file_overrides,
         &interface,
     )?;
+    let prompted_for_inputs = interactive
+        && (!missing_required_root_inputs(&env, &interface).is_empty()
+            || !promptable_external_slots(&env, &interface, prompt_optional_external_slots)
+                .is_empty());
     if interactive {
-        prompt_for_missing_inputs(&mut env, &interface, root_schema)?;
+        prompt_for_missing_inputs(
+            &mut env,
+            &interface,
+            root_schema,
+            prompt_optional_external_slots,
+        )?;
     }
 
     let root_env = select_root_env(&env, &interface);
@@ -1647,6 +1694,7 @@ fn prepare_mixed_run_inputs(
         root_env,
         external_slot_env: select_external_slot_env(&env, &interface),
         interface,
+        prompted_for_inputs,
     })
 }
 
@@ -1691,6 +1739,102 @@ fn export_listener_url(protocol: &str, addr: SocketAddr) -> String {
     }
 }
 
+fn print_run_section_heading(writer: &mut impl io::Write, title: &str, color: Color) -> Result<()> {
+    execute!(
+        writer,
+        SetForegroundColor(color),
+        SetAttribute(Attribute::Bold),
+        Print(title),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        Print("\n")
+    )
+    .into_diagnostic()
+}
+
+fn print_run_badge(writer: &mut impl io::Write, label: &str, color: Color) -> Result<()> {
+    queue!(
+        writer,
+        Print(" "),
+        SetForegroundColor(color),
+        Print(format!("[{label}]")),
+        ResetColor
+    )
+    .into_diagnostic()
+}
+
+fn render_status_indicator(
+    writer: &mut impl io::Write,
+    frame_index: usize,
+    label: &str,
+    accent_color: Color,
+) -> Result<()> {
+    let frame = ATTACHED_RUN_STATUS_SPINNER_FRAMES
+        .get(frame_index % ATTACHED_RUN_STATUS_SPINNER_FRAMES.len())
+        .copied()
+        .unwrap_or("-");
+    execute!(
+        writer,
+        MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+        SetForegroundColor(accent_color),
+        SetAttribute(Attribute::Bold),
+        Print(frame),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        Print(" "),
+        SetForegroundColor(Color::DarkGrey),
+        Print(label),
+        ResetColor
+    )
+    .into_diagnostic()?;
+    writer.flush().into_diagnostic()
+}
+
+fn clear_status_indicator(writer: &mut impl io::Write) -> Result<()> {
+    execute!(writer, MoveToColumn(0), Clear(ClearType::CurrentLine)).into_diagnostic()?;
+    writer.flush().into_diagnostic()
+}
+
+fn print_export_bindings(
+    writer: &mut impl io::Write,
+    interface: &RunInterface,
+    export_bindings: &BTreeMap<String, SocketAddr>,
+) -> Result<()> {
+    if export_bindings.is_empty() {
+        return Ok(());
+    }
+
+    print_run_section_heading(writer, "Exports", Color::DarkMagenta)?;
+    for (name, addr) in export_bindings {
+        let protocol = interface
+            .exports
+            .iter()
+            .find(|export| export.name == *name)
+            .map(|export| export.protocol.as_str())
+            .unwrap_or("http");
+        queue!(
+            writer,
+            Print("  "),
+            SetForegroundColor(Color::Magenta),
+            SetAttribute(Attribute::Bold),
+            Print(name),
+            SetAttribute(Attribute::Reset),
+            ResetColor
+        )
+        .into_diagnostic()?;
+        print_run_badge(writer, protocol, Color::DarkGrey)?;
+        queue!(
+            writer,
+            Print(": "),
+            Print(export_listener_url(protocol, *addr)),
+            Print("\n")
+        )
+        .into_diagnostic()?;
+    }
+    writer.flush().into_diagnostic()
+}
+
 async fn with_scoped_run_env<F, Fut, T>(vars: &BTreeMap<String, String>, run: F) -> T
 where
     F: FnOnce() -> Fut,
@@ -1700,111 +1844,191 @@ where
     run().await
 }
 
+trait StatusIndicator {
+    fn show(&mut self, frame_index: usize) -> Result<()>;
+    fn clear(&mut self) -> Result<()>;
+}
+
+struct SpinnerStatusIndicator<'a, W> {
+    writer: &'a mut W,
+    label: &'static str,
+    accent_color: Color,
+}
+
+impl<W: io::Write> SpinnerStatusIndicator<'_, W> {
+    fn new<'a>(
+        writer: &'a mut W,
+        label: &'static str,
+        accent_color: Color,
+    ) -> SpinnerStatusIndicator<'a, W> {
+        SpinnerStatusIndicator {
+            writer,
+            label,
+            accent_color,
+        }
+    }
+}
+
+impl<W: io::Write> StatusIndicator for SpinnerStatusIndicator<'_, W> {
+    fn show(&mut self, frame_index: usize) -> Result<()> {
+        render_status_indicator(self.writer, frame_index, self.label, self.accent_color)
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        clear_status_indicator(self.writer)
+    }
+}
+
+async fn await_with_status_indicator<T, F, S>(
+    future: F,
+    delay: Option<Duration>,
+    tick_interval: Duration,
+    indicator: &mut S,
+) -> Result<(T, bool)>
+where
+    F: Future<Output = T>,
+    S: StatusIndicator,
+{
+    tokio::pin!(future);
+    let mut shown = false;
+    let mut frame_index = 0usize;
+
+    if delay.is_none() {
+        indicator.show(frame_index)?;
+        shown = true;
+        frame_index = frame_index.wrapping_add(1);
+    }
+
+    let next_tick = sleep(delay.unwrap_or(tick_interval));
+    tokio::pin!(next_tick);
+
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                if shown {
+                    indicator.clear()?;
+                }
+                return Ok((result, shown));
+            }
+            _ = &mut next_tick => {
+                indicator.show(frame_index)?;
+                shown = true;
+                frame_index = frame_index.wrapping_add(1);
+                next_tick.as_mut().reset(Instant::now() + tick_interval);
+            }
+        }
+    }
+}
+
+async fn stop_run_with_cleanup_notice(
+    run_id: &str,
+    storage_root_override: Option<&Path>,
+) -> Result<()> {
+    if io::stdout().is_terminal() {
+        let mut stdout = io::stdout();
+        let mut indicator =
+            SpinnerStatusIndicator::new(&mut stdout, "Cleaning up run...", Color::DarkGrey);
+        let (result, _) = await_with_status_indicator(
+            mixed_run::stop_run(run_id, storage_root_override),
+            None,
+            ATTACHED_RUN_STATUS_SPINNER_TICK,
+            &mut indicator,
+        )
+        .await?;
+        result
+    } else {
+        mixed_run::stop_run(run_id, storage_root_override).await
+    }
+}
+
 async fn run_attached_mixed_run(
-    target: &str,
     source_plan_path: Option<&Path>,
     run_plan: &RunPlan,
     storage_root_override: Option<&Path>,
     observability: Option<&str>,
     prepared: PreparedMixedRunInputs,
 ) -> Result<()> {
-    let receipt = mixed_run::run_run_plan(
-        source_plan_path,
-        run_plan,
-        storage_root_override,
-        observability,
-        &prepared.root_env,
-    )
-    .await?;
-    let run_root = PathBuf::from(&receipt.run_root);
+    let startup = async {
+        let receipt = mixed_run::run_run_plan(
+            source_plan_path,
+            run_plan,
+            storage_root_override,
+            observability,
+            &prepared.root_env,
+        )
+        .await?;
+        let run_root = PathBuf::from(&receipt.run_root);
 
-    let export_bindings = prepared
-        .interface
-        .exports
-        .iter()
-        .map(|export| {
-            Ok((
-                export.name.clone(),
-                SocketAddr::from(([127, 0, 0, 1], mixed_run::reserve_loopback_port()?)),
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let slot_bindings = prepared
-        .interface
-        .external_slots
-        .iter()
-        .filter_map(|slot| {
-            prepared
-                .external_slot_env
-                .get(&slot.env_var)
-                .map(|value| (slot.name.clone(), value.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut proxy_child = if slot_bindings.is_empty() && export_bindings.is_empty() {
-        None
-    } else {
-        Some(mixed_run::spawn_run_outside_proxy(
-            &run_root,
-            &slot_bindings,
-            &export_bindings,
-        )?)
-    };
-    if proxy_child.is_some()
-        && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
-    {
-        if let Some(proxy_child) = proxy_child.as_mut() {
-            let _ = proxy_child.kill();
-            let _ = proxy_child.wait();
-        }
-        let _ = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
-        return Err(err);
-    }
-
-    let reuse_info = if prepared.interface.root_inputs.is_empty() {
-        None
-    } else {
-        let path = run_root.join("root-config.env");
-        let rendered = render_root_reuse_env(&prepared.root_env, &prepared.interface);
-        fs::write(&path, &rendered.contents)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to write {}", path.display()))?;
-        Some((path, rendered.omitted_secret_paths))
-    };
-
-    for line in render_resolved_input_lines(
-        &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
-        &prepared.interface,
-    ) {
-        println!("{line}");
-    }
-    if !prepared.interface.root_inputs.is_empty() || !prepared.interface.external_slots.is_empty() {
-        println!();
-    }
-    println!("Ready.");
-    for (name, addr) in &export_bindings {
-        let protocol = prepared
+        let export_bindings = prepared
             .interface
             .exports
             .iter()
-            .find(|export| export.name == *name)
-            .map(|export| export.protocol.as_str())
-            .unwrap_or("http");
-        println!("  {name}  {}", export_listener_url(protocol, *addr));
-    }
-    if let Some((path, omitted_secret_paths)) = reuse_info.as_ref() {
-        println!();
-        println!("Reuse:");
-        println!("  amber run {target} --env-file {}", path.display());
-        if !omitted_secret_paths.is_empty() {
-            println!(
-                "  note: secret root config is omitted from this file. Re-supply {} separately.",
-                omitted_secret_paths
-                    .iter()
-                    .map(|path| format!("config.{path}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            .map(|export| {
+                Ok((
+                    export.name.clone(),
+                    SocketAddr::from(([127, 0, 0, 1], mixed_run::reserve_loopback_port()?)),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let slot_bindings = prepared
+            .interface
+            .external_slots
+            .iter()
+            .filter_map(|slot| {
+                prepared
+                    .external_slot_env
+                    .get(&slot.env_var)
+                    .map(|value| (slot.name.clone(), value.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut proxy_child = if slot_bindings.is_empty() && export_bindings.is_empty() {
+            None
+        } else {
+            Some(mixed_run::spawn_run_outside_proxy(
+                &run_root,
+                &slot_bindings,
+                &export_bindings,
+            )?)
+        };
+        if proxy_child.is_some()
+            && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
+        {
+            if let Some(proxy_child) = proxy_child.as_mut() {
+                let _ = proxy_child.kill();
+                let _ = proxy_child.wait();
+            }
+            let _ = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
+            return Err(err);
         }
+
+        Ok((receipt, run_root, export_bindings, proxy_child))
+    };
+
+    let ((receipt, run_root, export_bindings, mut proxy_child), startup_status_shown) =
+        if io::stdout().is_terminal() {
+            let mut stdout = io::stdout();
+            let mut indicator =
+                SpinnerStatusIndicator::new(&mut stdout, "Starting scenario...", Color::Magenta);
+            let (startup_result, shown) = await_with_status_indicator(
+                startup,
+                Some(ATTACHED_RUN_STARTUP_NOTICE_DELAY),
+                ATTACHED_RUN_STATUS_SPINNER_TICK,
+                &mut indicator,
+            )
+            .await?;
+            (startup_result?, shown)
+        } else {
+            (startup.await?, false)
+        };
+
+    let mut stdout = io::stdout();
+    if prepared.prompted_for_inputs || startup_status_shown {
+        queue!(stdout, Print("\n")).into_diagnostic()?;
+    }
+    if export_bindings.is_empty() {
+        print_run_section_heading(&mut stdout, "Running", Color::DarkMagenta)?;
+    } else {
+        print_export_bindings(&mut stdout, &prepared.interface, &export_bindings)?;
     }
 
     let result = stream_run_logs_until(
@@ -1815,7 +2039,7 @@ async fn run_attached_mixed_run(
         },
     )
     .await;
-    let stop_result = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
+    let stop_result = stop_run_with_cleanup_notice(&receipt.run_id, storage_root_override).await;
     if let Some(proxy_child) = proxy_child.as_mut() {
         let _ = proxy_child.kill();
         let _ = proxy_child.wait();

@@ -2,6 +2,24 @@ use clap::CommandFactory as _;
 
 use super::*;
 
+#[derive(Default)]
+struct RecordingStatusIndicator {
+    shown_frames: Vec<usize>,
+    cleared: bool,
+}
+
+impl StatusIndicator for RecordingStatusIndicator {
+    fn show(&mut self, frame_index: usize) -> Result<()> {
+        self.shown_frames.push(frame_index);
+        Ok(())
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        self.cleared = true;
+        Ok(())
+    }
+}
+
 fn encode_json_b64(value: &serde_json::Value) -> String {
     base64::engine::general_purpose::STANDARD
         .encode(serde_json::to_vec(value).expect("json should serialize"))
@@ -182,6 +200,69 @@ fn build_runtime_template_context_uses_runtime_slot_ports() {
                 .collect::<Vec<_>>()),
         Some(vec!["http://127.0.0.1:32001", "http://127.0.0.1:32002"])
     );
+}
+
+#[tokio::test]
+async fn await_with_status_indicator_is_silent_for_fast_future() {
+    let mut indicator = RecordingStatusIndicator::default();
+
+    let (result, shown) = await_with_status_indicator(
+        async { 7usize },
+        Some(Duration::from_millis(50)),
+        Duration::from_millis(5),
+        &mut indicator,
+    )
+    .await
+    .expect("helper should succeed");
+
+    assert_eq!(result, 7);
+    assert!(!shown);
+    assert!(indicator.shown_frames.is_empty());
+    assert!(!indicator.cleared);
+}
+
+#[tokio::test]
+async fn await_with_status_indicator_renders_and_clears_for_slow_future() {
+    let mut indicator = RecordingStatusIndicator::default();
+
+    let (result, shown) = await_with_status_indicator(
+        async {
+            sleep(Duration::from_millis(30)).await;
+            11usize
+        },
+        Some(Duration::from_millis(1)),
+        Duration::from_millis(5),
+        &mut indicator,
+    )
+    .await
+    .expect("helper should succeed");
+
+    assert_eq!(result, 11);
+    assert!(shown);
+    assert_eq!(indicator.shown_frames.first().copied(), Some(0));
+    assert!(indicator.cleared);
+}
+
+#[tokio::test]
+async fn await_with_status_indicator_can_start_immediately() {
+    let mut indicator = RecordingStatusIndicator::default();
+
+    let (result, shown) = await_with_status_indicator(
+        async {
+            sleep(Duration::from_millis(20)).await;
+            5usize
+        },
+        None,
+        Duration::from_millis(5),
+        &mut indicator,
+    )
+    .await
+    .expect("helper should succeed");
+
+    assert_eq!(result, 5);
+    assert!(shown);
+    assert_eq!(indicator.shown_frames.first().copied(), Some(0));
+    assert!(indicator.cleared);
 }
 
 #[test]

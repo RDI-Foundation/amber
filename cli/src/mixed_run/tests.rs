@@ -48,6 +48,42 @@ fn test_site_receipt(
     }
 }
 
+#[test]
+fn compose_start_failure_explains_missing_docker_daemon() {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(
+            "echo 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the \
+             docker daemon running?' 1>&2; exit 1",
+        )
+        .output()
+        .expect("shell output");
+
+    let err = compose_start_failure("compose_local", &output);
+    let message = err.to_string();
+    assert!(message.contains("could not reach Docker"));
+    assert!(message.contains("Start Docker Desktop or the Docker daemon"));
+    assert!(message.contains("Cannot connect to the Docker daemon"));
+}
+
+#[test]
+fn compose_start_failure_surfaces_specific_compose_stderr() {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(
+            "echo 'Network amber_boundary  Creating' 1>&2; echo 'services.web.image must be a \
+             string' 1>&2; exit 1",
+        )
+        .output()
+        .expect("shell output");
+
+    let err = compose_start_failure("compose_local", &output);
+    let message = err.to_string();
+    assert!(message.contains("compose site `compose_local` failed to start"));
+    assert!(message.contains("services.web.image must be a string"));
+    assert!(!message.contains("Network amber_boundary  Creating"));
+}
+
 fn test_site_state(
     run_id: &str,
     site_id: &str,

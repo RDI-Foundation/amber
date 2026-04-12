@@ -83,9 +83,9 @@ amber run . --env-file .env.example
 Example:
 
 ```text
-Ready.
-  app  http://127.0.0.1:18080
-  api  http://127.0.0.1:18081
+Exports
+  app [http]: http://127.0.0.1:18080
+  api [http]: http://127.0.0.1:18081
 ```
 
 Then call it:
