@@ -34,7 +34,12 @@ fn accept_with_deadline(
 ) -> std::net::TcpStream {
     loop {
         match listener.accept() {
-            Ok((stream, _)) => return stream,
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("accepted manifest stream should be blocking");
+                return stream;
+            }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 if std::time::Instant::now() >= deadline {
                     panic!("timed out waiting for manifest request");

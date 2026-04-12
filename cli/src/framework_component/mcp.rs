@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, str::FromStr};
+use std::collections::BTreeMap;
 
 use amber_manifest::ManifestRef;
 use axum::http::request::Parts;
@@ -162,32 +162,32 @@ impl FrameworkComponentMcp {
     }
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(untagged)]
-enum ManifestArg {
-    Url(String),
-    Pinned(ManifestArgObject),
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct ManifestArgObject {
-    url: String,
-    #[serde(default)]
-    digest: Option<String>,
-}
-
-impl ManifestArg {
-    fn into_manifest_ref(self) -> Result<ManifestRef, McpError> {
-        match self {
-            Self::Url(url) => ManifestRef::from_str(&url)
-                .map_err(|err| McpError::invalid_params(err.to_string(), None)),
-            Self::Pinned(input) => serde_json::from_value(serde_json::json!({
-                "url": input.url,
-                "digest": input.digest,
-            }))
-            .map_err(|err| McpError::invalid_params(err.to_string(), None)),
-        }
-    }
+fn optional_manifest_ref_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "oneOf": [
+            {
+                "type": "string",
+                "minLength": 1
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url"],
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "digest": {
+                        "type": ["string", "null"]
+                    }
+                }
+            },
+            {
+                "type": "null"
+            }
+        ]
+    })
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -217,7 +217,8 @@ enum InspectArgs {
     ResolveTemplate {
         template: String,
         #[serde(default)]
-        manifest: Option<ManifestArg>,
+        #[schemars(schema_with = "optional_manifest_ref_schema")]
+        manifest: Option<ManifestRef>,
     },
     ListChildren,
     GetChild {
@@ -233,7 +234,8 @@ enum MutateArgs {
         template: String,
         name: String,
         #[serde(default)]
-        manifest: Option<ManifestArg>,
+        #[schemars(schema_with = "optional_manifest_ref_schema")]
+        manifest: Option<ManifestRef>,
         #[serde(default)]
         config: BTreeMap<String, Value>,
         #[serde(default)]
@@ -268,9 +270,7 @@ impl FrameworkComponentMcp {
                 InspectArgs::ResolveTemplate { template, manifest } => {
                     FrameworkComponentInspectRequest::ResolveTemplate {
                         template,
-                        request: TemplateResolveRequest {
-                            manifest: manifest.map(ManifestArg::into_manifest_ref).transpose()?,
-                        },
+                        request: TemplateResolveRequest { manifest },
                     }
                 }
                 InspectArgs::ListChildren => FrameworkComponentInspectRequest::ListChildren,
@@ -325,7 +325,7 @@ impl FrameworkComponentMcp {
                 } => FrameworkComponentMutateRequest::CreateChild(CreateChildRequest {
                     template,
                     name,
-                    manifest: manifest.map(ManifestArg::into_manifest_ref).transpose()?,
+                    manifest,
                     config,
                     bindings: bindings
                         .into_iter()
@@ -436,5 +436,52 @@ impl ServerHandler for FrameworkComponentMcp {
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             text, uri,
         )]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn resolve_template_manifest_rejects_unknown_fields() {
+        let err = serde_json::from_value::<InspectArgs>(json!({
+            "op": "resolve_template",
+            "template": "worker",
+            "manifest": {
+                "url": "worker.json5",
+                "digset": "sha256:dGVzdA=="
+            }
+        }))
+        .expect_err("unknown manifest fields should be rejected");
+        assert!(
+            err.to_string().contains("unknown field `digset`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn create_child_manifest_uses_shared_manifest_parser() {
+        let args = serde_json::from_value::<MutateArgs>(json!({
+            "op": "create_child",
+            "template": "worker",
+            "name": "job",
+            "manifest": {
+                "url": "worker.json5"
+            }
+        }))
+        .expect("manifest object should deserialize through ManifestRef");
+        match args {
+            MutateArgs::CreateChild {
+                manifest: Some(manifest),
+                ..
+            } => {
+                assert_eq!(manifest.url.as_str(), "worker.json5");
+                assert!(manifest.digest.is_none());
+            }
+            _ => panic!("expected create_child args"),
+        }
     }
 }
