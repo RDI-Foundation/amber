@@ -280,7 +280,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.timeout_minutes }}
     needs: docker-build
-    if: ${{ always() && (github.event_name != 'pull_request' || needs.docker-build.result == 'success') }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.docker-build.result == 'success') }}
     permissions:
       contents: read
       packages: read

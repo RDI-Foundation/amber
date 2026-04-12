@@ -176,39 +176,6 @@ impl CountingBackend {
     }
 }
 
-pub(super) struct StaticBackend {
-    source: Arc<str>,
-}
-
-impl StaticBackend {
-    pub(super) fn new(source: Arc<str>) -> Self {
-        Self { source }
-    }
-}
-
-impl Backend for StaticBackend {
-    fn resolve_url<'a>(
-        &'a self,
-        url: &'a Url,
-    ) -> Pin<Box<dyn Future<Output = Result<Resolution, amber_resolver::Error>> + Send + 'a>> {
-        let url = url.clone();
-        let source = Arc::clone(&self.source);
-
-        Box::pin(async move {
-            tokio::task::yield_now().await;
-            let spans = Arc::new(amber_manifest::ManifestSpans::parse(&source));
-            let manifest: Manifest = source.parse().unwrap();
-            Ok(Resolution {
-                url,
-                manifest,
-                source,
-                spans,
-                bundle_source: None,
-            })
-        })
-    }
-}
-
 impl Backend for CountingBackend {
     fn resolve_url<'a>(
         &'a self,
