@@ -94,7 +94,9 @@ That example shows the default Amber loop:
 For dynamic component creation, the supported path is `framework.component`. It gives a component
 authority over its realm through the same capability-routing model as the rest of Amber, instead of
 using backend-specific control surfaces. The smallest example is
-[`examples/framework-component`](examples/framework-component/README.md).
+[`examples/framework-component`](examples/framework-component/README.md). That control surface is
+available over HTTP at `$(slots.<name>.url)/v1/...` and over MCP at
+`$(slots.<name>.url)/mcp`.
 
 For background runs and persisted logs, `amber run --detach`, `amber ps`, `amber logs`, and
 `amber stop` give you a managed local workflow without requiring generated artifacts.
