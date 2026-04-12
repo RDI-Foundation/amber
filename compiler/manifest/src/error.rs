@@ -74,6 +74,10 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_export_target))]
     InvalidExportTarget { input: String, message: String },
 
+    #[error("invalid policy ref `{input}`: {message}")]
+    #[diagnostic(code(manifest::invalid_policy_ref))]
+    InvalidPolicyRef { input: String, message: String },
+
     #[error("invalid {kind} name `{name}`: dots are reserved")]
     #[diagnostic(code(manifest::invalid_name))]
     InvalidName { kind: &'static str, name: String },
@@ -184,6 +188,19 @@ pub enum Error {
         )
     )]
     FrameworkCapabilityRequiresFeature { capability: String, feature: String },
+
+    #[error("`{section}` requires experimental feature `{feature}`")]
+    #[diagnostic(
+        code(manifest::section_requires_feature),
+        help(
+            "Add this feature to `experimental_features` in the same manifest, or stop using this \
+             section."
+        )
+    )]
+    SectionRequiresFeature {
+        section: &'static str,
+        feature: String,
+    },
 
     #[error("duplicate endpoint name `{name}`")]
     #[diagnostic(code(manifest::duplicate_endpoint_name))]
@@ -297,6 +314,14 @@ pub enum Error {
     #[error("component `#{child}` references unknown environment `{environment}`")]
     #[diagnostic(code(manifest::unknown_component_environment))]
     UnknownComponentEnvironment { child: String, environment: String },
+
+    #[error("use `#{name}` references unknown environment `{environment}`")]
+    #[diagnostic(code(manifest::unknown_use_environment))]
+    UnknownUseEnvironment { name: String, environment: String },
+
+    #[error("policy references unknown use `#{alias}`")]
+    #[diagnostic(code(manifest::unknown_policy_use))]
+    UnknownPolicyUse { alias: String },
 }
 
 fn manifest_validation_path(diag: &DiagnosticError) -> &str {

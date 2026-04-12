@@ -426,6 +426,9 @@ fn collect_bundle_requests(
     for child in node.children.values() {
         collect_bundle_requests(child, store, requests_by_url, source_url_by_digest)?;
     }
+    for used in node.uses.values() {
+        collect_bundle_requests(used, store, requests_by_url, source_url_by_digest)?;
+    }
 
     Ok(())
 }

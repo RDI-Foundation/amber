@@ -115,11 +115,13 @@ Top-level object:
 
   program: { /* ... */ },      // optional
   components: { /* ... */ },   // optional; default {}
+  use: { /* ... */ },          // optional; default {}
   config_schema: { /* ... */ },// optional
   slots: { /* ... */ },        // optional; default {}
   resources: { /* ... */ },    // optional; default {}
   provides: { /* ... */ },      // optional; default {}
   bindings: [ /* ... */ ],      // optional; default []
+  policies: [ /* ... */ ],      // optional; default []
   exports: { /* ... */ },       // optional; default {}
   metadata: { /* ... */ },      // optional
 }
@@ -132,6 +134,8 @@ Top-level object:
 Current values:
 
 * `"docker"`
+* `"kvm"`
+* `"governance"` - required for the `use` and `policies` top-level sections
 
 Rules:
 

@@ -1,0 +1,13 @@
+manifest::unused_use
+
+  x use `#wrapper` is never referenced (in component /)
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/lint_unused_use.json5:5:5]
+ 4 |   use: {
+ 5 |     wrapper: "./lint_unused_use_wrapper.json5",
+   :     ^^^|^^^
+   :        `-- unused `use` entry `#wrapper`
+ 6 |   },
+   `----
+  help: warning treated as error because it was denied via `-D warnings`
+        Remove the `use` entry `#wrapper` if it is not needed, or reference it from `policies`.
+Error:   × check failed

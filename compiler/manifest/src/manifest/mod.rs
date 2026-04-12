@@ -24,8 +24,9 @@ use crate::{
     schema::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ChildTemplateDecl,
         ChildTemplateManifestDecl, ComponentDecl, ConfigSchema, EnvironmentDecl, ExportTarget,
-        LocalCapabilityRefKind, LocalComponentRef, ManifestBinding, MountSource, Program,
-        ProvideDecl, RawBinding, RawExportTarget, RawProgram, ResourceDecl, SlotDecl, VmScalarU32,
+        LocalCapabilityRefKind, LocalComponentRef, ManifestBinding, MountSource, PolicyRef,
+        Program, ProvideDecl, RawBinding, RawExportTarget, RawProgram, ResourceDecl, SlotDecl,
+        VmScalarU32,
     },
 };
 
@@ -43,6 +44,9 @@ pub struct RawManifest {
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub components: BTreeMap<String, ComponentDecl>,
+    #[serde_as(as = "MapPreventDuplicates<_, _>")]
+    #[serde(default)]
+    pub r#use: BTreeMap<String, ComponentDecl>,
 
     /// Optional named resolution environments for resolving child manifests.
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
@@ -65,6 +69,8 @@ pub struct RawManifest {
     pub child_templates: BTreeMap<String, ChildTemplateDecl>,
     #[serde(default)]
     pub bindings: Vec<RawBinding>,
+    #[serde(default)]
+    pub policies: Vec<PolicyRef>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub exports: BTreeMap<String, RawExportTarget>,
@@ -78,6 +84,7 @@ pub struct RawManifest {
 pub enum ExperimentalFeature {
     Docker,
     Kvm,
+    Governance,
 }
 
 impl fmt::Display for ExperimentalFeature {
@@ -85,6 +92,7 @@ impl fmt::Display for ExperimentalFeature {
         match self {
             ExperimentalFeature::Docker => f.write_str("docker"),
             ExperimentalFeature::Kvm => f.write_str("kvm"),
+            ExperimentalFeature::Governance => f.write_str("governance"),
         }
     }
 }
@@ -179,6 +187,28 @@ fn validate_component_manifest_refs(
             ComponentDecl::Reference(reference) => validate_manifest_ref(reference)?,
             ComponentDecl::Object(obj) => validate_manifest_ref(&obj.manifest)?,
         }
+    }
+    Ok(())
+}
+
+fn validate_policy_refs(
+    uses: &BTreeMap<String, ComponentDecl>,
+    policies: &[PolicyRef],
+) -> Result<(), Error> {
+    for policy in policies {
+        if !uses.contains_key(policy.alias.as_str()) {
+            return Err(Error::UnknownPolicyUse {
+                alias: policy.alias.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_use_names(uses: &BTreeMap<String, ComponentDecl>) -> Result<(), Error> {
+    for name in uses.keys() {
+        ensure_name_no_dot(name, "use")?;
     }
     Ok(())
 }
@@ -315,6 +345,24 @@ fn validate_component_environments(
     Ok(())
 }
 
+fn validate_use_environments(
+    uses: &BTreeMap<String, ComponentDecl>,
+    environments: &BTreeMap<String, EnvironmentDecl>,
+) -> Result<(), Error> {
+    for (use_name, decl) in uses {
+        if let ComponentDecl::Object(obj) = decl
+            && let Some(env) = obj.environment.as_deref()
+            && !environments.contains_key(env)
+        {
+            return Err(Error::UnknownUseEnvironment {
+                name: use_name.to_string(),
+                environment: env.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_no_ambiguous_capability(
     slots: &BTreeMap<SlotName, SlotDecl>,
     provides: &BTreeMap<ProvideName, ProvideDecl>,
@@ -429,6 +477,21 @@ fn require_framework_capability_feature(
     Err(Error::FrameworkCapabilityRequiresFeature {
         capability: capability.to_string(),
         feature: feature.to_string(),
+    })
+}
+
+fn require_section_feature(
+    section: &'static str,
+    required_feature: ExperimentalFeature,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
+) -> Result<(), Error> {
+    if enabled_features.contains(&required_feature) {
+        return Ok(());
+    }
+
+    Err(Error::SectionRequiresFeature {
+        section,
+        feature: required_feature.to_string(),
     })
 }
 
@@ -830,6 +893,7 @@ impl RawManifest {
             experimental_features,
             program,
             components,
+            r#use,
             environments,
             config_schema,
             slots,
@@ -837,6 +901,7 @@ impl RawManifest {
             resources,
             child_templates,
             bindings,
+            policies,
             exports,
             metadata,
         } = self;
@@ -848,11 +913,29 @@ impl RawManifest {
 
         validate_program_syntax_manifest_version(&manifest_version, program.as_ref())?;
 
+        if !r#use.is_empty() {
+            require_section_feature(
+                "use",
+                ExperimentalFeature::Governance,
+                &experimental_features,
+            )?;
+        }
+        if !policies.is_empty() {
+            require_section_feature(
+                "policies",
+                ExperimentalFeature::Governance,
+                &experimental_features,
+            )?;
+        }
+
         if let Some(schema) = config_schema.as_ref() {
             ConfigSchema::validate_value(&schema.0)?;
         }
         validate_component_manifest_refs(&components)?;
+        validate_component_manifest_refs(&r#use)?;
+        validate_use_names(&r#use)?;
         validate_environment_names(&environments)?;
+        validate_policy_refs(&r#use, &policies)?;
 
         let components = convert_components(components)?;
         let slots = convert_slots(slots)?;
@@ -863,6 +946,7 @@ impl RawManifest {
         validate_environment_extends(&environments)?;
         validate_environment_cycles(&environments)?;
         validate_component_environments(&components, &environments)?;
+        validate_use_environments(&r#use, &environments)?;
         validate_no_ambiguous_capability(&slots, &provides)?;
         validate_resource_decls(&resources)?;
         validate_child_templates(&child_templates, &slots, &bindings)?;
@@ -911,6 +995,7 @@ impl RawManifest {
             experimental_features,
             program,
             components,
+            r#use,
             environments,
             config_schema,
             slots,
@@ -918,6 +1003,7 @@ impl RawManifest {
             resources,
             child_templates,
             bindings: bindings_out,
+            policies,
             exports: exports_out,
             metadata,
             digest: ManifestDigest::new([0; 32]),
@@ -934,6 +1020,7 @@ pub struct Manifest {
     experimental_features: BTreeSet<ExperimentalFeature>,
     program: Option<Program>,
     components: BTreeMap<ChildName, ComponentDecl>,
+    r#use: BTreeMap<String, ComponentDecl>,
     environments: BTreeMap<String, EnvironmentDecl>,
     config_schema: Option<ConfigSchema>,
     slots: BTreeMap<SlotName, SlotDecl>,
@@ -941,6 +1028,7 @@ pub struct Manifest {
     resources: BTreeMap<ResourceName, ResourceDecl>,
     child_templates: BTreeMap<TemplateName, ChildTemplateDecl>,
     bindings: Vec<ManifestBinding>,
+    policies: Vec<PolicyRef>,
     exports: BTreeMap<ExportName, ExportTarget>,
     metadata: Option<Value>,
     digest: ManifestDigest,
@@ -965,6 +1053,10 @@ impl Manifest {
 
     pub fn components(&self) -> &BTreeMap<ChildName, ComponentDecl> {
         &self.components
+    }
+
+    pub fn uses(&self) -> &BTreeMap<String, ComponentDecl> {
+        &self.r#use
     }
 
     pub fn environments(&self) -> &BTreeMap<String, EnvironmentDecl> {
@@ -995,6 +1087,10 @@ impl Manifest {
         &self.bindings
     }
 
+    pub fn policies(&self) -> &[PolicyRef] {
+        &self.policies
+    }
+
     pub fn exports(&self) -> &BTreeMap<ExportName, ExportTarget> {
         &self.exports
     }
@@ -1005,6 +1101,7 @@ impl Manifest {
             experimental_features: BTreeSet::new(),
             program: None,
             components: BTreeMap::new(),
+            r#use: BTreeMap::new(),
             environments: BTreeMap::new(),
             config_schema: None,
             slots: BTreeMap::new(),
@@ -1012,6 +1109,7 @@ impl Manifest {
             resources: BTreeMap::new(),
             child_templates: BTreeMap::new(),
             bindings: Vec::new(),
+            policies: Vec::new(),
             exports: BTreeMap::new(),
             metadata: None,
         }
@@ -1036,6 +1134,7 @@ impl Manifest {
         #[builder(default)] experimental_features: BTreeSet<ExperimentalFeature>,
         program: Option<Program>,
         #[builder(default)] components: BTreeMap<String, ComponentDecl>,
+        #[builder(default)] r#use: BTreeMap<String, ComponentDecl>,
         #[builder(default)] environments: BTreeMap<String, EnvironmentDecl>,
         config_schema: Option<Value>,
         #[builder(default)] slots: BTreeMap<String, SlotDecl>,
@@ -1043,6 +1142,7 @@ impl Manifest {
         #[builder(default)] resources: BTreeMap<String, ResourceDecl>,
         #[builder(default)] child_templates: BTreeMap<String, ChildTemplateDecl>,
         #[builder(default)] bindings: Vec<RawBinding>,
+        #[builder(default)] policies: Vec<PolicyRef>,
         #[builder(default)] exports: BTreeMap<String, RawExportTarget>,
         metadata: Option<Value>,
     ) -> Result<Self, Error> {
@@ -1053,6 +1153,7 @@ impl Manifest {
             experimental_features,
             program: program.map(RawProgram::from),
             components,
+            r#use,
             environments,
             config_schema,
             slots,
@@ -1060,6 +1161,7 @@ impl Manifest {
             resources,
             child_templates,
             bindings,
+            policies,
             exports,
             metadata,
         }
@@ -1088,6 +1190,8 @@ impl From<&Manifest> for RawManifest {
             .iter()
             .map(|(name, decl)| (name.to_string(), decl.clone()))
             .collect();
+
+        let uses = manifest.r#use.clone();
 
         let slots = manifest
             .slots
@@ -1186,6 +1290,7 @@ impl From<&Manifest> for RawManifest {
             experimental_features: manifest.experimental_features.clone(),
             program: manifest.program.as_ref().map(RawProgram::from),
             components,
+            r#use: uses,
             environments: manifest.environments.clone(),
             config_schema: manifest.config_schema.clone(),
             slots,
@@ -1193,6 +1298,7 @@ impl From<&Manifest> for RawManifest {
             resources,
             child_templates,
             bindings,
+            policies: manifest.policies.clone(),
             exports,
             metadata: manifest.metadata.clone(),
         }

@@ -55,6 +55,24 @@ pub enum ManifestLint {
         span: SourceSpan,
     },
 
+    #[error("use `#{name}` is never referenced (in component {component})")]
+    #[diagnostic(
+        code(manifest::unused_use),
+        severity(Warning),
+        help(
+            "Remove the `use` entry `#{name}` if it is not needed, or reference it from \
+             `policies`."
+        )
+    )]
+    UnusedUse {
+        name: String,
+        component: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label("unused `use` entry `#{name}`")]
+        span: SourceSpan,
+    },
+
     #[error("config property `{path}` is never used (in component {component})")]
     #[diagnostic(
         code(manifest::unused_config),
