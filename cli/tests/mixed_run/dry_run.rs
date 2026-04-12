@@ -466,6 +466,48 @@ AMBER_EXTERNAL_SLOT_CATALOG_API_URL=http://127.0.0.1:9100\n",
 }
 
 #[test]
+fn mixed_run_dry_run_ignores_unselected_file_backed_inputs() {
+    let temp = temp_output_dir("mixed-run-runtime-inputs-ignore-unused-file-");
+    let fixture = copy_documented_mixed_site_fixture(temp.path());
+    let storage_root = temp.path().join("state");
+    let bundle_root = temp.path().join("launch-bundle");
+    let env_file = temp.path().join("runtime.env");
+    fs::write(
+        &env_file,
+        "\
+AMBER_CONFIG_TENANT=acme-local\n\
+AMBER_CONFIG_CATALOG_TOKEN=demo-token\n\
+AMBER_CONFIG_FILE_UNUSED=./missing.txt\n\
+AMBER_EXTERNAL_SLOT_CATALOG_API_URL=http://127.0.0.1:9100\n",
+    )
+    .expect("failed to write runtime env file");
+
+    let output = amber_command()
+        .arg("run")
+        .arg("-Z")
+        .arg("unstable-options")
+        .arg(&fixture.manifest)
+        .arg("--placement")
+        .arg(&fixture.placement)
+        .arg("--storage-root")
+        .arg(&storage_root)
+        .arg("--env-file")
+        .arg(&env_file)
+        .arg("--dry-run")
+        .arg("--emit-launch-bundle")
+        .arg(&bundle_root)
+        .output()
+        .expect("failed to run amber run --dry-run with unrelated AMBER_CONFIG_FILE_*");
+
+    assert!(
+        output.status.success(),
+        "amber run --dry-run with unrelated AMBER_CONFIG_FILE_* failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn mixed_run_dry_run_tolerates_unresolved_vm_preview_config() {
     let temp = temp_output_dir("mixed-run-dry-run-vm-preview-");
     let bundle_root = temp.path().join("launch-bundle");

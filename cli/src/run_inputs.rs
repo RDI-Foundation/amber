@@ -96,6 +96,7 @@ pub(crate) fn load_run_env(
     project_root: Option<&Path>,
     env_files: &[PathBuf],
     config_file_overrides: &[String],
+    interface: &RunInterface,
 ) -> Result<BTreeMap<String, String>> {
     let cwd = env::current_dir().into_diagnostic()?;
     let mut merged = RunInputLayer::default();
@@ -131,7 +132,7 @@ pub(crate) fn load_run_env(
         parse_cli_config_file_overrides(config_file_overrides, &cwd)?,
     );
 
-    resolve_run_input_layer(merged)
+    resolve_run_input_layer(&merged, interface)
 }
 
 fn merge_run_input_layer(target: &mut RunInputLayer, layer: RunInputLayer) {
@@ -246,23 +247,40 @@ fn same_root_input_source_kind(left: &RootInputSource, right: &RootInputSource) 
     )
 }
 
-fn resolve_run_input_layer(layer: RunInputLayer) -> Result<BTreeMap<String, String>> {
+fn resolve_run_input_layer(
+    layer: &RunInputLayer,
+    interface: &RunInterface,
+) -> Result<BTreeMap<String, String>> {
     let mut env = BTreeMap::new();
 
-    for (path, source) in layer.root_inputs {
-        let env_var = config::env_var_for_path(&path)
-            .map_err(|err| miette::miette!("invalid config path `{path}`: {err}"))?;
-        let value = match source {
-            RootInputSource::Literal(value) => value,
-            RootInputSource::File(path) => fs::read_to_string(&path)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to read config file {}", path.display()))?,
+    for input in &interface.root_inputs {
+        let Some(source) = layer.root_inputs.get(&input.path) else {
+            continue;
         };
-        env.insert(env_var, value);
+        let value = resolve_root_input_source(&input.path, source)?;
+        env.insert(input.env_var.clone(), value);
     }
 
-    env.extend(layer.external_slots);
+    for slot in &interface.external_slots {
+        if let Some(value) = layer.external_slots.get(&slot.env_var) {
+            env.insert(slot.env_var.clone(), value.clone());
+        }
+    }
     Ok(env)
+}
+
+fn resolve_root_input_source(path: &str, source: &RootInputSource) -> Result<String> {
+    match source {
+        RootInputSource::Literal(value) => Ok(value.clone()),
+        RootInputSource::File(file_path) => fs::read_to_string(file_path)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to read config file {} for config.{path}",
+                    file_path.display()
+                )
+            }),
+    }
 }
 
 fn resolve_input_file_path(base_dir: &Path, raw: &str) -> PathBuf {
@@ -1334,9 +1352,25 @@ AMBER_CONFIG_FILE_AUTH__JSON=./auth.json\n\
 AMBER_EXTERNAL_SLOT_CATALOG_API_URL=http://127.0.0.1:9100\n",
         )
         .expect("write env file");
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "auth.json".to_string(),
+                env_var: "AMBER_CONFIG_AUTH__JSON".to_string(),
+                required: true,
+                secret: false,
+            }],
+            external_slots: vec![ExternalSlotSpec {
+                name: "catalog_api".to_string(),
+                env_var: "AMBER_EXTERNAL_SLOT_CATALOG_API_URL".to_string(),
+                required: true,
+                kind: CapabilityKind::Http,
+            }],
+            ..RunInterface::default()
+        };
 
         let env = resolve_run_input_layer(
-            load_env_file_layer(&env_file, temp.path(), "test env file").expect("load env layer"),
+            &load_env_file_layer(&env_file, temp.path(), "test env file").expect("load env layer"),
+            &interface,
         )
         .expect("resolve env");
         assert_eq!(
@@ -1392,10 +1426,47 @@ AMBER_CONFIG_TOKEN=inline\nAMBER_CONFIG_FILE_TOKEN=./token.txt\n",
             )
             .expect("load cli overrides"),
         );
-        let env = resolve_run_input_layer(layer).expect("resolve env");
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "token".to_string(),
+                env_var: "AMBER_CONFIG_TOKEN".to_string(),
+                required: true,
+                secret: false,
+            }],
+            ..RunInterface::default()
+        };
+        let env = resolve_run_input_layer(&layer, &interface).expect("resolve env");
         assert_eq!(
             env.get("AMBER_CONFIG_TOKEN"),
             Some(&"from-file".to_string())
+        );
+    }
+
+    #[test]
+    fn load_run_env_ignores_unselected_file_backed_inputs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env_file = temp.path().join("runtime.env");
+        std::fs::write(
+            &env_file,
+            "\
+AMBER_CONFIG_TOKEN=inline\nAMBER_CONFIG_FILE_UNUSED=./missing.txt\n",
+        )
+        .expect("write env file");
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "token".to_string(),
+                env_var: "AMBER_CONFIG_TOKEN".to_string(),
+                required: true,
+                secret: false,
+            }],
+            ..RunInterface::default()
+        };
+
+        let env = load_run_env(None, &[env_file], &[], &interface).expect("load env");
+        assert_eq!(env.get("AMBER_CONFIG_TOKEN"), Some(&"inline".to_string()));
+        assert!(
+            !env.contains_key("AMBER_CONFIG_UNUSED"),
+            "unselected file-backed inputs should be ignored"
         );
     }
 

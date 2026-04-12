@@ -1288,7 +1288,6 @@ async fn run(args: RunArgs) -> Result<()> {
         return write_env_file_output(output_path, &render_run_env_file(&interface));
     }
 
-    let explicit_env = load_run_env(None, &args.env_file, &args.config_file)?;
     if let Some(target) = try_load_run_target(&args.output)? {
         return match target.kind {
             RunTargetKind::Direct => {
@@ -1298,6 +1297,9 @@ async fn run(args: RunArgs) -> Result<()> {
                          manifests and run plans"
                     ));
                 }
+                let interface = interface_for_run_target(&target)?;
+                let explicit_env =
+                    load_run_env(None, &args.env_file, &args.config_file, &interface)?;
                 with_scoped_run_env(&explicit_env, || async {
                     run_direct_init(RunDirectInitArgs {
                         plan: target.plan,
@@ -1319,6 +1321,9 @@ async fn run(args: RunArgs) -> Result<()> {
                          manifests and run plans"
                     ));
                 }
+                let interface = interface_for_run_target(&target)?;
+                let explicit_env =
+                    load_run_env(None, &args.env_file, &args.config_file, &interface)?;
                 with_scoped_run_env(&explicit_env, || async {
                     vm_runtime::run_vm_init(
                         target.plan,
@@ -1584,7 +1589,12 @@ fn prepare_mixed_run_inputs(
 ) -> Result<PreparedMixedRunInputs> {
     let interface = collect_run_interface(run_plan)?;
     let root_schema = run_plan_root_schema(run_plan);
-    let mut env = load_run_env(project_env_root, env_files, config_file_overrides)?;
+    let mut env = load_run_env(
+        project_env_root,
+        env_files,
+        config_file_overrides,
+        &interface,
+    )?;
     if interactive {
         prompt_for_missing_inputs(&mut env, &interface, root_schema)?;
     }
