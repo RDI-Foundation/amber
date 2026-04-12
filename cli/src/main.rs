@@ -245,6 +245,9 @@ This command understands direct/native artifacts from `amber compile --direct`, 
      `amber compile --vm`, mixed-site run plans from `amber compile --run-plan`, and manifest or \
      bundle inputs that Amber can compile into a run plan on the fly.
 
+Foreground mixed-site runs use temporary runtime state by default and clean it up when the run \
+     exits. Pass `--storage-root` when you want to keep that state for inspection or debugging.
+
 During interactive startup, non-secret root config prompts accept `@file` to load from a file and \
      `@@` for a literal leading `@`, with path suggestions as you type and Tab completion. Secret \
      root config uses the same `@file` / `@@` rules, but literal values stay hidden.";
@@ -520,7 +523,8 @@ struct RunArgs {
     #[arg(value_name = "TARGET")]
     output: String,
 
-    /// Override where Amber stores persistent runtime state.
+    /// Override where Amber stores runtime state. Mixed-site attached runs use temporary storage
+    /// by default; pass this to persist them.
     #[arg(long = "storage-root", value_name = "DIR")]
     storage_root: Option<PathBuf>,
 
@@ -1941,6 +1945,35 @@ async fn stop_run_with_cleanup_notice(
     }
 }
 
+enum AttachedRunStorage {
+    Persistent(PathBuf),
+    Temporary(tempfile::TempDir),
+}
+
+impl AttachedRunStorage {
+    fn new(storage_root_override: Option<&Path>) -> Result<Self> {
+        if let Some(root) = storage_root_override {
+            return Ok(Self::Persistent(mixed_run::mixed_run_storage_root(Some(
+                root,
+            ))?));
+        }
+
+        let temp_root = tempfile::Builder::new()
+            .prefix("amber-run-")
+            .tempdir()
+            .into_diagnostic()
+            .wrap_err("failed to create temporary storage for attached mixed-site run")?;
+        Ok(Self::Temporary(temp_root))
+    }
+
+    fn storage_root(&self) -> &Path {
+        match self {
+            Self::Persistent(path) => path.as_path(),
+            Self::Temporary(path) => path.path(),
+        }
+    }
+}
+
 async fn run_attached_mixed_run(
     source_plan_path: Option<&Path>,
     run_plan: &RunPlan,
@@ -1948,6 +1981,8 @@ async fn run_attached_mixed_run(
     observability: Option<&str>,
     prepared: PreparedMixedRunInputs,
 ) -> Result<()> {
+    let attached_storage = AttachedRunStorage::new(storage_root_override)?;
+    let storage_root_override = Some(attached_storage.storage_root());
     let startup = async {
         let receipt = mixed_run::run_run_plan(
             source_plan_path,

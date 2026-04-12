@@ -506,6 +506,31 @@ fn direct_storage_root_uses_explicit_override() {
 }
 
 #[test]
+fn attached_run_storage_defaults_to_temporary_root() {
+    let storage = AttachedRunStorage::new(None).expect("attached storage should build");
+    let path = storage.storage_root();
+    assert!(path.exists(), "temporary storage root should exist");
+    assert!(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("amber-run-")),
+        "unexpected temporary storage root: {}",
+        path.display()
+    );
+}
+
+#[test]
+fn attached_run_storage_uses_explicit_override() {
+    let storage = AttachedRunStorage::new(Some(Path::new("custom-storage-root")))
+        .expect("attached storage should build");
+    assert!(
+        storage.storage_root().ends_with("custom-storage-root"),
+        "override should be used verbatim: {}",
+        storage.storage_root().display()
+    );
+}
+
+#[test]
 fn framework_component_example_control_calls_use_extended_timeout_budget() {
     let admin_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
