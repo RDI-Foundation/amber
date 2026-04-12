@@ -19,6 +19,7 @@ mod linker;
 mod lint;
 pub mod mesh;
 mod mir;
+pub mod policy;
 pub mod run_plan;
 mod runtime_interface;
 mod slots;
