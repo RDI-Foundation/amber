@@ -68,6 +68,14 @@ On a first interactive run, Amber may read an existing `.env`, prompt for missin
 prompt for the external catalog URL, start the local process and Compose service, and print the
 localhost URLs for the entrypoints the system exposes.
 
+If you want a non-interactive setup flow instead, ask Amber to write the input template first:
+
+```sh
+amber run . --emit-env-file .env.example
+$EDITOR .env.example
+amber run . --env-file .env.example
+```
+
 Example:
 
 ```text

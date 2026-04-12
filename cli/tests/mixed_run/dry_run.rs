@@ -265,6 +265,43 @@ fn mixed_run_noninteractive_manifest_reports_missing_runtime_inputs() {
 }
 
 #[test]
+fn mixed_run_emit_env_file_writes_annotated_template() {
+    let temp = temp_output_dir("mixed-run-emit-env-file-");
+    let fixture = copy_documented_mixed_site_fixture(temp.path());
+    let output_path = temp.path().join("runtime.env");
+
+    let output = amber_command()
+        .arg("run")
+        .arg(&fixture.manifest)
+        .arg("--placement")
+        .arg(&fixture.placement)
+        .arg("--emit-env-file")
+        .arg(&output_path)
+        .output()
+        .expect("failed to run amber run --emit-env-file");
+
+    assert!(
+        output.status.success(),
+        "amber run --emit-env-file failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = fs::read_to_string(&output_path).expect("read emitted env file");
+    for needle in [
+        "Runtime inputs for `amber run --env-file`",
+        "AMBER_CONFIG_TENANT",
+        "AMBER_CONFIG_CATALOG_TOKEN",
+        "AMBER_EXTERNAL_SLOT_CATALOG_API_URL",
+        "AMBER_CONFIG_FILE_CATALOG_TOKEN",
+    ] {
+        assert!(
+            rendered.contains(needle),
+            "emitted env file should mention `{needle}`\n{rendered}"
+        );
+    }
+}
+
+#[test]
 fn mixed_run_dry_run_accepts_runtime_inputs_from_env_file() {
     let temp = temp_output_dir("mixed-run-runtime-inputs-env-file-");
     let fixture = copy_documented_mixed_site_fixture(temp.path());
@@ -319,6 +356,113 @@ AMBER_EXTERNAL_SLOT_CATALOG_API_URL=http://127.0.0.1:9100\n",
         compose_supervisor_plan.contains("acme-local"),
         "dry-run launch bundle should materialize supplied root config values"
     );
+}
+
+#[test]
+fn mixed_run_dry_run_accepts_runtime_inputs_from_config_file_flag() {
+    let temp = temp_output_dir("mixed-run-runtime-inputs-config-file-");
+    let fixture = copy_documented_mixed_site_fixture(temp.path());
+    let storage_root = temp.path().join("state");
+    let bundle_root = temp.path().join("launch-bundle");
+    let env_file = temp.path().join("runtime.env");
+    let secret_file = temp.path().join("catalog-token.txt");
+    fs::write(
+        &env_file,
+        "\
+AMBER_CONFIG_TENANT=acme-local\nAMBER_EXTERNAL_SLOT_CATALOG_API_URL=http://127.0.0.1:9100\n\
+         ",
+    )
+    .expect("failed to write runtime env file");
+    fs::write(&secret_file, "demo-token\n").expect("failed to write secret file");
+
+    let output = amber_command()
+        .arg("run")
+        .arg("-Z")
+        .arg("unstable-options")
+        .arg(&fixture.manifest)
+        .arg("--placement")
+        .arg(&fixture.placement)
+        .arg("--storage-root")
+        .arg(&storage_root)
+        .arg("--env-file")
+        .arg(&env_file)
+        .arg("--config-file")
+        .arg(format!("catalog_token={}", secret_file.display()))
+        .arg("--dry-run")
+        .arg("--emit-launch-bundle")
+        .arg(&bundle_root)
+        .output()
+        .expect("failed to run amber run --dry-run with --config-file");
+
+    assert!(
+        output.status.success(),
+        "amber run --dry-run with --config-file failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let compose_supervisor_plan = fs::read_to_string(
+        bundle_root
+            .join("state")
+            .join("compose_local")
+            .join("site-supervisor-plan.json"),
+    )
+    .expect("failed to read compose site-supervisor-plan.json from launch bundle");
+    assert!(compose_supervisor_plan.contains("acme-local"));
+    assert!(compose_supervisor_plan.contains("demo-token"));
+}
+
+#[test]
+fn mixed_run_dry_run_accepts_runtime_inputs_from_file_env_vars() {
+    let temp = temp_output_dir("mixed-run-runtime-inputs-file-env-var-");
+    let fixture = copy_documented_mixed_site_fixture(temp.path());
+    let storage_root = temp.path().join("state");
+    let bundle_root = temp.path().join("launch-bundle");
+    let env_file = temp.path().join("runtime.env");
+    let secret_file = temp.path().join("catalog-token.txt");
+    fs::write(&secret_file, "demo-token\n").expect("failed to write secret file");
+    fs::write(
+        &env_file,
+        "\
+AMBER_CONFIG_TENANT=acme-local\n\
+AMBER_CONFIG_FILE_CATALOG_TOKEN=./catalog-token.txt\n\
+AMBER_EXTERNAL_SLOT_CATALOG_API_URL=http://127.0.0.1:9100\n",
+    )
+    .expect("failed to write runtime env file");
+
+    let output = amber_command()
+        .arg("run")
+        .arg("-Z")
+        .arg("unstable-options")
+        .arg(&fixture.manifest)
+        .arg("--placement")
+        .arg(&fixture.placement)
+        .arg("--storage-root")
+        .arg(&storage_root)
+        .arg("--env-file")
+        .arg(&env_file)
+        .arg("--dry-run")
+        .arg("--emit-launch-bundle")
+        .arg(&bundle_root)
+        .output()
+        .expect("failed to run amber run --dry-run with AMBER_CONFIG_FILE_*");
+
+    assert!(
+        output.status.success(),
+        "amber run --dry-run with AMBER_CONFIG_FILE_* failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let compose_supervisor_plan = fs::read_to_string(
+        bundle_root
+            .join("state")
+            .join("compose_local")
+            .join("site-supervisor-plan.json"),
+    )
+    .expect("failed to read compose site-supervisor-plan.json from launch bundle");
+    assert!(compose_supervisor_plan.contains("acme-local"));
+    assert!(compose_supervisor_plan.contains("demo-token"));
 }
 
 #[test]

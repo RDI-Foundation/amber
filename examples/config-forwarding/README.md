@@ -98,6 +98,27 @@ and renders the child config as:
 That is the object you will see in the child log line. Only leaf paths become env vars, so nested
 paths use `__`: for example, `config.api.key` would become `AMBER_CONFIG_API__KEY`.
 
+## `amber run`
+
+If you want Amber to generate the input file it expects for `amber run`, ask it to emit the
+template first:
+
+```sh
+amber run . --emit-env-file .env.example
+```
+
+You can then point one root config value at a file instead of copying the file contents into the
+env file:
+
+```sh
+printf 'demo-key\n' > api-key.txt
+cat > .env.example <<'EOF'
+AMBER_CONFIG_FILE_API_KEY=./api-key.txt
+EOF
+
+amber run . --env-file .env.example
+```
+
 ## Docker Compose
 
 Compile to a compose output directory:
