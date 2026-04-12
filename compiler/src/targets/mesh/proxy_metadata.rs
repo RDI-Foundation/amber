@@ -40,6 +40,10 @@ pub struct RouterMetadata {
 pub struct ExportMetadata {
     pub component: String,
     pub provide: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_profile: Option<String>,
     pub protocol: String,
     pub router_mesh_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,6 +97,8 @@ pub fn collect_exports_metadata(
                 ExportMetadata {
                     component: export.component,
                     provide: export.provide,
+                    capability_kind: export.capability_kind,
+                    capability_profile: export.capability_profile,
                     protocol: export.protocol.to_string(),
                     router_mesh_port,
                     route_id: Some(route_id),

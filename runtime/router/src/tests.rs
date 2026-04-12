@@ -237,6 +237,7 @@ fn validate_outbound_routes_rejects_http_plugins_on_non_http_route() {
     let config = MeshConfig {
         outbound: vec![OutboundRoute {
             route_id: "bad-route".to_string(),
+            rewrite_route_id: None,
             slot: "slot".to_string(),
             capability_kind: None,
             capability_profile: None,
@@ -363,6 +364,7 @@ async fn run_surfaces_outbound_listener_bind_failure() {
     let mut config = test_mesh_config();
     config.outbound.push(amber_mesh::OutboundRoute {
         route_id: "route".to_string(),
+        rewrite_route_id: None,
         slot: "test-outbound".to_string(),
         capability_kind: None,
         capability_profile: None,
@@ -408,6 +410,7 @@ async fn run_with_prebound_outbound_listener_proxies_http_requests() {
     });
     config.outbound.push(OutboundRoute {
         route_id: "route".to_string(),
+        rewrite_route_id: None,
         slot: "matrix".to_string(),
         capability_kind: Some("http".to_string()),
         capability_profile: None,
@@ -1481,6 +1484,7 @@ fn inbound_export_labels_treat_router_slot_only_metadata_as_export() {
 fn external_slot_destination_ref_is_user_facing() {
     let route = OutboundRoute {
         route_id: "router:external:ext_api:http".to_string(),
+        rewrite_route_id: None,
         slot: "ext_api".to_string(),
         capability_kind: Some("http".to_string()),
         capability_profile: Some("debug-external".to_string()),

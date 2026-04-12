@@ -1,12 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
 
-use amber_manifest::{CapabilityKind, NetworkProtocol};
+use amber_manifest::NetworkProtocol;
 use amber_mesh::{
     DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV, DYNAMIC_CAPS_CONTROL_URL_ENV,
     DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV,
-    FRAMEWORK_COMPONENT_CCS_URL_ENV, HttpRoutePlugin, InboundRoute, InboundTarget,
-    MeshConfigTemplate, MeshIdentityTemplate, MeshPeerTemplate, MeshProtocol, OutboundRoute,
-    component_route_id, framework_cap_instance_id, router_export_route_id,
+    FRAMEWORK_COMPONENT_CCS_URL_ENV, InboundRoute, InboundTarget, MeshConfigTemplate,
+    MeshIdentityTemplate, MeshPeerTemplate, MeshProtocol, OutboundRoute, component_route_id,
+    framework_cap_instance_id, http_route_plugins_for_capability_kind, router_export_route_id,
     router_external_route_id, telemetry::SCENARIO_RUN_ID_ENV,
 };
 use amber_scenario::{ComponentId, Scenario};
@@ -259,13 +259,10 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 capability_kind: Some(provide_decl.decl.kind.to_string()),
                 capability_profile: provide_decl.decl.profile.clone(),
                 protocol,
-                http_plugins: matches!(
-                    (provide_decl.decl.kind, protocol),
-                    (CapabilityKind::A2a, MeshProtocol::Http)
-                )
-                .then_some(HttpRoutePlugin::A2a)
-                .into_iter()
-                .collect(),
+                http_plugins: http_route_plugins_for_capability_kind(
+                    Some(provide_decl.decl.kind.as_str()),
+                    protocol,
+                ),
                 target: InboundTarget::Local {
                     port: endpoint.port,
                 },
@@ -299,19 +296,17 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 .expect("binding provide should exist");
             outbound.push(OutboundRoute {
                 route_id: component_route_id(&peer_id, &binding.provide, protocol),
+                rewrite_route_id: None,
                 slot: binding.slot.clone(),
                 capability_kind: Some(provide_decl.decl.kind.to_string()),
                 capability_profile: provide_decl.decl.profile.clone(),
                 listen_port,
                 listen_addr: None,
                 protocol,
-                http_plugins: matches!(
-                    (provide_decl.decl.kind, protocol),
-                    (CapabilityKind::A2a, MeshProtocol::Http)
-                )
-                .then_some(HttpRoutePlugin::A2a)
-                .into_iter()
-                .collect(),
+                http_plugins: http_route_plugins_for_capability_kind(
+                    Some(provide_decl.decl.kind.as_str()),
+                    protocol,
+                ),
                 peer_addr,
                 peer_id: peer_id.clone(),
                 capability: binding.provide.clone(),
@@ -341,6 +336,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 .expect("external slot should exist on root");
             outbound.push(OutboundRoute {
                 route_id: router_external_route_id(&binding.external_slot),
+                rewrite_route_id: None,
                 slot: binding.slot.clone(),
                 capability_kind: Some(slot_decl.decl.kind.to_string()),
                 capability_profile: slot_decl.decl.profile.clone(),
@@ -385,6 +381,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             );
             outbound.push(OutboundRoute {
                 route_id,
+                rewrite_route_id: None,
                 slot: binding.slot.clone(),
                 capability_kind: Some(slot_decl.decl.kind.to_string()),
                 capability_profile: slot_decl.decl.profile.clone(),

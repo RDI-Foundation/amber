@@ -563,6 +563,7 @@ mod tests {
     ) -> OutboundRoute {
         OutboundRoute {
             route_id: route_id.to_string(),
+            rewrite_route_id: None,
             slot: slot.to_string(),
             capability_kind: Some("http".to_string()),
             capability_profile: None,

@@ -1037,6 +1037,7 @@ fn prepare_dynamic_compose_child_artifact_rewrites_same_site_static_provider_inp
                     inbound: Vec::new(),
                     outbound: vec![OutboundRoute {
                         route_id: component_route_id("/provider", "http", MeshProtocol::Http),
+                        rewrite_route_id: None,
                         slot: "upstream".to_string(),
                         capability_kind: Some("http".to_string()),
                         capability_profile: None,
@@ -1384,6 +1385,7 @@ fn direct_startup_route_overlay_does_not_require_materialized_child_mesh_files()
                         inbound: Vec::new(),
                         outbound: vec![OutboundRoute {
                             route_id: "placeholder".to_string(),
+                            rewrite_route_id: None,
                             slot: "upstream".to_string(),
                             capability: "http".to_string(),
                             capability_kind: Some("http".to_string()),

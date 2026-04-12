@@ -298,6 +298,8 @@ pub enum HttpRoutePlugin {
 #[serde(rename_all = "snake_case")]
 pub struct OutboundRoute {
     pub route_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite_route_id: Option<String>,
     pub slot: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_kind: Option<String>,
@@ -352,6 +354,32 @@ pub fn component_route_id(identity_id: &str, capability: &str, protocol: MeshPro
         "component:{identity_id}:{capability}:{}",
         protocol_label(protocol)
     )
+}
+
+pub fn public_export_rewrite_route_id(
+    component: &str,
+    provide: &str,
+    protocol: MeshProtocol,
+) -> String {
+    component_route_id(component, provide, protocol)
+}
+
+fn abstract_route_rewrite_enabled(capability_kind: Option<&str>, protocol: MeshProtocol) -> bool {
+    matches!(
+        (capability_kind, protocol),
+        (Some(kind), MeshProtocol::Http)
+            if kind == amber_manifest::CapabilityKind::A2a.as_str()
+    )
+}
+
+pub fn http_route_plugins_for_capability_kind(
+    capability_kind: Option<&str>,
+    protocol: MeshProtocol,
+) -> Vec<HttpRoutePlugin> {
+    abstract_route_rewrite_enabled(capability_kind, protocol)
+        .then_some(HttpRoutePlugin::A2a)
+        .into_iter()
+        .collect()
 }
 
 pub fn router_external_route_id(slot: &str) -> String {
@@ -581,6 +609,31 @@ mod key_serde_64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_route_plugins_only_enable_a2a_http_rewrites() {
+        assert_eq!(
+            http_route_plugins_for_capability_kind(
+                Some(amber_manifest::CapabilityKind::A2a.as_str()),
+                MeshProtocol::Http,
+            ),
+            vec![HttpRoutePlugin::A2a]
+        );
+        assert!(
+            http_route_plugins_for_capability_kind(
+                Some(amber_manifest::CapabilityKind::Http.as_str()),
+                MeshProtocol::Http,
+            )
+            .is_empty()
+        );
+        assert!(
+            http_route_plugins_for_capability_kind(
+                Some(amber_manifest::CapabilityKind::A2a.as_str()),
+                MeshProtocol::Tcp,
+            )
+            .is_empty()
+        );
+    }
 
     #[test]
     fn stable_temp_socket_path_is_deterministic_for_known_input() {

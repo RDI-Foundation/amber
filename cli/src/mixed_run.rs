@@ -23,10 +23,11 @@ use amber_compiler::{
 };
 use amber_manifest::{CapabilityKind, CapabilityTransport, NetworkProtocol};
 use amber_mesh::{
-    HttpRoutePlugin, InboundRoute, InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME,
-    MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer,
-    MeshProtocol, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTargetKind, OutboundRoute,
-    TransportConfig, component_route_id, router_dynamic_export_route_id, router_export_route_id,
+    InboundRoute, InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshConfig,
+    MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer, MeshProtocol,
+    MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTargetKind, OutboundRoute,
+    TransportConfig, component_route_id, http_route_plugins_for_capability_kind,
+    router_dynamic_export_route_id, router_export_route_id,
     telemetry::{SCENARIO_RUN_ID_ENV, SCENARIO_SCOPE_ENV},
 };
 use amber_proxy::{
@@ -607,6 +608,10 @@ struct RunOutsideProxyContext {
 #[derive(Clone, Debug)]
 struct RunOutsideExport {
     site_id: String,
+    component: String,
+    provide: String,
+    capability_kind: Option<String>,
+    capability_profile: Option<String>,
     protocol: String,
 }
 
@@ -1898,19 +1903,6 @@ fn dynamic_proxy_export_mesh_protocol(export: &DynamicProxyExportRecord) -> Resu
     mesh_protocol(protocol)
 }
 
-fn dynamic_proxy_export_http_plugins(
-    export: &DynamicProxyExportRecord,
-    protocol: MeshProtocol,
-) -> Vec<HttpRoutePlugin> {
-    matches!(
-        (export.capability_kind.as_str(), protocol),
-        ("a2a", MeshProtocol::Http)
-    )
-    .then_some(HttpRoutePlugin::A2a)
-    .into_iter()
-    .collect()
-}
-
 fn dynamic_proxy_export_route_id(
     export_name: &str,
     export: &DynamicProxyExportRecord,
@@ -1946,24 +1938,6 @@ fn dynamic_input_route_capability(input: &DynamicInputRouteRecord) -> String {
 
 fn is_compose_component_sidecar_service(service_name: &str) -> bool {
     service_name.ends_with("-net")
-}
-
-fn dynamic_input_route_http_plugins(
-    input: &DynamicInputRouteRecord,
-    protocol: MeshProtocol,
-) -> Vec<HttpRoutePlugin> {
-    dynamic_proxy_export_http_plugins(
-        &DynamicProxyExportRecord {
-            component_id: 0,
-            component: input.provider_component.clone(),
-            provide: dynamic_input_route_capability(input),
-            protocol: input.protocol.clone(),
-            capability_kind: input.capability_kind.clone(),
-            capability_profile: input.capability_profile.clone(),
-            target_port: 0,
-        },
-        protocol,
-    )
 }
 
 fn overlay_peer_addr_map_from_ports(ports: &BTreeMap<String, u16>) -> BTreeMap<String, String> {
@@ -2034,7 +2008,10 @@ fn routed_input_overlay_route(
         capability_kind: Some(input.capability_kind.clone()),
         capability_profile: input.capability_profile.clone(),
         protocol,
-        http_plugins: dynamic_input_route_http_plugins(input, protocol),
+        http_plugins: http_route_plugins_for_capability_kind(
+            Some(input.capability_kind.as_str()),
+            protocol,
+        ),
         target: InboundTarget::MeshForward {
             peer_addr: provider_peer_addr.to_string(),
             peer_id: input.provider_component.clone(),
@@ -2187,7 +2164,10 @@ fn rewrite_dynamic_routed_inputs(
             route.capability = capability.clone();
             route.capability_kind = Some(input.capability_kind.clone());
             route.capability_profile = input.capability_profile.clone();
-            route.http_plugins = dynamic_input_route_http_plugins(input, protocol);
+            route.http_plugins = http_route_plugins_for_capability_kind(
+                Some(input.capability_kind.as_str()),
+                protocol,
+            );
         }
         if !matched {
             return Err(miette::miette!(
@@ -2390,7 +2370,10 @@ fn ensure_dynamic_proxy_export_component_routes(
             capability_kind: Some(export.capability_kind.clone()),
             capability_profile: export.capability_profile.clone(),
             protocol,
-            http_plugins: dynamic_proxy_export_http_plugins(export, protocol),
+            http_plugins: http_route_plugins_for_capability_kind(
+                Some(export.capability_kind.as_str()),
+                protocol,
+            ),
             target: InboundTarget::Local {
                 port: export.target_port,
             },
@@ -2429,7 +2412,10 @@ fn add_dynamic_proxy_export_overlay_routes(
             capability_kind: Some(export.capability_kind.clone()),
             capability_profile: export.capability_profile.clone(),
             protocol,
-            http_plugins: dynamic_proxy_export_http_plugins(export, protocol),
+            http_plugins: http_route_plugins_for_capability_kind(
+                Some(export.capability_kind.as_str()),
+                protocol,
+            ),
             target: InboundTarget::MeshForward {
                 peer_addr: peer_addr_for_export(export)?,
                 peer_id: export.component.clone(),

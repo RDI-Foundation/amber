@@ -354,6 +354,7 @@ fn assign_direct_runtime_ports_preserves_repeated_slot_item_order() {
         outbound: vec![
             OutboundRoute {
                 route_id: "route-b".to_string(),
+                rewrite_route_id: None,
                 slot: "upstream".to_string(),
                 capability_kind: Some("http".to_string()),
                 capability_profile: None,
@@ -367,6 +368,7 @@ fn assign_direct_runtime_ports_preserves_repeated_slot_item_order() {
             },
             OutboundRoute {
                 route_id: "route-a".to_string(),
+                rewrite_route_id: None,
                 slot: "upstream".to_string(),
                 capability_kind: Some("http".to_string()),
                 capability_profile: None,

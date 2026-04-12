@@ -277,17 +277,7 @@ pub enum CapabilityKind {
 
 impl fmt::Display for CapabilityKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            CapabilityKind::Mcp => "mcp",
-            CapabilityKind::Llm => "llm",
-            CapabilityKind::Http => "http",
-            CapabilityKind::Component => "component",
-            CapabilityKind::Docker => "docker",
-            CapabilityKind::A2a => "a2a",
-            CapabilityKind::Storage => "storage",
-            CapabilityKind::Kvm => "kvm",
-        };
-        f.write_str(s)
+        f.write_str(self.as_str())
     }
 }
 
@@ -299,6 +289,19 @@ pub enum CapabilityTransport {
 }
 
 impl CapabilityKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::Llm => "llm",
+            Self::Http => "http",
+            Self::Component => "component",
+            Self::Docker => "docker",
+            Self::A2a => "a2a",
+            Self::Storage => "storage",
+            Self::Kvm => "kvm",
+        }
+    }
+
     pub const fn transport(self) -> CapabilityTransport {
         match self {
             Self::Mcp | Self::Llm | Self::Http | Self::Component | Self::A2a => {

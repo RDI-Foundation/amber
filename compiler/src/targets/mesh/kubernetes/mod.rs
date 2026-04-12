@@ -1411,6 +1411,8 @@ pub(crate) fn emit_kubernetes_artifact(
                 ExportMetadata {
                     component: export.component,
                     provide: export.provide,
+                    capability_kind: export.capability_kind,
+                    capability_profile: export.capability_profile,
                     protocol: export.protocol.to_string(),
                     router_mesh_port,
                     route_id: Some(route_id),

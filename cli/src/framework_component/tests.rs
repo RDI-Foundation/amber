@@ -545,6 +545,7 @@ fn dynamic_capability_origin_binding_routes_same_site_provider_via_mesh() {
         Vec::new(),
         vec![OutboundRoute {
             route_id: "provider-route".to_string(),
+            rewrite_route_id: None,
             slot: "provider".to_string(),
             capability_kind: Some("http".to_string()),
             capability_profile: None,
@@ -608,6 +609,7 @@ fn dynamic_capability_origin_external_slot_routes_via_router_external_target() {
         Vec::new(),
         vec![OutboundRoute {
             route_id: "router:external:catalog_api:http".to_string(),
+            rewrite_route_id: None,
             slot: "catalog_api".to_string(),
             capability_kind: Some("http".to_string()),
             capability_profile: Some("debug-external".to_string()),
@@ -673,6 +675,7 @@ fn dynamic_capability_origin_binding_rewrites_linux_slirp_peer_addr_for_host_rou
         Vec::new(),
         vec![OutboundRoute {
             route_id: "remote-route".to_string(),
+            rewrite_route_id: None,
             slot: "provider".to_string(),
             capability_kind: Some("http".to_string()),
             capability_profile: None,
@@ -782,6 +785,7 @@ fn dynamic_capability_origin_target_mesh_peer_uses_runtime_peer_catalog_for_bind
             inbound: Vec::new(),
             outbound: vec![OutboundRoute {
                 route_id: "provider-route".to_string(),
+                rewrite_route_id: None,
                 slot: "provider".to_string(),
                 capability_kind: Some("http".to_string()),
                 capability_profile: None,

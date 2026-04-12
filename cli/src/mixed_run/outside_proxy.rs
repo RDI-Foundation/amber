@@ -226,6 +226,10 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
             .get(&export.site_id)
             .expect("provider site should exist");
         let protocol = mesh_protocol_for_export(&export.protocol)?;
+        let http_plugins = amber_mesh::http_route_plugins_for_capability_kind(
+            export.capability_kind.as_deref(),
+            protocol,
+        );
         let peer_key =
             base64::engine::general_purpose::STANDARD.encode(outside_identity.public_key);
         register_export_peer_with_retry(
@@ -246,13 +250,18 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
             });
         outbound.push(OutboundRoute {
             route_id: router_export_route_id(export_name, protocol),
+            rewrite_route_id: Some(amber_mesh::public_export_rewrite_route_id(
+                &export.component,
+                &export.provide,
+                protocol,
+            )),
             slot: export_name.clone(),
-            capability_kind: None,
-            capability_profile: None,
+            capability_kind: export.capability_kind.clone(),
+            capability_profile: export.capability_profile.clone(),
             listen_port: listen.port(),
             listen_addr: Some(listen.ip().to_string()),
             protocol,
-            http_plugins: Vec::new(),
+            http_plugins,
             peer_addr: provider.router_addr.to_string(),
             peer_id: provider.router_identity.id.clone(),
             capability: export_name.clone(),
@@ -482,6 +491,10 @@ pub(super) fn build_run_outside_proxy_context(
                         name.clone(),
                         RunOutsideExport {
                             site_id: site_id.clone(),
+                            component: export.component,
+                            provide: export.provide,
+                            capability_kind: export.capability_kind,
+                            capability_profile: export.capability_profile,
                             protocol: export.protocol,
                         },
                     );
