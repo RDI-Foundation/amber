@@ -225,13 +225,17 @@ Print the manifest schema README that ships inside the CLI.
 
 Use this for the detailed manifest format, field semantics, and authoring examples.";
 
-const RUN_LONG_ABOUT: &str = "\
+const RUN_LONG_ABOUT: &str =
+    "\
 Start a compiled Amber runtime artifact, a mixed-site run plan, or a manifest/bundle.
 
 This command understands direct/native artifacts from `amber compile --direct`, VM artifacts from \
-                              `amber compile --vm`, mixed-site run plans from `amber compile \
-                              --run-plan`, and manifest or bundle inputs that Amber can compile \
-                              into a run plan on the fly.";
+     `amber compile --vm`, mixed-site run plans from `amber compile --run-plan`, and manifest or \
+     bundle inputs that Amber can compile into a run plan on the fly.
+
+During interactive startup, non-secret root config prompts accept `@file` to load from a file and \
+     `@@` for a literal leading `@`, with path suggestions as you type and Tab completion. Secret \
+     root config uses the same `@file` / `@@` rules, but literal values stay hidden.";
 
 const RUN_AFTER_HELP: &str = "\
 Examples:
@@ -1611,23 +1615,30 @@ fn prepare_mixed_run_inputs(
 
     let missing_slots = missing_required_external_slots(&env, &interface);
     if require_complete_inputs && (!missing_root.is_empty() || !missing_slots.is_empty()) {
+        let has_missing_root = !missing_root.is_empty();
         let mut message = String::from("missing required runtime inputs:");
-        for input in missing_root {
+        for input in &missing_root {
             message.push_str(&format!(
                 "\n  - {} for config.{}",
                 input.env_var, input.path
             ));
         }
-        for slot in missing_slots {
+        for slot in &missing_slots {
             message.push_str(&format!("\n  - {} for slot.{}", slot.env_var, slot.name));
         }
         if let Some(project_env_root) = project_env_root {
-            message.push_str(&format!(
-                "\n\nProvide them via ambient environment, `--env-file`, or {}",
-                project_env_path(project_env_root).display()
-            ));
+            message.push_str("\n\nProvide them via ambient environment");
+            if has_missing_root {
+                message.push_str(", `--config-file`");
+            }
+            message.push_str(", `--env-file`, or ");
+            message.push_str(&project_env_path(project_env_root).display().to_string());
         } else {
-            message.push_str("\n\nProvide them via ambient environment or `--env-file`.");
+            message.push_str("\n\nProvide them via ambient environment");
+            if has_missing_root {
+                message.push_str(", `--config-file`");
+            }
+            message.push_str(", or `--env-file`.");
         }
         return Err(miette::miette!(message));
     }
@@ -1749,17 +1760,15 @@ async fn run_attached_mixed_run(
         return Err(err);
     }
 
-    let reuse_path = if prepared.interface.root_inputs.is_empty() {
+    let reuse_info = if prepared.interface.root_inputs.is_empty() {
         None
     } else {
         let path = run_root.join("root-config.env");
-        fs::write(
-            &path,
-            render_root_reuse_env(&prepared.root_env, &prepared.interface),
-        )
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to write {}", path.display()))?;
-        Some(path)
+        let rendered = render_root_reuse_env(&prepared.root_env, &prepared.interface);
+        fs::write(&path, &rendered.contents)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+        Some((path, rendered.omitted_secret_paths))
     };
 
     for line in render_resolved_input_lines(
@@ -1782,10 +1791,20 @@ async fn run_attached_mixed_run(
             .unwrap_or("http");
         println!("  {name}  {}", export_listener_url(protocol, *addr));
     }
-    if let Some(path) = reuse_path.as_ref() {
+    if let Some((path, omitted_secret_paths)) = reuse_info.as_ref() {
         println!();
         println!("Reuse:");
         println!("  amber run {target} --env-file {}", path.display());
+        if !omitted_secret_paths.is_empty() {
+            println!(
+                "  note: secret root config is omitted from this file. Re-supply {} separately.",
+                omitted_secret_paths
+                    .iter()
+                    .map(|path| format!("config.{path}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
 
     let result = stream_run_logs_until(

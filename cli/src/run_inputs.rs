@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
-    io::{self, Write as _},
+    env, fs, io,
+    io::Write as _,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -9,8 +9,17 @@ use std::{
 use amber_compiler::run_plan::RunPlan;
 use amber_config::{self as config, CONFIG_ENV_PREFIX};
 use amber_manifest::{CapabilityKind, CapabilityTransport};
+use crossterm::{
+    cursor::{MoveToColumn, MoveToPreviousLine},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
+    execute, queue,
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    terminal::{self, Clear, ClearType},
+};
 use miette::{Context as _, IntoDiagnostic as _, Result};
-use rpassword::prompt_password;
 use serde_json::Value;
 use url::Url;
 
@@ -19,6 +28,8 @@ use crate::site_proxy_metadata::load_site_proxy_metadata;
 const GENERATED_ENV_SAMPLE_FILENAME: &str = "env.example";
 const PROJECT_ENV_FILENAME: &str = ".env";
 pub(crate) const CONFIG_FILE_ENV_PREFIX: &str = "AMBER_CONFIG_FILE_";
+const ROOT_PROMPT_SUGGESTION_LIMIT: usize = 8;
+const ROOT_PROMPT_LITERAL_PREVIEW_LIMIT: usize = 96;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RootInputSpec {
@@ -62,10 +73,51 @@ enum RootInputSource {
     File(PathBuf),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PromptedRootInput {
+    Literal(String),
+    File { raw_path: String, from_sigil: bool },
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct RunInputLayer {
     root_inputs: BTreeMap<String, RootInputSource>,
     external_slots: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RenderedRootReuseEnv {
+    pub(crate) contents: String,
+    pub(crate) omitted_secret_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RootPromptMeta {
+    description: Option<String>,
+    type_label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptBadge<'a> {
+    label: std::borrow::Cow<'a, str>,
+    color: Color,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PromptPrefix<'a> {
+    label: &'a str,
+    prefix_color: Color,
+    name_color: Color,
+}
+
+trait PromptDriver {
+    fn prompt_root(
+        &mut self,
+        input: &RootInputSpec,
+        meta: &RootPromptMeta,
+    ) -> Result<PromptedRootInput>;
+    fn prompt_external_slot(&mut self, slot: &ExternalSlotSpec) -> Result<String>;
+    fn print_error(&mut self, message: &str);
 }
 
 pub(crate) fn resolve_manifest_entry_path(path: &Path) -> Result<PathBuf> {
@@ -284,12 +336,36 @@ fn resolve_root_input_source(path: &str, source: &RootInputSource) -> Result<Str
 }
 
 fn resolve_input_file_path(base_dir: &Path, raw: &str) -> PathBuf {
+    resolve_input_file_path_with_home(base_dir, raw, home_dir().as_deref())
+}
+
+fn resolve_input_file_path_with_home(
+    base_dir: &Path,
+    raw: &str,
+    home_dir: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = expand_tilde_path(raw, home_dir) {
+        return path;
+    }
     let path = Path::new(raw);
     if path.is_absolute() {
         path.to_path_buf()
     } else {
         base_dir.join(path)
     }
+}
+
+fn expand_tilde_path(raw: &str, home_dir: Option<&Path>) -> Option<PathBuf> {
+    let home_dir = home_dir?;
+    if raw == "~" {
+        return Some(home_dir.to_path_buf());
+    }
+    let rest = raw.strip_prefix("~/")?;
+    Some(home_dir.join(rest))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME").map(PathBuf::from)
 }
 
 pub(crate) fn config_file_env_var_for_path(path: &str) -> Result<String> {
@@ -438,18 +514,20 @@ pub(crate) fn prompt_for_missing_inputs(
     interface: &RunInterface,
     root_schema: Option<&Value>,
 ) -> Result<()> {
-    let mut prompt_visible = |prompt: &str| prompt_line(prompt);
-    let mut prompt_secret = |prompt: &str| prompt_password(prompt).into_diagnostic();
-    let mut print_error = |message: &str| {
-        eprintln!("{message}");
+    let cwd = env::current_dir().into_diagnostic()?;
+    let home_dir = home_dir();
+    let mut driver = InteractivePromptDriver {
+        cwd: cwd.clone(),
+        home_dir: home_dir.clone(),
+        printed_root_prompt_note: false,
     };
     prompt_for_missing_inputs_with(
         env,
         interface,
         root_schema,
-        &mut prompt_visible,
-        &mut prompt_secret,
-        &mut print_error,
+        &cwd,
+        home_dir.as_deref(),
+        &mut driver,
     )
 }
 
@@ -457,29 +535,32 @@ fn prompt_for_missing_inputs_with(
     env: &mut BTreeMap<String, String>,
     interface: &RunInterface,
     root_schema: Option<&Value>,
-    prompt_visible: &mut impl FnMut(&str) -> Result<String>,
-    prompt_secret: &mut impl FnMut(&str) -> Result<String>,
-    print_error: &mut impl FnMut(&str),
+    cwd: &Path,
+    home_dir: Option<&Path>,
+    driver: &mut impl PromptDriver,
 ) -> Result<()> {
     for input in &interface.root_inputs {
         if !input.required || !root_env_var_missing(env, &input.env_var) {
             continue;
         }
-        let prompt = format!("config.{}: ", input.path);
+        let meta = root_prompt_meta(root_schema, &input.path);
         loop {
-            let value = if input.secret {
-                prompt_secret(&prompt)?
-            } else {
-                prompt_visible(&prompt)?
+            let prompted = driver.prompt_root(input, &meta)?;
+            let value = match resolve_prompted_root_input_value(input, prompted, cwd, home_dir) {
+                Ok(value) => value,
+                Err(err) => {
+                    driver.print_error(&err.to_string());
+                    continue;
+                }
             };
             if value.is_empty() {
-                print_error(&format!("config.{} must not be empty", input.path));
+                driver.print_error(&format!("config.{} must not be empty", input.path));
                 continue;
             }
             if let Some(schema) = root_schema
                 && let Err(err) = validate_root_input_value(schema, &input.path, &value)
             {
-                print_error(&format!("invalid value for config.{}: {err}", input.path));
+                driver.print_error(&format!("invalid value for config.{}: {err}", input.path));
                 continue;
             }
             env.insert(input.env_var.clone(), value);
@@ -488,17 +569,12 @@ fn prompt_for_missing_inputs_with(
     }
 
     for slot in missing_promptable_external_slots(env, interface) {
-        let prompt = if slot.required {
-            format!("slot.{}: ", slot.name)
-        } else {
-            format!("slot.{} (optional): ", slot.name)
-        };
         loop {
-            let value = prompt_visible(&prompt)?;
+            let value = driver.prompt_external_slot(slot)?;
             let trimmed = value.trim();
             if trimmed.is_empty() {
                 if slot.required {
-                    print_error(&format!("slot.{} must not be empty", slot.name));
+                    driver.print_error(&format!("slot.{} must not be empty", slot.name));
                     continue;
                 }
                 break;
@@ -509,13 +585,677 @@ fn prompt_for_missing_inputs_with(
                     break;
                 }
                 Err(err) => {
-                    print_error(&err.to_string());
+                    driver.print_error(&err.to_string());
                 }
             }
         }
     }
 
     Ok(())
+}
+
+struct InteractivePromptDriver {
+    cwd: PathBuf,
+    home_dir: Option<PathBuf>,
+    printed_root_prompt_note: bool,
+}
+
+impl PromptDriver for InteractivePromptDriver {
+    fn prompt_root(
+        &mut self,
+        input: &RootInputSpec,
+        meta: &RootPromptMeta,
+    ) -> Result<PromptedRootInput> {
+        if !self.printed_root_prompt_note {
+            let mut stderr = io::stderr();
+            execute!(
+                stderr,
+                SetForegroundColor(Color::DarkGrey),
+                Print("Enter each value directly, or use @file. Use @@ for a literal leading @."),
+                ResetColor,
+                Print("\n")
+            )
+            .into_diagnostic()?;
+            self.printed_root_prompt_note = true;
+        }
+        prompt_root_input(input, meta, &self.cwd, self.home_dir.as_deref())
+    }
+
+    fn prompt_external_slot(&mut self, slot: &ExternalSlotSpec) -> Result<String> {
+        prompt_external_slot_input(slot)
+    }
+
+    fn print_error(&mut self, message: &str) {
+        eprintln!("\r{message}");
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RootPromptBuffer {
+    raw: String,
+    secret: bool,
+}
+
+impl RootPromptBuffer {
+    fn new(secret: bool) -> Self {
+        Self {
+            raw: String::new(),
+            secret,
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.raw.push(ch);
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        self.raw.push_str(text);
+    }
+
+    fn pop_char(&mut self) {
+        self.raw.pop();
+    }
+
+    fn is_file_mode(&self) -> bool {
+        self.raw.starts_with('@') && !self.raw.starts_with("@@")
+    }
+
+    fn parse(&self) -> PromptedRootInput {
+        parse_interactive_root_input(&self.raw)
+    }
+
+    fn display(&self) -> String {
+        if self.secret && !self.is_file_mode() {
+            return "*".repeat(self.literal_display_len());
+        }
+        if !self.is_file_mode()
+            && (self.raw.contains('\n')
+                || self.raw.contains('\r')
+                || self.raw.chars().count() > ROOT_PROMPT_LITERAL_PREVIEW_LIMIT)
+        {
+            return format!("<{} bytes>", self.raw.len());
+        }
+        self.raw.clone()
+    }
+
+    fn literal_display_len(&self) -> usize {
+        if self.raw.starts_with("@@") {
+            self.raw.chars().count().saturating_sub(1)
+        } else {
+            self.raw.chars().count()
+        }
+    }
+
+    fn suggestions(&self, base_dir: &Path, home_dir: Option<&Path>) -> Vec<String> {
+        if !self.is_file_mode() {
+            return Vec::new();
+        }
+        collect_path_suggestions(&self.raw, base_dir, home_dir)
+            .into_iter()
+            .take(ROOT_PROMPT_SUGGESTION_LIMIT)
+            .collect()
+    }
+
+    fn apply_completion(&mut self, base_dir: &Path, home_dir: Option<&Path>) -> bool {
+        let suggestions = self.suggestions(base_dir, home_dir);
+        let Some(completion) = completion_from_suggestions(&self.raw, &suggestions) else {
+            return false;
+        };
+        self.raw = completion;
+        true
+    }
+}
+
+fn parse_interactive_root_input(raw: &str) -> PromptedRootInput {
+    if let Some(rest) = raw.strip_prefix("@@") {
+        return PromptedRootInput::Literal(format!("@{rest}"));
+    }
+    if let Some(raw_path) = raw.strip_prefix('@') {
+        return PromptedRootInput::File {
+            raw_path: raw_path.to_string(),
+            from_sigil: true,
+        };
+    }
+    PromptedRootInput::Literal(raw.to_string())
+}
+
+fn resolve_prompted_root_input_value(
+    input: &RootInputSpec,
+    prompted: PromptedRootInput,
+    cwd: &Path,
+    home_dir: Option<&Path>,
+) -> Result<String> {
+    match prompted {
+        PromptedRootInput::Literal(value) => Ok(value),
+        PromptedRootInput::File {
+            raw_path,
+            from_sigil,
+        } => {
+            if raw_path.is_empty() {
+                return Err(miette::miette!(
+                    "config.{} file path must not be empty",
+                    input.path
+                ));
+            }
+            let resolved_path = resolve_input_file_path_with_home(cwd, &raw_path, home_dir);
+            resolve_root_input_source(&input.path, &RootInputSource::File(resolved_path)).map_err(
+                |err| {
+                    if from_sigil {
+                        err.wrap_err("use `@@...` to enter a literal value starting with `@`")
+                    } else {
+                        err
+                    }
+                },
+            )
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DecodedPathInput<'a> {
+    raw_path: std::borrow::Cow<'a, str>,
+    rendered_prefix: &'static str,
+}
+
+fn decode_path_input(input: &str) -> Option<DecodedPathInput<'_>> {
+    if input.starts_with("@@") {
+        None
+    } else {
+        input.strip_prefix('@').map(|rest| DecodedPathInput {
+            raw_path: std::borrow::Cow::Borrowed(rest),
+            rendered_prefix: "@",
+        })
+    }
+}
+
+fn collect_path_suggestions(input: &str, base_dir: &Path, home_dir: Option<&Path>) -> Vec<String> {
+    let Some(decoded) = decode_path_input(input) else {
+        return Vec::new();
+    };
+    list_display_path_suggestions(decoded.raw_path.as_ref(), base_dir, home_dir)
+        .into_iter()
+        .map(|suggestion| format!("{}{}", decoded.rendered_prefix, suggestion))
+        .collect()
+}
+
+fn prompt_root_input(
+    input: &RootInputSpec,
+    meta: &RootPromptMeta,
+    cwd: &Path,
+    home_dir: Option<&Path>,
+) -> Result<PromptedRootInput> {
+    let mut state = RootPromptBuffer::new(input.secret);
+    let mut stderr = io::stderr();
+    print_root_prompt_context(&mut stderr, input, meta)?;
+    let raw_mode = RawTerminalGuard::new()?;
+
+    loop {
+        let suggestions = state.suggestions(cwd, home_dir);
+        let visible_suggestions = visible_prompt_suggestions(&state.raw, &suggestions);
+        render_root_prompt(&mut stderr, &state, &visible_suggestions)?;
+
+        let event = event::read().into_diagnostic()?;
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if handle_root_prompt_key(&mut state, key, cwd, home_dir)? {
+                    render_root_prompt(&mut stderr, &state, &[])?;
+                    stderr.write_all(b"\r\n").into_diagnostic()?;
+                    stderr.flush().into_diagnostic()?;
+                    drop(raw_mode);
+                    return Ok(state.parse());
+                }
+            }
+            Event::Paste(text) => state.insert_str(&text),
+            Event::Resize(_, _) => {}
+            _ => {}
+        }
+    }
+}
+
+fn handle_root_prompt_key(
+    state: &mut RootPromptBuffer,
+    key: KeyEvent,
+    cwd: &Path,
+    home_dir: Option<&Path>,
+) -> Result<bool> {
+    match key.code {
+        KeyCode::Enter => Ok(true),
+        KeyCode::Backspace => {
+            state.pop_char();
+            Ok(false)
+        }
+        KeyCode::Tab => {
+            state.apply_completion(cwd, home_dir);
+            Ok(false)
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.raw.clear();
+            Ok(false)
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Err(miette::miette!("interactive input cancelled"))
+        }
+        KeyCode::Char('d')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && state.raw.is_empty() =>
+        {
+            Err(miette::miette!("interactive input cancelled"))
+        }
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.insert_char(ch);
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn render_root_prompt(
+    writer: &mut impl io::Write,
+    state: &RootPromptBuffer,
+    suggestions: &[String],
+) -> Result<()> {
+    queue!(
+        writer,
+        MoveToColumn(0),
+        Clear(ClearType::FromCursorDown),
+        SetForegroundColor(Color::Cyan),
+        SetAttribute(Attribute::Bold),
+        Print("> "),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        Print(state.display())
+    )
+    .into_diagnostic()?;
+    for suggestion in suggestions {
+        queue!(writer, Print("\r\n  "), Print(suggestion)).into_diagnostic()?;
+    }
+    if !suggestions.is_empty() {
+        queue!(writer, MoveToPreviousLine(suggestions.len() as u16)).into_diagnostic()?;
+    }
+    queue!(
+        writer,
+        MoveToColumn((2 + state.display().chars().count()) as u16)
+    )
+    .into_diagnostic()?;
+    writer.flush().into_diagnostic()
+}
+
+fn print_root_prompt_context(
+    writer: &mut impl io::Write,
+    input: &RootInputSpec,
+    meta: &RootPromptMeta,
+) -> Result<()> {
+    let mut badges = Vec::with_capacity(2);
+    if input.secret {
+        badges.push(PromptBadge {
+            label: "secret".into(),
+            color: Color::DarkYellow,
+        });
+    }
+    if let Some(type_label) = meta.type_label.as_deref() {
+        badges.push(PromptBadge {
+            label: type_label.into(),
+            color: Color::DarkGrey,
+        });
+    }
+    print_prompt_context(
+        writer,
+        PromptPrefix {
+            label: "config.",
+            prefix_color: Color::DarkCyan,
+            name_color: Color::Cyan,
+        },
+        &input.path,
+        &badges,
+        meta.description.as_deref(),
+    )
+}
+
+fn visible_prompt_suggestions(current_input: &str, suggestions: &[String]) -> Vec<String> {
+    if matches!(suggestions, [only] if only == current_input) {
+        Vec::new()
+    } else {
+        suggestions.to_vec()
+    }
+}
+
+fn wrap_prompt_description(description: Option<&str>) -> Vec<String> {
+    let Some(description) = description
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+    else {
+        return Vec::new();
+    };
+    let width = terminal::size()
+        .ok()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or(100)
+        .saturating_sub(2)
+        .max(24);
+    wrap_text(description, width)
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for paragraph in text.lines() {
+        let paragraph = paragraph.trim();
+        if paragraph.is_empty() {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        for word in paragraph.split_whitespace() {
+            let next_len = if current.is_empty() {
+                word.len()
+            } else {
+                current.len() + 1 + word.len()
+            };
+            if !current.is_empty() && next_len > width {
+                lines.push(std::mem::take(&mut current));
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+
+    lines
+}
+
+fn root_prompt_meta(root_schema: Option<&Value>, path: &str) -> RootPromptMeta {
+    let Some(schema) = root_schema else {
+        return RootPromptMeta::default();
+    };
+    let Ok(leaf_schema) = config::schema_lookup_ref(schema, path) else {
+        return RootPromptMeta::default();
+    };
+    RootPromptMeta {
+        description: leaf_schema
+            .get("description")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        type_label: schema_type_label(leaf_schema),
+    }
+}
+
+fn schema_type_label(schema: &Value) -> Option<String> {
+    let ty = schema.get("type")?;
+    if let Some(single) = ty.as_str() {
+        return Some(single.to_string());
+    }
+    let types = ty.as_array()?;
+    let mut labels = Vec::new();
+    let mut saw_null = false;
+    for value in types {
+        let Some(label) = value.as_str() else {
+            continue;
+        };
+        if label == "null" {
+            saw_null = true;
+        } else {
+            labels.push(label);
+        }
+    }
+    labels.sort_unstable();
+    labels.dedup();
+    match labels.as_slice() {
+        [] if saw_null => Some("null".to_string()),
+        [single] if saw_null => Some(format!("{single}?")),
+        [single] => Some((*single).to_string()),
+        _ => Some("value".to_string()),
+    }
+}
+
+fn prompt_external_slot_input(slot: &ExternalSlotSpec) -> Result<String> {
+    let mut badges = Vec::with_capacity(2);
+    badges.push(PromptBadge {
+        label: slot.kind.to_string().into(),
+        color: Color::DarkGrey,
+    });
+    if !slot.required {
+        badges.push(PromptBadge {
+            label: "optional".into(),
+            color: Color::DarkGrey,
+        });
+    }
+
+    let mut stderr = io::stderr();
+    print_prompt_context(
+        &mut stderr,
+        PromptPrefix {
+            label: "slots.",
+            prefix_color: Color::DarkGreen,
+            name_color: Color::Green,
+        },
+        &slot.name,
+        &badges,
+        None,
+    )?;
+    prompt_visible_line()
+}
+
+fn print_prompt_context(
+    writer: &mut impl io::Write,
+    prefix: PromptPrefix<'_>,
+    name: &str,
+    badges: &[PromptBadge<'_>],
+    description: Option<&str>,
+) -> Result<()> {
+    queue!(
+        writer,
+        MoveToColumn(0),
+        SetForegroundColor(prefix.prefix_color),
+        SetAttribute(Attribute::Dim),
+        Print(prefix.label),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        SetForegroundColor(prefix.name_color),
+        SetAttribute(Attribute::Bold),
+        Print(name),
+        SetAttribute(Attribute::Reset),
+        ResetColor
+    )
+    .into_diagnostic()?;
+    for badge in badges {
+        queue!(
+            writer,
+            Print(" "),
+            SetForegroundColor(badge.color),
+            Print(format!("[{}]", badge.label)),
+            ResetColor
+        )
+        .into_diagnostic()?;
+    }
+    for line in wrap_prompt_description(description) {
+        queue!(
+            writer,
+            Print("\r\n  "),
+            SetForegroundColor(Color::DarkGrey),
+            SetAttribute(Attribute::Italic),
+            Print(line),
+            SetAttribute(Attribute::Reset),
+            ResetColor
+        )
+        .into_diagnostic()?;
+    }
+    queue!(writer, Print("\r\n")).into_diagnostic()?;
+    writer.flush().into_diagnostic()
+}
+
+fn prompt_visible_line() -> Result<String> {
+    let mut stderr = io::stderr();
+    execute!(
+        stderr,
+        MoveToColumn(0),
+        SetForegroundColor(Color::Cyan),
+        SetAttribute(Attribute::Bold),
+        Print("> "),
+        SetAttribute(Attribute::Reset),
+        ResetColor
+    )
+    .into_diagnostic()?;
+    stderr.flush().into_diagnostic()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).into_diagnostic()?;
+    stderr.write_all(b"\r").into_diagnostic()?;
+    stderr.flush().into_diagnostic()?;
+    while matches!(line.as_bytes().last(), Some(b'\n' | b'\r')) {
+        line.pop();
+    }
+    Ok(line)
+}
+
+struct RawTerminalGuard;
+
+impl RawTerminalGuard {
+    fn new() -> Result<Self> {
+        terminal::enable_raw_mode().into_diagnostic()?;
+        execute!(io::stderr(), EnableBracketedPaste).into_diagnostic()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawTerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stderr(), DisableBracketedPaste);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn completion_from_suggestions(input: &str, suggestions: &[String]) -> Option<String> {
+    let suggestion = if suggestions.len() == 1 {
+        suggestions.first().cloned()
+    } else {
+        let prefix = longest_common_prefix(suggestions);
+        (prefix.len() > input.len()).then_some(prefix)
+    }?;
+    (suggestion != input).then_some(suggestion)
+}
+
+fn list_display_path_suggestions(
+    raw: &str,
+    base_dir: &Path,
+    home_dir: Option<&Path>,
+) -> Vec<String> {
+    let Some((display_dir, basename, resolved_dir)) =
+        resolve_display_path_context(raw, base_dir, home_dir)
+    else {
+        return Vec::new();
+    };
+
+    let mut matches = fs::read_dir(&resolved_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(std::result::Result::ok))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().into_owned();
+            if !basename.is_empty() && !name.starts_with(&basename) {
+                return None;
+            }
+            if !basename.starts_with('.') && name.starts_with('.') {
+                return None;
+            }
+            let is_dir = entry.path().is_dir();
+            let suffix = if is_dir {
+                std::path::MAIN_SEPARATOR.to_string()
+            } else {
+                String::new()
+            };
+            Some((!is_dir, format!("{display_dir}{name}{suffix}")))
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    matches.into_iter().map(|(_, display)| display).collect()
+}
+
+fn resolve_display_path_context(
+    raw: &str,
+    base_dir: &Path,
+    home_dir: Option<&Path>,
+) -> Option<(String, String, PathBuf)> {
+    if raw == "~" {
+        let home_dir = home_dir?;
+        return Some(("~/".to_string(), String::new(), home_dir.to_path_buf()));
+    }
+    if raw.starts_with('~') && !raw.starts_with("~/") {
+        return None;
+    }
+
+    let (display_dir, basename, resolved_dir) = if let Some(suffix) = raw.strip_prefix("~/") {
+        let home_dir = home_dir?;
+        let (display_suffix_dir, basename) = split_display_dir_and_basename(suffix);
+        let resolved_dir = if display_suffix_dir.is_empty() {
+            home_dir.to_path_buf()
+        } else {
+            home_dir.join(trim_trailing_separators(display_suffix_dir))
+        };
+        (
+            format!("~/{display_suffix_dir}"),
+            basename.to_string(),
+            resolved_dir,
+        )
+    } else {
+        let (display_dir, basename) = split_display_dir_and_basename(raw);
+        let resolved_dir = if display_dir.is_empty() {
+            base_dir.to_path_buf()
+        } else {
+            resolve_display_dir(base_dir, display_dir)
+        };
+        (display_dir.to_string(), basename.to_string(), resolved_dir)
+    };
+
+    Some((display_dir, basename, resolved_dir))
+}
+
+fn split_display_dir_and_basename(raw: &str) -> (&str, &str) {
+    raw.rfind(std::path::is_separator)
+        .map(|index| raw.split_at(index + 1))
+        .unwrap_or(("", raw))
+}
+
+fn trim_trailing_separators(raw: &str) -> &str {
+    raw.trim_end_matches(std::path::is_separator)
+}
+
+fn resolve_display_dir(base_dir: &Path, display_dir: &str) -> PathBuf {
+    let trimmed = trim_trailing_separators(display_dir);
+    if trimmed.is_empty() && display_dir.starts_with(std::path::MAIN_SEPARATOR) {
+        PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
+    } else {
+        let path = Path::new(trimmed);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base_dir.join(path)
+        }
+    }
+}
+
+fn longest_common_prefix(values: &[String]) -> String {
+    let Some(first) = values.first() else {
+        return String::new();
+    };
+    let mut prefix = first.clone();
+    for value in &values[1..] {
+        let shared_len = prefix
+            .chars()
+            .zip(value.chars())
+            .take_while(|(left, right)| left == right)
+            .count();
+        prefix = prefix.chars().take(shared_len).collect();
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
 }
 
 pub(crate) fn render_resolved_input_lines(
@@ -557,10 +1297,20 @@ pub(crate) fn render_resolved_input_lines(
 pub(crate) fn render_root_reuse_env(
     env: &BTreeMap<String, String>,
     interface: &RunInterface,
-) -> String {
+) -> RenderedRootReuseEnv {
     let mut out = String::new();
+    let mut omitted_secret_paths = Vec::new();
     out.push_str("# Root config captured from a successful amber run\n");
     for input in &interface.root_inputs {
+        if input.secret {
+            if env
+                .get(&input.env_var)
+                .is_some_and(|value| !value.is_empty())
+            {
+                omitted_secret_paths.push(input.path.clone());
+            }
+            continue;
+        }
         if let Some(value) = env.get(&input.env_var).filter(|value| !value.is_empty()) {
             out.push_str(&input.env_var);
             out.push('=');
@@ -568,7 +1318,19 @@ pub(crate) fn render_root_reuse_env(
             out.push('\n');
         }
     }
-    out
+    if !omitted_secret_paths.is_empty() {
+        out.push_str("# Secret root inputs are omitted. Re-supply them before reuse.\n");
+        for path in &omitted_secret_paths {
+            out.push_str("# omitted secret ");
+            out.push_str("config.");
+            out.push_str(path);
+            out.push('\n');
+        }
+    }
+    RenderedRootReuseEnv {
+        contents: out,
+        omitted_secret_paths,
+    }
 }
 
 pub(crate) fn render_run_env_file(interface: &RunInterface) -> String {
@@ -734,7 +1496,9 @@ pub(crate) fn normalize_external_slot_value(slot: &ExternalSlotSpec, raw: &str) 
 }
 
 pub(crate) fn is_run_env_key(key: &str) -> bool {
-    key.starts_with(CONFIG_ENV_PREFIX) || key.starts_with("AMBER_EXTERNAL_SLOT_")
+    key.starts_with(CONFIG_ENV_PREFIX)
+        || key.starts_with(CONFIG_FILE_ENV_PREFIX)
+        || key.starts_with("AMBER_EXTERNAL_SLOT_")
 }
 
 pub(crate) fn run_interactive() -> bool {
@@ -823,27 +1587,6 @@ fn parse_root_input_comment(line: &str) -> Option<ParsedRootInputComment> {
     })
 }
 
-fn prompt_line(prompt: &str) -> Result<String> {
-    let mut stdout = io::stdout();
-    stdout.write_all(prompt.as_bytes()).into_diagnostic()?;
-    stdout.flush().into_diagnostic()?;
-    let mut line = String::new();
-    if io::stdin().read_line(&mut line).into_diagnostic()? == 0 {
-        return Err(miette::miette!("end of input"));
-    }
-    Ok(strip_trailing_newline(line))
-}
-
-fn strip_trailing_newline(mut value: String) -> String {
-    if value.ends_with('\n') {
-        value.pop();
-        if value.ends_with('\r') {
-            value.pop();
-        }
-    }
-    value
-}
-
 fn root_env_var_missing(env: &BTreeMap<String, String>, key: &str) -> bool {
     env.get(key).is_none_or(String::is_empty)
 }
@@ -862,6 +1605,8 @@ fn is_synthetic_external_slot_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use amber_compiler::{
         mesh::PROXY_METADATA_FILENAME,
         run_plan::{
@@ -872,6 +1617,37 @@ mod tests {
     use amber_scenario::{SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr};
 
     use super::*;
+
+    #[derive(Default)]
+    struct TestPromptDriver {
+        root_inputs: VecDeque<PromptedRootInput>,
+        slot_values: VecDeque<String>,
+        errors: Vec<String>,
+    }
+
+    impl PromptDriver for TestPromptDriver {
+        fn prompt_root(
+            &mut self,
+            _input: &RootInputSpec,
+            _meta: &RootPromptMeta,
+        ) -> Result<PromptedRootInput> {
+            Ok(self
+                .root_inputs
+                .pop_front()
+                .expect("root input should exist"))
+        }
+
+        fn prompt_external_slot(&mut self, _slot: &ExternalSlotSpec) -> Result<String> {
+            Ok(self
+                .slot_values
+                .pop_front()
+                .expect("slot value should exist"))
+        }
+
+        fn print_error(&mut self, message: &str) {
+            self.errors.push(message.to_string());
+        }
+    }
 
     fn empty_site(kind: SiteKind, artifact_files: BTreeMap<String, String>) -> RunSitePlan {
         RunSitePlan {
@@ -1471,6 +2247,254 @@ AMBER_CONFIG_TOKEN=inline\nAMBER_CONFIG_FILE_UNUSED=./missing.txt\n",
     }
 
     #[test]
+    fn parse_interactive_root_input_understands_file_sigils() {
+        assert_eq!(
+            parse_interactive_root_input("demo"),
+            PromptedRootInput::Literal("demo".to_string())
+        );
+        assert_eq!(
+            parse_interactive_root_input("@config.json"),
+            PromptedRootInput::File {
+                raw_path: "config.json".to_string(),
+                from_sigil: true,
+            }
+        );
+        assert_eq!(
+            parse_interactive_root_input("@"),
+            PromptedRootInput::File {
+                raw_path: String::new(),
+                from_sigil: true,
+            }
+        );
+        assert_eq!(
+            parse_interactive_root_input("@@config.json"),
+            PromptedRootInput::Literal("@config.json".to_string())
+        );
+    }
+
+    #[test]
+    fn root_prompt_meta_reads_leaf_schema_description_and_type() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "auth_json": {
+                    "type": "string",
+                    "description": "JSON auth payload forwarded to the child program."
+                }
+            }
+        });
+
+        assert_eq!(
+            root_prompt_meta(Some(&schema), "auth_json"),
+            RootPromptMeta {
+                description: Some("JSON auth payload forwarded to the child program.".to_string()),
+                type_label: Some("string".to_string()),
+            }
+        );
+        assert_eq!(
+            root_prompt_meta(Some(&schema), "missing"),
+            RootPromptMeta::default()
+        );
+        assert_eq!(
+            root_prompt_meta(None, "auth_json"),
+            RootPromptMeta::default()
+        );
+    }
+
+    #[test]
+    fn prompt_context_uses_manifest_style_prefixes() {
+        let mut root = Vec::new();
+        print_root_prompt_context(
+            &mut root,
+            &RootInputSpec {
+                path: "auth_json".to_string(),
+                env_var: "AMBER_CONFIG_AUTH_JSON".to_string(),
+                required: true,
+                secret: true,
+            },
+            &RootPromptMeta {
+                description: None,
+                type_label: Some("string".to_string()),
+            },
+        )
+        .expect("render root prompt");
+        let root = String::from_utf8(root).expect("utf8");
+        assert!(root.contains("config."));
+        assert!(root.contains("auth_json"));
+        assert!(root.contains("[secret]"));
+        assert!(root.contains("[string]"));
+
+        let mut slot = Vec::new();
+        print_prompt_context(
+            &mut slot,
+            PromptPrefix {
+                label: "slots.",
+                prefix_color: Color::DarkGreen,
+                name_color: Color::Green,
+            },
+            "catalog_api",
+            &[PromptBadge {
+                label: "http".into(),
+                color: Color::DarkGrey,
+            }],
+            None,
+        )
+        .expect("render slot prompt");
+        let slot = String::from_utf8(slot).expect("utf8");
+        assert!(slot.contains("slots."));
+        assert!(slot.contains("catalog_api"));
+        assert!(slot.contains("[http]"));
+    }
+
+    #[test]
+    fn schema_type_label_formats_nullable_scalars() {
+        assert_eq!(
+            schema_type_label(&serde_json::json!({ "type": ["null", "integer"] })),
+            Some("integer?".to_string())
+        );
+        assert_eq!(
+            schema_type_label(&serde_json::json!({ "type": ["string", "integer"] })),
+            Some("value".to_string())
+        );
+    }
+
+    #[test]
+    fn visible_prompt_suggestions_hides_single_completion() {
+        assert_eq!(
+            visible_prompt_suggestions("only", &["only".to_string()]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            visible_prompt_suggestions("@~/Do", &["@~/Documents/".to_string()]),
+            vec!["@~/Documents/".to_string()]
+        );
+        assert_eq!(
+            visible_prompt_suggestions("one", &["one".to_string(), "two".to_string()]),
+            vec!["one".to_string(), "two".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_text_wraps_words_without_dropping_content() {
+        assert_eq!(
+            wrap_text("one two three four", 9),
+            vec![
+                "one two".to_string(),
+                "three".to_string(),
+                "four".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn root_prompt_buffer_hides_secret_literals_but_shows_file_paths() {
+        let mut secret = RootPromptBuffer::new(true);
+        secret.insert_str("token");
+        assert_eq!(secret.display(), "*****");
+
+        let mut escaped = RootPromptBuffer::new(true);
+        escaped.insert_str("@@token");
+        assert_eq!(escaped.display(), "******");
+
+        let mut file = RootPromptBuffer::new(true);
+        file.insert_str("@config.json");
+        assert_eq!(file.display(), "@config.json");
+    }
+
+    #[test]
+    fn root_prompt_buffer_summarizes_large_visible_literals() {
+        let mut visible = RootPromptBuffer::new(false);
+        visible.insert_str(&"x".repeat(ROOT_PROMPT_LITERAL_PREVIEW_LIMIT + 1));
+        assert_eq!(
+            visible.display(),
+            format!("<{} bytes>", ROOT_PROMPT_LITERAL_PREVIEW_LIMIT + 1)
+        );
+    }
+
+    #[test]
+    fn resolve_input_file_path_expands_home() {
+        let base_dir = Path::new("/tmp/work");
+        let home_dir = Path::new("/home/tester");
+        assert_eq!(
+            resolve_input_file_path_with_home(base_dir, "~/.config/token.txt", Some(home_dir)),
+            Path::new("/home/tester/.config/token.txt")
+        );
+        assert_eq!(
+            resolve_input_file_path_with_home(base_dir, "relative.txt", Some(home_dir)),
+            Path::new("/tmp/work/relative.txt")
+        );
+    }
+
+    #[test]
+    fn collect_path_suggestions_handles_tilde_and_at_prefix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join("Documents")).expect("mkdir Documents");
+        std::fs::create_dir_all(home.join("Downloads")).expect("mkdir Downloads");
+        std::fs::write(home.join("@literal"), "").expect("write literal file");
+
+        assert_eq!(
+            collect_path_suggestions("@~/Doc", temp.path(), Some(home.as_path())),
+            vec!["@~/Documents/".to_string()]
+        );
+        assert_eq!(
+            collect_path_suggestions("@~", temp.path(), Some(home.as_path())),
+            vec![
+                "@~/Documents/".to_string(),
+                "@~/Downloads/".to_string(),
+                "@~/@literal".to_string()
+            ]
+        );
+        assert_eq!(
+            collect_path_suggestions("@@literal", temp.path(), Some(home.as_path())),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn completion_from_suggestions_uses_longest_common_prefix() {
+        assert_eq!(
+            completion_from_suggestions(
+                "@~/Doc",
+                &["@~/Documents/".to_string(), "@~/Documentary/".to_string()]
+            ),
+            Some("@~/Document".to_string())
+        );
+        assert_eq!(
+            completion_from_suggestions("@~/Documents/", &["@~/Documents/".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn root_prompt_buffer_tab_completion_updates_file_query() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join("Documents")).expect("mkdir Documents");
+        let mut prompt = RootPromptBuffer::new(false);
+        prompt.insert_str("@~/Doc");
+
+        assert!(prompt.apply_completion(temp.path(), Some(home.as_path())));
+        assert_eq!(prompt.raw, "@~/Documents/".to_string());
+    }
+
+    #[test]
+    fn handle_root_prompt_key_ctrl_u_clears_the_current_input() {
+        let mut prompt = RootPromptBuffer::new(false);
+        prompt.insert_str("@~/Documents/token");
+
+        handle_root_prompt_key(
+            &mut prompt,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            Path::new("/tmp"),
+            None,
+        )
+        .expect("ctrl-u should succeed");
+
+        assert!(prompt.raw.is_empty());
+    }
+
+    #[test]
     fn prompt_for_missing_inputs_reprompts_until_root_value_valid() {
         let interface = RunInterface {
             root_inputs: vec![RootInputSpec {
@@ -1489,23 +2513,28 @@ AMBER_CONFIG_TOKEN=inline\nAMBER_CONFIG_FILE_UNUSED=./missing.txt\n",
             "required": ["count"]
         });
         let mut env = BTreeMap::new();
-        let mut visible = vec!["abc".to_string(), "42".to_string()].into_iter();
-        let mut secret = std::iter::empty::<String>();
-        let mut errors = Vec::new();
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let mut driver = TestPromptDriver {
+            root_inputs: VecDeque::from([
+                PromptedRootInput::Literal("abc".to_string()),
+                PromptedRootInput::Literal("42".to_string()),
+            ]),
+            ..Default::default()
+        };
 
         prompt_for_missing_inputs_with(
             &mut env,
             &interface,
             Some(&root_schema),
-            &mut |_| Ok(visible.next().expect("visible input should exist")),
-            &mut |_| Ok(secret.next().expect("secret input should not be used")),
-            &mut |message| errors.push(message.to_string()),
+            cwd.path(),
+            None,
+            &mut driver,
         )
         .expect("prompt should succeed");
 
         assert_eq!(env.get("AMBER_CONFIG_COUNT"), Some(&"42".to_string()));
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("invalid value for config.count"));
+        assert_eq!(driver.errors.len(), 1);
+        assert!(driver.errors[0].contains("invalid value for config.count"));
     }
 
     #[test]
@@ -1528,23 +2557,25 @@ AMBER_CONFIG_TOKEN=inline\nAMBER_CONFIG_FILE_UNUSED=./missing.txt\n",
         });
         let large = format!("{{\"tokens\":\"{}\"}}", "x".repeat(8192));
         let mut env = BTreeMap::new();
-        let mut visible = vec![large.clone()].into_iter();
-        let mut secret = std::iter::empty::<String>();
-        let mut errors = Vec::new();
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let mut driver = TestPromptDriver {
+            root_inputs: VecDeque::from([PromptedRootInput::Literal(large.clone())]),
+            ..Default::default()
+        };
 
         prompt_for_missing_inputs_with(
             &mut env,
             &interface,
             Some(&root_schema),
-            &mut |_| Ok(visible.next().expect("visible input should exist")),
-            &mut |_| Ok(secret.next().expect("secret input should not be used")),
-            &mut |message| errors.push(message.to_string()),
+            cwd.path(),
+            None,
+            &mut driver,
         )
         .expect("prompt should succeed");
 
         assert_eq!(env.get("AMBER_CONFIG_AUTH_JSON"), Some(&large));
         assert!(
-            errors.is_empty(),
+            driver.errors.is_empty(),
             "prompt should not reject large single-line visible input"
         );
     }
@@ -1569,35 +2600,211 @@ AMBER_CONFIG_TOKEN=inline\nAMBER_CONFIG_FILE_UNUSED=./missing.txt\n",
         });
         let large = format!("{{\"tokens\":\"{}\"}}", "x".repeat(8192));
         let mut env = BTreeMap::new();
-        let mut visible = std::iter::empty::<String>();
-        let mut secret = vec![large.clone()].into_iter();
-        let mut errors = Vec::new();
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let mut driver = TestPromptDriver {
+            root_inputs: VecDeque::from([PromptedRootInput::Literal(large.clone())]),
+            ..Default::default()
+        };
 
         prompt_for_missing_inputs_with(
             &mut env,
             &interface,
             Some(&root_schema),
-            &mut |_| Ok(visible.next().expect("visible input should not be used")),
-            &mut |_| Ok(secret.next().expect("secret input should exist")),
-            &mut |message| errors.push(message.to_string()),
+            cwd.path(),
+            None,
+            &mut driver,
         )
         .expect("prompt should succeed");
 
         assert_eq!(env.get("AMBER_CONFIG_AUTH_JSON"), Some(&large));
         assert!(
-            errors.is_empty(),
+            driver.errors.is_empty(),
             "prompt should not reject large single-line secret input"
         );
     }
 
     #[test]
-    fn strip_trailing_newline_preserves_other_whitespace() {
-        assert_eq!(strip_trailing_newline("value\n".to_string()), "value");
-        assert_eq!(strip_trailing_newline("value\r\n".to_string()), "value");
+    fn prompt_for_missing_inputs_loads_non_secret_root_from_file_sigils() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file_path = temp.path().join("auth.json");
+        std::fs::write(&file_path, "demo-token").expect("write config file");
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "auth_json".to_string(),
+                env_var: "AMBER_CONFIG_AUTH_JSON".to_string(),
+                required: true,
+                secret: false,
+            }],
+            ..RunInterface::default()
+        };
+        let mut env = BTreeMap::new();
+        let mut driver = TestPromptDriver {
+            root_inputs: VecDeque::from([PromptedRootInput::File {
+                raw_path: file_path
+                    .file_name()
+                    .expect("filename")
+                    .to_string_lossy()
+                    .into_owned(),
+                from_sigil: true,
+            }]),
+            ..Default::default()
+        };
+
+        prompt_for_missing_inputs_with(&mut env, &interface, None, temp.path(), None, &mut driver)
+            .expect("prompt should succeed");
+
         assert_eq!(
-            strip_trailing_newline("  value \r\n".to_string()),
-            "  value "
+            env.get("AMBER_CONFIG_AUTH_JSON"),
+            Some(&"demo-token".to_string())
         );
+    }
+
+    #[test]
+    fn prompt_for_missing_inputs_reprompts_after_bare_at_file_input() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file_path = temp.path().join("api-key.txt");
+        std::fs::write(&file_path, "demo-key").expect("write file");
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "api_key".to_string(),
+                env_var: "AMBER_CONFIG_API_KEY".to_string(),
+                required: true,
+                secret: false,
+            }],
+            ..RunInterface::default()
+        };
+        let mut env = BTreeMap::new();
+        let mut driver = TestPromptDriver {
+            root_inputs: VecDeque::from([
+                PromptedRootInput::File {
+                    raw_path: String::new(),
+                    from_sigil: true,
+                },
+                PromptedRootInput::File {
+                    raw_path: file_path
+                        .file_name()
+                        .expect("filename")
+                        .to_string_lossy()
+                        .into_owned(),
+                    from_sigil: true,
+                },
+            ]),
+            ..Default::default()
+        };
+
+        prompt_for_missing_inputs_with(&mut env, &interface, None, temp.path(), None, &mut driver)
+            .expect("prompt should succeed");
+
+        assert_eq!(
+            env.get("AMBER_CONFIG_API_KEY"),
+            Some(&"demo-key".to_string())
+        );
+        assert_eq!(
+            driver.errors,
+            vec!["config.api_key file path must not be empty".to_string()]
+        );
+    }
+
+    #[test]
+    fn prompt_for_missing_inputs_loads_secret_root_from_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file_path = temp.path().join("secret.txt");
+        std::fs::write(&file_path, "shh").expect("write secret file");
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "api_key".to_string(),
+                env_var: "AMBER_CONFIG_API_KEY".to_string(),
+                required: true,
+                secret: true,
+            }],
+            ..RunInterface::default()
+        };
+        let mut env = BTreeMap::new();
+        let mut driver = TestPromptDriver {
+            root_inputs: VecDeque::from([PromptedRootInput::File {
+                raw_path: file_path.to_string_lossy().into_owned(),
+                from_sigil: true,
+            }]),
+            ..Default::default()
+        };
+
+        prompt_for_missing_inputs_with(&mut env, &interface, None, temp.path(), None, &mut driver)
+            .expect("prompt should succeed");
+
+        assert_eq!(env.get("AMBER_CONFIG_API_KEY"), Some(&"shh".to_string()));
+    }
+
+    #[test]
+    fn prompt_for_missing_inputs_reprompts_after_missing_file_and_mentions_escape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let interface = RunInterface {
+            root_inputs: vec![RootInputSpec {
+                path: "name".to_string(),
+                env_var: "AMBER_CONFIG_NAME".to_string(),
+                required: true,
+                secret: false,
+            }],
+            ..RunInterface::default()
+        };
+        let mut env = BTreeMap::new();
+        let mut driver = TestPromptDriver {
+            root_inputs: VecDeque::from([
+                PromptedRootInput::File {
+                    raw_path: "missing.txt".to_string(),
+                    from_sigil: true,
+                },
+                PromptedRootInput::Literal("@missing.txt".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        prompt_for_missing_inputs_with(&mut env, &interface, None, temp.path(), None, &mut driver)
+            .expect("prompt should succeed");
+
+        assert_eq!(
+            env.get("AMBER_CONFIG_NAME"),
+            Some(&"@missing.txt".to_string())
+        );
+        assert_eq!(driver.errors.len(), 1);
+        assert!(driver.errors[0].contains("use `@@...`"));
+    }
+
+    #[test]
+    fn render_root_reuse_env_omits_secret_inputs() {
+        let interface = RunInterface {
+            root_inputs: vec![
+                RootInputSpec {
+                    path: "tenant".to_string(),
+                    env_var: "AMBER_CONFIG_TENANT".to_string(),
+                    required: true,
+                    secret: false,
+                },
+                RootInputSpec {
+                    path: "api_key".to_string(),
+                    env_var: "AMBER_CONFIG_API_KEY".to_string(),
+                    required: true,
+                    secret: true,
+                },
+            ],
+            ..RunInterface::default()
+        };
+        let env = BTreeMap::from([
+            ("AMBER_CONFIG_TENANT".to_string(), "demo".to_string()),
+            ("AMBER_CONFIG_API_KEY".to_string(), "secret".to_string()),
+        ]);
+
+        let rendered = render_root_reuse_env(&env, &interface);
+        assert!(rendered.contents.contains("AMBER_CONFIG_TENANT=demo"));
+        assert!(!rendered.contents.contains("AMBER_CONFIG_API_KEY=secret"));
+        assert_eq!(rendered.omitted_secret_paths, vec!["api_key".to_string()]);
+    }
+
+    #[test]
+    fn is_run_env_key_includes_file_backed_root_inputs() {
+        assert!(is_run_env_key("AMBER_CONFIG_FOO"));
+        assert!(is_run_env_key("AMBER_CONFIG_FILE_FOO"));
+        assert!(is_run_env_key("AMBER_EXTERNAL_SLOT_API_URL"));
+        assert!(!is_run_env_key("PATH"));
     }
 
     #[test]

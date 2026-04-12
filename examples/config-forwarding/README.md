@@ -119,6 +119,10 @@ EOF
 amber run . --env-file .env.example
 ```
 
+On an interactive `amber run`, the same prompt also accepts `@./api-key.txt`, shows matching paths
+as you type, and completes them with `Tab`. Use `@@...` if you need a literal value that starts
+with `@`.
+
 ## Docker Compose
 
 Compile to a compose output directory:

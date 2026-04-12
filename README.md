@@ -68,6 +68,10 @@ On a first interactive run, Amber may read an existing `.env`, prompt for missin
 prompt for the external catalog URL, start the local process and Compose service, and print the
 localhost URLs for the entrypoints the system exposes.
 
+For interactive root config prompts, type the value directly or start with `@` to load it from a
+file. Amber shows matching paths as you type, `Tab` completes them, and `@@` escapes a literal
+leading `@`. The same rule works for secret root config, but literal values stay hidden.
+
 If you want a non-interactive setup flow instead, ask Amber to write the input template first:
 
 ```sh
