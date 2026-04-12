@@ -33,6 +33,7 @@ pub struct StoredSource {
     pub source: Arc<str>,
     pub spans: Arc<ManifestSpans>,
     pub bundle_source: Option<Arc<str>>,
+    pub observed_url: Option<Url>,
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +64,7 @@ impl DigestStore {
             spans,
             bundle_source: _,
             digest: _,
+            observed_url: _,
         } = self.get_source(url)?;
         let name = display_url(url);
         let src = NamedSource::new(name, source).with_language("json5");

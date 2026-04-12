@@ -389,6 +389,7 @@ fn check_from_tree_handles_malformed_program_image_from_builder_with_source() {
             source,
             spans,
             bundle_source: None,
+            observed_url: None,
         },
     );
 

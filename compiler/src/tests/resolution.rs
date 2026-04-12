@@ -418,6 +418,61 @@ async fn relative_manifest_refs_resolve_against_redirect_target_url() {
 }
 
 #[tokio::test]
+async fn cached_redirected_manifest_keeps_canonical_base_for_relative_children() {
+    let child_manifest = r#"{ manifest_version: "0.1.0" }"#.to_string();
+    let child_digest = child_manifest.parse::<Manifest>().unwrap().digest();
+    let root_manifest = format!(
+        r#"
+        {{
+          manifest_version: "0.1.0",
+          components: {{
+            child: {{ url: "./child.json5", digest: "{child_digest}" }}
+          }}
+        }}
+    "#
+    );
+    let root_digest = root_manifest.parse::<Manifest>().unwrap().digest();
+    let (requested_url, canonical_root_url, canonical_child_url, server) =
+        spawn_redirecting_relative_manifest_server(root_manifest, child_manifest);
+
+    let compiler = default_compiler();
+    let root_ref = ManifestRef::new(requested_url.clone(), Some(root_digest));
+
+    let first = compiler
+        .compile(root_ref.clone(), standard_compile_options())
+        .await
+        .unwrap();
+    let first_root = &first.provenance.components[first.scenario.root.0];
+    assert_eq!(first_root.observed_url.as_ref(), Some(&canonical_root_url));
+    let first_child = first.scenario.components[first.scenario.root.0]
+        .as_ref()
+        .expect("root component should exist")
+        .children[0];
+    assert_eq!(
+        first.provenance.components[first_child.0].resolved_url,
+        canonical_child_url
+    );
+
+    server.join().unwrap();
+
+    let second = compiler
+        .compile(root_ref, standard_compile_options())
+        .await
+        .unwrap();
+    let second_root = &second.provenance.components[second.scenario.root.0];
+    assert_eq!(second_root.resolved_url, requested_url);
+    assert_eq!(second_root.observed_url.as_ref(), Some(&canonical_root_url));
+    let second_child = second.scenario.components[second.scenario.root.0]
+        .as_ref()
+        .expect("root component should exist")
+        .children[0];
+    assert_eq!(
+        second.provenance.components[second_child.0].resolved_url,
+        canonical_child_url
+    );
+}
+
+#[tokio::test]
 async fn relative_child_template_manifest_refs_resolve_against_remote_parent_url() {
     let root_url: Url = "test://example/jobs/root.json5".parse().unwrap();
     let alpha_url: Url = "test://example/jobs/alpha.json5".parse().unwrap();

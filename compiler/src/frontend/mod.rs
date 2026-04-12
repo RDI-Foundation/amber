@@ -722,11 +722,15 @@ fn compute_environment(
 fn cached_manifest(svc: &ResolveService, r: &ManifestRef, url: &Url) -> Option<ResolvedManifest> {
     let expected = r.digest?;
     let manifest = svc.store.get(&expected)?;
+    let observed_url = svc
+        .store
+        .get_source(url)
+        .and_then(|stored| stored.observed_url);
     Some(ResolvedManifest {
         manifest,
         digest: expected,
         resolved_url: url.clone(),
-        observed_url: None,
+        observed_url,
     })
 }
 
@@ -791,15 +795,23 @@ async fn resolve_manifest_inner(
     let stored = svc.store.put(digest, manifest);
 
     let observed_url = (resolution.url != *url).then_some(resolution.url);
-    let source_record = StoredSource {
+    let requested_source_record = StoredSource {
         digest,
         source: resolution.source,
         spans: resolution.spans,
         bundle_source: resolution.bundle_source,
+        observed_url: observed_url.clone(),
     };
-    svc.store.put_source(url.clone(), source_record.clone());
+    svc.store
+        .put_source(url.clone(), requested_source_record.clone());
     if let Some(observed_url) = &observed_url {
-        svc.store.put_source(observed_url.clone(), source_record);
+        svc.store.put_source(
+            observed_url.clone(),
+            StoredSource {
+                observed_url: None,
+                ..requested_source_record
+            },
+        );
     }
 
     Ok(ResolvedManifest {
