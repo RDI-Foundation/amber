@@ -80,7 +80,7 @@ pub enum Error {
     #[diagnostic(code(compiler::cycle))]
     Cycle { cycle: Vec<Url> },
 
-    #[error("relative manifest reference `{reference}` requires a file:// base URL")]
+    #[error("relative manifest reference `{reference}` requires an owning manifest URL")]
     #[diagnostic(code(compiler::relative_manifest_ref))]
     RelativeManifestRef { reference: Box<str> },
 
@@ -280,11 +280,6 @@ async fn resolve_component(
                 reference: declared_ref.url.as_str().into(),
             });
         };
-        if base.scheme() != "file" {
-            return Err(Error::RelativeManifestRef {
-                reference: declared_ref.url.as_str().into(),
-            });
-        }
 
         declared_ref.resolve_against(base).map_err(|err| {
             let (src, span) =
@@ -341,7 +336,7 @@ async fn resolve_component(
         .filter_map(component_decl_environment)
         .collect();
 
-    let realm_url = resolved_url.clone();
+    let realm_url = observed_url.clone().unwrap_or_else(|| resolved_url.clone());
     let parent_features = manifest.experimental_features().clone();
 
     let mut env_cache: HashMap<String, Arc<ResolveEnv>> = HashMap::new();
@@ -584,18 +579,6 @@ fn resolve_manifest_ref_for_template(
     if !reference.url.is_relative() {
         return Ok(reference.clone());
     }
-    if realm_url.scheme() != "file" {
-        return Err(Error::ManifestRefResolution {
-            realm_path: display_url(realm_url).into(),
-            child: template_name.into(),
-            reference: reference.url.as_str().into(),
-            message: "relative child template manifest references require a file:// owning \
-                      manifest"
-                .into(),
-            src: None,
-            span: None,
-        });
-    }
     reference
         .resolve_against(realm_url)
         .map_err(|err| Error::ManifestRefResolution {
@@ -814,7 +797,10 @@ async fn resolve_manifest_inner(
         spans: resolution.spans,
         bundle_source: resolution.bundle_source,
     };
-    svc.store.put_source(url.clone(), source_record);
+    svc.store.put_source(url.clone(), source_record.clone());
+    if let Some(observed_url) = &observed_url {
+        svc.store.put_source(observed_url.clone(), source_record);
+    }
 
     Ok(ResolvedManifest {
         manifest: stored,

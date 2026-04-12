@@ -1,5 +1,95 @@
 use super::*;
 
+struct MapBackend {
+    manifests: BTreeMap<String, Arc<str>>,
+}
+
+impl MapBackend {
+    fn new(manifests: BTreeMap<String, Arc<str>>) -> Self {
+        Self { manifests }
+    }
+}
+
+impl Backend for MapBackend {
+    fn resolve_url<'a>(
+        &'a self,
+        url: &'a Url,
+    ) -> Pin<Box<dyn Future<Output = Result<Resolution, amber_resolver::Error>> + Send + 'a>> {
+        let url = url.clone();
+        let source = self.manifests.get(url.as_str()).cloned();
+
+        Box::pin(async move {
+            tokio::task::yield_now().await;
+            let source = source.ok_or_else(|| {
+                amber_resolver::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no test manifest for {url}"),
+                ))
+            })?;
+            let spans = Arc::new(amber_manifest::ManifestSpans::parse(&source));
+            let manifest: Manifest = source.parse().unwrap();
+            Ok(Resolution {
+                url,
+                manifest,
+                source,
+                spans,
+                bundle_source: None,
+            })
+        })
+    }
+}
+
+fn manifest_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json5\r\nConnection: \
+         close\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn spawn_redirecting_relative_manifest_server(
+    root_manifest: String,
+    child_manifest: String,
+) -> (Url, Url, Url, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let requested_url = Url::parse(&format!("{base}/start")).unwrap();
+    let canonical_root_url = Url::parse(&format!("{base}/nested/root.json5")).unwrap();
+    let canonical_child_url = Url::parse(&format!("{base}/nested/child.json5")).unwrap();
+
+    let server_root_url = canonical_root_url.clone();
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        for _ in 0..3 {
+            let mut stream = accept_with_deadline(&listener, deadline);
+            let path = read_request_path(&mut stream);
+            let response = match path.as_str() {
+                "/start" => format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {server_root_url}\r\nConnection: \
+                     close\r\nContent-Length: 0\r\n\r\n"
+                ),
+                "/nested/root.json5" => manifest_response(&root_manifest),
+                "/nested/child.json5" => manifest_response(&child_manifest),
+                _ => "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    .to_string(),
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.shutdown(Shutdown::Both).unwrap();
+        }
+    });
+
+    (
+        requested_url,
+        canonical_root_url,
+        canonical_child_url,
+        handle,
+    )
+}
+
 #[tokio::test]
 async fn compile_twice_unpinned_fails_when_sources_removed() {
     let dir = tmp_dir("scenario-compile");
@@ -234,8 +324,27 @@ async fn relative_manifest_refs_resolve_against_parent() {
 }
 
 #[tokio::test]
-async fn relative_manifest_refs_require_file_base() {
-    let source: Arc<str> = r#"
+async fn relative_root_manifest_refs_require_base_url() {
+    let compiler = default_compiler();
+    let root_ref = "./root.json5".parse().unwrap();
+
+    let err = compiler
+        .compile(root_ref, standard_compile_options())
+        .await
+        .unwrap_err();
+
+    let crate::Error::Frontend(crate::frontend::Error::RelativeManifestRef { reference }) = err
+    else {
+        panic!("expected relative manifest ref error");
+    };
+    assert_eq!(reference.as_ref(), "./root.json5");
+}
+
+#[tokio::test]
+async fn relative_manifest_refs_resolve_against_remote_parent_url() {
+    let root_url: Url = "test://example/nested/root.json5".parse().unwrap();
+    let child_url: Url = "test://example/nested/child.json5".parse().unwrap();
+    let root_source: Arc<str> = r#"
         {
           manifest_version: "0.1.0",
           components: {
@@ -244,19 +353,120 @@ async fn relative_manifest_refs_require_file_base() {
         }
         "#
     .into();
-    let backend = Arc::new(StaticBackend::new(Arc::clone(&source)));
+    let child_source: Arc<str> = r#"{ manifest_version: "0.1.0" }"#.into();
+    let backend = Arc::new(MapBackend::new(BTreeMap::from([
+        (root_url.to_string(), root_source),
+        (child_url.to_string(), child_source),
+    ])));
     let resolver = Resolver::new().with_remote(RemoteResolver::new(["test"], backend));
     let compiler = Compiler::new(resolver, DigestStore::default());
-    let root_ref = ManifestRef::from_url("test://root".parse().unwrap());
 
-    let err = compiler
-        .compile(root_ref, standard_compile_options())
+    let compilation = compiler
+        .compile(ManifestRef::from_url(root_url), standard_compile_options())
         .await
-        .unwrap_err();
+        .unwrap();
 
-    let crate::Error::Frontend(crate::frontend::Error::RelativeManifestRef { .. }) = err else {
-        panic!("expected relative manifest ref error");
-    };
+    assert_eq!(compilation.scenario.components.len(), 2);
+
+    let root_id = compilation.scenario.root;
+    let root = compilation.scenario.components[root_id.0]
+        .as_ref()
+        .expect("root component should exist");
+    let child_id = root.children[0];
+    let prov = &compilation.provenance.components[child_id.0];
+    assert_eq!(prov.declared_ref.url.as_str(), "./child.json5");
+    assert_eq!(prov.resolved_url, child_url);
+}
+
+#[tokio::test]
+async fn relative_manifest_refs_resolve_against_redirect_target_url() {
+    let root_manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            child: "./child.json5"
+          }
+        }
+    "#
+    .to_string();
+    let child_manifest = r#"{ manifest_version: "0.1.0" }"#.to_string();
+    let (requested_url, canonical_root_url, canonical_child_url, server) =
+        spawn_redirecting_relative_manifest_server(root_manifest, child_manifest);
+
+    let compiler = default_compiler();
+    let compilation = compiler
+        .compile(
+            ManifestRef::from_url(requested_url.clone()),
+            standard_compile_options(),
+        )
+        .await
+        .unwrap();
+
+    let root_prov = &compilation.provenance.components[compilation.scenario.root.0];
+    assert_eq!(root_prov.resolved_url, requested_url);
+    assert_eq!(root_prov.observed_url.as_ref(), Some(&canonical_root_url));
+
+    let root = compilation.scenario.components[compilation.scenario.root.0]
+        .as_ref()
+        .expect("root component should exist");
+    let child_id = root.children[0];
+    let child_prov = &compilation.provenance.components[child_id.0];
+    assert_eq!(child_prov.declared_ref.url.as_str(), "./child.json5");
+    assert_eq!(child_prov.resolved_url, canonical_child_url);
+
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn relative_child_template_manifest_refs_resolve_against_remote_parent_url() {
+    let root_url: Url = "test://example/jobs/root.json5".parse().unwrap();
+    let alpha_url: Url = "test://example/jobs/alpha.json5".parse().unwrap();
+    let beta_url: Url = "test://example/jobs/nested/beta.json5".parse().unwrap();
+    let root_source: Arc<str> = r#"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            realm: { kind: "component", optional: true },
+          },
+          child_templates: {
+            worker: {
+              manifest: ["./alpha.json5", "./nested/beta.json5"],
+              bindings: {
+                realm: "slots.realm",
+              },
+            },
+          },
+        }
+    "#
+    .into();
+    let manifest_source: Arc<str> = r#"{ manifest_version: "0.1.0" }"#.into();
+    let backend = Arc::new(MapBackend::new(BTreeMap::from([
+        (root_url.to_string(), root_source),
+        (alpha_url.to_string(), Arc::clone(&manifest_source)),
+        (beta_url.to_string(), manifest_source),
+    ])));
+    let resolver = Resolver::new().with_remote(RemoteResolver::new(["test"], backend));
+    let compiler = Compiler::new(resolver, DigestStore::default());
+
+    let compilation = compiler
+        .compile(ManifestRef::from_url(root_url), standard_compile_options())
+        .await
+        .unwrap();
+
+    let root = compilation.scenario.component(compilation.scenario.root);
+    let template = root
+        .child_templates
+        .get("worker")
+        .expect("child template should exist");
+    let manifests = template
+        .manifests
+        .as_ref()
+        .expect("bounded template should carry frozen manifest keys");
+
+    assert_eq!(
+        manifests,
+        &vec![alpha_url.to_string(), beta_url.to_string()]
+    );
 }
 
 #[tokio::test]

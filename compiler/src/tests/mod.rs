@@ -262,7 +262,7 @@ fn spawn_alias_cycle_manifest_server() -> (Url, std::thread::JoinHandle<()>) {
 
 mod bundle;
 mod features;
-use self::features::{CountingBackend, StaticBackend};
+use self::features::CountingBackend;
 mod lints;
 mod resolution;
 mod storage;
