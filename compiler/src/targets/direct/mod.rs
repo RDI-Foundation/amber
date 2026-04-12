@@ -1087,7 +1087,9 @@ mod tests {
     };
 
     use amber_manifest::{Manifest, ManifestRef};
-    use amber_mesh::{FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV, FRAMEWORK_COMPONENT_CCS_URL_ENV};
+    use amber_mesh::{
+        FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV, FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV,
+    };
     use amber_resolver::Resolver;
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
     use tempfile::TempDir;
@@ -1171,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_router_passthrough_includes_framework_ccs_auth() {
+    fn direct_router_passthrough_includes_framework_controller_auth() {
         let dir = TempDir::new().expect("temp dir");
         let root_path = dir.path().join("root.json5");
         let admin_path = dir.path().join("admin.json5");
@@ -1244,15 +1246,15 @@ mod tests {
             router
                 .env_passthrough
                 .iter()
-                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CCS_URL_ENV),
-            "router must receive the framework CCS URL env passthrough",
+                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV),
+            "router must receive the framework controller URL env passthrough",
         );
         assert!(
             router
                 .env_passthrough
                 .iter()
-                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV),
-            "router must receive the framework CCS auth env passthrough",
+                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV),
+            "router must receive the framework controller auth env passthrough",
         );
     }
 

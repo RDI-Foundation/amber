@@ -609,6 +609,21 @@ impl TrustBundle {
         }
         Ok(())
     }
+
+    pub(super) async fn remove_dynamic_peer_by_id(&self, peer_id: &str) -> Result<(), RouterError> {
+        let mut inner = self.inner.write().await;
+        let Some(existing) = inner.noise_by_id.remove(peer_id) else {
+            return Ok(());
+        };
+        if existing.static_peer {
+            inner.noise_by_id.insert(peer_id.to_string(), existing);
+            return Err(RouterError::Auth(format!(
+                "peer {peer_id} is statically registered"
+            )));
+        }
+        inner.id_by_noise.remove(&existing.noise);
+        Ok(())
+    }
 }
 
 fn insert_static_peer(

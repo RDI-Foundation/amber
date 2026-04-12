@@ -630,22 +630,38 @@ pub(crate) fn ensure_docker_image(tag: &str, dockerfile: &Path) {
         return;
     }
 
-    let mut command = Command::new("docker");
-    if docker_supports_buildx() {
-        command.arg("buildx").arg("build").arg("--load");
-    } else {
-        command.env("DOCKER_BUILDKIT", "1");
-        command.arg("build");
+    if image_platform_opt(tag).is_some() {
+        return;
     }
-    let status = command
-        .arg("-t")
-        .arg(tag)
-        .arg("-f")
-        .arg(dockerfile)
-        .arg(workspace_root())
-        .status()
-        .unwrap_or_else(|err| panic!("failed to build {tag}: {err}"));
-    assert!(status.success(), "docker build failed for {tag}");
+
+    let mut last_status = None;
+    for attempt in 1..=3 {
+        let mut command = Command::new("docker");
+        if docker_supports_buildx() {
+            command.arg("buildx").arg("build").arg("--load");
+        } else {
+            command.env("DOCKER_BUILDKIT", "1");
+            command.arg("build");
+        }
+        let status = command
+            .arg("-t")
+            .arg(tag)
+            .arg("-f")
+            .arg(dockerfile)
+            .arg(workspace_root())
+            .status()
+            .unwrap_or_else(|err| panic!("failed to build {tag}: {err}"));
+        if status.success() {
+            return;
+        }
+        last_status = Some(status);
+        if attempt < 3 {
+            eprintln!("docker build attempt {attempt} failed for {tag}; retrying");
+            thread::sleep(Duration::from_secs(attempt * 2));
+        }
+    }
+    let status = last_status.expect("docker build should have produced a status");
+    panic!("docker build failed for {tag} after retries with status {status}");
 }
 
 pub(crate) fn docker_supports_buildx() -> bool {
@@ -659,11 +675,10 @@ pub(crate) fn docker_supports_buildx() -> bool {
     })
 }
 
-pub(crate) fn ensure_internal_images() {
+pub(crate) fn ensure_amber_internal_images() {
     static READY: OnceLock<()> = OnceLock::new();
     READY.get_or_init(|| {
         let root = workspace_root();
-        ensure_local_image(TEST_APP_IMAGE);
         ensure_docker_image(
             AMBER_ROUTER.reference,
             &root.join("docker/amber-router/Dockerfile"),
@@ -679,21 +694,127 @@ pub(crate) fn ensure_internal_images() {
     });
 }
 
+pub(crate) fn ensure_internal_images() {
+    static READY: OnceLock<()> = OnceLock::new();
+    READY.get_or_init(|| {
+        ensure_local_image(TEST_APP_IMAGE);
+        ensure_amber_internal_images();
+    });
+}
+
 pub(crate) fn load_kind_image(cluster_name: &str, image: &str) {
-    let status = Command::new("kind")
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        let direct_error = match kind_load_docker_image(cluster_name, image) {
+            Ok(()) => return,
+            Err(err) => err,
+        };
+        match kind_load_image_archive(cluster_name, image) {
+            Ok(()) => return,
+            Err(archive_error) => {
+                last_error = Some(format!(
+                    "{direct_error}\n\nkind load image-archive fallback failed for {image} in \
+                     cluster {cluster_name}:\n{archive_error}"
+                ));
+            }
+        }
+        if attempt < 3 {
+            eprintln!(
+                "kind load docker-image attempt {attempt} failed for {image} in cluster \
+                 {cluster_name}; retrying"
+            );
+            thread::sleep(Duration::from_secs(attempt * 2));
+        }
+    }
+
+    let error = last_error.expect("kind image load should record a failure");
+    panic!("{error}");
+}
+
+fn kind_load_docker_image(cluster_name: &str, image: &str) -> Result<(), String> {
+    let output = Command::new("kind")
         .arg("load")
         .arg("docker-image")
         .arg("--name")
         .arg(cluster_name)
         .arg(image)
-        .status()
-        .unwrap_or_else(|err| {
-            panic!("failed to load {image} into kind cluster {cluster_name}: {err}")
-        });
-    assert!(
-        status.success(),
-        "kind load docker-image failed for {image} in cluster {cluster_name}"
-    );
+        .output()
+        .map_err(|err| {
+            format!("failed to run `kind load docker-image` for {image} in {cluster_name}: {err}")
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format_command_output(
+        &format!("kind load docker-image failed for {image} in cluster {cluster_name}"),
+        &output,
+    ))
+}
+
+fn kind_load_image_archive(cluster_name: &str, image: &str) -> Result<(), String> {
+    let mut docker = Command::new("docker")
+        .arg("image")
+        .arg("save")
+        .arg(image)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            format!("failed to run `docker image save` for {image} in {cluster_name}: {err}")
+        })?;
+    let docker_stdout = docker
+        .stdout
+        .take()
+        .ok_or_else(|| format!("docker image save for {image} did not expose stdout"))?;
+    let kind = Command::new("kind")
+        .arg("load")
+        .arg("image-archive")
+        .arg("--name")
+        .arg(cluster_name)
+        .arg("-")
+        .stdin(Stdio::from(docker_stdout))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to run `kind load image-archive` fallback for {image} in {cluster_name}: \
+                 {err}"
+            )
+        })?;
+    let docker_output = docker.wait_with_output().map_err(|err| {
+        format!("failed to collect `docker image save` output for {image}: {err}")
+    })?;
+    if kind.status.success() && docker_output.status.success() {
+        return Ok(());
+    }
+
+    let mut message = String::new();
+    if !docker_output.status.success() {
+        message.push_str(&format_command_output(
+            &format!("docker image save failed for {image}"),
+            &docker_output,
+        ));
+    }
+    if !kind.status.success() {
+        if !message.is_empty() {
+            message.push_str("\n\n");
+        }
+        message.push_str(&format_command_output(
+            &format!("kind load image-archive failed for {image} in cluster {cluster_name}"),
+            &kind,
+        ));
+    }
+    Err(message)
+}
+
+fn format_command_output(label: &str, output: &std::process::Output) -> String {
+    format!(
+        "{label} with status {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 pub(crate) fn ensure_kind_internal_images(kind_cluster: &KindCluster) {
@@ -710,7 +831,8 @@ pub(crate) fn ensure_kind_internal_images(kind_cluster: &KindCluster) {
     load_kind_image(&name, AMBER_ROUTER.reference);
     load_kind_image(&name, AMBER_PROVISIONER.reference);
     load_kind_image(&name, AMBER_HELPER.reference);
-    load_kind_image(&name, TEST_APP_IMAGE);
+    // The public test workload image is registry-pullable inside the kind cluster, so keep kind
+    // image preloading focused on the Amber images that only exist locally.
     loaded
         .lock()
         .expect("kind image-load guard should lock")

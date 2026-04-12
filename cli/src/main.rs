@@ -1,7 +1,6 @@
 mod command_support;
 mod direct_runtime;
 mod docs;
-mod framework_component;
 mod mixed_run;
 mod run_inputs;
 mod run_logs;
@@ -423,12 +422,8 @@ enum Command {
     RunVmInit(RunVmInitArgs),
     #[command(hide = true, name = "run-site-supervisor")]
     RunSiteSupervisor(RunSiteSupervisorArgs),
-    #[command(hide = true, name = "run-site-actuator")]
-    RunSiteActuator(RunSiteActuatorArgs),
-    #[command(hide = true, name = "run-framework-control-state")]
-    RunFrameworkControlState(RunFrameworkControlStateArgs),
-    #[command(hide = true, name = "run-framework-ccs")]
-    RunFrameworkCcs(RunFrameworkCcsArgs),
+    #[command(hide = true, name = "run-site-controller")]
+    RunSiteController(RunSiteControllerArgs),
     #[command(hide = true, name = "run-detached-coordinator")]
     RunDetachedCoordinator(RunDetachedCoordinatorArgs),
     #[command(hide = true, name = "run-observability-sink")]
@@ -701,22 +696,8 @@ struct RunSiteSupervisorArgs {
 }
 
 #[derive(Args)]
-struct RunSiteActuatorArgs {
-    /// Path to a mixed-site site-actuator plan JSON file.
-    #[arg(long = "plan", value_name = "FILE")]
-    plan: PathBuf,
-}
-
-#[derive(Args)]
-struct RunFrameworkControlStateArgs {
-    /// Path to a framework control-state service plan JSON file.
-    #[arg(long = "plan", value_name = "FILE")]
-    plan: PathBuf,
-}
-
-#[derive(Args)]
-struct RunFrameworkCcsArgs {
-    /// Path to a framework CCS plan JSON file.
+struct RunSiteControllerArgs {
+    /// Path to a mixed-site site-controller plan JSON file.
     #[arg(long = "plan", value_name = "FILE")]
     plan: PathBuf,
 }
@@ -895,12 +876,12 @@ async fn main() -> Result<()> {
                     .await
                 }
                 Command::RunSiteSupervisor(args) => mixed_run::run_site_supervisor(args.plan).await,
-                Command::RunSiteActuator(args) => mixed_run::run_site_actuator(args.plan).await,
-                Command::RunFrameworkControlState(args) => {
-                    framework_component::run_framework_control_state(args.plan).await
-                }
-                Command::RunFrameworkCcs(args) => {
-                    framework_component::run_framework_ccs(args.plan).await
+                Command::RunSiteController(args) => {
+                    amber_site_controller::run_site_controller(
+                        args.plan,
+                        mixed_run::site_controller_runtime(),
+                    )
+                    .await
                 }
                 Command::RunDetachedCoordinator(args) => run_detached_coordinator(args).await,
                 Command::RunObservabilitySink(args) => {

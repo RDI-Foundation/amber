@@ -256,18 +256,12 @@ pub(super) fn build_supervisor_plan(
             None
         },
         observability_endpoint: input.observability_endpoint.map(ToOwned::to_owned),
-        framework_ccs_plan_path: input
-            .framework_ccs_plan_path
+        site_controller_plan_path: input
+            .site_controller_plan_path
             .map(|path| path.display().to_string()),
-        site_actuator_plan_path: input
-            .site_actuator_plan_path
-            .map(|path| path.display().to_string()),
+        site_controller_url: input.site_controller_url.map(ToOwned::to_owned),
         launch_env,
     })
-}
-
-pub(super) fn write_site_actuator_plan(path: &Path, plan: &SiteActuatorPlan) -> Result<()> {
-    write_json(path, plan)
 }
 
 pub(super) fn spawn_site_supervisor(site_state_root: &Path) -> Result<SupervisorChild> {
@@ -650,6 +644,8 @@ pub(super) fn launched_site_from_state(
             router_mesh_addr: state.router_mesh_addr.clone(),
             router_identity_id: state.router_identity_id.clone(),
             router_public_key_b64: state.router_public_key_b64.clone(),
+            site_controller_pid: state.site_controller_pid,
+            site_controller_url: state.site_controller_url.clone(),
         },
         router_control,
         router_identity,
@@ -701,31 +697,22 @@ pub(super) async fn ensure_site_running(
 ) -> Result<()> {
     reap_child(&mut runtime.site_process)?;
     reap_child(&mut runtime.port_forward)?;
-    reap_child(&mut runtime.framework_ccs)?;
-    reap_child(&mut runtime.site_actuator)?;
+    reap_child(&mut runtime.site_controller)?;
 
-    if runtime.framework_ccs.is_none()
-        && let Some(plan_path) = plan.framework_ccs_plan_path.as_deref()
+    if runtime.site_controller.is_none()
+        && let Some(plan_path) = plan.site_controller_plan_path.as_deref()
     {
-        runtime.framework_ccs = Some(spawn_runtime_process(
+        let controller = super::site_controller_command()?;
+        runtime.site_controller = Some(spawn_runtime_process_with_executable(
+            &controller.executable,
             &PathBuf::from(&plan.site_state_root),
-            "framework-ccs.log",
+            "site-controller.log",
             &plan.launch_env,
             |cmd| {
-                cmd.arg("run-framework-ccs").arg("--plan").arg(plan_path);
-            },
-        )?);
-    }
-
-    if runtime.site_actuator.is_none()
-        && let Some(plan_path) = plan.site_actuator_plan_path.as_deref()
-    {
-        runtime.site_actuator = Some(spawn_runtime_process(
-            &PathBuf::from(&plan.site_state_root),
-            "site-actuator.log",
-            &plan.launch_env,
-            |cmd| {
-                cmd.arg("run-site-actuator").arg("--plan").arg(plan_path);
+                for arg in &controller.prefix_args {
+                    cmd.arg(arg);
+                }
+                cmd.arg("--plan").arg(plan_path);
             },
         )?);
     }
@@ -1133,8 +1120,7 @@ pub(super) async fn cleanup_site(
 ) -> Result<()> {
     reap_child(&mut runtime.site_process)?;
     reap_child(&mut runtime.port_forward)?;
-    reap_child(&mut runtime.framework_ccs)?;
-    reap_child(&mut runtime.site_actuator)?;
+    reap_child(&mut runtime.site_controller)?;
 
     if let Some(child) = runtime.site_process.as_mut() {
         stop_child(child).await?;
@@ -1142,17 +1128,13 @@ pub(super) async fn cleanup_site(
     if let Some(child) = runtime.port_forward.as_mut() {
         stop_child(child).await?;
     }
-    if let Some(child) = runtime.framework_ccs.as_mut() {
-        stop_child(child).await?;
-    }
-    if let Some(child) = runtime.site_actuator.as_mut() {
+    if let Some(child) = runtime.site_controller.as_mut() {
         stop_child(child).await?;
     }
     runtime.site_process = None;
     runtime.site_started = false;
     runtime.port_forward = None;
-    runtime.framework_ccs = None;
-    runtime.site_actuator = None;
+    runtime.site_controller = None;
 
     match plan.kind {
         SiteKind::Compose => {
@@ -1238,6 +1220,8 @@ pub(super) fn build_site_state(
         router_mesh_addr,
         router_identity_id,
         router_public_key_b64,
+        site_controller_pid: runtime.site_controller.as_ref().map(Child::id),
+        site_controller_url: plan.site_controller_url.clone(),
         last_error,
     }
 }
@@ -1274,6 +1258,8 @@ pub(super) fn persist_site_state(
             router_mesh_addr: launched.receipt.router_mesh_addr.clone(),
             router_identity_id: launched.receipt.router_identity_id.clone(),
             router_public_key_b64: launched.receipt.router_public_key_b64.clone(),
+            site_controller_pid: launched.receipt.site_controller_pid,
+            site_controller_url: launched.receipt.site_controller_url.clone(),
             last_error,
         },
     )
@@ -1639,9 +1625,7 @@ pub(crate) fn spawn_detached_child(
     #[cfg(unix)]
     use std::os::unix::process::CommandExt as _;
 
-    let exe = env::current_exe()
-        .into_diagnostic()
-        .wrap_err("failed to resolve amber executable path")?;
+    let exe = super::amber_cli_executable()?;
     let log = fs::File::create(log_path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create log {}", log_path.display()))?;
@@ -1678,9 +1662,17 @@ pub(super) fn spawn_runtime_process(
     extra_env: &BTreeMap<String, String>,
     build: impl FnOnce(&mut Command),
 ) -> Result<Child> {
-    let exe = env::current_exe()
-        .into_diagnostic()
-        .wrap_err("failed to resolve amber executable path")?;
+    let exe = super::amber_cli_executable()?;
+    spawn_runtime_process_with_executable(&exe, site_state_root, log_name, extra_env, build)
+}
+
+pub(super) fn spawn_runtime_process_with_executable(
+    executable: &Path,
+    site_state_root: &Path,
+    log_name: &str,
+    extra_env: &BTreeMap<String, String>,
+    build: impl FnOnce(&mut Command),
+) -> Result<Child> {
     let log_path = site_state_root.join(log_name);
     let log = fs::File::create(&log_path)
         .into_diagnostic()
@@ -1689,7 +1681,7 @@ pub(super) fn spawn_runtime_process(
         .try_clone()
         .into_diagnostic()
         .wrap_err("failed to clone site log")?;
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(executable);
     cmd.envs(extra_env);
     cmd.stdout(Stdio::from(log));
     cmd.stderr(Stdio::from(log_err));

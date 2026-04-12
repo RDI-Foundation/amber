@@ -212,6 +212,39 @@ pub(crate) fn root_authority_key(selector: &RootAuthoritySelectorIr) -> String {
         .encode(serde_json::to_vec(selector).expect("root authority selector should serialize"))
 }
 
+fn origin_overlay_suffix(
+    holder_component_id: &str,
+    root_authority_selector: &RootAuthoritySelectorIr,
+) -> String {
+    URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({
+            "holder_component_id": holder_component_id,
+            "root_authority_selector": root_authority_selector,
+        }))
+        .expect("dynamic capability origin overlay key should serialize"),
+    )
+}
+
+pub(crate) fn origin_overlay_id(
+    holder_component_id: &str,
+    root_authority_selector: &RootAuthoritySelectorIr,
+) -> String {
+    format!(
+        "dynamic-cap-origin-{}",
+        origin_overlay_suffix(holder_component_id, root_authority_selector)
+    )
+}
+
+pub(crate) fn origin_route_id(
+    holder_component_id: &str,
+    root_authority_selector: &RootAuthoritySelectorIr,
+) -> String {
+    format!(
+        "dynamic-cap-origin-route-{}",
+        origin_overlay_suffix(holder_component_id, root_authority_selector)
+    )
+}
+
 pub(crate) fn held_id_for_root(selector: &RootAuthoritySelectorIr) -> String {
     format!(
         "{DYNAMIC_CAPABILITY_ROOT_HELD_PREFIX}{}",
@@ -257,7 +290,7 @@ pub(crate) fn next_dynamic_grant_id(state: &mut FrameworkControlState) -> String
         "{DYNAMIC_CAPABILITY_GRANT_ID_PREFIX}{:016x}",
         state.next_dynamic_capability_grant_id
     );
-    state.next_dynamic_capability_grant_id += 1;
+    state.next_dynamic_capability_grant_id += state.id_stride.max(1);
     grant_id
 }
 

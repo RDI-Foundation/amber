@@ -1219,7 +1219,7 @@ pub(crate) fn rewrite_peer_addr_for_slirp_gateway(peer_addr: &str) -> String {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn rewrite_sidecar_env_passthrough_for_slirp(name: &str, value: &str) -> String {
-    if name != amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV {
+    if name != amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV {
         return value.to_string();
     }
     rewrite_loopback_url_for_slirp_gateway(value)

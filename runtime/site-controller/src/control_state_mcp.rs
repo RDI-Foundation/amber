@@ -20,21 +20,22 @@ use serde_json::Value;
 
 use super::{
     control_state_api::{
-        self, DynamicCapsInspectRequest, DynamicCapsInspectResponse, DynamicCapsMutateRequest,
+        DynamicCapsInspectRequest, DynamicCapsInspectResponse, DynamicCapsMutateRequest,
         DynamicCapsMutateResponse,
     },
     dynamic_caps,
-    http::authorize_framework_auth_header,
-    mcp_common::{json_response, map_protocol_api_error},
-    planner::ControlStateApp,
-    *,
+    mcp_common::{McpOperationResponse, json_response, map_protocol_api_error},
+    planner::SiteControllerApp,
+    site_controller::{
+        execute_site_controller_dynamic_caps_inspect, execute_site_controller_dynamic_caps_mutate,
+    },
 };
 
 const HELP_RESOURCE_URI: &str = "amber://framework-dynamic-caps";
 const OPERATION_RESOURCE_PREFIX: &str = "amber://framework-dynamic-caps/op/";
 
 pub(crate) fn service(
-    app: ControlStateApp,
+    app: SiteControllerApp,
 ) -> StreamableHttpService<FrameworkDynamicCapsMcp, LocalSessionManager> {
     StreamableHttpService::new(
         move || Ok(FrameworkDynamicCapsMcp::new(app.clone())),
@@ -45,12 +46,12 @@ pub(crate) fn service(
 
 #[derive(Clone)]
 pub(crate) struct FrameworkDynamicCapsMcp {
-    app: ControlStateApp,
+    app: SiteControllerApp,
     tool_router: ToolRouter<Self>,
 }
 
 impl FrameworkDynamicCapsMcp {
-    fn new(app: ControlStateApp) -> Self {
+    fn new(app: SiteControllerApp) -> Self {
         Self {
             app,
             tool_router: Self::tool_router(),
@@ -62,66 +63,51 @@ impl FrameworkDynamicCapsMcp {
             .extensions
             .get::<Parts>()
             .ok_or_else(|| McpError::invalid_request("missing HTTP request context", None))?;
-        authorize_framework_auth_header(&parts.headers, self.app.control_state_auth_token.as_ref())
-            .map_err(map_protocol_api_error)
+        super::http::authorize_framework_auth_header(
+            &parts.headers,
+            self.app.control.control_state_auth_token.as_ref(),
+        )
+        .map_err(map_protocol_api_error)
     }
 
-    fn render_help_resource(&self) -> String {
-        let mut out = String::from("# framework dynamic caps MCP\n\n");
-        out.push_str("Tools:\n");
-        out.push_str("- `amber.v1.framework_dynamic_caps.inspect`\n");
-        out.push_str("- `amber.v1.framework_dynamic_caps.mutate`\n\n");
-        out.push_str("Transport:\n");
-        out.push_str("- MCP endpoint: `/mcp`\n");
-        out.push_str("- HTTP endpoints remain under `/v1/control-state/dynamic-caps/...`\n\n");
-        out.push_str("Inspect operations:\n");
-        for op in ["held_list", "held_detail", "inspect_ref", "resolve_origin"] {
-            out.push_str(&format!(
-                "- `{op}`: read `{}{op}` for argument details\n",
-                OPERATION_RESOURCE_PREFIX
-            ));
-        }
-        out.push_str("\nMutate operations:\n");
-        for op in ["share", "revoke"] {
-            out.push_str(&format!(
-                "- `{op}`: read `{}{op}` for argument details\n",
-                OPERATION_RESOURCE_PREFIX
-            ));
-        }
-        out
+    fn help_resource(&self) -> String {
+        "# framework dynamic caps MCP\n\n- `amber.v1.framework_dynamic_caps.inspect`\n- \
+         `amber.v1.framework_dynamic_caps.mutate`\n"
+            .to_string()
     }
 
-    fn render_operation_resource(&self, name: &str) -> Result<String, McpError> {
+    fn operation_resource(&self, name: &str) -> Result<String, McpError> {
         let doc = match name {
             "held_list" => {
-                "# `held_list`\n\nTool: `amber.v1.framework_dynamic_caps.inspect`\n\nArguments:\n\
-                 ```json\n{ \"op\": \"held_list\", \"holder_component_id\": \"components./alice\" }\n```\n\n\
-                 Returns `data` matching HTTP `POST /v1/control-state/dynamic-caps/held`."
+                "# `held_list`\n\nTool: `amber.v1.framework_dynamic_caps.inspect`\n\n```json\n{ \
+                 \"op\": \"held_list\", \"holder_component_id\": \"components./alice\" }\n```"
             }
             "held_detail" => {
-                "# `held_detail`\n\nTool: `amber.v1.framework_dynamic_caps.inspect`\n\nArguments:\n\
-                 ```json\n{ \"op\": \"held_detail\", \"holder_component_id\": \"components./alice\", \"held_id\": \"held_root_...\" }\n```\n\n\
-                 Returns `data` matching HTTP `POST /v1/control-state/dynamic-caps/held/detail`."
+                "# `held_detail`\n\nTool: `amber.v1.framework_dynamic_caps.inspect`\n\n```json\n{ \
+                 \"op\": \"held_detail\", \"holder_component_id\": \"components./alice\", \
+                 \"held_id\": \"held_root_...\" }\n```"
             }
             "inspect_ref" => {
-                "# `inspect_ref`\n\nTool: `amber.v1.framework_dynamic_caps.inspect`\n\nArguments:\n\
-                 ```json\n{ \"op\": \"inspect_ref\", \"holder_component_id\": \"components./carol\", \"ref\": \"amber://ref/...\" }\n```\n\n\
-                 Returns `data` matching HTTP `POST /v1/control-state/dynamic-caps/inspect-ref`."
+                "# `inspect_ref`\n\nTool: `amber.v1.framework_dynamic_caps.inspect`\n\n```json\n{ \
+                 \"op\": \"inspect_ref\", \"holder_component_id\": \"components./carol\", \"ref\": \
+                 \"amber://ref/...\" }\n```"
             }
             "resolve_origin" => {
-                "# `resolve_origin`\n\nTool: `amber.v1.framework_dynamic_caps.inspect`\n\nArguments:\n\
-                 ```json\n{\n  \"op\": \"resolve_origin\",\n  \"holder_component_id\": \"components./alice\",\n  \"source\": {\n    \"kind\": \"root_authority\",\n    \"root_authority_selector\": {\n      \"kind\": \"binding\",\n      \"consumer_component_id\": \"components./alice\",\n      \"slot_name\": \"upstream\",\n      \"provider_component_id\": \"components./provider\",\n      \"provider_capability_name\": \"http\"\n    }\n  }\n}\n```\n\n\
-                 Returns `data` matching HTTP `POST /v1/control-state/dynamic-caps/resolve-origin`."
+                "# `resolve_origin`\n\nTool: \
+                 `amber.v1.framework_dynamic_caps.inspect`\n\n```json\n{\n  \"op\": \
+                 \"resolve_origin\",\n  \"holder_component_id\": \"components./alice\",\n  \
+                 \"source\": { \"kind\": \"grant\", \"grant_id\": \"g_...\" }\n}\n```"
             }
             "share" => {
-                "# `share`\n\nTool: `amber.v1.framework_dynamic_caps.mutate`\n\nArguments:\n\
-                 ```json\n{\n  \"op\": \"share\",\n  \"caller_component_id\": \"components./alice\",\n  \"source\": {\n    \"kind\": \"root_authority\",\n    \"root_authority_selector\": {\n      \"kind\": \"binding\",\n      \"consumer_component_id\": \"components./alice\",\n      \"slot_name\": \"upstream\",\n      \"provider_component_id\": \"components./provider\",\n      \"provider_capability_name\": \"http\"\n    }\n  },\n  \"recipient_component_id\": \"components./carol\"\n}\n```\n\n\
-                 Returns `data` matching HTTP `POST /v1/control-state/dynamic-caps/share`."
+                "# `share`\n\nTool: `amber.v1.framework_dynamic_caps.mutate`\n\n```json\n{\n  \
+                 \"op\": \"share\",\n  \"caller_component_id\": \"components./alice\",\n  \
+                 \"source\": { \"kind\": \"grant\", \"grant_id\": \"g_...\" },\n  \
+                 \"recipient_component_id\": \"components./carol\"\n}\n```"
             }
             "revoke" => {
-                "# `revoke`\n\nTool: `amber.v1.framework_dynamic_caps.mutate`\n\nArguments:\n\
-                 ```json\n{\n  \"op\": \"revoke\",\n  \"caller_component_id\": \"components./alice\",\n  \"target\": { \"kind\": \"grant\", \"grant_id\": \"g_...\" }\n}\n```\n\n\
-                 Returns `data` matching HTTP `POST /v1/control-state/dynamic-caps/revoke`."
+                "# `revoke`\n\nTool: `amber.v1.framework_dynamic_caps.mutate`\n\n```json\n{\n  \
+                 \"op\": \"revoke\",\n  \"caller_component_id\": \"components./alice\",\n  \
+                 \"target\": { \"kind\": \"grant\", \"grant_id\": \"g_...\" }\n}\n```"
             }
             _ => {
                 return Err(McpError::resource_not_found(
@@ -155,7 +141,7 @@ enum RootAuthoritySelectorArg {
     },
 }
 
-impl From<RootAuthoritySelectorArg> for RootAuthoritySelectorIr {
+impl From<RootAuthoritySelectorArg> for amber_mesh::dynamic_caps::RootAuthoritySelectorIr {
     fn from(value: RootAuthoritySelectorArg) -> Self {
         match value {
             RootAuthoritySelectorArg::SelfProvide {
@@ -264,9 +250,9 @@ impl FrameworkDynamicCapsMcp {
         &self,
         Parameters(args): Parameters<InspectArgs>,
         context: RequestContext<RoleServer>,
-    ) -> Result<Json<super::mcp_common::McpOperationResponse>, McpError> {
+    ) -> Result<Json<McpOperationResponse>, McpError> {
         self.authorize(&context)?;
-        let response = control_state_api::execute_dynamic_caps_inspect(
+        let response = execute_site_controller_dynamic_caps_inspect(
             &self.app,
             match args {
                 InspectArgs::HeldList {
@@ -304,10 +290,10 @@ impl FrameworkDynamicCapsMcp {
                     },
                 ),
             },
+            false,
         )
         .await
         .map_err(map_protocol_api_error)?;
-
         match response {
             DynamicCapsInspectResponse::HeldList(data) => json_response("held_list", data),
             DynamicCapsInspectResponse::HeldDetail(data) => json_response("held_detail", data),
@@ -326,9 +312,9 @@ impl FrameworkDynamicCapsMcp {
         &self,
         Parameters(args): Parameters<MutateArgs>,
         context: RequestContext<RoleServer>,
-    ) -> Result<Json<super::mcp_common::McpOperationResponse>, McpError> {
+    ) -> Result<Json<McpOperationResponse>, McpError> {
         self.authorize(&context)?;
-        let response = control_state_api::execute_dynamic_caps_mutate(
+        let response = execute_site_controller_dynamic_caps_mutate(
             &self.app,
             match args {
                 MutateArgs::Share {
@@ -352,10 +338,10 @@ impl FrameworkDynamicCapsMcp {
                     target: target.into(),
                 }),
             },
+            false,
         )
         .await
         .map_err(map_protocol_api_error)?;
-
         match response {
             DynamicCapsMutateResponse::Share(data) => json_response("share", data),
             DynamicCapsMutateResponse::Revoke(data) => json_response("revoke", data),
@@ -375,9 +361,8 @@ impl ServerHandler for FrameworkDynamicCapsMcp {
         .with_server_info(Implementation::new("amber-framework-dynamic-caps", "dev"))
         .with_protocol_version(ProtocolVersion::V_2025_06_18)
         .with_instructions(
-            "Use `amber.v1.framework_dynamic_caps.inspect` for reads and \
-             `amber.v1.framework_dynamic_caps.mutate` for share or revoke. Read \
-             `amber://framework-dynamic-caps` only when you need more detail."
+            "Use the framework_dynamic_caps tools. Read the amber:// help resources only when \
+             needed."
                 .to_string(),
         )
     }
@@ -436,16 +421,15 @@ impl ServerHandler for FrameworkDynamicCapsMcp {
         self.authorize(&context)?;
         let uri = request.uri;
         let text = if uri.as_str() == HELP_RESOURCE_URI {
-            self.render_help_resource()
+            self.help_resource()
         } else if let Some(name) = uri.as_str().strip_prefix(OPERATION_RESOURCE_PREFIX) {
-            self.render_operation_resource(name)?
+            self.operation_resource(name)?
         } else {
             return Err(McpError::resource_not_found(
-                format!("resource {} not found", uri),
+                format!("resource {uri} not found"),
                 None,
             ));
         };
-
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             text, uri,
         )]))

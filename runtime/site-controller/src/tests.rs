@@ -10,6 +10,7 @@ use amber_mesh::{
         HeldEntryKind, HeldEntryState, RootAuthoritySelectorIr,
     },
 };
+use axum::{Router, extract::State, http::HeaderMap, routing::post};
 use reqwest::{Client, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -17,6 +18,356 @@ use tempfile::TempDir;
 use url::Url;
 
 use super::{api::*, http::*, orchestration::*, planner::*, state::*, *};
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct DirectRuntimeState {
+    #[serde(default)]
+    slot_ports_by_component: BTreeMap<usize, BTreeMap<String, u16>>,
+    #[serde(default)]
+    slot_route_ports_by_component: BTreeMap<usize, BTreeMap<String, Vec<u16>>>,
+    #[serde(default)]
+    dynamic_caps_port_by_component: BTreeMap<usize, u16>,
+    #[serde(default)]
+    component_mesh_port_by_id: BTreeMap<usize, u16>,
+    #[serde(default)]
+    router_mesh_port: Option<u16>,
+}
+
+fn direct_runtime_state_path(plan_root: &Path) -> PathBuf {
+    plan_root.join(".amber").join("direct-runtime.json")
+}
+
+#[derive(Clone, Default)]
+struct TestSiteControllerRuntime;
+
+impl SiteControllerRuntime for TestSiteControllerRuntime {
+    fn cleanup<'a>(&'a self) -> SiteControllerRuntimeFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn resolve_link_external_url<'a>(
+        &'a self,
+        _provider: &'a LaunchedSite,
+        _provider_output_dir: &'a Path,
+        link: &'a amber_compiler::run_plan::RunLink,
+        _consumer_kind: SiteKind,
+        _run_root: &'a Path,
+    ) -> SiteControllerRuntimeFuture<'a, String> {
+        Box::pin(async move {
+            Ok(match link.protocol {
+                amber_manifest::NetworkProtocol::Tcp => "tcp://127.0.0.1:1".to_string(),
+                _ => "http://127.0.0.1:1".to_string(),
+            })
+        })
+    }
+
+    fn prepare_child<'a>(
+        &'a self,
+        _plan: &'a SiteControllerPlan,
+        _child_id: u64,
+        _site_plan: DynamicSitePlanRecord,
+    ) -> SiteControllerRuntimeFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn publish_child<'a>(
+        &'a self,
+        _plan: &'a SiteControllerPlan,
+        _child_id: u64,
+        _site_plan: DynamicSitePlanRecord,
+    ) -> SiteControllerRuntimeFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn rollback_child<'a>(
+        &'a self,
+        _plan: &'a SiteControllerPlan,
+        _child_id: u64,
+    ) -> SiteControllerRuntimeFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn destroy_child<'a>(
+        &'a self,
+        _plan: &'a SiteControllerPlan,
+        _child_id: u64,
+        _desired_site_plan: Option<DynamicSitePlanRecord>,
+    ) -> SiteControllerRuntimeFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn collect_live_component_runtime_metadata(
+        &self,
+        plan: &SiteControllerRuntimePlan,
+    ) -> miette::Result<BTreeMap<String, LiveComponentRuntimeMetadata>> {
+        if plan.kind != SiteKind::Direct {
+            return Err(miette::miette!(
+                "test runtime only implements direct site runtime metadata"
+            ));
+        }
+        let artifact_dir = PathBuf::from(&plan.artifact_dir);
+        let runtime_root = PathBuf::from(
+            plan.runtime_root
+                .as_deref()
+                .ok_or_else(|| miette::miette!("direct test site is missing its runtime root"))?,
+        );
+        let direct_plan: serde_json::Value =
+            read_json(&artifact_dir.join("direct-plan.json"), "direct plan")?;
+        let runtime_state: DirectRuntimeState = read_json(
+            &direct_runtime_state_path(&artifact_dir),
+            "direct runtime state",
+        )?;
+        let mut components = BTreeMap::new();
+        for component in direct_plan["components"].as_array().into_iter().flatten() {
+            let Some(component_id) = component.get("id").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            let Some(moniker) = component.get("moniker").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(port) = runtime_state
+                .component_mesh_port_by_id
+                .get(&(component_id as usize))
+                .copied()
+            else {
+                continue;
+            };
+            let Some(mesh_config_path) = component
+                .get("sidecar")
+                .and_then(|value| value.get("mesh_config_path"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let mesh_config = read_json(
+                &runtime_root.join(mesh_config_path),
+                "component mesh config",
+            )?;
+            components.insert(
+                moniker.to_string(),
+                LiveComponentRuntimeMetadata {
+                    moniker: moniker.to_string(),
+                    host_mesh_addr: format!("127.0.0.1:{port}"),
+                    mesh_config,
+                },
+            );
+        }
+        Ok(components)
+    }
+
+    fn load_live_site_router_mesh_config(
+        &self,
+        plan: &SiteControllerRuntimePlan,
+    ) -> miette::Result<MeshConfigPublic> {
+        if plan.kind != SiteKind::Direct {
+            return Err(miette::miette!(
+                "test runtime only implements direct site router metadata"
+            ));
+        }
+        let artifact_dir = PathBuf::from(&plan.artifact_dir);
+        let runtime_root = PathBuf::from(
+            plan.runtime_root
+                .as_deref()
+                .ok_or_else(|| miette::miette!("direct test site is missing its runtime root"))?,
+        );
+        let direct_plan: serde_json::Value =
+            read_json(&artifact_dir.join("direct-plan.json"), "direct plan")?;
+        let mesh_config_path = direct_plan["router"]["mesh_config_path"]
+            .as_str()
+            .ok_or_else(|| {
+                miette::miette!("direct test site is missing router mesh config path")
+            })?;
+        read_json(&runtime_root.join(mesh_config_path), "router mesh config")
+    }
+
+    fn router_mesh_addr_for_consumer(
+        &self,
+        _provider_kind: SiteKind,
+        _consumer_kind: SiteKind,
+        router_mesh_addr: &str,
+    ) -> miette::Result<String> {
+        Ok(router_mesh_addr.to_string())
+    }
+
+    fn update_desired_overlay_for_consumer(
+        &self,
+        _site_state_root: &Path,
+        _overlay_id: &str,
+        _overlay: DesiredExternalSlotOverlay,
+    ) -> miette::Result<()> {
+        Ok(())
+    }
+
+    fn update_desired_overlay_for_provider(
+        &self,
+        _site_state_root: &Path,
+        _overlay_id: &str,
+        _overlay: DesiredExportPeerOverlay,
+    ) -> miette::Result<()> {
+        Ok(())
+    }
+
+    fn clear_desired_overlay_for_consumer(
+        &self,
+        _site_state_root: &Path,
+        _overlay_id: &str,
+    ) -> miette::Result<()> {
+        Ok(())
+    }
+
+    fn clear_desired_overlay_for_provider(
+        &self,
+        _site_state_root: &Path,
+        _overlay_id: &str,
+    ) -> miette::Result<()> {
+        Ok(())
+    }
+}
+
+fn test_runtime() -> SharedSiteControllerRuntime {
+    Arc::new(TestSiteControllerRuntime)
+}
+
+type DestroyCalls = Arc<std::sync::Mutex<Vec<(u64, Option<DynamicSitePlanRecord>)>>>;
+
+#[derive(Clone, Default)]
+struct FailingPublishRuntime {
+    destroy_calls: DestroyCalls,
+}
+
+impl SiteControllerRuntime for FailingPublishRuntime {
+    fn cleanup<'a>(&'a self) -> SiteControllerRuntimeFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn resolve_link_external_url<'a>(
+        &'a self,
+        _provider: &'a LaunchedSite,
+        _provider_output_dir: &'a Path,
+        _link: &'a amber_compiler::run_plan::RunLink,
+        _consumer_kind: SiteKind,
+        _run_root: &'a Path,
+    ) -> SiteControllerRuntimeFuture<'a, String> {
+        Box::pin(async { Ok("http://127.0.0.1:1".to_string()) })
+    }
+
+    fn prepare_child<'a>(
+        &'a self,
+        _plan: &'a SiteControllerPlan,
+        _child_id: u64,
+        _site_plan: DynamicSitePlanRecord,
+    ) -> SiteControllerRuntimeFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn publish_child<'a>(
+        &'a self,
+        _plan: &'a SiteControllerPlan,
+        _child_id: u64,
+        _site_plan: DynamicSitePlanRecord,
+    ) -> SiteControllerRuntimeFuture<'a, ()> {
+        Box::pin(async { Err(miette::miette!("publish exploded")) })
+    }
+
+    fn rollback_child<'a>(
+        &'a self,
+        _plan: &'a SiteControllerPlan,
+        _child_id: u64,
+    ) -> SiteControllerRuntimeFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn destroy_child<'a>(
+        &'a self,
+        _plan: &'a SiteControllerPlan,
+        child_id: u64,
+        desired_site_plan: Option<DynamicSitePlanRecord>,
+    ) -> SiteControllerRuntimeFuture<'a, ()> {
+        let destroy_calls = self.destroy_calls.clone();
+        Box::pin(async move {
+            destroy_calls
+                .lock()
+                .expect("destroy call log mutex should lock")
+                .push((child_id, desired_site_plan));
+            Ok(())
+        })
+    }
+
+    fn collect_live_component_runtime_metadata(
+        &self,
+        _plan: &SiteControllerRuntimePlan,
+    ) -> miette::Result<BTreeMap<String, LiveComponentRuntimeMetadata>> {
+        Ok(BTreeMap::new())
+    }
+
+    fn load_live_site_router_mesh_config(
+        &self,
+        _plan: &SiteControllerRuntimePlan,
+    ) -> miette::Result<MeshConfigPublic> {
+        Err(miette::miette!(
+            "failing publish runtime should not load live site router mesh config"
+        ))
+    }
+
+    fn router_mesh_addr_for_consumer(
+        &self,
+        _provider_kind: SiteKind,
+        _consumer_kind: SiteKind,
+        router_mesh_addr: &str,
+    ) -> miette::Result<String> {
+        Ok(router_mesh_addr.to_string())
+    }
+
+    fn update_desired_overlay_for_consumer(
+        &self,
+        _site_state_root: &Path,
+        _overlay_id: &str,
+        _overlay: DesiredExternalSlotOverlay,
+    ) -> miette::Result<()> {
+        Ok(())
+    }
+
+    fn update_desired_overlay_for_provider(
+        &self,
+        _site_state_root: &Path,
+        _overlay_id: &str,
+        _overlay: DesiredExportPeerOverlay,
+    ) -> miette::Result<()> {
+        Ok(())
+    }
+
+    fn clear_desired_overlay_for_consumer(
+        &self,
+        _site_state_root: &Path,
+        _overlay_id: &str,
+    ) -> miette::Result<()> {
+        Ok(())
+    }
+
+    fn clear_desired_overlay_for_provider(
+        &self,
+        _site_state_root: &Path,
+        _overlay_id: &str,
+    ) -> miette::Result<()> {
+        Ok(())
+    }
+}
+
+fn with_runtime(app: &ControlStateApp, runtime: SharedSiteControllerRuntime) -> ControlStateApp {
+    ControlStateApp {
+        control_state: app.control_state.clone(),
+        client: app.client.clone(),
+        state_path: app.state_path.clone(),
+        run_root: app.run_root.clone(),
+        state_root: app.state_root.clone(),
+        mesh_scope: app.mesh_scope.clone(),
+        control_state_auth_token: app.control_state_auth_token.clone(),
+        controller_plan: app.controller_plan.clone(),
+        peer_controllers: app.peer_controllers.clone(),
+        authority_locks: app.authority_locks.clone(),
+        runtime,
+    }
+}
 
 fn write_file(path: &Path, contents: &str) {
     fs::write(path, contents).expect("test fixture should write");
@@ -432,7 +783,7 @@ async fn compile_dynamic_caps_binding_state() -> FrameworkControlState {
             path: Some("direct_local".to_string()),
             ..PlacementDefaults::default()
         },
-        components: BTreeMap::new(),
+        components: BTreeMap::from([("/".to_string(), "direct_local".to_string())]),
         dynamic_capabilities: None,
         framework_children: None,
     };
@@ -1030,7 +1381,7 @@ async fn same_site_dynamic_child_output_bindings_reuse_provider_component_routes
     write_control_state(&state_path, &state).expect("state should write");
     let root_authority = state.base_scenario.root;
     let app = test_control_state_app(&dir, state, state_path);
-    let actuators = install_success_site_actuator(&app).await;
+    let (app, controllers) = install_success_site_controllers(&app).await;
 
     execute_create_child(
         &app,
@@ -1088,8 +1439,8 @@ async fn same_site_dynamic_child_output_bindings_reuse_provider_component_routes
         );
     }
 
-    for actuator in actuators {
-        actuator.abort();
+    for controller in controllers {
+        controller.abort();
     }
 }
 
@@ -1188,7 +1539,7 @@ async fn same_site_static_child_export_bindings_reuse_provider_component_routes(
     write_control_state(&state_path, &state).expect("state should write");
     let root_authority = state.base_scenario.root;
     let app = test_control_state_app(&dir, state, state_path);
-    let actuators = install_success_site_actuator(&app).await;
+    let (app, controllers) = install_success_site_controllers(&app).await;
 
     execute_create_child(
         &app,
@@ -1232,47 +1583,61 @@ async fn same_site_static_child_export_bindings_reuse_provider_component_routes(
         );
     }
 
-    for actuator in actuators {
-        actuator.abort();
+    for controller in controllers {
+        controller.abort();
     }
 }
 
 #[test]
-fn framework_ccs_addressing_matches_site_runtime_topology() {
+fn controller_authority_url_normalizes_unspecified_bind_addresses() {
     assert_eq!(
-        ccs_listen_addr_for_site(SiteKind::Direct, 41000),
-        SocketAddr::from(([127, 0, 0, 1], 41000))
-    );
-    assert_eq!(
-        ccs_url_for_site(SiteKind::Direct, 41000),
+        authority_url_for_listen_addr(SocketAddr::from(([127, 0, 0, 1], 41000))),
         "http://127.0.0.1:41000"
     );
     assert_eq!(
-        ccs_listen_addr_for_site(SiteKind::Vm, 42000),
-        SocketAddr::from(([127, 0, 0, 1], 42000))
-    );
-    assert_eq!(
-        ccs_url_for_site(SiteKind::Vm, 42000),
+        authority_url_for_listen_addr(SocketAddr::from(([0, 0, 0, 0], 42000))),
         "http://127.0.0.1:42000"
     );
-    assert_eq!(
-        ccs_listen_addr_for_site(SiteKind::Compose, 43000),
-        SocketAddr::from(([0, 0, 0, 0], 43000))
+}
+
+#[tokio::test]
+async fn dynamic_grant_routes_to_holder_site_not_offered_site_order() {
+    let mut state = compile_dynamic_caps_binding_state().await;
+    state.placement.offered_sites.insert(
+        "compose_local".to_string(),
+        SiteDefinition {
+            kind: SiteKind::Compose,
+            context: None,
+        },
     );
+    let share = super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./provider",
+        &super::dynamic_caps::source_key_from_control_request(
+            &dynamic_caps::DynamicCapabilityControlSourceRequest::RootAuthority {
+                root_authority_selector: RootAuthoritySelectorIr::SelfProvide {
+                    component_id: "components./provider".to_string(),
+                    provide_name: "http".to_string(),
+                },
+            },
+        ),
+        "components./alice",
+        None,
+        &json!({}),
+    )
+    .expect("share should succeed");
+    let grant_id = match share {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. }
+        | super::dynamic_caps::DynamicCapabilityShareOutcome::Deduplicated { grant_id, .. } => {
+            grant_id
+        }
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Noop { reason } => {
+            panic!("share should not noop: {reason}");
+        }
+    };
     assert_eq!(
-        ccs_url_for_site(SiteKind::Compose, 43000),
-        "http://host.docker.internal:43000"
-    );
-    assert_eq!(
-        ccs_listen_addr_for_site(SiteKind::Kubernetes, 44000),
-        SocketAddr::from(([0, 0, 0, 0], 44000))
-    );
-    assert_eq!(
-        ccs_url_for_site(SiteKind::Kubernetes, 44000),
-        format!(
-            "http://{}:44000",
-            host_service_host_for_consumer(SiteKind::Kubernetes)
-        )
+        site_id_for_dynamic_grant(&state, &grant_id).expect("grant site should resolve"),
+        "direct_local",
     );
 }
 
@@ -1288,7 +1653,25 @@ async fn compile_empty_control_state() -> (TempDir, FrameworkControlState, PathB
             }
             "#,
     );
-    let state = compile_control_state(&root_path).await;
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([(
+            "direct_local".to_string(),
+            SiteDefinition {
+                kind: SiteKind::Direct,
+                context: None,
+            },
+        )]),
+        defaults: PlacementDefaults {
+            path: Some("direct_local".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::new(),
+        dynamic_capabilities: None,
+        framework_children: None,
+    };
+    let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
     write_control_state(&state_path, &state).expect("state should write");
     (dir, state, state_path)
@@ -1331,7 +1714,25 @@ async fn compile_exact_template_control_state() -> (TempDir, FrameworkControlSta
             child = file_url(&child_path),
         ),
     );
-    let state = compile_control_state(&root_path).await;
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([(
+            "direct_local".to_string(),
+            SiteDefinition {
+                kind: SiteKind::Direct,
+                context: None,
+            },
+        )]),
+        defaults: PlacementDefaults {
+            path: Some("direct_local".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::from([("/".to_string(), "direct_local".to_string())]),
+        dynamic_capabilities: None,
+        framework_children: None,
+    };
+    let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
     write_control_state(&state_path, &state).expect("state should write");
     (dir, state, state_path)
@@ -1365,8 +1766,8 @@ async fn compile_framework_binding_control_state() -> (
             {
               manifest_version: "0.3.0",
               program: {
-                path: "/bin/echo",
-                args: ["worker"],
+                path: "/usr/bin/env",
+                args: ["python3", "-m", "http.server", "8080"],
                 network: { endpoints: [{ name: "out", port: 8080, protocol: "http" }] }
               },
               provides: { out: { kind: "http", endpoint: "out" } },
@@ -1399,7 +1800,25 @@ async fn compile_framework_binding_control_state() -> (
         ),
     );
 
-    let state = compile_control_state(&root_path).await;
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([(
+            "direct_local".to_string(),
+            SiteDefinition {
+                kind: SiteKind::Direct,
+                context: None,
+            },
+        )]),
+        defaults: PlacementDefaults {
+            path: Some("direct_local".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::from([("/".to_string(), "direct_local".to_string())]),
+        dynamic_capabilities: None,
+        framework_children: None,
+    };
+    let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
     let state_path = dir.path().join("control-state.json");
     write_control_state(&state_path, &state).expect("state should write");
     let record = state
@@ -1451,16 +1870,55 @@ fn test_control_state_app(
     let state_root = dir.path().join("state");
     fs::create_dir_all(&run_root).expect("run root should exist");
     fs::create_dir_all(&state_root).expect("state root should exist");
+    let site_id = state
+        .placement
+        .offered_sites
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "direct_local".to_string());
+    let site_state_root = state_root.join(&site_id);
+    let artifact_dir = dir.path().join("artifact").join(&site_id);
+    let storage_root = dir.path().join("storage").join(&site_id);
+    let runtime_root = dir.path().join("runtime").join(&site_id);
     ControlStateApp {
         control_state: Arc::new(Mutex::new(state)),
         client: ReqwestClient::new(),
-        state_path,
-        run_root,
-        state_root,
+        state_path: state_path.clone(),
+        run_root: run_root.clone(),
+        state_root: state_root.clone(),
         mesh_scope: Arc::<str>::from("test-mesh"),
         control_state_auth_token: Arc::<str>::from("test-control-state-auth"),
+        controller_plan: Arc::new(SiteControllerPlan {
+            schema: "amber.framework_component.site_controller_plan".to_string(),
+            version: 1,
+            run_id: "test-run".to_string(),
+            mesh_scope: "test-mesh".to_string(),
+            site_id: site_id.clone(),
+            kind: SiteKind::Direct,
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            authority_url: "http://127.0.0.1:0".to_string(),
+            router_identity_id: format!("/site/{site_id}/router"),
+            state_path: state_path.display().to_string(),
+            run_root: run_root.display().to_string(),
+            state_root: state_root.display().to_string(),
+            site_state_root: site_state_root.display().to_string(),
+            artifact_dir: artifact_dir.display().to_string(),
+            auth_token: "test-control-state-auth".to_string(),
+            dynamic_caps_token_verify_key_b64: String::new(),
+            peer_controllers: BTreeMap::new(),
+            storage_root: Some(storage_root.display().to_string()),
+            runtime_root: Some(runtime_root.display().to_string()),
+            router_mesh_port: Some(24000),
+            compose_project: None,
+            kubernetes_namespace: None,
+            context: None,
+            observability_endpoint: None,
+            launch_env: BTreeMap::new(),
+        }),
+        peer_controllers: Arc::new(BTreeMap::new()),
         authority_locks: Arc::new(Mutex::new(BTreeMap::new())),
-        bridge_proxies: Arc::new(Mutex::new(BTreeMap::new())),
+        runtime: test_runtime(),
     }
 }
 
@@ -1487,6 +1945,13 @@ async fn spawn_test_router(router: Router) -> (String, tokio::task::JoinHandle<(
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("test listener");
+    spawn_test_router_on(listener, router)
+}
+
+fn spawn_test_router_on(
+    listener: tokio::net::TcpListener,
+    router: Router,
+) -> (String, tokio::task::JoinHandle<()>) {
     let addr = listener.local_addr().expect("test listener addr");
     let handle = tokio::spawn(async move {
         axum::serve(listener, router.into_make_service())
@@ -1604,6 +2069,121 @@ fn normalize_dynamic_share_ref(value: &mut Value) {
     }
 }
 
+const TEST_SITE_STATE_SCHEMA: &str = "amber.run.site_state";
+const TEST_SITE_STATE_VERSION: u32 = 2;
+
+fn with_controller_endpoint(
+    app: &ControlStateApp,
+    authority_url: &str,
+    listen_addr: SocketAddr,
+) -> ControlStateApp {
+    let mut controller_plan = app.controller_plan.as_ref().clone();
+    controller_plan.authority_url = authority_url.to_string();
+    controller_plan.listen_addr = listen_addr;
+    ControlStateApp {
+        control_state: app.control_state.clone(),
+        client: app.client.clone(),
+        state_path: app.state_path.clone(),
+        run_root: app.run_root.clone(),
+        state_root: app.state_root.clone(),
+        mesh_scope: app.mesh_scope.clone(),
+        control_state_auth_token: app.control_state_auth_token.clone(),
+        controller_plan: Arc::new(controller_plan),
+        peer_controllers: app.peer_controllers.clone(),
+        authority_locks: app.authority_locks.clone(),
+        runtime: app.runtime.clone(),
+    }
+}
+
+async fn install_framework_site_controller_fixture(
+    app: &ControlStateApp,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let plan = app.controller_plan.as_ref();
+    let site_state_root = PathBuf::from(&plan.site_state_root);
+    let artifact_dir = PathBuf::from(&plan.artifact_dir);
+    let runtime_root = PathBuf::from(
+        plan.runtime_root
+            .as_deref()
+            .expect("test controller plan should include runtime root"),
+    );
+    fs::create_dir_all(artifact_dir.join(".amber").join("control"))
+        .expect("artifact control dir should exist");
+    fs::create_dir_all(&runtime_root).expect("runtime root should exist");
+    fs::create_dir_all(&site_state_root).expect("site state root should exist");
+    write_json(&site_controller_plan_path(&site_state_root), plan)
+        .expect("site controller plan should write");
+
+    let overlay_router = Router::new().route(
+        "/overlays/{overlay_id}",
+        axum::routing::put(|| async { StatusCode::NO_CONTENT })
+            .delete(|| async { StatusCode::NO_CONTENT }),
+    );
+    let (router_base_url, overlay_handle) = spawn_test_router(overlay_router).await;
+    let router_control = router_base_url
+        .strip_prefix("http://")
+        .expect("router control URL should be absolute HTTP")
+        .to_string();
+
+    write_json(
+        &site_state_path(&app.state_root, &plan.site_id),
+        &json!({
+            "schema": TEST_SITE_STATE_SCHEMA,
+            "version": TEST_SITE_STATE_VERSION,
+            "run_id": plan.run_id,
+            "site_id": plan.site_id,
+            "kind": plan.kind,
+            "status": "running",
+            "artifact_dir": plan.artifact_dir,
+            "supervisor_pid": 1,
+            "router_control": router_control,
+            "router_mesh_addr": format!("127.0.0.1:{}", plan.router_mesh_port.expect("router mesh port")),
+            "router_identity_id": plan.router_identity_id,
+            "router_public_key_b64": base64::engine::general_purpose::STANDARD.encode([11; 32]),
+            "site_controller_pid": 1,
+            "site_controller_url": plan.authority_url,
+        }),
+    )
+    .expect("manager state should write");
+    write_json(
+        &artifact_dir.join("direct-plan.json"),
+        &json!({
+            "version": "3",
+            "mesh_provision_plan": "mesh-provision-plan.json",
+            "startup_order": [],
+            "components": [],
+            "router": {
+                "identity_id": plan.router_identity_id,
+                "mesh_port": plan.router_mesh_port.expect("router mesh port"),
+                "control_port": 39011,
+                "control_socket_path": "router.sock",
+                "mesh_config_path": "router-mesh.json",
+                "mesh_identity_path": "router-identity.json",
+            },
+        }),
+    )
+    .expect("direct plan should write");
+    write_json(
+        &direct_runtime_state_path(&artifact_dir),
+        &DirectRuntimeState {
+            router_mesh_port: plan.router_mesh_port,
+            ..Default::default()
+        },
+    )
+    .expect("direct runtime state should write");
+    let mut router_mesh = test_live_site_router(Vec::new());
+    router_mesh.identity.id = plan.router_identity_id.clone();
+    router_mesh.mesh_listen = format!(
+        "127.0.0.1:{}",
+        plan.router_mesh_port.expect("router mesh port")
+    )
+    .parse()
+    .expect("router mesh listen should parse");
+    write_json(&runtime_root.join("router-mesh.json"), &router_mesh)
+        .expect("router mesh config should write");
+
+    vec![overlay_handle]
+}
+
 struct TestMcpClient {
     client: Client,
     endpoint: String,
@@ -1614,8 +2194,15 @@ struct TestMcpClient {
 
 impl TestMcpClient {
     async fn connect(base_url: &str, client_name: &str, headers: Vec<(String, String)>) -> Self {
+        Self::connect_endpoint(&format!("{base_url}/mcp"), client_name, headers).await
+    }
+
+    async fn connect_endpoint(
+        endpoint: &str,
+        client_name: &str,
+        headers: Vec<(String, String)>,
+    ) -> Self {
         let client = Client::new();
-        let endpoint = format!("{base_url}/mcp");
         let initialize = json!({
             "jsonrpc": "2.0",
             "id": 0,
@@ -1629,7 +2216,7 @@ impl TestMcpClient {
                 },
             },
         });
-        let response = apply_headers(client.post(&endpoint), &headers)
+        let response = apply_headers(client.post(endpoint), &headers)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .json(&initialize)
@@ -1656,7 +2243,7 @@ impl TestMcpClient {
             Some("2025-06-18")
         );
 
-        let notification = apply_headers(client.post(&endpoint), &headers)
+        let notification = apply_headers(client.post(endpoint), &headers)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("mcp-session-id", &session_id)
@@ -1671,7 +2258,7 @@ impl TestMcpClient {
 
         Self {
             client,
-            endpoint,
+            endpoint: endpoint.to_string(),
             session_id,
             headers,
             next_id: 1,
@@ -1786,53 +2373,37 @@ struct FrameworkMcpHarness {
 }
 
 impl FrameworkMcpHarness {
-    async fn start(with_actuators: bool) -> Self {
+    async fn start(with_live_site_runtime: bool) -> Self {
         let (dir, state, state_path, record) = compile_framework_binding_control_state().await;
-        let app = test_control_state_app(&dir, state, state_path);
-        let mut handles = if with_actuators {
-            install_success_site_actuator(&app).await
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("site controller listener");
+        let listen_addr = listener.local_addr().expect("site controller addr");
+        let base_url = format!("http://{listen_addr}");
+        let app = with_controller_endpoint(
+            &test_control_state_app(&dir, state, state_path),
+            &base_url,
+            listen_addr,
+        );
+        assert_eq!(app.controller_plan.site_id, record.recipient_site_id);
+        let mut handles = if with_live_site_runtime {
+            install_framework_site_controller_fixture(&app).await
         } else {
             Vec::new()
         };
-        let control_router = Router::new()
-            .route(CONTROL_SERVICE_PATH, get(get_control_state))
-            .route("/v1/control-state/children", post(control_create_child))
-            .route(
-                "/v1/control-state/children/{child}/destroy",
-                post(control_destroy_child),
-            )
-            .with_state(app.clone());
-        let (control_state_url, control_handle) = spawn_test_router(control_router).await;
-        handles.push(control_handle);
-
         let auth_token = "test-router-auth".to_string();
-        let ccs_app = CcsApp {
-            client: ReqwestClient::new(),
-            site_state_root: app.state_root.clone(),
-            control_state_url: Arc::<str>::from(control_state_url),
+        let controller_app = SiteControllerApp {
+            control: app,
             router_auth_token: Arc::<str>::from(auth_token.clone()),
-            control_state_auth_token: app.control_state_auth_token.clone(),
         };
-        let ccs_router = Router::new()
-            .nest_service("/mcp", mcp::service(ccs_app.clone()))
-            .route("/v1/templates", get(ccs_list_templates))
-            .route("/v1/templates/{template}", get(ccs_describe_template))
-            .route(
-                "/v1/templates/{template}/resolve",
-                post(ccs_resolve_template),
+        handles.push(tokio::spawn(async move {
+            axum::serve(
+                listener,
+                super::site_controller::site_controller_router(controller_app).into_make_service(),
             )
-            .route(
-                "/v1/children",
-                get(ccs_list_children).post(ccs_create_child),
-            )
-            .route(
-                "/v1/children/{child}",
-                get(ccs_describe_child).delete(ccs_destroy_child),
-            )
-            .route("/v1/snapshot", post(ccs_snapshot))
-            .with_state(ccs_app);
-        let (base_url, ccs_handle) = spawn_test_router(ccs_router).await;
-        handles.push(ccs_handle);
+            .await
+            .expect("site controller should serve");
+        }));
 
         Self {
             _dir: dir,
@@ -1942,10 +2513,6 @@ async fn framework_component_mcp_discovers_compact_surface() {
     assert!(
         help.contains("amber.v1.framework_component.inspect"),
         "help resource should point callers to the inspect tool"
-    );
-    assert!(
-        help.contains("/mcp"),
-        "help resource should explain the MCP endpoint path"
     );
 }
 
@@ -2101,37 +2668,29 @@ impl DynamicCapsMcpHarness {
         let state = compile_dynamic_caps_binding_state().await;
         let state_path = dir.path().join("control-state.json");
         write_control_state(&state_path, &state).expect("state should write");
-        let app = test_control_state_app(&dir, state, state_path);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("site controller listener");
+        let listen_addr = listener.local_addr().expect("site controller addr");
+        let base_url = format!("http://{listen_addr}");
+        let app = with_controller_endpoint(
+            &test_control_state_app(&dir, state, state_path),
+            &base_url,
+            listen_addr,
+        );
         let mut handles = vec![install_dynamic_caps_origin_fixture(&app).await];
-        let router = Router::new()
-            .nest_service("/mcp", control_state_mcp::service(app.clone()))
-            .route(
-                "/v1/control-state/dynamic-caps/held",
-                post(control_dynamic_held_list),
+        let controller_app = SiteControllerApp {
+            control: app,
+            router_auth_token: Arc::<str>::from("test-router-auth"),
+        };
+        handles.push(tokio::spawn(async move {
+            axum::serve(
+                listener,
+                super::site_controller::site_controller_router(controller_app).into_make_service(),
             )
-            .route(
-                "/v1/control-state/dynamic-caps/held/detail",
-                post(control_dynamic_held_detail),
-            )
-            .route(
-                "/v1/control-state/dynamic-caps/share",
-                post(control_dynamic_share),
-            )
-            .route(
-                "/v1/control-state/dynamic-caps/inspect-ref",
-                post(control_dynamic_inspect_ref),
-            )
-            .route(
-                "/v1/control-state/dynamic-caps/revoke",
-                post(control_dynamic_revoke),
-            )
-            .route(
-                "/v1/control-state/dynamic-caps/resolve-origin",
-                post(control_dynamic_resolve_origin),
-            )
-            .with_state(app);
-        let (base_url, handle) = spawn_test_router(router).await;
-        handles.push(handle);
+            .await
+            .expect("site controller should serve");
+        }));
         Self {
             _dir: dir,
             client: Client::new(),
@@ -2146,8 +2705,8 @@ impl DynamicCapsMcpHarness {
     }
 
     async fn connect(&self) -> TestMcpClient {
-        TestMcpClient::connect(
-            &self.base_url,
+        TestMcpClient::connect_endpoint(
+            &format!("{}/v1/controller/dynamic-caps/mcp", self.base_url),
             "framework-dynamic-caps-test",
             self.http_headers(),
         )
@@ -2174,109 +2733,61 @@ impl Drop for DynamicCapsMcpHarness {
 }
 
 async fn install_dynamic_caps_origin_fixture(app: &ControlStateApp) -> tokio::task::JoinHandle<()> {
-    let site_id = "direct_local";
-    let site_state_root = Path::new(&app.state_root).join(site_id);
-    let artifact_dir = site_state_root.join("artifact");
-    let runtime_root = site_state_root.join("runtime");
-    fs::create_dir_all(artifact_dir.join(".amber")).expect("artifact root should exist");
-    fs::create_dir_all(&runtime_root).expect("runtime root should exist");
-
-    let control_state_auth_token = app.control_state_auth_token.to_string();
-    let publish_router = Router::new().route(
-        "/v1/internal/dynamic-caps/origins/publish",
-        post({
-            let expected = control_state_auth_token.clone();
-            move |headers: HeaderMap,
-                  Json(request): Json<dynamic_caps::PublishDynamicCapabilityOriginRequest>| {
-                let expected = expected.clone();
-                async move {
-                    assert_eq!(
-                        headers
-                            .get(FRAMEWORK_AUTH_HEADER)
-                            .and_then(|value| value.to_str().ok()),
-                        Some(expected.as_str()),
-                        "origin publish should authenticate with the control-state token",
-                    );
-                    Json(dynamic_caps::PublishDynamicCapabilityOriginResponse {
-                        route_id: request.route_id,
-                        capability: "provider.http".to_string(),
-                        protocol: "http".to_string(),
-                    })
-                }
-            }
-        }),
+    let plan = app.controller_plan.as_ref();
+    let site_state_root = PathBuf::from(&plan.site_state_root);
+    let artifact_dir = PathBuf::from(&plan.artifact_dir);
+    let runtime_root = PathBuf::from(
+        plan.runtime_root
+            .as_deref()
+            .expect("test controller plan should include runtime root"),
     );
-    let (publish_base_url, publish_handle) = spawn_test_router(publish_router).await;
-    let publish_addr = publish_base_url
+    fs::create_dir_all(artifact_dir.join(".amber").join("control"))
+        .expect("artifact control dir should exist");
+    fs::create_dir_all(&runtime_root).expect("runtime root should exist");
+    fs::create_dir_all(&site_state_root).expect("site state root should exist");
+
+    write_json(&site_controller_plan_path(&site_state_root), plan)
+        .expect("site controller plan should write");
+
+    let overlay_router = Router::new().route(
+        "/overlays/{overlay_id}",
+        axum::routing::put(|| async { StatusCode::NO_CONTENT })
+            .delete(|| async { StatusCode::NO_CONTENT }),
+    );
+    let (router_base_url, overlay_handle) = spawn_test_router(overlay_router).await;
+    let router_control = router_base_url
         .strip_prefix("http://")
-        .expect("publish base URL should be absolute HTTP")
-        .parse()
-        .expect("publish base URL should parse as socket address");
+        .expect("router control URL should be absolute HTTP")
+        .to_string();
 
     write_json(
-        &site_state_root.join("site-actuator-plan.json"),
-        &SiteActuatorPlan {
-            schema: "amber.run.site_actuator_plan".to_string(),
-            version: 1,
-            run_id: "test-run".to_string(),
-            mesh_scope: "test-mesh".to_string(),
-            run_root: app.run_root.display().to_string(),
-            site_id: site_id.to_string(),
-            kind: SiteKind::Direct,
-            router_identity_id: "/router".to_string(),
-            artifact_dir: artifact_dir.display().to_string(),
-            site_state_root: site_state_root.display().to_string(),
-            listen_addr: "127.0.0.1:0".parse().expect("listen addr"),
-            storage_root: None,
-            runtime_root: Some(runtime_root.display().to_string()),
-            router_mesh_port: None,
-            compose_project: None,
-            kubernetes_namespace: None,
-            context: None,
-            observability_endpoint: None,
-            launch_env: BTreeMap::new(),
-        },
-    )
-    .expect("site actuator plan should write");
-    write_json(
-        &site_state_root.join("framework-ccs-plan.json"),
-        &FrameworkCcsPlan {
-            schema: CCS_PLAN_SCHEMA.to_string(),
-            version: CCS_PLAN_VERSION,
-            site_id: site_id.to_string(),
-            site_state_root: site_state_root.display().to_string(),
-            listen_addr: publish_addr,
-            control_state_url: "http://127.0.0.1:0".to_string(),
-            router_auth_token: "unused".to_string(),
-            control_state_auth_token: control_state_auth_token.clone(),
-        },
-    )
-    .expect("framework ccs plan should write");
-    write_json(
-        &site_state_root.join("manager-state.json"),
+        &site_state_path(&app.state_root, &plan.site_id),
         &json!({
             "status": "running",
-            "kind": SiteKind::Direct,
+            "kind": plan.kind,
             "artifact_dir": artifact_dir.display().to_string(),
             "supervisor_pid": 1,
+            "router_control": router_control,
             "router_mesh_addr": "127.0.0.1:39001",
-            "router_identity_id": "/router",
+            "router_identity_id": plan.router_identity_id,
             "router_public_key_b64": "dGVzdC1yb3V0ZXIta2V5",
+            "site_controller_pid": 1,
+            "site_controller_url": plan.authority_url,
         }),
     )
     .expect("manager state should write");
     write_json(
-        &site_state_root.join("site-actuator-state.json"),
+        &site_state_root.join("site-controller-runtime-state.json"),
         &json!({
-            "schema": "amber.site_actuator_state",
+            "schema": "amber.run.site_controller_runtime_state",
             "version": 1,
-            "run_id": "test-run",
-            "site_id": site_id,
-            "kind": SiteKind::Direct,
+            "run_id": plan.run_id,
+            "site_id": plan.site_id,
+            "kind": plan.kind,
             "children": {},
         }),
     )
-    .expect("site actuator state should write");
+    .expect("site controller runtime state should write");
     write_json(
         &artifact_dir.join("direct-plan.json"),
         &json!({
@@ -2324,7 +2835,7 @@ async fn install_dynamic_caps_origin_fixture(app: &ControlStateApp) -> tokio::ta
                 },
             ],
             "router": {
-                "identity_id": "/router",
+                "identity_id": plan.router_identity_id,
                 "mesh_port": 39001,
                 "control_port": 39011,
                 "control_socket_path": "router.sock",
@@ -2335,8 +2846,8 @@ async fn install_dynamic_caps_origin_fixture(app: &ControlStateApp) -> tokio::ta
     )
     .expect("direct plan should write");
     write_json(
-        &crate::direct_runtime::direct_runtime_state_path(&artifact_dir),
-        &crate::direct_runtime::DirectRuntimeState {
+        &direct_runtime_state_path(&artifact_dir),
+        &DirectRuntimeState {
             component_mesh_port_by_id: BTreeMap::from([(1, 24001), (2, 24002)]),
             ..Default::default()
         },
@@ -2361,18 +2872,31 @@ async fn install_dynamic_caps_origin_fixture(app: &ControlStateApp) -> tokio::ta
             "/alice",
             "127.0.0.1:24002",
             Vec::new(),
-            Vec::new(),
+            vec![OutboundRoute {
+                route_id: "provider-route".to_string(),
+                slot: "upstream".to_string(),
+                capability_kind: Some("http".to_string()),
+                capability_profile: None,
+                listen_port: 20000,
+                listen_addr: None,
+                protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
+                peer_addr: "127.0.0.1:24001".to_string(),
+                peer_id: "/provider".to_string(),
+                capability: "http".to_string(),
+            }],
         )
         .mesh_config,
     )
     .expect("alice mesh config should write");
-    write_json(
-        &runtime_root.join("router-mesh.json"),
-        &test_live_site_router(Vec::new()),
-    )
+    write_json(&runtime_root.join("router-mesh.json"), &{
+        let mut router = test_live_site_router(Vec::new());
+        router.identity.id = plan.router_identity_id.clone();
+        router
+    })
     .expect("router mesh config should write");
 
-    publish_handle
+    overlay_handle
 }
 
 #[tokio::test]
@@ -2412,10 +2936,6 @@ async fn dynamic_caps_mcp_discovers_compact_surface() {
         help.contains("amber.v1.framework_dynamic_caps.inspect"),
         "help resource should point callers to the inspect tool"
     );
-    assert!(
-        help.contains("/v1/control-state/dynamic-caps"),
-        "help resource should explain the HTTP endpoint family",
-    );
 }
 
 #[tokio::test]
@@ -2428,7 +2948,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
         holder_component_id: "components./alice".to_string(),
     };
     let http_held: amber_mesh::dynamic_caps::HeldListResponse = http
-        .post_json("/v1/control-state/dynamic-caps/held", &held_list_request)
+        .post_json("/v1/controller/dynamic-caps/held", &held_list_request)
         .await;
     let mcp_held: Value = mcp
         .call_tool(
@@ -2456,7 +2976,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
     };
     let http_detail: HeldEntryDetail = http
         .post_json(
-            "/v1/control-state/dynamic-caps/held/detail",
+            "/v1/controller/dynamic-caps/held/detail",
             &held_detail_request,
         )
         .await;
@@ -2490,7 +3010,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
         options: Value::Null,
     };
     let http_share: amber_mesh::dynamic_caps::ShareResponse = http
-        .post_json("/v1/control-state/dynamic-caps/share", &share_request)
+        .post_json("/v1/controller/dynamic-caps/share", &share_request)
         .await;
     let mcp_share: Value = mcp
         .call_tool(
@@ -2531,7 +3051,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
         holder_component_id: "components./carol".to_string(),
     };
     let http_carol_held: amber_mesh::dynamic_caps::HeldListResponse = http
-        .post_json("/v1/control-state/dynamic-caps/held", &carol_held_request)
+        .post_json("/v1/controller/dynamic-caps/held", &carol_held_request)
         .await;
     let mcp_carol_held: Value = mcp
         .call_tool(
@@ -2553,7 +3073,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
     };
     let http_inspect_ref: amber_mesh::dynamic_caps::InspectRefResponse = http
         .post_json(
-            "/v1/control-state/dynamic-caps/inspect-ref",
+            "/v1/controller/dynamic-caps/inspect-ref",
             &inspect_ref_request,
         )
         .await;
@@ -2580,7 +3100,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
     };
     let http_resolve_origin: dynamic_caps::ControlDynamicResolveOriginResponse = http
         .post_json(
-            "/v1/control-state/dynamic-caps/resolve-origin",
+            "/v1/controller/dynamic-caps/resolve-origin",
             &resolve_origin_request,
         )
         .await;
@@ -2610,7 +3130,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
         },
     };
     let http_revoke: amber_mesh::dynamic_caps::RevokeResponse = http
-        .post_json("/v1/control-state/dynamic-caps/revoke", &revoke_request)
+        .post_json("/v1/controller/dynamic-caps/revoke", &revoke_request)
         .await;
     let mcp_revoke: Value = mcp
         .call_tool(
@@ -2636,7 +3156,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
     };
     let http_revoked_detail: HeldEntryDetail = http
         .post_json(
-            "/v1/control-state/dynamic-caps/held/detail",
+            "/v1/controller/dynamic-caps/held/detail",
             &revoked_detail_request,
         )
         .await;
@@ -2656,78 +3176,44 @@ async fn dynamic_caps_mcp_matches_http_surface() {
     );
 }
 
-async fn install_success_site_actuator(app: &ControlStateApp) -> Vec<tokio::task::JoinHandle<()>> {
-    let offered_sites = {
-        let state = app.control_state.lock().await;
-        state
-            .placement
-            .offered_sites
-            .iter()
-            .map(|(site_id, site)| (site_id.clone(), site.kind))
-            .collect::<Vec<_>>()
-    };
-    let mut handles = Vec::with_capacity(offered_sites.len());
-    for (site_id, site_kind) in offered_sites {
-        let site_state_root = Path::new(&app.state_root).join(&site_id);
-        fs::create_dir_all(&site_state_root).expect("site state root should exist");
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .expect("actuator listener");
-        let listen_addr = listener.local_addr().expect("actuator addr");
-        write_json(
-            &site_state_root.join("site-actuator-plan.json"),
-            &SiteActuatorPlan {
-                schema: "amber.run.site_actuator_plan".to_string(),
-                version: 1,
-                run_id: "test-run".to_string(),
-                mesh_scope: "test-mesh".to_string(),
-                run_root: app.run_root.display().to_string(),
-                site_id: site_id.clone(),
-                kind: site_kind,
-                router_identity_id: format!("/site/{site_id}/router"),
-                artifact_dir: site_state_root.join("artifact").display().to_string(),
-                site_state_root: site_state_root.display().to_string(),
-                listen_addr,
-                storage_root: None,
-                runtime_root: None,
-                router_mesh_port: None,
-                compose_project: None,
-                kubernetes_namespace: None,
-                context: None,
-                observability_endpoint: None,
-                launch_env: BTreeMap::new(),
-            },
-        )
-        .expect("site actuator plan should write");
-        let app = Router::new()
-            .route(
-                "/v1/children/{child_id}/prepare",
-                post(|| async { StatusCode::NO_CONTENT }),
-            )
-            .route(
-                "/v1/children/{child_id}/rollback",
-                post(|| async { StatusCode::NO_CONTENT }),
-            )
-            .route(
-                "/v1/children/{child_id}/publish",
-                post(|| async { StatusCode::NO_CONTENT }),
-            )
-            .route(
-                "/v1/children/{child_id}/destroy",
-                post(|| async { StatusCode::NO_CONTENT }),
-            );
-        handles.push(tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("site actuator should serve");
-        }));
-    }
-    handles
+#[derive(Clone)]
+struct MockSiteControllerState {
+    expected_auth: String,
+    rollback_status: StatusCode,
 }
 
-async fn install_failing_rollback_site_actuator(
+async fn mock_site_controller_status(
+    State(state): State<MockSiteControllerState>,
+    headers: HeaderMap,
+) -> StatusCode {
+    assert_eq!(
+        headers
+            .get(FRAMEWORK_AUTH_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(state.expected_auth.as_str()),
+        "site controller requests should authenticate with the control token",
+    );
+    StatusCode::NO_CONTENT
+}
+
+async fn mock_site_controller_rollback_status(
+    State(state): State<MockSiteControllerState>,
+    headers: HeaderMap,
+) -> StatusCode {
+    assert_eq!(
+        headers
+            .get(FRAMEWORK_AUTH_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(state.expected_auth.as_str()),
+        "site controller requests should authenticate with the control token",
+    );
+    state.rollback_status
+}
+
+async fn install_mock_site_controllers(
     app: &ControlStateApp,
-) -> Vec<tokio::task::JoinHandle<()>> {
+    rollback_status: StatusCode,
+) -> (ControlStateApp, Vec<tokio::task::JoinHandle<()>>) {
     let offered_sites = {
         let state = app.control_state.lock().await;
         state
@@ -2737,68 +3223,83 @@ async fn install_failing_rollback_site_actuator(
             .map(|(site_id, site)| (site_id.clone(), site.kind))
             .collect::<Vec<_>>()
     };
+    let mut peer_controllers = BTreeMap::new();
     let mut handles = Vec::with_capacity(offered_sites.len());
     for (site_id, site_kind) in offered_sites {
-        let site_state_root = Path::new(&app.state_root).join(&site_id);
-        fs::create_dir_all(&site_state_root).expect("site state root should exist");
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .expect("actuator listener");
-        let listen_addr = listener.local_addr().expect("actuator addr");
-        write_json(
-            &site_state_root.join("site-actuator-plan.json"),
-            &SiteActuatorPlan {
-                schema: "amber.run.site_actuator_plan".to_string(),
-                version: 1,
-                run_id: "test-run".to_string(),
-                mesh_scope: "test-mesh".to_string(),
-                run_root: app.run_root.display().to_string(),
-                site_id: site_id.clone(),
+        let state = MockSiteControllerState {
+            expected_auth: app.control_state_auth_token.to_string(),
+            rollback_status,
+        };
+        let router = Router::new()
+            .route(
+                "/v1/controller/site/children/{child_id}/prepare",
+                post(mock_site_controller_status),
+            )
+            .route(
+                "/v1/controller/site/children/{child_id}/rollback",
+                post(mock_site_controller_rollback_status),
+            )
+            .route(
+                "/v1/controller/site/children/{child_id}/publish",
+                post(mock_site_controller_status),
+            )
+            .route(
+                "/v1/controller/site/children/{child_id}/destroy",
+                post(mock_site_controller_status),
+            )
+            .with_state(state);
+        let (authority_url, handle) = spawn_test_router(router).await;
+        peer_controllers.insert(
+            site_id.clone(),
+            SiteControllerPeerPlan {
+                site_id,
                 kind: site_kind,
-                router_identity_id: format!("/site/{site_id}/router"),
-                artifact_dir: site_state_root.join("artifact").display().to_string(),
-                site_state_root: site_state_root.display().to_string(),
-                listen_addr,
-                storage_root: None,
-                runtime_root: None,
-                router_mesh_port: None,
-                compose_project: None,
-                kubernetes_namespace: None,
-                context: None,
-                observability_endpoint: None,
-                launch_env: BTreeMap::new(),
+                authority_url,
             },
-        )
-        .expect("site actuator plan should write");
-        let app = Router::new()
-            .route(
-                "/v1/children/{child_id}/prepare",
-                post(|| async { StatusCode::NO_CONTENT }),
-            )
-            .route(
-                "/v1/children/{child_id}/rollback",
-                post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
-            )
-            .route(
-                "/v1/children/{child_id}/publish",
-                post(|| async { StatusCode::NO_CONTENT }),
-            )
-            .route(
-                "/v1/children/{child_id}/destroy",
-                post(|| async { StatusCode::NO_CONTENT }),
-            );
-        handles.push(tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("site actuator should serve");
-        }));
+        );
+        handles.push(handle);
     }
-    handles
+    (with_peer_site_controllers(app, peer_controllers), handles)
 }
 
-async fn install_barrier_destroy_site_actuator(
+async fn install_success_site_controllers(
+    app: &ControlStateApp,
+) -> (ControlStateApp, Vec<tokio::task::JoinHandle<()>>) {
+    install_mock_site_controllers(app, StatusCode::NO_CONTENT).await
+}
+
+async fn install_failing_rollback_site_controllers(
+    app: &ControlStateApp,
+) -> (ControlStateApp, Vec<tokio::task::JoinHandle<()>>) {
+    install_mock_site_controllers(app, StatusCode::INTERNAL_SERVER_ERROR).await
+}
+
+fn with_peer_site_controllers(
+    app: &ControlStateApp,
+    peer_controllers: BTreeMap<String, SiteControllerPeerPlan>,
+) -> ControlStateApp {
+    let mut controller_plan = app.controller_plan.as_ref().clone();
+    controller_plan.site_id = "__test_controller__".to_string();
+    controller_plan.peer_controllers = peer_controllers.clone();
+    ControlStateApp {
+        control_state: app.control_state.clone(),
+        client: app.client.clone(),
+        state_path: app.state_path.clone(),
+        run_root: app.run_root.clone(),
+        state_root: app.state_root.clone(),
+        mesh_scope: app.mesh_scope.clone(),
+        control_state_auth_token: app.control_state_auth_token.clone(),
+        controller_plan: Arc::new(controller_plan),
+        peer_controllers: Arc::new(peer_controllers),
+        authority_locks: app.authority_locks.clone(),
+        runtime: app.runtime.clone(),
+    }
+}
+
+async fn install_barrier_destroy_site_controllers(
     app: &ControlStateApp,
 ) -> (
+    ControlStateApp,
     Vec<tokio::task::JoinHandle<()>>,
     tokio::sync::mpsc::UnboundedReceiver<String>,
     Arc<tokio::sync::Barrier>,
@@ -2814,78 +3315,73 @@ async fn install_barrier_destroy_site_actuator(
     };
     let barrier = Arc::new(tokio::sync::Barrier::new(offered_sites.len() + 1));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut peer_controllers = BTreeMap::new();
     let mut handles = Vec::with_capacity(offered_sites.len());
     for (site_id, site_kind) in offered_sites {
-        let site_state_root = Path::new(&app.state_root).join(&site_id);
-        fs::create_dir_all(&site_state_root).expect("site state root should exist");
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .expect("actuator listener");
-        let listen_addr = listener.local_addr().expect("actuator addr");
-        write_json(
-            &site_state_root.join("site-actuator-plan.json"),
-            &SiteActuatorPlan {
-                schema: "amber.run.site_actuator_plan".to_string(),
-                version: 1,
-                run_id: "test-run".to_string(),
-                mesh_scope: "test-mesh".to_string(),
-                run_root: app.run_root.display().to_string(),
-                site_id: site_id.clone(),
-                kind: site_kind,
-                router_identity_id: format!("/site/{site_id}/router"),
-                artifact_dir: site_state_root.join("artifact").display().to_string(),
-                site_state_root: site_state_root.display().to_string(),
-                listen_addr,
-                storage_root: None,
-                runtime_root: None,
-                router_mesh_port: None,
-                compose_project: None,
-                kubernetes_namespace: None,
-                context: None,
-                observability_endpoint: None,
-                launch_env: BTreeMap::new(),
-            },
-        )
-        .expect("site actuator plan should write");
+        let state = MockSiteControllerState {
+            expected_auth: app.control_state_auth_token.to_string(),
+            rollback_status: StatusCode::NO_CONTENT,
+        };
         let start_tx = tx.clone();
         let destroy_barrier = barrier.clone();
         let site_id_for_destroy = site_id.clone();
-        let app = Router::new()
+        let router = Router::new()
             .route(
-                "/v1/children/{child_id}/prepare",
-                post(|| async { StatusCode::NO_CONTENT }),
+                "/v1/controller/site/children/{child_id}/prepare",
+                post(mock_site_controller_status),
             )
             .route(
-                "/v1/children/{child_id}/publish",
-                post(|| async { StatusCode::NO_CONTENT }),
+                "/v1/controller/site/children/{child_id}/publish",
+                post(mock_site_controller_status),
             )
             .route(
-                "/v1/children/{child_id}/destroy",
-                post(move || {
-                    let start_tx = start_tx.clone();
-                    let destroy_barrier = destroy_barrier.clone();
-                    let site_id = site_id_for_destroy.clone();
-                    async move {
-                        start_tx
-                            .send(site_id)
-                            .expect("destroy start notification should send");
-                        destroy_barrier.wait().await;
-                        StatusCode::NO_CONTENT
-                    }
-                }),
+                "/v1/controller/site/children/{child_id}/destroy",
+                post(
+                    move |State(state): State<MockSiteControllerState>, headers: HeaderMap| {
+                        let start_tx = start_tx.clone();
+                        let destroy_barrier = destroy_barrier.clone();
+                        let site_id = site_id_for_destroy.clone();
+                        async move {
+                            assert_eq!(
+                                headers
+                                    .get(FRAMEWORK_AUTH_HEADER)
+                                    .and_then(|value| value.to_str().ok()),
+                                Some(state.expected_auth.as_str()),
+                                "site controller requests should authenticate with the control \
+                                 token",
+                            );
+                            start_tx
+                                .send(site_id)
+                                .expect("destroy start notification should send");
+                            destroy_barrier.wait().await;
+                            StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
             );
-        handles.push(tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("site actuator should serve");
-        }));
+        let (authority_url, handle) = spawn_test_router(router.with_state(state)).await;
+        peer_controllers.insert(
+            site_id.clone(),
+            SiteControllerPeerPlan {
+                site_id,
+                kind: site_kind,
+                authority_url,
+            },
+        );
+        handles.push(handle);
     }
-    (handles, rx, barrier)
+    (
+        with_peer_site_controllers(app, peer_controllers),
+        handles,
+        rx,
+        barrier,
+    )
 }
 
-async fn install_barrier_publish_site_actuator(
+async fn install_barrier_publish_site_controllers(
     app: &ControlStateApp,
 ) -> (
+    ControlStateApp,
     Vec<tokio::task::JoinHandle<()>>,
     tokio::sync::mpsc::UnboundedReceiver<String>,
     Arc<tokio::sync::Barrier>,
@@ -2901,73 +3397,67 @@ async fn install_barrier_publish_site_actuator(
     };
     let barrier = Arc::new(tokio::sync::Barrier::new(offered_sites.len() + 1));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut peer_controllers = BTreeMap::new();
     let mut handles = Vec::with_capacity(offered_sites.len());
     for (site_id, site_kind) in offered_sites {
-        let site_state_root = Path::new(&app.state_root).join(&site_id);
-        fs::create_dir_all(&site_state_root).expect("site state root should exist");
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .expect("actuator listener");
-        let listen_addr = listener.local_addr().expect("actuator addr");
-        write_json(
-            &site_state_root.join("site-actuator-plan.json"),
-            &SiteActuatorPlan {
-                schema: "amber.run.site_actuator_plan".to_string(),
-                version: 1,
-                run_id: "test-run".to_string(),
-                mesh_scope: "test-mesh".to_string(),
-                run_root: app.run_root.display().to_string(),
-                site_id: site_id.clone(),
-                kind: site_kind,
-                router_identity_id: format!("/site/{site_id}/router"),
-                artifact_dir: site_state_root.join("artifact").display().to_string(),
-                site_state_root: site_state_root.display().to_string(),
-                listen_addr,
-                storage_root: None,
-                runtime_root: None,
-                router_mesh_port: None,
-                compose_project: None,
-                kubernetes_namespace: None,
-                context: None,
-                observability_endpoint: None,
-                launch_env: BTreeMap::new(),
-            },
-        )
-        .expect("site actuator plan should write");
+        let state = MockSiteControllerState {
+            expected_auth: app.control_state_auth_token.to_string(),
+            rollback_status: StatusCode::NO_CONTENT,
+        };
         let start_tx = tx.clone();
         let publish_barrier = barrier.clone();
         let site_id_for_publish = site_id.clone();
-        let app = Router::new()
+        let router = Router::new()
             .route(
-                "/v1/children/{child_id}/prepare",
-                post(|| async { StatusCode::NO_CONTENT }),
+                "/v1/controller/site/children/{child_id}/prepare",
+                post(mock_site_controller_status),
             )
             .route(
-                "/v1/children/{child_id}/publish",
-                post(move || {
-                    let start_tx = start_tx.clone();
-                    let publish_barrier = publish_barrier.clone();
-                    let site_id = site_id_for_publish.clone();
-                    async move {
-                        start_tx
-                            .send(site_id)
-                            .expect("publish start notification should send");
-                        publish_barrier.wait().await;
-                        StatusCode::NO_CONTENT
-                    }
-                }),
+                "/v1/controller/site/children/{child_id}/publish",
+                post(
+                    move |State(state): State<MockSiteControllerState>, headers: HeaderMap| {
+                        let start_tx = start_tx.clone();
+                        let publish_barrier = publish_barrier.clone();
+                        let site_id = site_id_for_publish.clone();
+                        async move {
+                            assert_eq!(
+                                headers
+                                    .get(FRAMEWORK_AUTH_HEADER)
+                                    .and_then(|value| value.to_str().ok()),
+                                Some(state.expected_auth.as_str()),
+                                "site controller requests should authenticate with the control \
+                                 token",
+                            );
+                            start_tx
+                                .send(site_id)
+                                .expect("publish start notification should send");
+                            publish_barrier.wait().await;
+                            StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
             )
             .route(
-                "/v1/children/{child_id}/destroy",
-                post(|| async { StatusCode::NO_CONTENT }),
+                "/v1/controller/site/children/{child_id}/destroy",
+                post(mock_site_controller_status),
             );
-        handles.push(tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("site actuator should serve");
-        }));
+        let (authority_url, handle) = spawn_test_router(router.with_state(state)).await;
+        peer_controllers.insert(
+            site_id.clone(),
+            SiteControllerPeerPlan {
+                site_id,
+                kind: site_kind,
+                authority_url,
+            },
+        );
+        handles.push(handle);
     }
-    (handles, rx, barrier)
+    (
+        with_peer_site_controllers(app, peer_controllers),
+        handles,
+        rx,
+        barrier,
+    )
 }
 
 #[tokio::test]
@@ -3337,6 +3827,49 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
 
     fs::remove_file(&beta_path).expect("beta source should be removable before replay");
     fs::remove_file(&beta_leaf_path).expect("beta leaf source should be removable before replay");
+
+    let replay_scenario_ir: ScenarioIr = serde_json::from_value(snapshot_response.scenario.clone())
+        .expect("snapshot scenario should decode for replay run plan");
+    let replay_placement = placement_from_snapshot(&snapshot_response);
+    let replay_compiled =
+        CompiledScenario::from_ir(replay_scenario_ir).expect("snapshot replay should compile");
+    let replay_run_plan =
+        build_run_plan(&replay_compiled, Some(&replay_placement)).expect("replay run plan");
+    let mut localized_replay = build_site_controller_state(
+        "replay-run",
+        &replay_run_plan,
+        "direct_local",
+        0,
+        1,
+        &mesh_dynamic_caps::signing_seed_b64(&mesh_dynamic_caps::signing_key_from_seed(
+            mesh_dynamic_caps::generate_dynamic_capability_signing_seed(),
+        )),
+    )
+    .expect("site-local replay state should build");
+    assert!(
+        localized_replay
+            .live_children
+            .iter()
+            .any(|child| child.name == "job-open" && child.state == ChildState::Live),
+        "site-local replay should preserve live children even when the root authority has no \
+         explicit assignment"
+    );
+    let replayed_live_child_id = localized_replay
+        .live_children
+        .iter()
+        .map(|child| child.child_id)
+        .max()
+        .expect("site-local replay should keep the restored live child id");
+    assert_eq!(
+        localized_replay.next_child_id, replayed_live_child_id,
+        "site-local replay must preserve the child id allocator after restoring live children"
+    );
+    let replay_next_child_id = allocate_child_id(&mut localized_replay);
+    assert!(
+        replay_next_child_id > replayed_live_child_id,
+        "site-local replay must allocate a fresh child id instead of colliding with restored \
+         children"
+    );
 
     let mut replayed = compile_control_state_from_snapshot(&snapshot_response).await;
     let replay_state_path = dir.path().join("replay-control-state.json");
@@ -4185,6 +4718,7 @@ fn shared_cross_site_link_is_retained_while_another_child_still_needs_it() {
         generation: 0,
         next_child_id: 2,
         next_tx_id: 0,
+        id_stride: 1,
         next_component_id: 0,
         dynamic_capability_signing_seed_b64: mesh_dynamic_caps::signing_seed_b64(
             &mesh_dynamic_caps::signing_key_from_seed(
@@ -4301,6 +4835,73 @@ async fn create_rejects_duplicate_names_and_destroy_is_idempotent() {
     assert!(
         state.live_children.is_empty(),
         "destroy should remove the child"
+    );
+}
+
+#[tokio::test]
+async fn create_aborts_and_destroys_partially_published_child_when_publish_fails() {
+    let (dir, state, state_path) = compile_exact_template_control_state().await;
+    let authority_realm_id = state.base_scenario.root;
+    let base_app = test_control_state_app(&dir, state, state_path);
+    let runtime = Arc::new(FailingPublishRuntime::default());
+    let app = with_runtime(&base_app, runtime.clone());
+
+    let err = execute_create_child(
+        &app,
+        authority_realm_id,
+        CreateChildRequest {
+            template: "worker".to_string(),
+            name: "broken".to_string(),
+            manifest: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        },
+    )
+    .await
+    .expect_err("publish failure should abort the create");
+    assert_eq!(err.0.code, ProtocolErrorCode::PublishFailed);
+    assert!(
+        err.0.message.contains("publish exploded"),
+        "publish failure should preserve the underlying detail, got: {}",
+        err.0.message
+    );
+
+    let state = app.control_state.lock().await.clone();
+    assert!(
+        state.pending_creates.is_empty(),
+        "failed publish cleanup must remove the pending create"
+    );
+    assert!(
+        state
+            .live_children
+            .iter()
+            .all(|child| child.name != "broken"),
+        "failed publish cleanup must not leave a live child behind"
+    );
+    assert_eq!(
+        state.journal.last().map(|entry| entry.state),
+        Some(ChildState::CreateAborted),
+        "failed publish cleanup must record an aborted transaction"
+    );
+
+    let destroy_calls = runtime
+        .destroy_calls
+        .lock()
+        .expect("destroy call log mutex should lock")
+        .clone();
+    assert_eq!(
+        destroy_calls.len(),
+        1,
+        "failed publish cleanup must destroy the prepared site-local child"
+    );
+    assert_eq!(destroy_calls[0].0, 1);
+    assert_eq!(
+        destroy_calls[0]
+            .1
+            .as_ref()
+            .map(|site_plan| site_plan.site_id.as_str()),
+        Some("direct_local"),
+        "failed publish cleanup must reconcile the child site back to the desired plan",
     );
 }
 
@@ -4562,7 +5163,7 @@ async fn concurrent_same_name_creates_serialize_to_one_live_child() {
     let (dir, state, state_path) = compile_exact_template_control_state().await;
     let root_authority = state.base_scenario.root;
     let app = test_control_state_app(&dir, state, state_path);
-    let actuators = install_success_site_actuator(&app).await;
+    let (app, controllers) = install_success_site_controllers(&app).await;
     let request = CreateChildRequest {
         template: "worker".to_string(),
         name: "job".to_string(),
@@ -4611,8 +5212,8 @@ async fn concurrent_same_name_creates_serialize_to_one_live_child() {
         1,
         "snapshot should remain clean after the same-name race",
     );
-    for actuator in actuators {
-        actuator.abort();
+    for controller in controllers {
+        controller.abort();
     }
 }
 
@@ -4667,8 +5268,8 @@ async fn destroy_retracted_tears_down_sites_concurrently() {
     write_control_state(&state_path, &state).expect("state should write");
     let root_authority = state.base_scenario.root;
     let app = test_control_state_app(&dir, state, state_path);
-    let (actuators, mut destroy_starts, barrier) =
-        install_barrier_destroy_site_actuator(&app).await;
+    let (app, controllers, mut destroy_starts, barrier) =
+        install_barrier_destroy_site_controllers(&app).await;
     {
         let mut state = app.control_state.lock().await;
         state.pending_destroys.push(pending_destroy(
@@ -4729,7 +5330,7 @@ async fn destroy_retracted_tears_down_sites_concurrently() {
         .expect("second destroy notification should arrive");
     assert_ne!(
         first, second,
-        "destroy should reach both site actuators before either completes"
+        "destroy should reach both peer site controllers before either completes"
     );
 
     barrier.wait().await;
@@ -4743,8 +5344,8 @@ async fn destroy_retracted_tears_down_sites_concurrently() {
         recovered.live_children.is_empty(),
         "successful destroy should remove the child after concurrent site teardown",
     );
-    for actuator in actuators {
-        actuator.abort();
+    for controller in controllers {
+        controller.abort();
     }
 }
 
@@ -4863,8 +5464,8 @@ async fn create_committed_hidden_publishes_independent_sites_concurrently() {
     ];
     write_control_state(&state_path, &state).expect("state should write");
     let app = test_control_state_app(&dir, state, state_path);
-    let (actuators, mut publish_starts, barrier) =
-        install_barrier_publish_site_actuator(&app).await;
+    let (app, controllers, mut publish_starts, barrier) =
+        install_barrier_publish_site_controllers(&app).await;
     {
         let mut state = app.control_state.lock().await;
         state.pending_creates.push(pending_create(1, child));
@@ -4885,7 +5486,7 @@ async fn create_committed_hidden_publishes_independent_sites_concurrently() {
         .expect("second publish notification should arrive");
     assert_ne!(
         first, second,
-        "create should reach both independent site actuators before either completes"
+        "create should reach both independent site controllers before either completes"
     );
 
     barrier.wait().await;
@@ -4905,8 +5506,8 @@ async fn create_committed_hidden_publishes_independent_sites_concurrently() {
         ChildState::Live,
         "successful concurrent site publication should promote the child to live",
     );
-    for actuator in actuators {
-        actuator.abort();
+    for controller in controllers {
+        controller.abort();
     }
 }
 
@@ -4970,7 +5571,7 @@ async fn concurrent_distinct_creates_commit_both_children() {
     write_control_state(&state_path, &state).expect("state should write");
     let root_authority = state.base_scenario.root;
     let app = test_control_state_app(&dir, state, state_path);
-    let actuators = install_success_site_actuator(&app).await;
+    let (app, controllers) = install_success_site_controllers(&app).await;
 
     let (left, right) = tokio::join!(
         execute_create_child(
@@ -5031,8 +5632,8 @@ async fn concurrent_distinct_creates_commit_both_children() {
             .any(|component| component.moniker == "/job-b"),
         "snapshot should contain the second child",
     );
-    for actuator in actuators {
-        actuator.abort();
+    for controller in controllers {
+        controller.abort();
     }
 }
 
@@ -6031,7 +6632,7 @@ async fn recover_control_state_surfaces_create_prepared_rollback_failures() {
     let state_path = dir.path().join("control-state.json");
     let root_authority = state.base_scenario.root;
     let app = test_control_state_app(&dir, state.clone(), state_path.clone());
-    let actuators = install_failing_rollback_site_actuator(&app).await;
+    let (app, controllers) = install_failing_rollback_site_controllers(&app).await;
     state.pending_creates.push(pending_create(
         1,
         LiveChildRecord {
@@ -6082,8 +6683,8 @@ async fn recover_control_state_surfaces_create_prepared_rollback_failures() {
         recovered.journal.is_empty(),
         "failed rollback must not pretend the child was aborted"
     );
-    for actuator in actuators {
-        actuator.abort();
+    for controller in controllers {
+        controller.abort();
     }
 }
 
@@ -6194,8 +6795,8 @@ async fn recover_control_state_does_not_republish_live_children() {
     });
     write_control_state(&state_path, &state).expect("state should write");
     let app = test_control_state_app(&dir, state, state_path);
-    let (actuators, mut publish_starts, _barrier) =
-        install_barrier_publish_site_actuator(&app).await;
+    let (_app, controllers, mut publish_starts, _barrier) =
+        install_barrier_publish_site_controllers(&app).await;
 
     recover_control_state(&app)
         .await
@@ -6215,8 +6816,8 @@ async fn recover_control_state_does_not_republish_live_children() {
         recovered.journal.is_empty(),
         "live recovery should not append synthetic journal entries",
     );
-    for actuator in actuators {
-        actuator.abort();
+    for controller in controllers {
+        controller.abort();
     }
 }
 

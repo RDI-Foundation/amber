@@ -1736,6 +1736,13 @@ fn control_status(code: u16, body: &str) -> Result<(), ControlUpdateError> {
     })
 }
 
+fn control_delete_status(code: u16, body: &str) -> Result<(), ControlUpdateError> {
+    if (200..300).contains(&code) || code == 404 {
+        return Ok(());
+    }
+    control_status(code, body)
+}
+
 async fn send_control_put_json(
     endpoint: &ControlEndpoint,
     path: &str,
@@ -1775,7 +1782,7 @@ async fn send_control_delete_json(
     );
     let response = send_control_request(endpoint, &request).await?;
     let (code, body) = parse_http_response(&response).ok_or(ControlUpdateError::Retryable)?;
-    control_status(code, body)
+    control_delete_status(code, body)
 }
 
 fn parse_http_response(response: &str) -> Option<(u16, &str)> {

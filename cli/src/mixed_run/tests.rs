@@ -2,8 +2,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
+    sync::Mutex,
 };
 
+use amber_compiler::reporter::direct::{
+    DIRECT_PLAN_VERSION, DirectComponentPlan, DirectPlan, DirectProgramExecutionPlan,
+    DirectProgramPlan, DirectRuntimeAddressPlan, DirectSidecarPlan,
+};
+use amber_site_controller::DynamicProxyExportRecord;
 use base64::Engine as _;
 use opentelemetry_proto::tonic::{
     collector::logs::v1::ExportLogsServiceRequest,
@@ -16,7 +22,8 @@ use tempfile::tempdir;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::*;
-use crate::framework_component::DynamicProxyExportRecord;
+
+static EXECUTABLE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn test_dynamic_proxy_export_record(
     component_id: usize,
@@ -56,6 +63,8 @@ fn test_site_receipt(
         router_mesh_addr: router_mesh_addr.map(str::to_string),
         router_identity_id: None,
         router_public_key_b64: None,
+        site_controller_pid: None,
+        site_controller_url: None,
     }
 }
 
@@ -127,17 +136,19 @@ fn test_site_state(
         router_mesh_addr: router_mesh_addr.map(str::to_string),
         router_identity_id: None,
         router_public_key_b64: None,
+        site_controller_pid: None,
+        site_controller_url: None,
         last_error: None,
     }
 }
 
-fn test_site_actuator_plan(
+fn test_site_controller_runtime_plan(
     kind: SiteKind,
     artifact_dir: &Path,
     site_state_root: &Path,
-) -> SiteActuatorPlan {
-    SiteActuatorPlan {
-        schema: "amber.run.site_actuator_plan".to_string(),
+) -> SiteControllerRuntimePlan {
+    SiteControllerRuntimePlan {
+        schema: "amber.run.site_controller_runtime_plan".to_string(),
         version: 1,
         run_id: "run-test".to_string(),
         mesh_scope: "test-scope".to_string(),
@@ -283,7 +294,7 @@ fn site_router_control_endpoint_prefers_manager_state_for_local_sites() {
         )
         .expect("manager state should be written");
 
-        let endpoint = site_router_control_endpoint(&test_site_actuator_plan(
+        let endpoint = site_router_control_endpoint(&test_site_controller_runtime_plan(
             kind,
             &artifact_dir,
             &site_state_root,
@@ -293,7 +304,7 @@ fn site_router_control_endpoint_prefers_manager_state_for_local_sites() {
         assert_eq!(
             endpoint.to_string(),
             "unix:///tmp/router-from-manager.sock",
-            "local site actuator should use the live manager-state endpoint for {kind:?}",
+            "local site controller runtime should use the live manager-state endpoint for {kind:?}",
         );
     }
 }
@@ -371,6 +382,81 @@ fn mesh_config_local_targets_ready_rejects_unreachable_http_inbound_routes() {
 }
 
 #[test]
+fn direct_peer_ports_for_artifact_reads_mesh_listen_ports_without_runtime_state() {
+    let temp = tempdir().expect("tempdir should be created");
+    let artifact_root = temp.path().join("artifact");
+    let runtime_root = temp.path().join("runtime");
+    let mesh_config_rel = PathBuf::from("mesh/components/app/mesh-config.json");
+    let mesh_config_path = runtime_root.join(&mesh_config_rel);
+    fs::create_dir_all(
+        mesh_config_path
+            .parent()
+            .expect("mesh config should have a parent directory"),
+    )
+    .expect("mesh config directory should be created");
+    fs::create_dir_all(artifact_root.join(".amber")).expect("artifact .amber dir should exist");
+    write_json(
+        &mesh_config_path,
+        &MeshConfigPublic {
+            identity: MeshIdentityPublic {
+                id: "/app".to_string(),
+                public_key: [9; 32],
+                mesh_scope: None,
+            },
+            mesh_listen: SocketAddr::from(([127, 0, 0, 1], 18081)),
+            control_listen: None,
+            dynamic_caps_listen: None,
+            control_allow: None,
+            peers: Vec::new(),
+            inbound: Vec::new(),
+            outbound: Vec::new(),
+            transport: TransportConfig::NoiseIk {},
+        },
+    )
+    .expect("component mesh config should be written");
+    write_json(
+        &artifact_root.join("direct-plan.json"),
+        &DirectPlan {
+            version: DIRECT_PLAN_VERSION.to_string(),
+            mesh_provision_plan: "{}".to_string(),
+            startup_order: vec![7],
+            components: vec![DirectComponentPlan {
+                id: 7,
+                moniker: "/app".to_string(),
+                log_name: "app".to_string(),
+                source_dir: None,
+                depends_on: Vec::new(),
+                sidecar: DirectSidecarPlan {
+                    log_name: "app-sidecar".to_string(),
+                    mesh_port: 0,
+                    mesh_config_path: mesh_config_rel.display().to_string(),
+                    mesh_identity_path: "mesh/components/app/mesh-identity.json".to_string(),
+                    env_passthrough: Vec::new(),
+                },
+                program: DirectProgramPlan {
+                    log_name: "app-program".to_string(),
+                    work_dir: "work/components/app".to_string(),
+                    storage_mounts: Vec::new(),
+                    execution: DirectProgramExecutionPlan::Direct {
+                        entrypoint: vec!["/bin/echo".to_string()],
+                        env: BTreeMap::new(),
+                    },
+                },
+            }],
+            runtime_addresses: DirectRuntimeAddressPlan {
+                slots_by_scope: BTreeMap::new(),
+                slot_items_by_scope: BTreeMap::new(),
+            },
+            router: None,
+        },
+    )
+    .expect("direct plan should be written");
+
+    let ports = direct_peer_ports_for_artifact(&artifact_root, &runtime_root).expect("peer ports");
+    assert_eq!(ports.get("/app"), Some(&18081));
+}
+
+#[test]
 fn read_compose_launch_env_returns_saved_launch_env() {
     let temp = tempdir().expect("tempdir should be created");
     let run_root = temp.path().join("run-root");
@@ -397,8 +483,8 @@ fn read_compose_launch_env_returns_saved_launch_env() {
             port_forward_mesh_port: None,
             port_forward_control_port: None,
             observability_endpoint: None,
-            framework_ccs_plan_path: None,
-            site_actuator_plan_path: None,
+            site_controller_plan_path: None,
+            site_controller_url: None,
             launch_env: BTreeMap::from([
                 ("AMBER_CONFIG_TENANT".to_string(), "acme-local".to_string()),
                 (
@@ -421,6 +507,112 @@ fn read_compose_launch_env_returns_saved_launch_env() {
             ("AMBER_CONFIG_TENANT".to_string(), "acme-local".to_string()),
         ])
     );
+}
+
+#[test]
+fn site_launch_commands_include_site_controller_binary_when_present() {
+    let _guard = EXECUTABLE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let temp = tempdir().expect("tempdir should be created");
+    let amber = temp.path().join("amber");
+    let controller = temp.path().join("amber-site-controller");
+    fs::write(&amber, "").expect("amber binary placeholder should be written");
+    fs::write(&controller, "").expect("site controller binary placeholder should be written");
+    let previous_amber = std::env::var_os("CARGO_BIN_EXE_amber");
+    let previous_controller = std::env::var_os("CARGO_BIN_EXE_amber-site-controller");
+    // This test serializes access to process-global environment mutation with
+    // `EXECUTABLE_ENV_LOCK`, so these temporary overrides do not race other tests.
+    unsafe {
+        std::env::set_var("CARGO_BIN_EXE_amber", &amber);
+        std::env::set_var("CARGO_BIN_EXE_amber-site-controller", &controller);
+    }
+
+    let plan = SiteSupervisorPlan {
+        schema: SITE_PLAN_SCHEMA.to_string(),
+        version: SITE_PLAN_VERSION,
+        run_id: "run-123".to_string(),
+        mesh_scope: "test.scope".to_string(),
+        run_root: temp.path().join("run-root").display().to_string(),
+        coordinator_pid: 1,
+        site_id: "compose_local".to_string(),
+        kind: SiteKind::Compose,
+        artifact_dir: temp.path().join("artifact").display().to_string(),
+        site_state_root: temp.path().join("state").display().to_string(),
+        storage_root: None,
+        runtime_root: None,
+        router_mesh_port: None,
+        compose_project: Some("amber-test".to_string()),
+        kubernetes_namespace: None,
+        context: None,
+        port_forward_mesh_port: None,
+        port_forward_control_port: None,
+        observability_endpoint: None,
+        site_controller_plan_path: Some(
+            temp.path()
+                .join("state")
+                .join("site-controller-plan.json")
+                .display()
+                .to_string(),
+        ),
+        site_controller_url: Some("http://127.0.0.1:41000".to_string()),
+        launch_env: BTreeMap::from([("AMBER_TEST".to_string(), "1".to_string())]),
+    };
+
+    let commands = site_launch_commands(&plan).expect("launch commands should build");
+    assert_eq!(
+        commands.len(),
+        2,
+        "compose site should list controller and site commands"
+    );
+    assert_eq!(commands[0].argv[0], controller.display().to_string());
+    assert_eq!(commands[0].argv[1], "--plan");
+    assert!(
+        commands[0].argv[2].ends_with("site-controller-plan.json"),
+        "controller command should point at the site controller plan"
+    );
+    assert_eq!(commands[0].env, plan.launch_env);
+    assert_eq!(commands[1].argv[0], "docker");
+
+    match previous_amber {
+        Some(value) => unsafe { std::env::set_var("CARGO_BIN_EXE_amber", value) },
+        None => unsafe { std::env::remove_var("CARGO_BIN_EXE_amber") },
+    }
+    match previous_controller {
+        Some(value) => unsafe { std::env::set_var("CARGO_BIN_EXE_amber-site-controller", value) },
+        None => unsafe { std::env::remove_var("CARGO_BIN_EXE_amber-site-controller") },
+    }
+}
+
+#[test]
+fn site_controller_command_falls_back_to_amber_subcommand_without_standalone_binary() {
+    let _guard = EXECUTABLE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let temp = tempdir().expect("tempdir should be created");
+    let amber = temp.path().join("amber");
+    let current = temp.path().join("not-the-controller");
+    fs::write(&amber, "").expect("amber binary placeholder should be written");
+    let previous_amber = std::env::var_os("CARGO_BIN_EXE_amber");
+    let previous_controller = std::env::var_os("CARGO_BIN_EXE_amber-site-controller");
+    unsafe {
+        std::env::set_var("CARGO_BIN_EXE_amber", &amber);
+        std::env::remove_var("CARGO_BIN_EXE_amber-site-controller");
+    }
+
+    let command = site_controller_command_from(&current)
+        .expect("site controller command should fall back to amber");
+    assert_eq!(command.executable, amber);
+    assert_eq!(command.prefix_args, vec!["run-site-controller"]);
+
+    match previous_amber {
+        Some(value) => unsafe { std::env::set_var("CARGO_BIN_EXE_amber", value) },
+        None => unsafe { std::env::remove_var("CARGO_BIN_EXE_amber") },
+    }
+    match previous_controller {
+        Some(value) => unsafe { std::env::set_var("CARGO_BIN_EXE_amber-site-controller", value) },
+        None => unsafe { std::env::remove_var("CARGO_BIN_EXE_amber-site-controller") },
+    }
 }
 
 #[test]
@@ -623,7 +815,7 @@ fn prepare_dynamic_compose_child_artifact_keeps_only_child_owned_services() {
                             protocol: MeshProtocol::Http,
                             http_plugins: Vec::new(),
                             target: InboundTarget::External {
-                                url_env: "AMBER_FRAMEWORK_COMPONENT_CCS_URL".to_string(),
+                                url_env: "AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL".to_string(),
                                 optional: false,
                             },
                             allowed_issuers: vec!["/compose_admin".to_string()],
@@ -636,7 +828,7 @@ fn prepare_dynamic_compose_child_artifact_keeps_only_child_owned_services() {
                             protocol: MeshProtocol::Http,
                             http_plugins: Vec::new(),
                             target: InboundTarget::External {
-                                url_env: "AMBER_FRAMEWORK_COMPONENT_CCS_URL".to_string(),
+                                url_env: "AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL".to_string(),
                                 optional: false,
                             },
                             allowed_issuers: vec!["/job/root".to_string()],
@@ -767,6 +959,8 @@ x-amber:
             router_public_key_b64: Some(
                 base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
             ),
+            site_controller_pid: None,
+            site_controller_url: None,
             last_error: None,
         },
     )
@@ -816,7 +1010,7 @@ x-amber:
     .expect("compose subnet assignment should be idempotent");
 
     prepare_dynamic_compose_child_artifact(
-        &SiteActuatorPlan {
+        &SiteControllerRuntimePlan {
             schema: SITE_PLAN_SCHEMA.to_string(),
             version: SITE_PLAN_VERSION,
             run_id: "run-123".to_string(),
@@ -1196,7 +1390,7 @@ x-amber:
     .expect("site compose artifact should be written");
 
     prepare_dynamic_compose_child_artifact(
-        &SiteActuatorPlan {
+        &SiteControllerRuntimePlan {
             schema: SITE_PLAN_SCHEMA.to_string(),
             version: SITE_PLAN_VERSION,
             run_id: "run-123".to_string(),
@@ -1346,7 +1540,7 @@ x-amber:
 
 #[test]
 fn dynamic_route_issuer_grants_include_component_provide_inputs() {
-    let issuers = dynamic_route_issuer_grants(&[SiteActuatorChildRecord {
+    let issuers = dynamic_route_issuer_grants(&[SiteControllerRuntimeChildRecord {
         child_id: 7,
         artifact_root: "/tmp/child".to_string(),
         assigned_components: vec!["/sibling".to_string()],
@@ -1647,7 +1841,7 @@ fn filter_dynamic_mesh_provision_plan_keeps_only_child_owned_router_routes() {
                                 protocol: MeshProtocol::Http,
                                 http_plugins: Vec::new(),
                                 target: InboundTarget::External {
-                                    url_env: "AMBER_FRAMEWORK_COMPONENT_CCS_URL".to_string(),
+                                    url_env: "AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL".to_string(),
                                     optional: false,
                                 },
                                 allowed_issuers: vec!["/vm_admin".to_string()],
@@ -1660,7 +1854,7 @@ fn filter_dynamic_mesh_provision_plan_keeps_only_child_owned_router_routes() {
                                 protocol: MeshProtocol::Http,
                                 http_plugins: Vec::new(),
                                 target: InboundTarget::External {
-                                    url_env: "AMBER_FRAMEWORK_COMPONENT_CCS_URL".to_string(),
+                                    url_env: "AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL".to_string(),
                                     optional: false,
                                 },
                                 allowed_issuers: vec!["/job-compose/vm_helper/root".to_string()],
@@ -2023,7 +2217,7 @@ fn child_router_overlay_payload_synthesizes_dynamic_proxy_export_routes_for_dire
                             protocol: MeshProtocol::Http,
                             http_plugins: Vec::new(),
                             target: InboundTarget::External {
-                                url_env: "AMBER_FRAMEWORK_COMPONENT_CCS_URL".to_string(),
+                                url_env: "AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL".to_string(),
                                 optional: false,
                             },
                             allowed_issuers: vec!["/job/root".to_string()],
@@ -2057,7 +2251,7 @@ fn child_router_overlay_payload_synthesizes_dynamic_proxy_export_routes_for_dire
                             protocol: MeshProtocol::Http,
                             http_plugins: Vec::new(),
                             target: InboundTarget::External {
-                                url_env: "AMBER_FRAMEWORK_COMPONENT_CCS_URL".to_string(),
+                                url_env: "AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL".to_string(),
                                 optional: false,
                             },
                             allowed_issuers: vec!["/job/root".to_string()],
@@ -2112,9 +2306,9 @@ fn child_router_overlay_payload_synthesizes_dynamic_proxy_export_routes_for_dire
     .expect("mesh config should be written");
 
     let (_peers, inbound_routes) = child_router_overlay_payload(
-        &SiteActuatorPlan {
-            schema: SITE_ACTUATOR_PLAN_SCHEMA.to_string(),
-            version: SITE_ACTUATOR_PLAN_VERSION,
+        &SiteControllerRuntimePlan {
+            schema: SITE_CONTROLLER_RUNTIME_PLAN_SCHEMA.to_string(),
+            version: SITE_CONTROLLER_RUNTIME_PLAN_VERSION,
             run_id: "run-123".to_string(),
             mesh_scope: "mesh-scope-test".to_string(),
             run_root: temp.path().display().to_string(),
@@ -2314,7 +2508,7 @@ fn prepare_dynamic_kubernetes_child_artifact_keeps_router_overlay_local() {
                             protocol: MeshProtocol::Http,
                             http_plugins: Vec::new(),
                             target: InboundTarget::External {
-                                url_env: "AMBER_FRAMEWORK_COMPONENT_CCS_URL".to_string(),
+                                url_env: "AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL".to_string(),
                                 optional: false,
                             },
                             allowed_issuers: vec!["/kind_admin".to_string()],
@@ -2327,7 +2521,7 @@ fn prepare_dynamic_kubernetes_child_artifact_keeps_router_overlay_local() {
                             protocol: MeshProtocol::Http,
                             http_plugins: Vec::new(),
                             target: InboundTarget::External {
-                                url_env: "AMBER_FRAMEWORK_COMPONENT_CCS_URL".to_string(),
+                                url_env: "AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL".to_string(),
                                 optional: false,
                             },
                             allowed_issuers: vec!["/job/root".to_string()],
@@ -2488,14 +2682,16 @@ secretGenerator:
             router_public_key_b64: Some(
                 base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
             ),
+            site_controller_pid: None,
+            site_controller_url: None,
             last_error: None,
         },
     )
     .expect("site manager state should be written");
 
     prepare_dynamic_kubernetes_child_artifact(
-        &SiteActuatorPlan {
-            schema: SITE_ACTUATOR_PLAN_SCHEMA.to_string(),
+        &SiteControllerRuntimePlan {
+            schema: SITE_CONTROLLER_RUNTIME_PLAN_SCHEMA.to_string(),
             version: SITE_PLAN_VERSION,
             run_id: "run-123".to_string(),
             mesh_scope: "mesh-scope-test".to_string(),
@@ -2875,21 +3071,21 @@ metadata:
 fn cleanup_dynamic_site_children_removes_child_roots_and_clears_state() {
     let temp = tempdir().expect("tempdir should be created");
     let site_state_root = temp.path().join("state").join("direct_local");
-    let child_root = site_actuator_child_root_for_site(&site_state_root, 7);
+    let child_root = site_controller_runtime_child_root_for_site(&site_state_root, 7);
     fs::create_dir_all(child_root.join("artifact")).expect("child artifact dir should exist");
     fs::write(child_root.join("artifact").join("marker.txt"), "marker")
         .expect("child marker should be written");
     write_json(
-        &site_actuator_state_path(&site_state_root),
-        &SiteActuatorState {
-            schema: "amber.run.site_actuator_state".to_string(),
+        &site_controller_runtime_state_path(&site_state_root),
+        &SiteControllerRuntimeState {
+            schema: "amber.run.site_controller_runtime_state".to_string(),
             version: 1,
             run_id: "run-123".to_string(),
             site_id: "direct_local".to_string(),
             kind: SiteKind::Direct,
             children: BTreeMap::from([(
                 7,
-                SiteActuatorChildRecord {
+                SiteControllerRuntimeChildRecord {
                     child_id: 7,
                     artifact_root: child_root.join("artifact").display().to_string(),
                     assigned_components: Vec::new(),
@@ -2901,16 +3097,16 @@ fn cleanup_dynamic_site_children_removes_child_roots_and_clears_state() {
             )]),
         },
     )
-    .expect("site actuator state should be written");
+    .expect("site controller runtime state should be written");
 
     cleanup_dynamic_site_children(&site_state_root, SiteKind::Direct)
         .expect("dynamic site children should be cleaned");
 
-    let state: SiteActuatorState = read_json(
-        &site_actuator_state_path(&site_state_root),
-        "site actuator state",
+    let state: SiteControllerRuntimeState = read_json(
+        &site_controller_runtime_state_path(&site_state_root),
+        "site controller runtime state",
     )
-    .expect("site actuator state should be readable");
+    .expect("site controller runtime state should be readable");
     assert!(state.children.is_empty());
     assert!(!child_root.exists());
 }
@@ -3194,6 +3390,8 @@ fn test_launched_site_with_kind(kind: SiteKind) -> LaunchedSite {
             router_control: None,
             router_identity_id: None,
             router_public_key_b64: None,
+            site_controller_pid: None,
+            site_controller_url: None,
         },
         router_identity: MeshIdentityPublic {
             id: format!("/site/{kind:?}"),
@@ -3262,8 +3460,8 @@ fn prepare_kubernetes_site_artifact_for_apply_rewrites_runtime_artifact_state() 
 
     let mut launch_env = BTreeMap::new();
     launch_env.insert("AMBER_TEST_VALUE".to_string(), "fresh".to_string());
-    let plan = SiteActuatorPlan {
-        schema: SITE_ACTUATOR_PLAN_SCHEMA.to_string(),
+    let plan = SiteControllerRuntimePlan {
+        schema: SITE_CONTROLLER_RUNTIME_PLAN_SCHEMA.to_string(),
         version: SITE_PLAN_VERSION,
         run_id: "run-1234abcd".to_string(),
         mesh_scope: "mesh-scope-test".to_string(),
@@ -3352,7 +3550,6 @@ fn maybe_resolve_proxy_run_target_resolves_run_id_and_prefers_live_state() {
         plan_path: run_plan_path(&run_root).display().to_string(),
         source_plan_path: None,
         run_root: run_root.display().to_string(),
-        framework_control_state: None,
         observability: None,
         bridge_proxies: Vec::new(),
         sites: BTreeMap::from([(
@@ -3425,7 +3622,6 @@ fn maybe_resolve_proxy_run_target_requires_site_for_multi_site_run() {
         plan_path: run_plan_path(&run_root).display().to_string(),
         source_plan_path: None,
         run_root: run_root.display().to_string(),
-        framework_control_state: None,
         observability: None,
         bridge_proxies: Vec::new(),
         sites: BTreeMap::from([
@@ -3488,7 +3684,6 @@ async fn stop_run_forces_supervisor_shutdown_and_cleans_up() {
         plan_path: run_plan_path(&run_root).display().to_string(),
         source_plan_path: None,
         run_root: run_root.display().to_string(),
-        framework_control_state: None,
         observability: None,
         bridge_proxies: Vec::new(),
         sites: BTreeMap::from([(
@@ -3673,9 +3868,9 @@ async fn wait_for_kubernetes_site_router_ready_waits_for_live_discovery() {
 
     let started = Instant::now();
     wait_for_kubernetes_site_router_ready(
-        &SiteActuatorPlan {
-            schema: SITE_ACTUATOR_PLAN_SCHEMA.to_string(),
-            version: SITE_ACTUATOR_PLAN_VERSION,
+        &SiteControllerRuntimePlan {
+            schema: SITE_CONTROLLER_RUNTIME_PLAN_SCHEMA.to_string(),
+            version: SITE_CONTROLLER_RUNTIME_PLAN_VERSION,
             run_id: "run-test".to_string(),
             mesh_scope: "mesh.scope.test".to_string(),
             run_root: temp.path().display().to_string(),

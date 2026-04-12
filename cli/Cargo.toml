@@ -16,6 +16,7 @@ amber-proxy = { workspace = true }
 amber-resolver = { workspace = true }
 amber-router = { workspace = true }
 amber-scenario = { workspace = true }
+amber-site-controller = { workspace = true }
 amber-template = { workspace = true }
 axum = { version = "0.8.6", features = ["http1", "json", "tokio"] }
 base64 = { workspace = true }

@@ -1154,12 +1154,12 @@ pub(super) fn wrapper_manifest_url(authority_realm_id: usize, child_id: u64) -> 
 }
 
 pub(super) fn allocate_child_id(state: &mut FrameworkControlState) -> u64 {
-    state.next_child_id += 1;
+    state.next_child_id += state.id_stride.max(1);
     state.next_child_id
 }
 
 pub(super) fn allocate_tx_id(state: &mut FrameworkControlState) -> u64 {
-    state.next_tx_id += 1;
+    state.next_tx_id += state.id_stride.max(1);
     state.next_tx_id
 }
 
@@ -3048,17 +3048,22 @@ pub(super) struct ControlStateApp {
     pub(super) state_root: PathBuf,
     pub(super) mesh_scope: Arc<str>,
     pub(super) control_state_auth_token: Arc<str>,
+    pub(super) controller_plan: Arc<SiteControllerPlan>,
+    pub(super) peer_controllers: Arc<BTreeMap<String, SiteControllerPeerPlan>>,
     pub(super) authority_locks: Arc<Mutex<BTreeMap<usize, Arc<Mutex<()>>>>>,
-    pub(super) bridge_proxies: Arc<Mutex<BTreeMap<BridgeProxyKey, BridgeProxyHandle>>>,
+    pub(super) runtime: SharedSiteControllerRuntime,
 }
 
 #[derive(Clone)]
-pub(super) struct CcsApp {
-    pub(super) client: ReqwestClient,
-    pub(super) site_state_root: PathBuf,
-    pub(super) control_state_url: Arc<str>,
+pub(super) struct SiteControllerApp {
+    pub(super) control: ControlStateApp,
     pub(super) router_auth_token: Arc<str>,
-    pub(super) control_state_auth_token: Arc<str>,
+}
+
+#[derive(Clone)]
+pub(super) struct LocalDynamicCapabilityOriginApp {
+    pub(super) site_state_root: PathBuf,
+    pub(super) runtime: SharedSiteControllerRuntime,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -3085,4 +3090,8 @@ pub(super) struct SiteManagerStateView {
     pub(super) router_identity_id: Option<String>,
     #[serde(default)]
     pub(super) router_public_key_b64: Option<String>,
+    #[serde(default)]
+    pub(super) site_controller_pid: Option<u32>,
+    #[serde(default)]
+    pub(super) site_controller_url: Option<String>,
 }

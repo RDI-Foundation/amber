@@ -20,19 +20,19 @@ use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use super::*;
 
-const DYNAMIC_CAPS_CONTROL_HELD_LIST_PATH: &str = "/v1/control-state/dynamic-caps/held";
-const DYNAMIC_CAPS_CONTROL_HELD_DETAIL_PATH: &str = "/v1/control-state/dynamic-caps/held/detail";
-const DYNAMIC_CAPS_CONTROL_SHARE_PATH: &str = "/v1/control-state/dynamic-caps/share";
-const DYNAMIC_CAPS_CONTROL_INSPECT_REF_PATH: &str = "/v1/control-state/dynamic-caps/inspect-ref";
-const DYNAMIC_CAPS_CONTROL_REVOKE_PATH: &str = "/v1/control-state/dynamic-caps/revoke";
-const DYNAMIC_CAPS_CONTROL_RESOLVE_ORIGIN_PATH: &str =
-    "/v1/control-state/dynamic-caps/resolve-origin";
+const DYNAMIC_CAPS_CONTROLLER_HELD_LIST_PATH: &str = "/v1/controller/dynamic-caps/held";
+const DYNAMIC_CAPS_CONTROLLER_HELD_DETAIL_PATH: &str = "/v1/controller/dynamic-caps/held/detail";
+const DYNAMIC_CAPS_CONTROLLER_SHARE_PATH: &str = "/v1/controller/dynamic-caps/share";
+const DYNAMIC_CAPS_CONTROLLER_INSPECT_REF_PATH: &str = "/v1/controller/dynamic-caps/inspect-ref";
+const DYNAMIC_CAPS_CONTROLLER_REVOKE_PATH: &str = "/v1/controller/dynamic-caps/revoke";
+const DYNAMIC_CAPS_CONTROLLER_RESOLVE_ORIGIN_PATH: &str =
+    "/v1/controller/dynamic-caps/resolve-origin";
 const DYNAMIC_CAPS_HANDLE_PREFIX: &str = "/v1/handles/";
 const DYNAMIC_CAPS_HANDLE_ID_PREFIX: &str = "hdl_";
 const DYNAMIC_CAPS_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
-struct DynamicCapsControlEnv {
+struct DynamicCapsControllerEnv {
     control_url: String,
     control_auth_token: String,
     verify_key_raw: String,
@@ -184,7 +184,7 @@ impl DynamicCapsRuntime {
         let Some(listen_addr) = config.dynamic_caps_listen else {
             return Ok(None);
         };
-        let Some(control_env) = resolve_dynamic_caps_control_env()? else {
+        let Some(control_env) = resolve_dynamic_caps_controller_env()? else {
             tracing::warn!(
                 target: "amber.internal",
                 component_id = %config.identity.id,
@@ -294,7 +294,7 @@ impl DynamicCapsRuntime {
 
     async fn control_held_list(&self) -> Result<HeldListResponse, ProtocolErrorResponse> {
         self.control_post_json(
-            DYNAMIC_CAPS_CONTROL_HELD_LIST_PATH,
+            DYNAMIC_CAPS_CONTROLLER_HELD_LIST_PATH,
             &ControlDynamicHeldListRequest {
                 holder_component_id: self.component_id.to_string(),
             },
@@ -307,7 +307,7 @@ impl DynamicCapsRuntime {
         held_id: &str,
     ) -> Result<HeldEntryDetail, ProtocolErrorResponse> {
         self.control_post_json(
-            DYNAMIC_CAPS_CONTROL_HELD_DETAIL_PATH,
+            DYNAMIC_CAPS_CONTROLLER_HELD_DETAIL_PATH,
             &ControlDynamicHeldDetailRequest {
                 holder_component_id: self.component_id.to_string(),
                 held_id: held_id.to_string(),
@@ -321,7 +321,7 @@ impl DynamicCapsRuntime {
         source: DynamicCapabilityControlSourceRequest,
     ) -> Result<ControlDynamicResolveOriginResponse, ProtocolErrorResponse> {
         self.control_post_json(
-            DYNAMIC_CAPS_CONTROL_RESOLVE_ORIGIN_PATH,
+            DYNAMIC_CAPS_CONTROLLER_RESOLVE_ORIGIN_PATH,
             &ControlDynamicResolveOriginRequest {
                 holder_component_id: self.component_id.to_string(),
                 source,
@@ -1117,22 +1117,23 @@ fn required_dynamic_caps_env_var(
     })
 }
 
-fn resolve_dynamic_caps_control_env() -> Result<Option<DynamicCapsControlEnv>, RouterError> {
-    let control_url = nonempty_env_var(amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV);
-    let control_auth_token = nonempty_env_var(amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV);
+fn resolve_dynamic_caps_controller_env() -> Result<Option<DynamicCapsControllerEnv>, RouterError> {
+    let control_url = nonempty_env_var(amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV);
+    let control_auth_token =
+        nonempty_env_var(amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV);
     let verify_key_raw = nonempty_env_var(amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV);
     if control_url.is_none() && control_auth_token.is_none() && verify_key_raw.is_none() {
         return Ok(None);
     }
     let run_id =
         required_dynamic_caps_env_var(SCENARIO_RUN_ID_ENV, nonempty_env_var(SCENARIO_RUN_ID_ENV))?;
-    Ok(Some(DynamicCapsControlEnv {
+    Ok(Some(DynamicCapsControllerEnv {
         control_url: required_dynamic_caps_env_var(
-            amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV,
+            amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV,
             control_url,
         )?,
         control_auth_token: required_dynamic_caps_env_var(
-            amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV,
+            amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV,
             control_auth_token,
         )?,
         verify_key_raw: required_dynamic_caps_env_var(
@@ -1188,50 +1189,56 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dynamic_caps_control_env_disables_listener_when_control_env_is_absent() {
+    fn resolve_dynamic_caps_controller_env_disables_listener_when_control_env_is_absent() {
         let _guard = ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env lock");
         let _env = EnvGuard::replace([
-            (amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV, None),
-            (amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV, None),
+            (amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV, None),
+            (
+                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV,
+                None,
+            ),
             (amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, None),
             (SCENARIO_RUN_ID_ENV, Some("run-1234")),
         ]);
 
         assert!(
-            resolve_dynamic_caps_control_env()
+            resolve_dynamic_caps_controller_env()
                 .expect("dynamic caps env should resolve")
                 .is_none(),
-            "sidecars without dynamic caps control env should leave the listener disabled",
+            "sidecars without dynamic caps controller env should leave the listener disabled",
         );
     }
 
     #[test]
-    fn resolve_dynamic_caps_control_env_rejects_partial_configuration() {
+    fn resolve_dynamic_caps_controller_env_rejects_partial_configuration() {
         let _guard = ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env lock");
         let _env = EnvGuard::replace([
             (
-                amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV,
+                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV,
                 Some("http://127.0.0.1:24000"),
             ),
-            (amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV, None),
+            (
+                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV,
+                None,
+            ),
             (amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, None),
             (SCENARIO_RUN_ID_ENV, Some("run-1234")),
         ]);
 
-        let err = resolve_dynamic_caps_control_env().expect_err("partial env must fail");
+        let err = resolve_dynamic_caps_controller_env().expect_err("partial env must fail");
         assert!(
             matches!(
                 &err,
                 RouterError::InvalidConfig(message)
-                    if message.contains(amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV)
+                    if message.contains(amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV)
             ),
-            "partial dynamic caps control env should fail with the missing variable name: {err}",
+            "partial dynamic caps controller env should fail with the missing variable name: {err}",
         );
     }
 }
@@ -1367,7 +1374,7 @@ async fn dynamic_caps_service(
             };
             let response: ShareResponse = match state
                 .control_post_json(
-                    DYNAMIC_CAPS_CONTROL_SHARE_PATH,
+                    DYNAMIC_CAPS_CONTROLLER_SHARE_PATH,
                     &ControlDynamicShareRequest {
                         caller_component_id: state.component_id.to_string(),
                         source,
@@ -1425,7 +1432,7 @@ async fn dynamic_caps_service(
             };
             match state
                 .control_post_json::<_, RevokeResponse>(
-                    DYNAMIC_CAPS_CONTROL_REVOKE_PATH,
+                    DYNAMIC_CAPS_CONTROLLER_REVOKE_PATH,
                     &ControlDynamicRevokeRequest {
                         caller_component_id: state.component_id.to_string(),
                         target: source,
@@ -1453,7 +1460,7 @@ async fn dynamic_caps_service(
             }
             let response: InspectRefResponse = match state
                 .control_post_json(
-                    DYNAMIC_CAPS_CONTROL_INSPECT_REF_PATH,
+                    DYNAMIC_CAPS_CONTROLLER_INSPECT_REF_PATH,
                     &ControlDynamicInspectRefRequest {
                         holder_component_id: state.component_id.to_string(),
                         r#ref: request.r#ref,

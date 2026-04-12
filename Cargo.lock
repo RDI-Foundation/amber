@@ -110,6 +110,7 @@ dependencies = [
  "amber-resolver",
  "amber-router",
  "amber-scenario",
+ "amber-site-controller",
  "amber-template",
  "axum",
  "base64",
@@ -413,6 +414,30 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "amber-site-controller"
+version = "0.0.0"
+dependencies = [
+ "amber-compiler",
+ "amber-manifest",
+ "amber-mesh",
+ "amber-proxy",
+ "amber-resolver",
+ "amber-scenario",
+ "axum",
+ "base64",
+ "miette",
+ "regex",
+ "reqwest 0.13.2",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]

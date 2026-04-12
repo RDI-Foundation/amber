@@ -2,9 +2,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use amber_manifest::NetworkProtocol;
 use amber_mesh::{
-    DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV, DYNAMIC_CAPS_CONTROL_URL_ENV,
-    DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV,
-    FRAMEWORK_COMPONENT_CCS_URL_ENV, InboundRoute, InboundTarget, MeshConfigTemplate,
+    DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV,
+    FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV, InboundRoute, InboundTarget, MeshConfigTemplate,
     MeshIdentityTemplate, MeshPeerTemplate, MeshProtocol, OutboundRoute, component_route_id,
     framework_cap_instance_id, http_route_plugins_for_capability_kind, router_export_route_id,
     router_external_route_id, telemetry::SCENARIO_RUN_ID_ENV,
@@ -190,11 +189,11 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
     push_env_passthrough_once(&mut component_sidecar_env_passthrough, SCENARIO_RUN_ID_ENV);
     push_env_passthrough_once(
         &mut component_sidecar_env_passthrough,
-        DYNAMIC_CAPS_CONTROL_URL_ENV,
+        FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV,
     );
     push_env_passthrough_once(
         &mut component_sidecar_env_passthrough,
-        DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV,
+        FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV,
     );
     push_env_passthrough_once(
         &mut component_sidecar_env_passthrough,
@@ -499,10 +498,13 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             .filter(|binding| binding.capability.as_str() == "component")
             .collect::<Vec<_>>();
         if !framework_bindings.is_empty() {
-            push_env_passthrough_once(&mut router_env_passthrough, FRAMEWORK_COMPONENT_CCS_URL_ENV);
             push_env_passthrough_once(
                 &mut router_env_passthrough,
-                FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV,
+                FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV,
+            );
+            push_env_passthrough_once(
+                &mut router_env_passthrough,
+                FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV,
             );
         }
         for binding in framework_bindings {
@@ -533,7 +535,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 protocol: MeshProtocol::Http,
                 http_plugins: Vec::new(),
                 target: InboundTarget::External {
-                    url_env: FRAMEWORK_COMPONENT_CCS_URL_ENV.to_string(),
+                    url_env: FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV.to_string(),
                     optional: false,
                 },
                 allowed_issuers: vec![consumer_id],

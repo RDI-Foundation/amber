@@ -1177,6 +1177,91 @@ async fn revoke_route_overlay_allows_same_peer_id_with_new_key_after_cleanup() {
 }
 
 #[tokio::test]
+async fn revoke_route_overlay_cleans_up_stale_dynamic_peer_registration_by_id() {
+    let config = test_mesh_config();
+    let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
+    let trust = TrustBundle::new(&config).expect("trust");
+    let dynamic_route_overlays: DynamicRouteOverlays = Arc::new(RwLock::new(HashMap::new()));
+    let dynamic_issuers: DynamicIssuers = Arc::new(RwLock::new(HashMap::new()));
+    let original_peer = test_peer("dynamic-peer");
+    let stale_peer = test_peer("dynamic-peer");
+    let replacement_peer = test_peer("dynamic-peer");
+    assert_ne!(
+        original_peer.public_key, stale_peer.public_key,
+        "test peers should use distinct keys for the same peer id"
+    );
+    assert_ne!(
+        stale_peer.public_key, replacement_peer.public_key,
+        "replacement test peer should also use a distinct key"
+    );
+
+    apply_route_overlay(
+        "overlay-a",
+        ControlRouteOverlay {
+            peers: vec![ControlRouteOverlayPeer {
+                peer_id: original_peer.id.clone(),
+                peer_key: base64::engine::general_purpose::STANDARD
+                    .encode(original_peer.public_key),
+            }],
+            inbound_routes: vec![inbound_route(
+                "dynamic-route",
+                "dynamic",
+                MeshProtocol::Http,
+                InboundTarget::Local { port: 8080 },
+                &["dynamic-peer"],
+            )],
+        },
+        &trust,
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await
+    .expect("first overlay should apply");
+
+    trust
+        .remove_dynamic_peer_by_id("dynamic-peer")
+        .await
+        .expect("simulated drift cleanup should remove the original registration");
+    trust
+        .insert_peer(&stale_peer)
+        .await
+        .expect("simulated stale dynamic registration should install");
+
+    revoke_route_overlay(
+        "overlay-a",
+        &trust,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await;
+
+    apply_route_overlay(
+        "overlay-b",
+        ControlRouteOverlay {
+            peers: vec![ControlRouteOverlayPeer {
+                peer_id: replacement_peer.id.clone(),
+                peer_key: base64::engine::general_purpose::STANDARD
+                    .encode(replacement_peer.public_key),
+            }],
+            inbound_routes: vec![inbound_route(
+                "dynamic-route",
+                "dynamic",
+                MeshProtocol::Http,
+                InboundTarget::Local { port: 8080 },
+                &["dynamic-peer"],
+            )],
+        },
+        &trust,
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await
+    .expect("overlay revoke should clear a stale dynamic peer registration by id");
+}
+
+#[tokio::test]
 async fn apply_route_overlay_rejects_header_invalid_peer_id() {
     let config = test_mesh_config();
     let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
@@ -1714,7 +1799,7 @@ fn resolve_http_external_target_with_override_rejects_loopback_ip_literals() {
 fn resolve_http_external_target_with_override_accepts_framework_loopback_ip_literals() {
     let target = ExternalTarget {
         name: "component".to_string(),
-        url_env: amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV.to_string(),
+        url_env: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV.to_string(),
         optional: false,
         url_override: None,
     };

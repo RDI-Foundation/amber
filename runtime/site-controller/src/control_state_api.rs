@@ -1,11 +1,10 @@
 use base64::Engine as _;
-use serde_json::json;
 
 use super::{
     dynamic_caps,
     orchestration::{
-        ProtocolApiError, dynamic_capability_component_runtime_endpoint, load_site_actuator_plan,
-        load_site_manager_state, publish_dynamic_capability_origin,
+        ProtocolApiError, dynamic_capability_component_runtime_endpoint, load_site_manager_state,
+        load_site_runtime_plan, publish_dynamic_capability_origin,
     },
     planner::{ControlStateApp, protocol_error},
     state::persist_control_state_update,
@@ -182,11 +181,11 @@ async fn resolve_dynamic_capability_origin(
         })?;
     let holder_runtime =
         dynamic_capability_component_runtime_endpoint(app, &state, &request.holder_component_id)?;
-    let holder_plan = load_site_actuator_plan(app, &holder_runtime.site_id)?;
+    let holder_plan = load_site_runtime_plan(app, &holder_runtime.site_id)?;
     let origin_runtime =
         dynamic_capability_component_runtime_endpoint(app, &state, &root.holder_component_id)?;
     let origin_site_id = origin_runtime.site_id.clone();
-    let origin_plan = load_site_actuator_plan(app, &origin_site_id)?;
+    let origin_plan = load_site_runtime_plan(app, &origin_site_id)?;
     let origin_manager_state = load_site_manager_state(app, &origin_site_id)?;
     let origin_peer_id = origin_manager_state
         .router_identity_id
@@ -225,7 +224,8 @@ async fn resolve_dynamic_capability_origin(
             ))
         })
         .and_then(|router_mesh_addr| {
-            router_mesh_addr_for_consumer(origin_plan.kind, holder_plan.kind, router_mesh_addr)
+            app.runtime
+                .router_mesh_addr_for_consumer(origin_plan.kind, holder_plan.kind, router_mesh_addr)
                 .map_err(|err| {
                     ProtocolApiError::from(protocol_error(
                         ProtocolErrorCode::OriginUnavailable,
@@ -236,15 +236,14 @@ async fn resolve_dynamic_capability_origin(
                     ))
                 })
         })?;
-    let overlay_suffix = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&json!({
-            "holder_component_id": request.holder_component_id,
-            "root_authority_selector": resolved_source.root_authority_selector.clone(),
-        }))
-        .expect("dynamic capability origin overlay key should serialize"),
+    let overlay_id = dynamic_caps::origin_overlay_id(
+        &request.holder_component_id,
+        &resolved_source.root_authority_selector,
     );
-    let overlay_id = format!("dynamic-cap-origin-{overlay_suffix}");
-    let route_id = format!("dynamic-cap-origin-route-{overlay_suffix}");
+    let route_id = dynamic_caps::origin_route_id(
+        &request.holder_component_id,
+        &resolved_source.root_authority_selector,
+    );
     let publish = publish_dynamic_capability_origin(
         app,
         &origin_site_id,

@@ -307,7 +307,7 @@ const AMBER_PEER_ID_HEADER: &str = "x-amber-peer-id";
 const AMBER_FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
 
 fn framework_component_auth_header_value() -> Option<HeaderValue> {
-    env::var(amber_mesh::FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV)
+    env::var(amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
