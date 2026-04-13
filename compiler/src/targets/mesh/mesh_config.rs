@@ -506,45 +506,6 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             });
         }
 
-        let framework_bindings = mesh_plan
-            .framework_bindings()
-            .filter(|binding| binding.capability.as_str() == "component")
-            .collect::<Vec<_>>();
-        for binding in framework_bindings {
-            let slot_decl = scenario
-                .component(binding.consumer)
-                .slots
-                .get(binding.slot.as_str())
-                .expect("framework binding target slot should exist");
-            let consumer_id = identities_by_component
-                .get(&binding.consumer)
-                .expect("framework binding consumer identity missing")
-                .id
-                .clone();
-            let authority_moniker = scenario.component(binding.authority_realm).moniker.as_str();
-            let consumer_moniker = scenario.component(binding.consumer).moniker.as_str();
-            let route_id = framework_cap_instance_id(
-                authority_moniker,
-                consumer_moniker,
-                &binding.consumer.0.to_string(),
-                &binding.slot,
-                binding.capability.as_str(),
-            );
-            inbound.push(InboundRoute {
-                route_id,
-                capability: binding.capability.to_string(),
-                capability_kind: Some(slot_decl.decl.kind.to_string()),
-                capability_profile: slot_decl.decl.profile.clone(),
-                protocol: MeshProtocol::Http,
-                http_plugins: Vec::new(),
-                target: InboundTarget::External {
-                    url_env: FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV.to_string(),
-                    optional: false,
-                },
-                allowed_issuers: vec![consumer_id],
-            });
-        }
-
         let mesh_listen = format!("{}:{router_mesh_port}", options.router_mesh_listen_addr)
             .parse()
             .expect("mesh listen");
@@ -652,7 +613,7 @@ mod tests {
         sync::Arc,
     };
 
-    use amber_manifest::{ManifestDigest, ProvideDecl, SlotDecl};
+    use amber_manifest::{FrameworkCapabilityName, ManifestDigest, ProvideDecl, SlotDecl};
     use amber_scenario::{Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport};
     use serde_json::json;
 
@@ -661,6 +622,7 @@ mod tests {
         mesh::{
             plan::{
                 EndpointInfo, MeshPlan, ResolvedBinding, ResolvedComponentBinding, ResolvedExport,
+                ResolvedFrameworkBinding,
             },
             ports::allocate_local_route_ports,
         },
@@ -846,6 +808,96 @@ mod tests {
         assert!(
             unused_route.is_none(),
             "unused local routes must stay closed to the router and should not be emitted",
+        );
+    }
+
+    #[test]
+    fn build_mesh_config_plan_leaves_framework_component_routes_to_site_controller_overlays() {
+        let mut consumer = component(
+            0,
+            "/consumer",
+            json!({
+                "image": "consumer",
+                "entrypoint": ["consumer"],
+            }),
+        );
+        consumer.slots.insert(
+            "realm".to_string(),
+            serde_json::from_value::<SlotDecl>(json!({
+                "kind": "component",
+            }))
+            .expect("slot decl"),
+        );
+
+        let scenario = Scenario {
+            root: ComponentId(0),
+            components: vec![Some(consumer)],
+            bindings: Vec::new(),
+            exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
+        };
+
+        let mesh_plan = MeshPlan::new(
+            vec![ComponentId(0)],
+            vec![ResolvedBinding::Framework(ResolvedFrameworkBinding {
+                consumer: ComponentId(0),
+                slot: "realm".to_string(),
+                authority_realm: ComponentId(0),
+                capability: FrameworkCapabilityName::try_from("component")
+                    .expect("framework capability"),
+            })],
+            Vec::new(),
+            HashMap::new(),
+        );
+
+        let endpoint_plan = build_endpoint_plan(&scenario).expect("endpoint plan");
+        let route_ports = allocate_local_route_ports(&scenario, &endpoint_plan, &mesh_plan)
+            .expect("local route ports");
+        let mesh_ports_by_component = HashMap::from([(ComponentId(0), 23000)]);
+
+        let plan = build_mesh_config_plan(MeshConfigBuildInput {
+            scenario: &scenario,
+            mesh_plan: &mesh_plan,
+            route_ports: &route_ports,
+            mesh_ports_by_component: &mesh_ports_by_component,
+            router_ports: Some(RouterPorts {
+                mesh: 24000,
+                control: 24100,
+            }),
+            addressing: &StaticAddressing,
+            options: MeshConfigBuildOptions {
+                router_identity_id: "/site/test/router",
+                ..default_mesh_config_build_options()
+            },
+        })
+        .expect("mesh config plan");
+
+        let component_config = plan
+            .component_configs
+            .get(&ComponentId(0))
+            .expect("component config");
+        assert!(
+            component_config.outbound.iter().any(|route| {
+                route.slot == "realm"
+                    && route.capability == "component"
+                    && route.peer_id == "/site/test/router"
+                    && route.peer_addr == "router:24000"
+            }),
+            "framework.component consumers should still send requests to the local router",
+        );
+
+        let router_config = plan.router_config.expect("router config");
+        assert!(
+            router_config.inbound.iter().all(|route| {
+                route.capability != "component"
+                    || !matches!(
+                        route.target,
+                        InboundTarget::External { ref url_env, optional }
+                            if url_env == FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV && !optional
+                    )
+            }),
+            "static router mesh config must not bake in framework.component delivery; the site \
+             controller overlay owns those routes",
         );
     }
 }

@@ -236,6 +236,8 @@ pub struct FrameworkControlState {
     pub(crate) next_dynamic_capability_grant_id: u64,
     #[serde(default)]
     pub(crate) dynamic_capability_grants: BTreeMap<String, dynamic_caps::DynamicGrantRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) dynamic_capability_grant_authority_sites: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) dynamic_capability_journal: Vec<dynamic_caps::DynamicCapabilityJournalEntry>,
     #[serde(default)]
@@ -263,6 +265,8 @@ pub struct SiteControllerPlan {
     pub router_identity_id: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub peer_site_router_urls: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peer_router_identities: BTreeMap<String, amber_mesh::MeshIdentityPublic>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub peer_router_mesh_addrs: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -450,6 +454,7 @@ fn build_control_state_with_signing_seed(
         dynamic_capability_signing_seed_b64: dynamic_capability_signing_seed_b64.to_string(),
         next_dynamic_capability_grant_id: 0,
         dynamic_capability_grants: BTreeMap::new(),
+        dynamic_capability_grant_authority_sites: BTreeMap::new(),
         dynamic_capability_journal: Vec::new(),
         live_children: Vec::new(),
         pending_creates: Vec::new(),
@@ -498,6 +503,20 @@ pub(crate) fn localize_framework_control_state(
 
     let roots = dynamic_caps::derive_root_authorities(state)
         .map_err(|err| miette::miette!(err.message.clone()))?;
+    let local_grant_authority_sites = state
+        .dynamic_capability_grants
+        .iter()
+        .filter_map(|(grant_id, grant)| {
+            let authority_site_id = roots
+                .get(&dynamic_caps::root_authority_key(
+                    &grant.root_authority_selector,
+                ))
+                .and_then(|root| component_site_id(state, &root.holder_component_id).ok())?;
+            let holder_site_id = component_site_id(state, &grant.holder_component_id).ok()?;
+            (holder_site_id == site_id && authority_site_id != site_id)
+                .then_some((grant_id.clone(), authority_site_id))
+        })
+        .collect::<BTreeMap<_, _>>();
     let local_grant_ids = state
         .dynamic_capability_grants
         .iter()
@@ -514,6 +533,7 @@ pub(crate) fn localize_framework_control_state(
     state
         .dynamic_capability_grants
         .retain(|grant_id, _| local_grant_ids.contains(grant_id));
+    state.dynamic_capability_grant_authority_sites = local_grant_authority_sites;
     state.dynamic_capability_journal.retain(|entry| {
         entry
             .grant_id
@@ -536,6 +556,7 @@ fn child_authority_site_id(
         &authority_moniker,
         &format!("authority realm `{authority_moniker}`"),
     )
+    .or_else(|_| child_runtime_site_id(child))
 }
 
 fn component_site_id(
@@ -556,12 +577,12 @@ fn site_id_for_moniker(
     moniker: &str,
     subject: &str,
 ) -> std::result::Result<String, ProtocolErrorResponse> {
-    let assignments = live_assignment_map(state);
-    if let Some(site_id) = assignments.get(moniker) {
+    let components = planned_component_site_map(state);
+    if let Some(site_id) = components.get(moniker) {
         return Ok(site_id.clone());
     }
 
-    let descendant_sites = assignments
+    let descendant_sites = components
         .iter()
         .filter(|(assigned_moniker, _)| moniker_contains(assigned_moniker, moniker))
         .map(|(_, site_id)| site_id.clone())
@@ -584,6 +605,15 @@ fn site_id_for_moniker(
             )
         },
     ))
+}
+
+fn planned_component_site_map(state: &FrameworkControlState) -> BTreeMap<String, String> {
+    let mut components = state.placement.placement_components.clone();
+    components.extend(state.placement.assignments.clone());
+    for child in visible_child_records(state) {
+        components.extend(child.assignments.clone());
+    }
+    components
 }
 
 fn moniker_contains(candidate: &str, realm: &str) -> bool {
@@ -1204,6 +1234,7 @@ pub fn write_site_controller_plan(
     authority_url: &str,
     router_identity_id: &str,
     peer_site_router_urls: &BTreeMap<String, String>,
+    peer_router_identities: &BTreeMap<String, amber_mesh::MeshIdentityPublic>,
     peer_router_mesh_addrs: &BTreeMap<String, String>,
     local_router_control: Option<&str>,
     published_router_mesh_addr: Option<&str>,
@@ -1234,6 +1265,7 @@ pub fn write_site_controller_plan(
         authority_url: authority_url.to_string(),
         router_identity_id: router_identity_id.to_string(),
         peer_site_router_urls: peer_site_router_urls.clone(),
+        peer_router_identities: peer_router_identities.clone(),
         peer_router_mesh_addrs: peer_router_mesh_addrs.clone(),
         local_router_control: local_router_control.map(str::to_string),
         published_router_mesh_addr: published_router_mesh_addr.map(str::to_string),
@@ -1272,28 +1304,74 @@ pub(crate) fn site_id_for_authority_realm(
     )
 }
 
+pub(crate) fn framework_authority_site_id(
+    state: &FrameworkControlState,
+    record: &CapabilityInstanceRecord,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    if let Ok(site_id) = site_id_for_authority_realm(state, record.authority_realm_id) {
+        return Ok(site_id);
+    }
+    let authority = record.authority_realm_moniker.as_str();
+    let recipient = record.recipient_component_moniker.as_str();
+    if authority != "/"
+        && recipient != authority
+        && !recipient.starts_with(&format!("{authority}/"))
+    {
+        return Err(protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "framework.component recipient `{recipient}` is not inside authority realm \
+                 `{authority}`"
+            ),
+        ));
+    }
+    let assignments = planned_component_site_map(state);
+    let recipient_segments = recipient
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let authority_depth = authority
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count();
+    for depth in authority_depth..=recipient_segments.len() {
+        let moniker = if depth == 0 {
+            "/".to_string()
+        } else {
+            format!("/{}", recipient_segments[..depth].join("/"))
+        };
+        if let Some(site_id) = assignments.get(&moniker) {
+            return Ok(site_id.clone());
+        }
+    }
+    Err(protocol_error(
+        ProtocolErrorCode::ControlStateUnavailable,
+        &format!(
+            "framework.component authority realm `{authority}` has no assigned component on the \
+             path to recipient `{recipient}`"
+        ),
+    ))
+}
+
 pub(crate) fn site_id_for_dynamic_grant(
     state: &FrameworkControlState,
     grant_id: &str,
 ) -> std::result::Result<String, ProtocolErrorResponse> {
-    let grant = state
-        .dynamic_capability_grants
+    if let Some(grant) = state.dynamic_capability_grants.get(grant_id) {
+        return site_id_for_root_authority_selector(state, &grant.root_authority_selector);
+    }
+    state
+        .dynamic_capability_grant_authority_sites
         .get(grant_id)
+        .cloned()
         .ok_or_else(|| {
             protocol_error(
                 ProtocolErrorCode::UnknownSource,
                 &format!("dynamic grant `{grant_id}` is not live"),
             )
-        })?;
-    site_id_for_logical_component(state, &grant.holder_component_id).map_err(|_| {
-        protocol_error(
-            ProtocolErrorCode::ControlStateUnavailable,
-            &format!(
-                "dynamic grant `{grant_id}` holder `{}` is missing a live site assignment",
-                grant.holder_component_id
-            ),
-        )
-    })
+        })
 }
 
 pub(crate) fn site_id_for_logical_component(

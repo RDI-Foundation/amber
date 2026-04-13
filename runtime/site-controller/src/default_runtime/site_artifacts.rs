@@ -410,16 +410,19 @@ pub(super) fn local_kubernetes_peer_identities(
 pub(crate) fn collect_live_component_runtime_metadata(
     plan: &SiteControllerRuntimePlan,
 ) -> Result<BTreeMap<String, LiveComponentRuntimeMetadata>> {
-    let state: SiteControllerRuntimeState = read_json(
-        &site_controller_runtime_state_path(Path::new(&plan.site_state_root)),
-        "site controller runtime state",
-    )?;
-    let published_children = state
-        .children
-        .values()
-        .filter(|child| child.published)
-        .cloned()
-        .collect::<Vec<_>>();
+    let state_path = site_controller_runtime_state_path(Path::new(&plan.site_state_root));
+    let published_children = if state_path.is_file() {
+        let state: SiteControllerRuntimeState =
+            read_json(&state_path, "site controller runtime state")?;
+        state
+            .children
+            .values()
+            .filter(|child| child.published)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut components = match plan.kind {
         SiteKind::Direct => collect_direct_artifact_runtime_metadata(
             Path::new(&plan.artifact_dir),
@@ -731,7 +734,7 @@ fn collect_compose_artifact_runtime_metadata(
                             compose_project,
                             service_name,
                         ),
-                        socket_path: COMPONENT_CONTROL_SOCKET_PATH_IN_CONTAINER.to_string(),
+                        socket_path: COMPONENT_CONTROL_SOCKET_PATH_IN_VOLUME.to_string(),
                     }
                 }),
                 mesh_config,
@@ -743,6 +746,8 @@ fn collect_compose_artifact_runtime_metadata(
 
 #[cfg(test)]
 mod tests {
+    use amber_mesh::MeshConfigTemplate;
+
     use super::*;
 
     #[test]
@@ -782,6 +787,323 @@ mod tests {
         assert!(
             rendered.len() < 104,
             "vm runtime metadata should use the hashed short socket path: {rendered}",
+        );
+    }
+
+    #[test]
+    fn collect_direct_runtime_metadata_uses_hashed_sidecar_control_socket_path() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let artifact_root = temp.path().join("artifact");
+        let runtime_root = temp.path().join("runtime");
+        fs::create_dir_all(&artifact_root).expect("artifact root should create");
+        fs::create_dir_all(runtime_root.join("work/components/c1-provider"))
+            .expect("runtime work dir should create");
+
+        write_json(
+            &artifact_root.join("direct-plan.json"),
+            &serde_json::json!({
+                "version": "3",
+                "mesh_provision_plan": "mesh-provision-plan.json",
+                "startup_order": [1],
+                "components": [
+                    {
+                        "id": 1,
+                        "moniker": "/provider",
+                        "log_name": "provider",
+                        "sidecar": {
+                            "log_name": "provider-sidecar",
+                            "mesh_port": 24001,
+                            "mesh_config_path": "provider-mesh.json",
+                            "mesh_identity_path": "provider-identity.json",
+                        },
+                        "program": {
+                            "log_name": "provider-program",
+                            "work_dir": "work/components/c1-provider",
+                            "execution": {
+                                "kind": "direct",
+                                "entrypoint": ["/bin/true"],
+                            },
+                        },
+                    }
+                ],
+                "router": {
+                    "identity_id": "/site/direct/router",
+                    "mesh_port": 24000,
+                    "control_port": 24100,
+                    "control_socket_path": "router.sock",
+                    "mesh_config_path": "router-mesh.json",
+                    "mesh_identity_path": "router-identity.json"
+                }
+            }),
+        )
+        .expect("direct plan should write");
+        write_json(
+            &direct_runtime_state_path(&artifact_root),
+            &DirectRuntimeState {
+                component_mesh_port_by_id: BTreeMap::from([(1, 24001)]),
+                ..Default::default()
+            },
+        )
+        .expect("direct runtime state should write");
+        write_json(
+            &runtime_root.join("provider-mesh.json"),
+            &MeshConfigPublic {
+                identity: MeshIdentityPublic {
+                    id: "/provider".to_string(),
+                    public_key: [3; 32],
+                    mesh_scope: None,
+                },
+                mesh_listen: "127.0.0.1:24001".parse().expect("mesh listen"),
+                control_listen: None,
+                dynamic_caps_listen: None,
+                control_allow: None,
+                peers: Vec::new(),
+                inbound: Vec::new(),
+                outbound: Vec::new(),
+                transport: amber_mesh::TransportConfig::NoiseIk {},
+            },
+        )
+        .expect("provider mesh config should write");
+
+        let metadata = collect_direct_artifact_runtime_metadata(&artifact_root, &runtime_root)
+            .expect("direct metadata should load");
+        let provider = metadata.get("/provider").expect("provider metadata");
+        let Some(ControlEndpoint::Unix(path)) = provider.control_endpoint.as_ref() else {
+            panic!("direct metadata should expose a unix control socket");
+        };
+        assert_eq!(
+            path,
+            &amber_mesh::stable_temp_socket_path(
+                "amber-direct-control",
+                "sidecar-1",
+                &runtime_root.join("work/components/c1-provider"),
+            ),
+            "direct runtime metadata should use the hashed short sidecar control socket path",
+        );
+    }
+
+    #[test]
+    fn collect_vm_runtime_metadata_uses_hashed_sidecar_control_socket_path() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let artifact_root = temp.path().join("artifact");
+        let runtime_root = temp.path().join("runtime");
+        fs::create_dir_all(&artifact_root).expect("artifact root should create");
+        fs::create_dir_all(runtime_root.join("work/sidecars/vm-provider"))
+            .expect("runtime sidecar dir should create");
+
+        write_json(
+            &artifact_root.join("vm-plan.json"),
+            &serde_json::json!({
+                "version": "1",
+                "mesh_provision_plan": "mesh-provision-plan.json",
+                "startup_order": [1],
+                "runtime_addresses": {},
+                "components": [
+                    {
+                        "id": 1,
+                        "moniker": "/provider",
+                        "log_name": "vm-provider",
+                        "mesh_config_path": "provider-mesh.json",
+                        "mesh_identity_path": "provider-identity.json",
+                        "cpus": { "kind": "literal", "value": 1 },
+                        "memory_mib": { "kind": "literal", "value": 512 },
+                        "base_image": { "kind": "static", "path": "/tmp/base.img" },
+                        "egress": "none",
+                        "storage_mounts": [],
+                    }
+                ]
+            }),
+        )
+        .expect("vm plan should write");
+        write_vm_runtime_state(
+            &artifact_root,
+            &VmRuntimeState {
+                slot_ports_by_component: BTreeMap::new(),
+                slot_route_ports_by_component: BTreeMap::new(),
+                route_host_ports_by_component: BTreeMap::new(),
+                endpoint_forwards_by_component: BTreeMap::new(),
+                component_mesh_port_by_id: BTreeMap::from([(1, 24001)]),
+                router_mesh_port: None,
+            },
+        )
+        .expect("vm runtime state should write");
+        write_json(
+            &runtime_root.join("provider-mesh.json"),
+            &MeshConfigPublic {
+                identity: MeshIdentityPublic {
+                    id: "/provider".to_string(),
+                    public_key: [5; 32],
+                    mesh_scope: None,
+                },
+                mesh_listen: "127.0.0.1:24001".parse().expect("mesh listen"),
+                control_listen: None,
+                dynamic_caps_listen: None,
+                control_allow: None,
+                peers: Vec::new(),
+                inbound: Vec::new(),
+                outbound: Vec::new(),
+                transport: amber_mesh::TransportConfig::NoiseIk {},
+            },
+        )
+        .expect("provider mesh config should write");
+
+        let metadata = collect_vm_artifact_runtime_metadata(&artifact_root, &runtime_root)
+            .expect("vm metadata should load");
+        let provider = metadata.get("/provider").expect("provider metadata");
+        let Some(ControlEndpoint::Unix(path)) = provider.control_endpoint.as_ref() else {
+            panic!("vm metadata should expose a unix control socket");
+        };
+        assert_eq!(
+            path,
+            &amber_mesh::stable_temp_socket_path(
+                "amber-vm-control",
+                "sidecar-1",
+                &runtime_root.join("work/sidecars/vm-provider"),
+            ),
+            "vm runtime metadata should use the hashed short sidecar control socket path",
+        );
+    }
+
+    #[test]
+    fn collect_live_component_runtime_metadata_tolerates_missing_runtime_state_file() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let artifact_root = temp.path().join("artifact");
+        let runtime_root = temp.path().join("runtime");
+        let site_state_root = temp.path().join("state");
+        fs::create_dir_all(&artifact_root).expect("artifact root should create");
+        fs::create_dir_all(&runtime_root).expect("runtime root should create");
+        fs::create_dir_all(&site_state_root).expect("site state root should create");
+
+        write_json(
+            &artifact_root.join("direct-plan.json"),
+            &serde_json::json!({
+                "version": "3",
+                "mesh_provision_plan": "mesh-provision-plan.json",
+                "startup_order": [],
+                "components": [],
+                "router": {
+                    "identity_id": "/site/direct/router",
+                    "mesh_port": 24000,
+                    "control_port": 24100,
+                    "control_socket_path": "router.sock",
+                    "mesh_config_path": "router-mesh.json",
+                    "mesh_identity_path": "router-identity.json"
+                }
+            }),
+        )
+        .expect("direct plan should write");
+        write_json(
+            &direct_runtime_state_path(&artifact_root),
+            &DirectRuntimeState::default(),
+        )
+        .expect("direct runtime state should write");
+
+        let metadata = collect_live_component_runtime_metadata(&SiteControllerRuntimePlan {
+            schema: "amber.run.site_controller_runtime_plan".to_string(),
+            version: 1,
+            run_id: "run-123".to_string(),
+            mesh_scope: "amber.test".to_string(),
+            run_root: temp.path().display().to_string(),
+            site_id: "direct_local".to_string(),
+            kind: SiteKind::Direct,
+            router_identity_id: "/site/direct/router".to_string(),
+            local_router_control: None,
+            artifact_dir: artifact_root.display().to_string(),
+            site_state_root: site_state_root.display().to_string(),
+            listen_addr: "127.0.0.1:35000".parse().expect("listen addr should parse"),
+            storage_root: None,
+            runtime_root: Some(runtime_root.display().to_string()),
+            router_mesh_port: Some(24000),
+            compose_project: None,
+            kubernetes_namespace: None,
+            context: None,
+            observability_endpoint: None,
+            launch_env: BTreeMap::new(),
+        })
+        .expect("metadata collection should succeed without a runtime state file");
+
+        assert!(
+            metadata.is_empty(),
+            "static-only sites should not require a site controller runtime state file",
+        );
+    }
+
+    #[test]
+    fn compose_runtime_metadata_uses_volume_root_control_socket_path() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let artifact_root = temp.path().join("artifact");
+        fs::create_dir_all(artifact_root.join(".amber/mesh/provider-net"))
+            .expect("mesh artifact dir should create");
+
+        write_json(
+            &artifact_root.join("mesh-provision-plan.json"),
+            &MeshProvisionPlan {
+                version: amber_mesh::MESH_PROVISION_PLAN_VERSION.to_string(),
+                identity_seed: None,
+                existing_peer_identities: Vec::new(),
+                targets: vec![MeshProvisionTarget {
+                    kind: MeshProvisionTargetKind::Component,
+                    config: MeshConfigTemplate {
+                        identity: amber_mesh::MeshIdentityTemplate {
+                            id: "/provider".to_string(),
+                            mesh_scope: None,
+                        },
+                        mesh_listen: "127.0.0.1:24001".parse().expect("mesh listen"),
+                        control_listen: None,
+                        dynamic_caps_listen: None,
+                        control_allow: None,
+                        peers: Vec::new(),
+                        inbound: Vec::new(),
+                        outbound: Vec::new(),
+                        transport: amber_mesh::TransportConfig::NoiseIk {},
+                    },
+                    output: MeshProvisionOutput::Filesystem {
+                        dir: ".amber/mesh/provider-net".to_string(),
+                    },
+                }],
+            },
+        )
+        .expect("mesh provision plan should write");
+        write_json(
+            &artifact_root
+                .join(".amber/mesh/provider-net")
+                .join(MESH_CONFIG_FILENAME),
+            &MeshConfigPublic {
+                identity: MeshIdentityPublic {
+                    id: "/provider".to_string(),
+                    public_key: [9; 32],
+                    mesh_scope: None,
+                },
+                mesh_listen: "127.0.0.1:24001".parse().expect("mesh listen"),
+                control_listen: None,
+                dynamic_caps_listen: None,
+                control_allow: None,
+                peers: Vec::new(),
+                inbound: Vec::new(),
+                outbound: Vec::new(),
+                transport: amber_mesh::TransportConfig::NoiseIk {},
+            },
+        )
+        .expect("mesh config should write");
+
+        let components = collect_compose_artifact_runtime_metadata(&artifact_root, Some("demo"))
+            .expect("compose metadata should load");
+        let provider = components.get("/provider").expect("provider metadata");
+        let endpoint = provider
+            .control_endpoint
+            .as_ref()
+            .expect("compose metadata should expose a control endpoint");
+        let ControlEndpoint::VolumeSocket {
+            volume,
+            socket_path,
+        } = endpoint
+        else {
+            panic!("expected compose control endpoint to use a volume socket");
+        };
+        assert_eq!(volume, "demo_provider-net-control");
+        assert_eq!(
+            socket_path, "/router-control.sock",
+            "compose volume sockets must use the volume-root path, not the in-container mount path",
         );
     }
 }

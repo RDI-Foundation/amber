@@ -53,3 +53,4 @@ serde_yaml = { workspace = true }
 similar = "2.7.0"
 strip-ansi-escapes = "0.2"
 tempfile = { workspace = true }
+time = { version = "0.3.44", features = ["parsing"] }

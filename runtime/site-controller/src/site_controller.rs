@@ -22,13 +22,14 @@ use super::{
         resolve_dynamic_capability_origin_internal,
     },
     dynamic_caps::{
-        self, ControlDynamicHeldDetailRequest, ControlDynamicHeldListRequest,
+        self, ControlDynamicGrantAuthoritySyncRequest, ControlDynamicGrantAuthoritySyncResponse,
+        ControlDynamicHeldDetailRequest, ControlDynamicHeldListRequest,
         ControlDynamicInspectRefRequest, ControlDynamicResolveOriginRequest,
         ControlDynamicRevokeRequest, ControlDynamicShareRequest,
         InternalDynamicResolveOriginRequest,
     },
     http::{
-        authorize_framework_auth_header, cleanup_dynamic_bridge_proxies, healthz, read_json,
+        authorize_framework_auth_header, cleanup_dynamic_bridge_proxies, read_json,
         required_header, shutdown_signal,
     },
     orchestration::{
@@ -71,20 +72,40 @@ pub(crate) async fn run_site_controller(
         authority_locks: Arc::new(Mutex::new(BTreeMap::new())),
         runtime,
     };
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let app_state = SiteControllerApp {
         control: control.clone(),
         router_auth_token: Arc::<str>::from(plan.auth_token),
+        ready: ready.clone(),
     };
-    recover_control_state(&control).await?;
     let app = site_controller_router(app_state.clone());
     let listener = TcpListener::bind(plan.listen_addr)
         .await
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to bind site controller on {}", plan.listen_addr))?;
-    let serve_result = axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(shutdown_signal())
+    let serve_task = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .into_diagnostic()
+    });
+    if let Err(err) = recover_control_state(&control).await {
+        serve_task.abort();
+        let _ = serve_task.await;
+        let cleanup_result = cleanup_dynamic_bridge_proxies(&control).await;
+        return match cleanup_result {
+            Ok(()) => Err(err).wrap_err("site controller recovery failed"),
+            Err(cleanup_err) => Err(miette::miette!(
+                "site controller recovery failed: {err}\nbridge proxy cleanup failed: \
+                 {cleanup_err}"
+            )),
+        };
+    }
+    ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    let serve_result = serve_task
         .await
-        .into_diagnostic();
+        .into_diagnostic()
+        .wrap_err("site controller task failed")?;
     let cleanup_result = cleanup_dynamic_bridge_proxies(&control).await;
     match (serve_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -103,8 +124,8 @@ pub(crate) fn site_controller_router(app_state: SiteControllerApp) -> Router {
             "/v1/controller/dynamic-caps/mcp",
             super::control_state_mcp::service(app_state.clone()),
         )
-        .route("/", get(healthz))
-        .route("/healthz", get(healthz))
+        .route("/", get(controller_healthz))
+        .route("/healthz", get(controller_healthz))
         .route(
             SITE_CONTROLLER_STATE_PATH,
             get(get_site_controller_state_route),
@@ -167,6 +188,10 @@ pub(crate) fn site_controller_router(app_state: SiteControllerApp) -> Router {
             post(control_dynamic_share_route),
         )
         .route(
+            "/v1/controller/dynamic-caps/grant-authorities/sync",
+            post(control_dynamic_grant_authorities_sync_route),
+        )
+        .route(
             "/v1/controller/dynamic-caps/inspect-ref",
             post(control_dynamic_inspect_ref_route),
         )
@@ -179,6 +204,16 @@ pub(crate) fn site_controller_router(app_state: SiteControllerApp) -> Router {
             post(control_dynamic_resolve_origin_route),
         )
         .with_state(app_state)
+}
+
+async fn controller_healthz(State(app): State<SiteControllerApp>) -> Response {
+    let ready = app.ready.load(std::sync::atomic::Ordering::SeqCst);
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(json!({ "ok": ready }))).into_response()
 }
 
 async fn get_site_controller_state_route(
@@ -276,6 +311,15 @@ fn controller_local_only(headers: &HeaderMap) -> bool {
         .get(CONTROLLER_LOCAL_ONLY_HEADER)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value == "1")
+}
+
+fn ensure_controller_ready(app: &SiteControllerApp) -> std::result::Result<(), ProtocolApiError> {
+    if app.ready.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+    Err(ProtocolApiError::control_state_unavailable(
+        "site controller is still recovering",
+    ))
 }
 
 fn peer_site_router_url_for_site(
@@ -482,15 +526,37 @@ async fn local_share(
     app: &SiteControllerApp,
     request: ControlDynamicShareRequest,
 ) -> std::result::Result<amber_mesh::dynamic_caps::ShareResponse, ProtocolApiError> {
-    match control_state_api::execute_dynamic_caps_mutate(
+    let response = match control_state_api::execute_dynamic_caps_mutate(
         &app.control,
-        DynamicCapsMutateRequest::Share(request),
+        DynamicCapsMutateRequest::Share(request.clone()),
     )
     .await?
     {
-        DynamicCapsMutateResponse::Share(response) => Ok(response),
+        DynamicCapsMutateResponse::Share(response) => response,
         _ => unreachable!("share should return share response"),
+    };
+    if let Err(err) = sync_shared_grant_authority_site(app, &response).await {
+        if response.outcome == "created"
+            && let Some(grant_id) = response.grant_id.as_ref()
+            && let Err(rollback_err) = control_state_api::execute_dynamic_caps_mutate(
+                &app.control,
+                DynamicCapsMutateRequest::Revoke(ControlDynamicRevokeRequest {
+                    caller_component_id: request.caller_component_id,
+                    target: dynamic_caps::DynamicCapabilityControlSourceRequest::Grant {
+                        grant_id: grant_id.clone(),
+                    },
+                }),
+            )
+            .await
+        {
+            return Err(ProtocolApiError::control_state_unavailable(format!(
+                "{}; failed to roll back shared grant `{grant_id}` after sync failure: {}",
+                err.0.message, rollback_err.0.message
+            )));
+        }
+        return Err(err);
     }
+    Ok(response)
 }
 
 async fn local_revoke(
@@ -521,6 +587,71 @@ fn site_for_dynamic_source(
         }
     }
     .map_err(ProtocolApiError::from)
+}
+
+async fn sync_shared_grant_authority_site(
+    app: &SiteControllerApp,
+    response: &amber_mesh::dynamic_caps::ShareResponse,
+) -> std::result::Result<(), ProtocolApiError> {
+    let Some(grant_id) = response.grant_id.as_ref() else {
+        return Ok(());
+    };
+    let holder_site_id = {
+        let state = app.control.control_state.lock().await;
+        let grant = state
+            .dynamic_capability_grants
+            .get(grant_id)
+            .ok_or_else(|| {
+                ProtocolApiError::control_state_unavailable(format!(
+                    "dynamic capability share reported grant `{grant_id}` but it is missing from \
+                     site controller `{}` state",
+                    app.control.controller_plan.site_id
+                ))
+            })?;
+        site_id_for_logical_component(&state, &grant.holder_component_id).map_err(|err| {
+            ProtocolApiError::control_state_unavailable(format!(
+                "shared grant `{grant_id}` holder `{}` has no live site assignment: {}",
+                grant.holder_component_id, err.message
+            ))
+        })?
+    };
+    let authority_site_id = app.control.controller_plan.site_id.as_str();
+    if holder_site_id == authority_site_id {
+        return Ok(());
+    }
+    let _: ControlDynamicGrantAuthoritySyncResponse = peer_dynamic_caps_post_via_router(
+        app,
+        &holder_site_id,
+        "/v1/controller/dynamic-caps/grant-authorities/sync",
+        &ControlDynamicGrantAuthoritySyncRequest {
+            authority_sites: BTreeMap::from([(grant_id.clone(), authority_site_id.to_string())]),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn local_sync_dynamic_grant_authorities(
+    app: &SiteControllerApp,
+    request: ControlDynamicGrantAuthoritySyncRequest,
+) -> std::result::Result<ControlDynamicGrantAuthoritySyncResponse, ProtocolApiError> {
+    let synced = request.authority_sites.len();
+    {
+        let mut state = app.control.control_state.lock().await;
+        persist_control_state_update(
+            &mut state,
+            &app.control.state_path,
+            "dynamic capability grant authority sync",
+            |state| {
+                dynamic_caps::sync_dynamic_capability_grant_authority_sites(
+                    state,
+                    &request.authority_sites,
+                );
+                Ok(())
+            },
+        )?;
+    }
+    Ok(ControlDynamicGrantAuthoritySyncResponse { synced })
 }
 
 fn site_for_held_id(
@@ -554,10 +685,7 @@ fn framework_request_site_id(
     state: &FrameworkControlState,
     record: &CapabilityInstanceRecord,
 ) -> std::result::Result<String, ProtocolApiError> {
-    match site_id_for_authority_realm(state, record.authority_realm_id) {
-        Ok(site_id) => Ok(site_id),
-        Err(_) => Ok(record.recipient_site_id.clone()),
-    }
+    framework_authority_site_id(state, record).map_err(ProtocolApiError::from)
 }
 
 pub(super) async fn execute_site_controller_framework_inspect(
@@ -566,6 +694,7 @@ pub(super) async fn execute_site_controller_framework_inspect(
     state: &FrameworkControlState,
     request: FrameworkComponentInspectRequest,
 ) -> std::result::Result<FrameworkComponentInspectResponse, ProtocolApiError> {
+    ensure_controller_ready(app)?;
     let authority_site = framework_request_site_id(state, record)?;
     if authority_site != app.control.controller_plan.site_id {
         return Err(ProtocolApiError::control_state_unavailable(format!(
@@ -586,6 +715,7 @@ pub(super) async fn execute_site_controller_framework_mutate(
     state: &FrameworkControlState,
     request: ccs_api::FrameworkComponentMutateRequest,
 ) -> std::result::Result<ccs_api::FrameworkComponentMutateResponse, ProtocolApiError> {
+    ensure_controller_ready(app)?;
     let authority_site = framework_request_site_id(state, record)?;
     if authority_site != app.control.controller_plan.site_id {
         return Err(ProtocolApiError::control_state_unavailable(format!(
@@ -618,6 +748,7 @@ pub(super) async fn execute_site_controller_dynamic_caps_inspect(
     request: DynamicCapsInspectRequest,
     local_only: bool,
 ) -> std::result::Result<DynamicCapsInspectResponse, ProtocolApiError> {
+    ensure_controller_ready(app)?;
     match request {
         DynamicCapsInspectRequest::HeldList(request) => {
             if local_only {
@@ -730,6 +861,7 @@ pub(super) async fn execute_site_controller_dynamic_caps_mutate(
     request: DynamicCapsMutateRequest,
     local_only: bool,
 ) -> std::result::Result<DynamicCapsMutateResponse, ProtocolApiError> {
+    ensure_controller_ready(app)?;
     match request {
         DynamicCapsMutateRequest::Share(request) => {
             if local_only {
@@ -1080,6 +1212,17 @@ async fn control_dynamic_share_route(
         DynamicCapsMutateResponse::Share(response) => Ok(Json(response)),
         _ => unreachable!("share should return share response"),
     }
+}
+
+async fn control_dynamic_grant_authorities_sync_route(
+    State(app): State<SiteControllerApp>,
+    headers: HeaderMap,
+    Json(request): Json<ControlDynamicGrantAuthoritySyncRequest>,
+) -> std::result::Result<Json<ControlDynamicGrantAuthoritySyncResponse>, ProtocolApiError> {
+    authorize_framework_auth_header(&headers, app.control.control_state_auth_token.as_ref())?;
+    Ok(Json(
+        local_sync_dynamic_grant_authorities(&app, request).await?,
+    ))
 }
 
 async fn control_dynamic_inspect_ref_route(

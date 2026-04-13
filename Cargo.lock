@@ -133,6 +133,7 @@ dependencies = [
  "similar",
  "strip-ansi-escapes",
  "tempfile",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",

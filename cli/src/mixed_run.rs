@@ -57,13 +57,13 @@ mod supervisor;
 pub(crate) use self::{launch_bundle::*, outside_proxy::*, supervisor::*};
 
 const RECEIPT_SCHEMA: &str = "amber.run.receipt";
-const RECEIPT_VERSION: u32 = 3;
+const RECEIPT_VERSION: u32 = 4;
 const LAUNCH_BUNDLE_SCHEMA: &str = "amber.run.launch_bundle";
 const LAUNCH_BUNDLE_VERSION: u32 = 1;
 const SITE_STATE_SCHEMA: &str = "amber.run.site_state";
-const SITE_STATE_VERSION: u32 = 2;
+const SITE_STATE_VERSION: u32 = 3;
 const SITE_PLAN_SCHEMA: &str = "amber.run.site_supervisor_plan";
-const SITE_PLAN_VERSION: u32 = 1;
+const SITE_PLAN_VERSION: u32 = 2;
 const DESIRED_LINKS_SCHEMA: &str = "amber.run.desired_links";
 const DESIRED_LINKS_VERSION: u32 = 1;
 const OTLP_SINK_PLAN_SCHEMA: &str = "amber.run.observability_sink";
@@ -99,7 +99,11 @@ pub(crate) fn amber_cli_executable() -> Result<PathBuf> {
     let current = env::current_exe()
         .into_diagnostic()
         .wrap_err("failed to resolve amber executable path")?;
-    workspace_executable_from(&current, "CARGO_BIN_EXE_amber", "amber", true)
+    amber_cli_executable_from(&current)
+}
+
+fn amber_cli_executable_from(current: &Path) -> Result<PathBuf> {
+    workspace_executable_from(current, "CARGO_BIN_EXE_amber", "amber", true)
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +120,18 @@ pub(crate) fn site_controller_command() -> Result<SiteControllerCommand> {
 }
 
 fn site_controller_command_from(current: &Path) -> Result<SiteControllerCommand> {
+    if let Some(executable) = cargo_binary_override("CARGO_BIN_EXE_amber-site-controller") {
+        return Ok(SiteControllerCommand {
+            executable,
+            prefix_args: Vec::new(),
+        });
+    }
+    if launched_from_cargo_test_binary(current) {
+        return Ok(SiteControllerCommand {
+            executable: amber_cli_executable_from(current)?,
+            prefix_args: vec!["run-site-controller"],
+        });
+    }
     match workspace_executable_from(
         current,
         "CARGO_BIN_EXE_amber-site-controller",
@@ -139,11 +155,8 @@ fn workspace_executable_from(
     binary_name: &str,
     allow_current: bool,
 ) -> Result<PathBuf> {
-    if let Some(path) = env::var_os(env_var) {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
-        }
+    if let Some(path) = cargo_binary_override(env_var) {
+        return Ok(path);
     }
 
     let executable_name = format!("{binary_name}{}", std::env::consts::EXE_SUFFIX);
@@ -165,6 +178,20 @@ fn workspace_executable_from(
          next to {}",
         current.display()
     ))
+}
+
+fn cargo_binary_override(env_var: &str) -> Option<PathBuf> {
+    env::var_os(env_var)
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+}
+
+fn launched_from_cargo_test_binary(current: &Path) -> bool {
+    current
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("deps")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

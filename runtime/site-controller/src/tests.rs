@@ -51,6 +51,10 @@ fn direct_runtime_state_path(plan_root: &Path) -> PathBuf {
 #[derive(Clone, Default)]
 struct TestSiteControllerRuntime;
 
+fn ready_site_controller_flag() -> Arc<std::sync::atomic::AtomicBool> {
+    Arc::new(std::sync::atomic::AtomicBool::new(true))
+}
+
 impl SiteControllerRuntime for TestSiteControllerRuntime {
     fn cleanup<'a>(&'a self) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
@@ -1927,6 +1931,142 @@ async fn dynamic_grant_routes_to_holder_site_not_offered_site_order() {
     );
 }
 
+#[tokio::test]
+async fn dynamic_caps_cross_site_share_syncs_holder_authority_through_site_router() {
+    let dir = TempDir::new().expect("temp dir");
+    let base = compile_dynamic_caps_binding_state().await;
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([
+            (
+                "direct_a".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            ),
+            (
+                "direct_b".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            ),
+        ]),
+        defaults: PlacementDefaults {
+            path: Some("direct_a".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::from([
+            ("/provider".to_string(), "direct_a".to_string()),
+            ("/alice".to_string(), "direct_a".to_string()),
+            ("/bob".to_string(), "direct_b".to_string()),
+        ]),
+        dynamic_capabilities: None,
+        framework_children: None,
+    };
+    let mut authority_state = compile_control_state_from_ir_with_run_id(
+        base.base_scenario.clone(),
+        Some(&placement),
+        "test-run",
+    )
+    .await;
+    localize_framework_control_state(&mut authority_state, "direct_a")
+        .expect("authority site state should localize");
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &authority_state,
+        "components./alice",
+        &root_held_id_for(&authority_state, "components./alice"),
+    )
+    .expect("alice root source should resolve");
+    let dynamic_caps::DynamicCapabilitySourceKey::RootAuthority(root_authority_selector) =
+        alice_root
+    else {
+        panic!("alice root held id should resolve to a root authority selector");
+    };
+    let state_path = dir.path().join("control-state.json");
+    write_control_state(&state_path, &authority_state).expect("authority state should write");
+
+    let sync_requests = Arc::new(std::sync::Mutex::new(Vec::<
+        dynamic_caps::ControlDynamicGrantAuthoritySyncRequest,
+    >::new()));
+    let router = Router::new().route(
+        "/v1/controller/dynamic-caps/grant-authorities/sync",
+        axum::routing::post({
+            let sync_requests = sync_requests.clone();
+            move |headers: HeaderMap,
+                  Json(request): Json<dynamic_caps::ControlDynamicGrantAuthoritySyncRequest>| {
+                let sync_requests = sync_requests.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("1"),
+                        "cross-site share sync should stay local on the destination controller",
+                    );
+                    sync_requests
+                        .lock()
+                        .expect("sync request log poisoned")
+                        .push(request.clone());
+                    Json(dynamic_caps::ControlDynamicGrantAuthoritySyncResponse {
+                        synced: request.authority_sites.len(),
+                    })
+                }
+            }
+        }),
+    );
+    let (holder_base_url, _holder_handle) = spawn_test_router(router).await;
+
+    let mut app = test_control_state_app(&dir, authority_state, state_path);
+    let controller_plan = Arc::make_mut(&mut app.controller_plan);
+    controller_plan.site_id = "direct_a".to_string();
+    controller_plan.router_identity_id = "/site/direct_a/router".to_string();
+    controller_plan.peer_site_router_urls =
+        BTreeMap::from([("direct_b".to_string(), holder_base_url)]);
+    let controller_app = SiteControllerApp {
+        control: app,
+        router_auth_token: Arc::<str>::from("test-router-auth"),
+        ready: ready_site_controller_flag(),
+    };
+
+    let response = super::site_controller::execute_site_controller_dynamic_caps_mutate(
+        &controller_app,
+        super::control_state_api::DynamicCapsMutateRequest::Share(
+            dynamic_caps::ControlDynamicShareRequest {
+                caller_component_id: "components./alice".to_string(),
+                source: dynamic_caps::DynamicCapabilityControlSourceRequest::RootAuthority {
+                    root_authority_selector,
+                },
+                recipient_component_id: "components./bob".to_string(),
+                idempotency_key: None,
+                options: json!({}),
+            },
+        ),
+        false,
+    )
+    .await
+    .expect("authority site should create the share and sync it through the holder router");
+
+    let super::control_state_api::DynamicCapsMutateResponse::Share(response) = response else {
+        panic!("share should return a share response");
+    };
+    let grant_id = response
+        .grant_id
+        .clone()
+        .expect("cross-site share should create a concrete grant id");
+    assert_eq!(response.outcome, "created");
+
+    let sync_requests = sync_requests.lock().expect("sync request log poisoned");
+    assert_eq!(sync_requests.len(), 1, "expected exactly one holder sync");
+    assert_eq!(
+        sync_requests[0].authority_sites,
+        BTreeMap::from([(grant_id, "direct_a".to_string())]),
+        "the holder site should learn that direct_a remains authoritative for the shared grant",
+    );
+}
+
 async fn compile_empty_control_state() -> (TempDir, FrameworkControlState, PathBuf) {
     let dir = TempDir::new().expect("temp dir");
     let root_path = dir.path().join("root.json5");
@@ -2303,6 +2443,7 @@ fn test_control_state_app(
             authority_url: "http://127.0.0.1:0".to_string(),
             router_identity_id: format!("/site/{site_id}/router"),
             peer_site_router_urls: BTreeMap::new(),
+            peer_router_identities: BTreeMap::new(),
             peer_router_mesh_addrs: BTreeMap::new(),
             local_router_control: None,
             published_router_mesh_addr: Some("127.0.0.1:24000".to_string()),
@@ -2478,7 +2619,7 @@ fn normalize_dynamic_share_ref(value: &mut Value) {
 }
 
 const TEST_SITE_STATE_SCHEMA: &str = "amber.run.site_state";
-const TEST_SITE_STATE_VERSION: u32 = 2;
+const TEST_SITE_STATE_VERSION: u32 = 3;
 const TEST_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
 async fn with_test_timeout<T>(label: impl Into<String>, future: impl Future<Output = T>) -> T {
@@ -2827,6 +2968,7 @@ impl FrameworkMcpHarness {
         let controller_app = SiteControllerApp {
             control: app,
             router_auth_token: Arc::<str>::from(auth_token.clone()),
+            ready: ready_site_controller_flag(),
         };
         handles.push(tokio::spawn(async move {
             axum::serve(
@@ -3115,6 +3257,7 @@ async fn framework_component_rejects_stale_nonlocal_controller_delivery() {
             runtime: app.runtime.clone(),
         },
         router_auth_token: Arc::<str>::from("test-router-auth"),
+        ready: ready_site_controller_flag(),
     };
 
     let err = match super::site_controller::execute_site_controller_framework_inspect(
@@ -3136,6 +3279,31 @@ async fn framework_component_rejects_stale_nonlocal_controller_delivery() {
         "unexpected error: {}",
         err.0.message
     );
+}
+
+#[tokio::test]
+async fn framework_component_rejects_requests_while_controller_recovers() {
+    let (_dir, state, state_path, record) = compile_framework_binding_control_state().await;
+    let controller_app = SiteControllerApp {
+        control: test_control_state_app(&_dir, state.clone(), state_path),
+        router_auth_token: Arc::<str>::from("test-router-auth"),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let err = match super::site_controller::execute_site_controller_framework_inspect(
+        &controller_app,
+        &record,
+        &state,
+        FrameworkComponentInspectRequest::ListTemplates,
+    )
+    .await
+    {
+        Ok(_) => panic!("recovering controller should reject public framework requests"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.0.code, ProtocolErrorCode::ControlStateUnavailable);
+    assert_eq!(err.0.message, "site controller is still recovering");
 }
 
 #[tokio::test]
@@ -3279,6 +3447,205 @@ async fn framework_component_cross_site_routes_forward_through_site_routers() {
 }
 
 #[tokio::test]
+async fn framework_route_overlay_payload_uses_planned_peer_router_identities() {
+    let (dir, mut state, state_path, _) = compile_framework_binding_control_state().await;
+    state.placement.offered_sites = BTreeMap::from([
+        (
+            "authority".to_string(),
+            SiteDefinition {
+                kind: SiteKind::Direct,
+                context: None,
+            },
+        ),
+        (
+            "consumer".to_string(),
+            SiteDefinition {
+                kind: SiteKind::Direct,
+                context: None,
+            },
+        ),
+    ]);
+    state.placement.defaults = PlacementDefaults {
+        path: Some("authority".to_string()),
+        ..PlacementDefaults::default()
+    };
+    state.placement.placement_components = BTreeMap::from([
+        ("/".to_string(), "authority".to_string()),
+        ("/admin".to_string(), "consumer".to_string()),
+    ]);
+    state.placement.assignments = state.placement.placement_components.clone();
+    refresh_capability_instances(&mut state).expect("framework routes should refresh");
+    write_control_state(&state_path, &state).expect("state should write");
+    let app = test_control_state_app(&dir, state, state_path);
+
+    let mut consumer_plan = app.controller_plan.as_ref().clone();
+    consumer_plan.site_id = "consumer".to_string();
+    consumer_plan.router_identity_id = "/site/consumer/router".to_string();
+    consumer_plan.peer_router_identities = BTreeMap::from([(
+        "authority".to_string(),
+        MeshIdentityPublic {
+            id: "/site/authority/router".to_string(),
+            public_key: [9u8; 32],
+            mesh_scope: Some("test-mesh".to_string()),
+        },
+    )]);
+    consumer_plan.peer_router_mesh_addrs =
+        BTreeMap::from([("authority".to_string(), "127.0.0.1:24000".to_string())]);
+    let consumer_app = ControlStateApp {
+        controller_plan: Arc::new(consumer_plan),
+        ..app
+    };
+
+    let overlay = framework_route_overlay_payload(&consumer_app)
+        .await
+        .expect("consumer framework routes should materialize")
+        .expect("consumer site should get a framework route overlay");
+
+    assert!(
+        overlay
+            .peers
+            .iter()
+            .any(|peer| peer.id == "/site/authority/router" && peer.public_key == [9u8; 32]),
+        "consumer overlay should use the planned authority router identity without a peer \
+         controller round trip",
+    );
+}
+
+#[tokio::test]
+async fn recover_control_state_reconciles_framework_routes_without_live_peer_controllers() {
+    let (dir, mut state, state_path, _) = compile_framework_binding_control_state().await;
+    state.placement.offered_sites = BTreeMap::from([
+        (
+            "authority".to_string(),
+            SiteDefinition {
+                kind: SiteKind::Direct,
+                context: None,
+            },
+        ),
+        (
+            "consumer".to_string(),
+            SiteDefinition {
+                kind: SiteKind::Direct,
+                context: None,
+            },
+        ),
+    ]);
+    state.placement.defaults = PlacementDefaults {
+        path: Some("authority".to_string()),
+        ..PlacementDefaults::default()
+    };
+    state.placement.placement_components = BTreeMap::from([
+        ("/".to_string(), "authority".to_string()),
+        ("/admin".to_string(), "consumer".to_string()),
+    ]);
+    state.placement.assignments = state.placement.placement_components.clone();
+    refresh_capability_instances(&mut state).expect("framework routes should refresh");
+    write_control_state(&state_path, &state).expect("state should write");
+    let app = test_control_state_app(&dir, state, state_path);
+
+    let mut authority_plan = app.controller_plan.as_ref().clone();
+    authority_plan.site_id = "authority".to_string();
+    authority_plan.router_identity_id = "/site/authority/router".to_string();
+    authority_plan.peer_router_identities = BTreeMap::from([(
+        "consumer".to_string(),
+        MeshIdentityPublic {
+            id: "/site/consumer/router".to_string(),
+            public_key: [8u8; 32],
+            mesh_scope: Some("test-mesh".to_string()),
+        },
+    )]);
+    let authority_app = ControlStateApp {
+        controller_plan: Arc::new(authority_plan),
+        ..app
+    };
+
+    recover_control_state(&authority_app).await.expect(
+        "recovery should not require a live peer controller when peer router identities were \
+         already planned",
+    );
+}
+
+#[test]
+fn inject_site_controller_peer_router_routes_records_peer_router_identities() {
+    let temp = TempDir::new().expect("tempdir");
+    let artifact_root = temp.path();
+    write_json(
+        &artifact_root.join("mesh-provision-plan.json"),
+        &amber_mesh::MeshProvisionPlan {
+            version: amber_mesh::MESH_PROVISION_PLAN_VERSION.to_string(),
+            identity_seed: None,
+            existing_peer_identities: Vec::new(),
+            targets: vec![amber_mesh::MeshProvisionTarget {
+                kind: amber_mesh::MeshProvisionTargetKind::Router,
+                config: amber_mesh::MeshConfigTemplate {
+                    identity: amber_mesh::MeshIdentityTemplate {
+                        id: "/site/local/router".to_string(),
+                        mesh_scope: Some("test-mesh".to_string()),
+                    },
+                    mesh_listen: "127.0.0.1:24000".parse().expect("mesh listen"),
+                    control_listen: None,
+                    dynamic_caps_listen: None,
+                    control_allow: None,
+                    peers: Vec::new(),
+                    inbound: Vec::new(),
+                    outbound: Vec::new(),
+                    transport: TransportConfig::NoiseIk {},
+                },
+                output: amber_mesh::MeshProvisionOutput::Filesystem {
+                    dir: "mesh/router".to_string(),
+                },
+            }],
+        },
+    )
+    .expect("mesh provision plan should write");
+
+    inject_site_controller_peer_router_routes(
+        artifact_root,
+        "local",
+        &["/site/peer/router".to_string()],
+        &[SiteControllerPeerRouterRoute {
+            site_id: "peer".to_string(),
+            peer_router: MeshIdentityPublic {
+                id: "/site/peer/router".to_string(),
+                public_key: [5u8; 32],
+                mesh_scope: Some("test-mesh".to_string()),
+            },
+            peer_addr: "10.0.0.2:24000".to_string(),
+            listen_addr: "127.0.0.1".to_string(),
+            listen_port: 24123,
+        }],
+    )
+    .expect("site controller peer routes should inject");
+
+    let plan: amber_mesh::MeshProvisionPlan = read_json(
+        &artifact_root.join("mesh-provision-plan.json"),
+        "mesh provision plan",
+    )
+    .expect("mesh provision plan should read");
+    assert!(
+        plan.existing_peer_identities
+            .iter()
+            .any(|identity| identity.id == "/site/peer/router" && identity.public_key == [5u8; 32]),
+        "the injected router plan should carry peer router identities so startup does not need \
+         runtime discovery",
+    );
+    let router = plan
+        .targets
+        .iter()
+        .find(|target| matches!(target.kind, amber_mesh::MeshProvisionTargetKind::Router))
+        .expect("router target should remain present");
+    assert!(
+        router
+            .config
+            .outbound
+            .iter()
+            .any(|route| route.route_id == "site-controller:peer"
+                && route.peer_id == "/site/peer/router"),
+        "the router plan should include the site-controller forwarding route for the peer site",
+    );
+}
+
+#[tokio::test]
 async fn prepare_child_on_site_rejects_nonlocal_site_plan() {
     let dir = TempDir::new().expect("temp dir");
     let root_path = dir.path().join("root.json5");
@@ -3361,6 +3728,7 @@ impl DynamicCapsMcpHarness {
         let controller_app = SiteControllerApp {
             control: app,
             router_auth_token: Arc::<str>::from("test-router-auth"),
+            ready: ready_site_controller_flag(),
         };
         handles.push(tokio::spawn(async move {
             axum::serve(
@@ -3601,6 +3969,7 @@ async fn dynamic_caps_held_list_ignores_unrouted_offered_sites() {
     let controller_app = SiteControllerApp {
         control: test_control_state_app(&dir, state, state_path),
         router_auth_token: Arc::<str>::from("test-router-auth"),
+        ready: ready_site_controller_flag(),
     };
 
     let response = super::site_controller::execute_site_controller_dynamic_caps_inspect(
@@ -3623,6 +3992,229 @@ async fn dynamic_caps_held_list_ignores_unrouted_offered_sites() {
             .iter()
             .any(|entry| entry.entry_kind == HeldEntryKind::RootAuthority),
         "local held roots should still be returned",
+    );
+}
+
+#[tokio::test]
+async fn localize_framework_control_state_tracks_remote_grant_authority_sites() {
+    let base = compile_dynamic_caps_binding_state().await;
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([
+            (
+                "direct_a".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            ),
+            (
+                "direct_b".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            ),
+        ]),
+        defaults: PlacementDefaults {
+            path: Some("direct_a".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::from([
+            ("/provider".to_string(), "direct_a".to_string()),
+            ("/alice".to_string(), "direct_a".to_string()),
+            ("/bob".to_string(), "direct_b".to_string()),
+        ]),
+        dynamic_capabilities: None,
+        framework_children: None,
+    };
+    let mut state = compile_control_state_from_ir_with_run_id(
+        base.base_scenario.clone(),
+        Some(&placement),
+        "test-run",
+    )
+    .await;
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &state,
+        "components./alice",
+        &root_held_id_for(&state, "components./alice"),
+    )
+    .expect("alice root source should resolve");
+    let share = super::dynamic_caps::share_dynamic_capability(
+        &mut state,
+        "components./alice",
+        &alice_root,
+        "components./bob",
+        None,
+        &json!({}),
+    )
+    .expect("cross-site share should succeed");
+    let super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } = share else {
+        panic!("cross-site share should create a grant");
+    };
+
+    localize_framework_control_state(&mut state, "direct_b")
+        .expect("recipient site state should localize");
+
+    assert!(
+        state.dynamic_capability_grants.is_empty(),
+        "recipient site should not retain the authoritative grant record",
+    );
+    assert_eq!(
+        state
+            .dynamic_capability_grant_authority_sites
+            .get(&grant_id),
+        Some(&"direct_a".to_string()),
+        "recipient site should retain a lightweight authority index for delegated grants",
+    );
+}
+
+#[tokio::test]
+async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
+    let dir = TempDir::new().expect("temp dir");
+    let base = compile_dynamic_caps_binding_state().await;
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([
+            (
+                "direct_a".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            ),
+            (
+                "direct_b".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            ),
+        ]),
+        defaults: PlacementDefaults {
+            path: Some("direct_a".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::from([
+            ("/provider".to_string(), "direct_a".to_string()),
+            ("/alice".to_string(), "direct_a".to_string()),
+            ("/bob".to_string(), "direct_b".to_string()),
+        ]),
+        dynamic_capabilities: None,
+        framework_children: None,
+    };
+    let mut authoritative = compile_control_state_from_ir_with_run_id(
+        base.base_scenario.clone(),
+        Some(&placement),
+        "test-run",
+    )
+    .await;
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &authoritative,
+        "components./alice",
+        &root_held_id_for(&authoritative, "components./alice"),
+    )
+    .expect("alice root source should resolve");
+    let share = super::dynamic_caps::share_dynamic_capability(
+        &mut authoritative,
+        "components./alice",
+        &alice_root,
+        "components./bob",
+        None,
+        &json!({}),
+    )
+    .expect("cross-site share should succeed");
+    let (grant_id, shared_ref) = match share {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, r#ref } => {
+            (grant_id, r#ref)
+        }
+        _ => panic!("cross-site share should create a grant"),
+    };
+
+    let mut holder_state = authoritative.clone();
+    localize_framework_control_state(&mut holder_state, "direct_b")
+        .expect("holder site state should localize");
+    let state_path = dir.path().join("control-state.json");
+    write_control_state(&state_path, &holder_state).expect("holder state should write");
+
+    let hits = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let remote_grant_id = grant_id.clone();
+    let router = Router::new().route(
+        "/v1/controller/dynamic-caps/inspect-ref",
+        axum::routing::post({
+            let hits = hits.clone();
+            let remote_grant_id = remote_grant_id.clone();
+            move |headers: HeaderMap,
+                  Json(request): Json<dynamic_caps::ControlDynamicInspectRefRequest>| {
+                let hits = hits.clone();
+                let remote_grant_id = remote_grant_id.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("1"),
+                        "peer-routed inspect_ref should stay local on the destination controller",
+                    );
+                    hits.lock()
+                        .expect("inspect-ref hit log poisoned")
+                        .push(request.r#ref.clone());
+                    Json(amber_mesh::dynamic_caps::InspectRefResponse {
+                        state: HeldEntryState::Live,
+                        grant_id: remote_grant_id,
+                        holder_component_id: "components./bob".to_string(),
+                        descriptor: DescriptorIr {
+                            kind: "http".to_string(),
+                            label: "provider.http".to_string(),
+                            profile: None,
+                        },
+                        held_id: Some(super::dynamic_caps::held_id_for_grant("g_0000000000000000")),
+                    })
+                }
+            }
+        }),
+    );
+    let (authority_base_url, _authority_handle) = spawn_test_router(router).await;
+
+    let mut app = test_control_state_app(&dir, holder_state, state_path);
+    let controller_plan = Arc::make_mut(&mut app.controller_plan);
+    controller_plan.site_id = "direct_b".to_string();
+    controller_plan.router_identity_id = "/site/direct_b/router".to_string();
+    controller_plan.peer_site_router_urls =
+        BTreeMap::from([("direct_a".to_string(), authority_base_url)]);
+    let controller_app = SiteControllerApp {
+        control: app,
+        router_auth_token: Arc::<str>::from("test-router-auth"),
+        ready: ready_site_controller_flag(),
+    };
+
+    let response = super::site_controller::execute_site_controller_dynamic_caps_inspect(
+        &controller_app,
+        super::control_state_api::DynamicCapsInspectRequest::InspectRef(
+            dynamic_caps::ControlDynamicInspectRefRequest {
+                holder_component_id: "components./bob".to_string(),
+                r#ref: shared_ref.clone(),
+            },
+        ),
+        false,
+    )
+    .await
+    .expect("holder site should route inspect_ref through the authority site");
+
+    let super::control_state_api::DynamicCapsInspectResponse::InspectRef(response) = response
+    else {
+        panic!("inspect_ref should return inspect response");
+    };
+    assert_eq!(response.state, HeldEntryState::Live);
+    assert_eq!(response.grant_id, grant_id);
+    assert_eq!(
+        hits.lock()
+            .expect("inspect-ref hit log poisoned")
+            .as_slice(),
+        &[shared_ref],
+        "inspect_ref should route exactly once through the authority site router",
     );
 }
 
@@ -3900,6 +4492,68 @@ async fn dynamic_caps_mcp_matches_http_surface() {
     assert_eq!(
         serde_json::to_value(&http_revoked_detail).expect("held detail should serialize"),
         mcp_revoked_detail["data"],
+    );
+}
+
+#[tokio::test]
+async fn dynamic_caps_resolve_origin_tolerates_missing_static_runtime_state_file() {
+    let harness = DynamicCapsMcpHarness::start().await;
+
+    let held: amber_mesh::dynamic_caps::HeldListResponse = harness
+        .post_json(
+            "/v1/controller/dynamic-caps/held",
+            &dynamic_caps::ControlDynamicHeldListRequest {
+                holder_component_id: "components./alice".to_string(),
+            },
+        )
+        .await;
+    let root_held_id = held
+        .held
+        .iter()
+        .find(|entry| entry.entry_kind == HeldEntryKind::RootAuthority)
+        .map(|entry| entry.held_id.clone())
+        .expect("alice should have a root authority");
+    let detail: HeldEntryDetail = harness
+        .post_json(
+            "/v1/controller/dynamic-caps/held/detail",
+            &dynamic_caps::ControlDynamicHeldDetailRequest {
+                holder_component_id: "components./alice".to_string(),
+                held_id: root_held_id,
+            },
+        )
+        .await;
+    let selector = detail
+        .summary
+        .root_authority_selector
+        .clone()
+        .expect("root held detail should include a root authority selector");
+
+    fs::remove_file(
+        harness
+            ._dir
+            .path()
+            .join("state")
+            .join("direct_local")
+            .join("site-controller-runtime-state.json"),
+    )
+    .expect("fixture runtime state should be removable");
+
+    let resolve_origin: dynamic_caps::ControlDynamicResolveOriginResponse = harness
+        .post_json(
+            "/v1/controller/dynamic-caps/resolve-origin",
+            &dynamic_caps::ControlDynamicResolveOriginRequest {
+                holder_component_id: "components./alice".to_string(),
+                source: dynamic_caps::DynamicCapabilityControlSourceRequest::RootAuthority {
+                    root_authority_selector: selector,
+                },
+            },
+        )
+        .await;
+
+    assert!(
+        !resolve_origin.origin_peer_addr.is_empty(),
+        "static components should still resolve a live origin even when the dynamic runtime state \
+         file is absent",
     );
 }
 
@@ -4714,6 +5368,324 @@ async fn dynamic_framework_bindings_refresh_capability_instances_and_preserve_or
 }
 
 #[tokio::test]
+async fn delegated_cross_site_framework_requests_route_to_the_forwarded_authority_site() {
+    let dir = TempDir::new().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let parent_path = dir.path().join("parent.json5");
+    let worker_path = dir.path().join("worker.json5");
+    let root_worker_path = dir.path().join("root-worker.json5");
+    write_file(
+        &worker_path,
+        r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                realm: { kind: "component", optional: true }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["worker", "${slots.realm.url}"],
+                network: { endpoints: [{ name: "http", port: 8080 }] }
+              },
+              provides: { http: { kind: "http", endpoint: "http" } },
+              exports: { http: "provides.http" },
+            }
+            "#,
+    );
+    write_file(
+        &root_worker_path,
+        r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/echo",
+                args: ["root-worker"],
+                network: { endpoints: [{ name: "http", port: 8082 }] }
+              },
+              provides: { http: { kind: "http", endpoint: "http" } },
+              exports: { http: "provides.http" },
+            }
+            "#,
+    );
+    write_file(
+        &parent_path,
+        &format!(
+            r#"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  program: {{
+                    path: "/bin/echo",
+                    args: ["parent", "${{slots.realm.url}}"]
+                  }},
+                  child_templates: {{
+                    worker: {{
+                      manifest: "{worker}",
+                      bindings: {{
+                        realm: "slots.realm"
+                      }}
+                    }}
+                  }},
+                }}
+                "#,
+            worker = file_url(&worker_path),
+        ),
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  child_templates: {{
+                    root_worker: {{
+                      manifest: "{root_worker}"
+                    }}
+                  }},
+                  components: {{
+                    parent: "{parent}"
+                  }},
+                  bindings: [
+                    {{ to: "#parent.realm", from: "framework.component" }}
+                  ],
+                }}
+                "##,
+            root_worker = file_url(&root_worker_path),
+            parent = file_url(&parent_path),
+        ),
+    );
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([
+            (
+                "compose_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            ),
+            (
+                "direct_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            ),
+        ]),
+        defaults: PlacementDefaults {
+            path: Some("direct_local".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::from([
+            ("/parent".to_string(), "compose_local".to_string()),
+            ("/parent/delegate".to_string(), "direct_local".to_string()),
+            ("/sibling".to_string(), "compose_local".to_string()),
+        ]),
+        dynamic_capabilities: None,
+        framework_children: None,
+    };
+
+    let mut authoritative =
+        compile_control_state_with_placement(&root_path, Some(&placement)).await;
+    let authoritative_state_path = dir.path().join("authoritative-state.json");
+    write_control_state(&authoritative_state_path, &authoritative).expect("state should write");
+    let base = Scenario::try_from(authoritative.base_scenario.clone()).expect("base scenario");
+    let parent_id = base
+        .components_iter()
+        .find(|(_, component)| component.moniker.as_str() == "/parent")
+        .map(|(id, _)| id.0)
+        .expect("parent component should exist");
+    create_child(
+        &mut authoritative,
+        parent_id,
+        CreateChildRequest {
+            template: "worker".to_string(),
+            name: "delegate".to_string(),
+            manifest: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        },
+        &authoritative_state_path,
+    )
+    .await
+    .expect("delegate child should be created");
+
+    let mut direct_state = authoritative.clone();
+    localize_framework_control_state(&mut direct_state, "direct_local")
+        .expect("direct-local state should localize");
+    direct_state.placement.assignments =
+        BTreeMap::from([("/parent/delegate".to_string(), "direct_local".to_string())]);
+    let direct_record = direct_state
+        .capability_instances
+        .values()
+        .find(|record| record.recipient_component_moniker == "/parent/delegate")
+        .cloned()
+        .expect("delegate should have a forwarded framework capability instance");
+    assert_eq!(
+        framework_authority_site_id(&direct_state, &direct_record)
+            .expect("authority site should resolve through composite placement"),
+        "compose_local",
+        "delegated root authority should stay anchored at the forwarded realm site",
+    );
+    let router_public_key_b64 = base64::engine::general_purpose::STANDARD.encode([11u8; 32]);
+    let peer_router_attempts = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let peer_router = Router::new().route(
+        "/v1/controller/router-identity",
+        axum::routing::get({
+            let router_public_key_b64 = router_public_key_b64.clone();
+            let peer_router_attempts = peer_router_attempts.clone();
+            move || {
+                let router_public_key_b64 = router_public_key_b64.clone();
+                let peer_router_attempts = peer_router_attempts.clone();
+                async move {
+                    let mut attempts = peer_router_attempts
+                        .lock()
+                        .expect("peer router attempt log poisoned");
+                    *attempts += 1;
+                    if *attempts == 1 {
+                        return Err(StatusCode::BAD_GATEWAY);
+                    }
+                    Ok(Json(RouterIdentityResponse {
+                        id: "/site/direct_local/router".to_string(),
+                        public_key_b64: router_public_key_b64,
+                    }))
+                }
+            }
+        }),
+    );
+    let (peer_router_base_url, _peer_router_handle) = spawn_test_router(peer_router).await;
+    let direct_state_path = dir.path().join("direct-state.json");
+    write_control_state(&direct_state_path, &direct_state).expect("direct state should write");
+    let mut direct_plan = test_control_state_app(&dir, direct_state.clone(), direct_state_path)
+        .controller_plan
+        .as_ref()
+        .clone();
+    direct_plan.site_id = "direct_local".to_string();
+    direct_plan.kind = SiteKind::Direct;
+    direct_plan.peer_site_router_urls =
+        BTreeMap::from([("compose_local".to_string(), peer_router_base_url.clone())]);
+    direct_plan.peer_router_mesh_addrs =
+        BTreeMap::from([("compose_local".to_string(), "127.0.0.1:25000".to_string())]);
+    let direct_controller_app = SiteControllerApp {
+        control: ControlStateApp {
+            control_state: Arc::new(Mutex::new(direct_state.clone())),
+            controller_plan: Arc::new(direct_plan),
+            ..test_control_state_app(
+                &dir,
+                direct_state.clone(),
+                dir.path().join("direct-state.json"),
+            )
+        },
+        router_auth_token: Arc::<str>::from("test-router-auth"),
+        ready: ready_site_controller_flag(),
+    };
+    reconcile_local_framework_routes(&direct_controller_app.control)
+        .await
+        .expect("direct-local controller should publish delegated framework routes");
+    let stale_err = match super::site_controller::execute_site_controller_framework_mutate(
+        &direct_controller_app,
+        &direct_record,
+        &direct_state,
+        super::ccs_api::FrameworkComponentMutateRequest::CreateChild(CreateChildRequest {
+            template: "root_worker".to_string(),
+            name: "sibling".to_string(),
+            manifest: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        }),
+    )
+    .await
+    {
+        Ok(_) => panic!("the delegated caller site should reject stale local delivery"),
+        Err(err) => err,
+    };
+    assert_eq!(stale_err.0.code, ProtocolErrorCode::ControlStateUnavailable);
+    assert!(
+        stale_err
+            .0
+            .message
+            .contains("router framework route overlays are stale"),
+        "unexpected stale-delivery error: {}",
+        stale_err.0.message
+    );
+
+    let mut compose_state = authoritative;
+    localize_framework_control_state(&mut compose_state, "compose_local")
+        .expect("compose-local state should localize");
+    let compose_record = compose_state
+        .capability_instances
+        .values()
+        .find(|record| record.recipient_component_moniker == "/parent/delegate")
+        .cloned()
+        .expect("compose-local controller should retain the delegated capability instance");
+    let compose_state_path = dir.path().join("compose-state.json");
+    write_control_state(&compose_state_path, &compose_state).expect("compose state should write");
+    let mut compose_plan =
+        test_control_state_app(&dir, compose_state.clone(), compose_state_path.clone())
+            .controller_plan
+            .as_ref()
+            .clone();
+    compose_plan.site_id = "compose_local".to_string();
+    compose_plan.kind = SiteKind::Direct;
+    compose_plan.peer_site_router_urls =
+        BTreeMap::from([("direct_local".to_string(), peer_router_base_url)]);
+    compose_plan.peer_router_mesh_addrs =
+        BTreeMap::from([("direct_local".to_string(), "127.0.0.1:24000".to_string())]);
+    let compose_controller_app = SiteControllerApp {
+        control: ControlStateApp {
+            control_state: Arc::new(Mutex::new(compose_state.clone())),
+            controller_plan: Arc::new(compose_plan),
+            ..test_control_state_app(&dir, compose_state.clone(), compose_state_path)
+        },
+        router_auth_token: Arc::<str>::from("test-router-auth"),
+        ready: ready_site_controller_flag(),
+    };
+    let response = super::site_controller::execute_site_controller_framework_mutate(
+        &compose_controller_app,
+        &compose_record,
+        &compose_state,
+        super::ccs_api::FrameworkComponentMutateRequest::CreateChild(CreateChildRequest {
+            template: "root_worker".to_string(),
+            name: "sibling".to_string(),
+            manifest: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        }),
+    )
+    .await
+    .expect("forwarded realm create should succeed on the authority site controller");
+    let super::ccs_api::FrameworkComponentMutateResponse::CreateChild(response) = response else {
+        panic!("framework mutate response should be a create result");
+    };
+    assert_eq!(
+        response.child.selector, "children.sibling",
+        "the authority controller should create the child under the forwarded root realm",
+    );
+    let persisted = compose_controller_app
+        .control
+        .control_state
+        .lock()
+        .await
+        .clone();
+    assert!(
+        persisted
+            .live_children
+            .iter()
+            .any(|child| child.name == "sibling"
+                && child_runtime_site_id(child)
+                    .as_deref()
+                    .is_ok_and(|site_id| site_id == "compose_local")),
+        "the forwarded root child should be owned by the compose-local controller state"
+    );
+}
+
+#[tokio::test]
 async fn capability_instance_auth_and_snapshot_scope_are_enforced() {
     let dir = TempDir::new().expect("temp dir");
     let root_path = dir.path().join("root.json5");
@@ -5175,6 +6147,7 @@ fn shared_cross_site_link_is_retained_while_another_child_still_needs_it() {
         ),
         next_dynamic_capability_grant_id: 0,
         dynamic_capability_grants: BTreeMap::new(),
+        dynamic_capability_grant_authority_sites: BTreeMap::new(),
         dynamic_capability_journal: Vec::new(),
         capability_instances: BTreeMap::new(),
         journal: Vec::new(),
@@ -7533,6 +8506,7 @@ volumes:
         "/site/compose-site/router",
         &BTreeMap::new(),
         &BTreeMap::new(),
+        &BTreeMap::new(),
         Some("unix:///amber/control/router-control.sock"),
         Some("127.0.0.1:24000"),
         &site_state_root.join("site-controller-state.json"),
@@ -7587,6 +8561,14 @@ volumes:
         .get(serde_yaml::Value::String("volumes".to_string()))
         .and_then(serde_yaml::Value::as_sequence)
         .expect("controller service should mount volumes");
+    let extra_hosts = service
+        .get(serde_yaml::Value::String("extra_hosts".to_string()))
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("controller service should set extra_hosts");
+    let healthcheck = service
+        .get(serde_yaml::Value::String("healthcheck".to_string()))
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("controller service should define a healthcheck");
     assert!(volumes.iter().any(|value| {
         value.as_str()
             == Some(&format!(
@@ -7604,6 +8586,22 @@ volumes:
         volumes
             .iter()
             .any(|value| value.as_str() == Some("/var/run/docker.sock:/var/run/docker.sock"))
+    );
+    assert!(
+        extra_hosts
+            .iter()
+            .any(|value| value.as_str() == Some("host.docker.internal:host-gateway")),
+        "compose site controller should resolve host.docker.internal inside the site network",
+    );
+    let healthcheck_test = healthcheck
+        .get(serde_yaml::Value::String("test".to_string()))
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("controller healthcheck should define a test command");
+    assert!(
+        healthcheck_test.iter().any(|value| value
+            .as_str()
+            .is_some_and(|value| value.contains("/healthz"))),
+        "compose site controller healthcheck should wait for the controller readiness endpoint",
     );
 }
 
@@ -7652,6 +8650,7 @@ spec:
         SocketAddr::from(([0, 0, 0, 0], SITE_CONTROLLER_PORT)),
         &format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{SITE_CONTROLLER_PORT}"),
         "/site/kube-site/router",
+        &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
         Some("amber-router:24100"),
@@ -7759,6 +8758,7 @@ fn local_site_manager_state_uses_controller_plan_when_host_state_is_absent() {
         ),
         next_dynamic_capability_grant_id: 0,
         dynamic_capability_grants: BTreeMap::new(),
+        dynamic_capability_grant_authority_sites: BTreeMap::new(),
         dynamic_capability_journal: Vec::new(),
         live_children: Vec::new(),
         pending_creates: Vec::new(),

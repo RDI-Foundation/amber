@@ -54,6 +54,17 @@ pub fn inject_compose_site_controller(
         "user": "0:0",
         "command": ["--plan", plan_path.display().to_string()],
         "networks": networks,
+        "extra_hosts": ["host.docker.internal:host-gateway"],
+        "healthcheck": {
+            "test": [
+                "CMD-SHELL",
+                "wget -qO- http://127.0.0.1:4100/healthz | grep -q '\"ok\":true'"
+            ],
+            "interval": "2s",
+            "timeout": "2s",
+            "retries": 30,
+            "start_period": "1s"
+        },
         "volumes": [
             format!("{}:{}", plan.run_root, plan.run_root),
             format!(

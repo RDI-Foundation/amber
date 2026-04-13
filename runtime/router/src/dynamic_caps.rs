@@ -1079,6 +1079,7 @@ impl DynamicCapsRuntime {
                     Arc::from(Vec::<Arc<dyn HttpExchangePlugin>>::new())
                 },
                 route_id: upstream.route_id.clone(),
+                peer_id: Arc::<str>::from(self.config.identity.id.as_str()),
                 labels: HttpExchangeLabels {
                     kind: HttpEdgeKind::Binding,
                     emit_telemetry: true,

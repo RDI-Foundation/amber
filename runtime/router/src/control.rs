@@ -558,6 +558,7 @@ pub(super) async fn handle_inbound(
                     &mut session,
                     outbound,
                     route.route_id.clone().into(),
+                    remote_id.clone().into(),
                     plugins,
                     labels,
                 )
@@ -677,6 +678,7 @@ pub(super) async fn handle_outbound(
         proxy_local_http_to_noise(
             &mut outbound,
             route.route_id.clone().into(),
+            config.identity.id.clone().into(),
             stream,
             plugins,
             HttpExchangeLabels::outbound_from_route(config.identity.id.clone().into(), &route),

@@ -391,7 +391,9 @@ fn is_expected_exited_service(service: &ComposePsEntry) -> bool {
         return false;
     }
 
-    EXPECTED_EXITED_SERVICES.contains(&name) || name.ends_with("-egress-init")
+    EXPECTED_EXITED_SERVICES.contains(&name)
+        || name.ends_with("-egress-init")
+        || name.ends_with("-control-init")
 }
 
 fn is_expected_exited_state(state: &str) -> bool {
@@ -612,11 +614,32 @@ mod tests {
     }
 
     #[test]
+    fn compose_health_treats_successful_control_init_as_healthy() {
+        assert_eq!(
+            classify_compose_services(&[
+                service("controller", "running"),
+                service("c0-component-net-control-init", "exited (0)"),
+            ]),
+            ScenarioHealth::Healthy
+        );
+    }
+
+    #[test]
     fn compose_health_treats_failed_egress_init_as_failed() {
         assert_eq!(
             classify_compose_services(&[service("c0-component-net-egress-init", "exited (1)")]),
             ScenarioHealth::Failed(
                 "service c0-component-net-egress-init is exited (1)".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn compose_health_treats_failed_control_init_as_failed() {
+        assert_eq!(
+            classify_compose_services(&[service("c0-component-net-control-init", "exited (1)")]),
+            ScenarioHealth::Failed(
+                "service c0-component-net-control-init is exited (1)".to_string()
             )
         );
     }

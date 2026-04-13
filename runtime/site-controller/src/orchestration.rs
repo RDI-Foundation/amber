@@ -289,13 +289,30 @@ async fn peer_router_identity_for_overlay(
     app: &ControlStateApp,
     site_id: &str,
 ) -> std::result::Result<MeshPeer, ProtocolErrorResponse> {
+    if let Some(identity) = app.controller_plan.peer_router_identities.get(site_id) {
+        return Ok(MeshPeer {
+            id: identity.id.clone(),
+            public_key: identity.public_key,
+        });
+    }
     let site_app = SiteControllerApp {
         control: app.clone(),
         router_auth_token: app.control_state_auth_token.clone(),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
-    let identity = super::site_controller::peer_router_identity_via_router(&site_app, site_id)
-        .await
-        .map_err(|err| err.0)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let identity = loop {
+        match super::site_controller::peer_router_identity_via_router(&site_app, site_id).await {
+            Ok(identity) => break identity,
+            Err(err)
+                if err.0.code == ProtocolErrorCode::ControlStateUnavailable
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => return Err(err.0),
+        }
+    };
     Ok(MeshPeer {
         id: identity.id,
         public_key: identity.public_key,
@@ -626,7 +643,7 @@ pub(super) async fn framework_route_overlay_payload(
     };
 
     for record in state.capability_instances.values() {
-        let authority_site_id = site_id_for_authority_realm(&state, record.authority_realm_id)?;
+        let authority_site_id = framework_authority_site_id(&state, record)?;
         let consumer_site_id = record.recipient_site_id.clone();
 
         if authority_site_id == local_site_id {
@@ -655,6 +672,16 @@ pub(super) async fn framework_route_overlay_payload(
         }
 
         let authority_peer = peer_router_identity_for_overlay(app, &authority_site_id).await?;
+        let route = framework_component_route(
+            record,
+            vec![record.recipient_peer_id.clone()],
+            InboundTarget::MeshForward {
+                peer_addr: peer_router_mesh_addr_for_overlay(app, &authority_site_id)?,
+                peer_id: authority_peer.id.clone(),
+                route_id: record.route_id.clone(),
+                capability: record.capability.clone(),
+            },
+        );
         if !overlay
             .peers
             .iter()
@@ -662,16 +689,7 @@ pub(super) async fn framework_route_overlay_payload(
         {
             overlay.peers.push(authority_peer.clone());
         }
-        overlay.inbound_routes.push(framework_component_route(
-            record,
-            vec![record.recipient_peer_id.clone()],
-            InboundTarget::MeshForward {
-                peer_addr: peer_router_mesh_addr_for_overlay(app, &authority_site_id)?,
-                peer_id: authority_peer.id,
-                route_id: record.route_id.clone(),
-                capability: record.capability.clone(),
-            },
-        ));
+        overlay.inbound_routes.push(route);
     }
 
     if overlay.peers.is_empty() && overlay.inbound_routes.is_empty() {
@@ -1351,7 +1369,7 @@ fn site_controller_child_needs_prepare(err: &ProtocolErrorResponse, child_id: u6
     err.code == ProtocolErrorCode::PublishFailed
         && err
             .message
-            .contains(&format!("site controller child {child_id} is not prepared"))
+            .contains(&format!("child {child_id} is not prepared"))
 }
 
 pub(super) async fn publish_child_on_site_with_prepare_retry(

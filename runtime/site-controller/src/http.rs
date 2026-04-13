@@ -12,10 +12,6 @@ use super::{
     orchestration::ProtocolApiError, planner::ControlStateApp, state::FRAMEWORK_AUTH_HEADER, *,
 };
 
-pub(super) async fn healthz() -> Json<serde_json::Value> {
-    Json(json!({ "ok": true }))
-}
-
 pub(super) async fn cleanup_dynamic_bridge_proxies(app: &ControlStateApp) -> Result<()> {
     app.runtime.cleanup().await
 }

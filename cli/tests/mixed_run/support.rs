@@ -29,6 +29,7 @@ use cloud_image_support::default_host_arch_cloud_image_filename;
 use outputs_root_support::cli_test_outputs_root;
 use serde_json::{Value, json};
 use target_dir_support::cargo_target_dir;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub(crate) use workspace_root_support::workspace_root;
 
 const COMMON_HTTP_APP: &str = r#"import json
@@ -630,7 +631,7 @@ pub(crate) fn ensure_docker_image(tag: &str, dockerfile: &Path) {
         return;
     }
 
-    if image_platform_opt(tag).is_some() {
+    if docker_image_is_fresh(tag, dockerfile) {
         return;
     }
 
@@ -662,6 +663,92 @@ pub(crate) fn ensure_docker_image(tag: &str, dockerfile: &Path) {
     }
     let status = last_status.expect("docker build should have produced a status");
     panic!("docker build failed for {tag} after retries with status {status}");
+}
+
+fn docker_image_is_fresh(tag: &str, dockerfile: &Path) -> bool {
+    if image_platform_opt(tag).is_none() {
+        return false;
+    }
+    let Some(image_created) = docker_image_created_at(tag) else {
+        return false;
+    };
+    !source_is_newer_than_image(
+        image_created,
+        newest_internal_image_input_mtime(&workspace_root(), dockerfile),
+    )
+}
+
+fn docker_image_created_at(tag: &str) -> Option<SystemTime> {
+    let output = Command::new("docker")
+        .arg("image")
+        .arg("inspect")
+        .arg("-f")
+        .arg("{{.Created}}")
+        .arg(tag)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let created = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let timestamp = OffsetDateTime::parse(&created, &Rfc3339).ok()?;
+    Some(UNIX_EPOCH + Duration::from_secs(timestamp.unix_timestamp() as u64))
+}
+
+fn newest_internal_image_input_mtime(
+    workspace_root: &Path,
+    dockerfile: &Path,
+) -> Option<SystemTime> {
+    [
+        workspace_root.join("Cargo.toml"),
+        workspace_root.join("Cargo.lock"),
+        workspace_root.join("rust-toolchain.toml"),
+        workspace_root.join("cli"),
+        workspace_root.join("compiler"),
+        workspace_root.join("images"),
+        workspace_root.join("runtime"),
+        dockerfile.to_path_buf(),
+    ]
+    .into_iter()
+    .filter_map(|path| newest_path_mtime(&path))
+    .max()
+}
+
+fn newest_path_mtime(path: &Path) -> Option<SystemTime> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.is_file() {
+        return metadata.modified().ok();
+    }
+    if !metadata.is_dir() {
+        return None;
+    }
+
+    let mut newest = metadata.modified().ok();
+    let entries = fs::read_dir(path).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        let child = entry.path();
+        let child_name = child
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if child_name == "target" || child_name == ".git" {
+            continue;
+        }
+        if let Some(child_mtime) = newest_path_mtime(&child) {
+            newest = match newest {
+                Some(current) if current >= child_mtime => Some(current),
+                _ => Some(child_mtime),
+            };
+        }
+    }
+    newest
+}
+
+fn source_is_newer_than_image(
+    image_created: SystemTime,
+    newest_source: Option<SystemTime>,
+) -> bool {
+    newest_source.is_some_and(|source| source > image_created)
 }
 
 pub(crate) fn docker_supports_buildx() -> bool {
@@ -2157,4 +2244,26 @@ pub(crate) fn namespace_exists(namespace: &str, kubeconfig: &Path, context: &str
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_is_newer_than_image_detects_newer_sources() {
+        let image_created = UNIX_EPOCH + Duration::from_secs(10);
+        let newest_source = Some(UNIX_EPOCH + Duration::from_secs(11));
+        assert!(source_is_newer_than_image(image_created, newest_source));
+    }
+
+    #[test]
+    fn source_is_newer_than_image_ignores_older_or_missing_sources() {
+        let image_created = UNIX_EPOCH + Duration::from_secs(10);
+        assert!(!source_is_newer_than_image(
+            image_created,
+            Some(UNIX_EPOCH + Duration::from_secs(9))
+        ));
+        assert!(!source_is_newer_than_image(image_created, None));
+    }
 }

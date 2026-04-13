@@ -118,6 +118,16 @@ pub(crate) struct ControlDynamicShareRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ControlDynamicGrantAuthoritySyncRequest {
+    pub(crate) authority_sites: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ControlDynamicGrantAuthoritySyncResponse {
+    pub(crate) synced: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ControlDynamicInspectRefRequest {
     pub(crate) holder_component_id: String,
     pub(crate) r#ref: String,
@@ -1358,6 +1368,15 @@ pub(crate) fn share_dynamic_capability(
         grant_id,
         r#ref: dynamic_ref,
     })
+}
+
+pub(crate) fn sync_dynamic_capability_grant_authority_sites(
+    state: &mut FrameworkControlState,
+    authority_sites: &BTreeMap<String, String>,
+) {
+    state
+        .dynamic_capability_grant_authority_sites
+        .extend(authority_sites.clone());
 }
 
 fn caller_has_revoke_authority(

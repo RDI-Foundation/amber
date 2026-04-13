@@ -3285,6 +3285,7 @@ pub(super) struct ControlStateApp {
 pub(super) struct SiteControllerApp {
     pub(super) control: ControlStateApp,
     pub(super) router_auth_token: Arc<str>,
+    pub(super) ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]

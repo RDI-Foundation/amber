@@ -784,7 +784,10 @@ pub(super) async fn try_discover_site(
             try_discover_kubernetes_site(plan, runtime, stop_requested, run_root).await
         }
     }?;
-    if discovery.is_none() && plan.kind == SiteKind::Compose {
+    if discovery.is_none()
+        && plan.kind == SiteKind::Compose
+        && !compose_site_controller_started(plan)?
+    {
         runtime.site_started = false;
     }
     Ok(discovery)
@@ -826,6 +829,9 @@ pub(super) async fn try_discover_direct_site(
             Ok(None) | Err(_) => return Ok(None),
         };
         let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
+        if !local_site_controller_ready(plan, VM_LOCAL_TARGET_READY_TIMEOUT)? {
+            return Ok(None);
+        }
         return Ok(Some(RouterDiscovery {
             control_endpoint,
             router_identity,
@@ -867,6 +873,9 @@ pub(super) async fn try_discover_vm_site(
     };
     let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
     if !vm_component_targets_ready(plan, &artifact_dir)? {
+        return Ok(None);
+    }
+    if !local_site_controller_ready(plan, VM_LOCAL_TARGET_READY_TIMEOUT)? {
         return Ok(None);
     }
     Ok(Some(RouterDiscovery {
@@ -922,18 +931,127 @@ pub(super) fn mesh_config_local_targets_ready(path: &Path, timeout: Duration) ->
     Ok(true)
 }
 
+pub(super) fn local_site_controller_ready(
+    plan: &SiteSupervisorPlan,
+    timeout: Duration,
+) -> Result<bool> {
+    let Some(addr) = local_site_controller_addr(plan)? else {
+        return Ok(false);
+    };
+    Ok(wait_for_http_response(addr, timeout).is_ok())
+}
+
+pub(super) fn local_site_controller_addr(plan: &SiteSupervisorPlan) -> Result<Option<SocketAddr>> {
+    let Some(url) = plan.site_controller_url.as_deref() else {
+        return Ok(None);
+    };
+    let url = Url::parse(url)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid site controller url `{url}`"))?;
+    if url.scheme() != "http" {
+        return Ok(None);
+    }
+    let host = url.host_str().ok_or_else(|| {
+        miette::miette!(
+            "site controller url `{url}` for site `{}` is missing a host",
+            plan.site_id
+        )
+    })?;
+    let ip = match host {
+        "localhost" => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        _ => host.parse().into_diagnostic().wrap_err_with(|| {
+            format!(
+                "site controller url `{url}` for site `{}` has a non-IP host `{host}`",
+                plan.site_id
+            )
+        })?,
+    };
+    if !ip.is_loopback() {
+        return Ok(None);
+    }
+    let port = url.port_or_known_default().ok_or_else(|| {
+        miette::miette!(
+            "site controller url `{url}` for site `{}` is missing a port",
+            plan.site_id
+        )
+    })?;
+    Ok(Some(SocketAddr::new(ip, port)))
+}
+
+pub(super) fn compose_site_controller_container_name(plan: &SiteSupervisorPlan) -> Option<String> {
+    (plan.kind == SiteKind::Compose)
+        .then_some(plan.compose_project.as_deref()?)
+        .map(|project| {
+            format!(
+                "{project}-{}-1",
+                amber_site_controller::SITE_CONTROLLER_SERVICE_NAME
+            )
+        })
+}
+
+pub(super) fn parse_container_runtime_status(raw: &str) -> Option<(&str, Option<&str>)> {
+    let mut parts = raw.split_whitespace();
+    let status = parts.next()?;
+    let health = parts.next();
+    Some((status, health))
+}
+
+fn inspect_compose_site_controller_status(
+    plan: &SiteSupervisorPlan,
+) -> Result<Option<(String, Option<String>)>> {
+    let Some(container_name) = compose_site_controller_container_name(plan) else {
+        return Ok(None);
+    };
+    let output = Command::new("docker")
+        .arg("inspect")
+        .arg("--format")
+        .arg("{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}")
+        .arg(&container_name)
+        .output()
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!("failed to inspect compose site controller container `{container_name}`")
+        })?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_container_runtime_status(&stdout)
+        .map(|(status, health)| (status.to_string(), health.map(str::to_string))))
+}
+
+fn compose_site_controller_started(plan: &SiteSupervisorPlan) -> Result<bool> {
+    Ok(inspect_compose_site_controller_status(plan)?
+        .is_some_and(|(status, _)| matches!(status.as_str(), "created" | "running" | "restarting")))
+}
+
+fn compose_site_controller_ready(plan: &SiteSupervisorPlan) -> Result<bool> {
+    Ok(
+        inspect_compose_site_controller_status(plan)?.is_some_and(|(status, health)| {
+            status == "running" && health.as_deref().is_none_or(|health| health == "healthy")
+        }),
+    )
+}
+
 pub(super) async fn try_discover_compose_site(
     plan: &SiteSupervisorPlan,
     stop_requested: &AtomicBool,
     run_root: &Path,
 ) -> Result<Option<RouterDiscovery>> {
-    run_until_stop(
+    let Some(discovery) = run_until_stop(
         run_root,
         stop_requested,
         discover_router_for_output(&plan.artifact_dir, plan.compose_project.as_deref(), true),
     )
     .await
-    .wrap_err_with(|| format!("compose router discovery for site `{}`", plan.site_id))
+    .wrap_err_with(|| format!("compose router discovery for site `{}`", plan.site_id))?
+    else {
+        return Ok(None);
+    };
+    if !compose_site_controller_ready(plan)? {
+        return Ok(None);
+    }
+    Ok(Some(discovery))
 }
 
 pub(super) async fn try_discover_kubernetes_site(

@@ -1196,7 +1196,10 @@ pub(super) fn apply_dynamic_route_issuer_grants(
 }
 
 pub(super) fn dynamic_direct_input_overlay_id(component: &str) -> String {
-    format!("framework-direct-inputs:{component}")
+    format!(
+        "framework-direct-inputs:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(component.as_bytes())
+    )
 }
 
 pub(super) fn dynamic_direct_input_grants(
@@ -1525,6 +1528,20 @@ mod direct_input_tests {
     }
 
     #[test]
+    fn dynamic_direct_input_overlay_id_is_path_safe_for_component_monikers() {
+        let overlay_id = dynamic_direct_input_overlay_id("/source");
+        assert_eq!(
+            overlay_id, "framework-direct-inputs:L3NvdXJjZQ",
+            "overlay ids should encode component monikers so router control paths stay \
+             single-segment",
+        );
+        assert!(
+            !overlay_id.contains('/'),
+            "overlay ids must not contain path separators: {overlay_id}",
+        );
+    }
+
+    #[test]
     fn cleanup_dynamic_site_children_removes_child_roots_and_clears_state() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let site_state_root = temp.path().join("state").join("direct_local");
@@ -1667,7 +1684,7 @@ mod direct_input_tests {
             r#"
 services:
   amber-router:
-    image: ghcr.io/rdi-foundation/amber-router:v0.1.x
+    image: ghcr.io/rdi-foundation/amber-router:v0.2.x
     ports:
       - "127.0.0.1::24000"
 "#,

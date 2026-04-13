@@ -421,6 +421,7 @@ pub(super) async fn proxy_noise_to_noise_http(
     session: &mut NoiseSession,
     outbound: NoiseSession,
     route_id: Arc<str>,
+    peer_id: Arc<str>,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     labels: HttpExchangeLabels,
 ) -> Result<(), RouterError> {
@@ -453,6 +454,7 @@ pub(super) async fn proxy_noise_to_noise_http(
         upstream: Arc::new(Mutex::new(sender)),
         plugins,
         route_id,
+        peer_id,
         labels,
         dynamic_caps: None,
     };

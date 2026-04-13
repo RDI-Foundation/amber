@@ -59,6 +59,7 @@ pub(crate) struct BridgeProxyKey {
 #[derive(Clone, Default)]
 pub struct DefaultSiteControllerRuntime {
     bridge_proxies: Arc<AsyncMutex<BTreeMap<BridgeProxyKey, BridgeProxyHandle>>>,
+    runtime_apps: Arc<std::sync::Mutex<BTreeMap<PathBuf, SiteControllerRuntimeApp>>>,
 }
 
 pub(crate) fn default_site_controller_runtime() -> SharedSiteControllerRuntime {
@@ -72,6 +73,10 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
                 let mut guard = self.bridge_proxies.lock().await;
                 std::mem::take(&mut *guard)
             };
+            self.runtime_apps
+                .lock()
+                .expect("site controller runtime app cache poisoned")
+                .clear();
             stop_bridge_proxies(&mut bridge_proxies).await
         })
     }
@@ -104,7 +109,10 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
         state: FrameworkControlState,
         child: LiveChildRecord,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
-        Box::pin(async move { site_controller_prepare_child(plan, state, child).await })
+        Box::pin(async move {
+            let app = self.runtime_app(plan)?;
+            site_controller_runtime_prepare_child(&app, &state, &child).await
+        })
     }
 
     fn publish_child<'a>(
@@ -113,7 +121,10 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
         state: FrameworkControlState,
         child: LiveChildRecord,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
-        Box::pin(async move { site_controller_publish_child(plan, state, child).await })
+        Box::pin(async move {
+            let app = self.runtime_app(plan)?;
+            site_controller_runtime_publish_child(&app, &state, &child).await
+        })
     }
 
     fn rollback_child<'a>(
@@ -121,7 +132,10 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
         plan: &'a SiteControllerPlan,
         child_id: u64,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
-        Box::pin(async move { site_controller_rollback_child(plan, child_id).await })
+        Box::pin(async move {
+            let app = self.runtime_app(plan)?;
+            site_controller_runtime_rollback_child(&app, child_id).await
+        })
     }
 
     fn destroy_child<'a>(
@@ -130,13 +144,17 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
         state: FrameworkControlState,
         child: LiveChildRecord,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
-        Box::pin(async move { site_controller_destroy_child(plan, state, child).await })
+        Box::pin(async move {
+            let app = self.runtime_app(plan)?;
+            site_controller_runtime_destroy_child(&app, &state, &child).await
+        })
     }
 
     fn collect_live_component_runtime_metadata(
         &self,
         plan: &SiteControllerRuntimePlan,
     ) -> Result<BTreeMap<String, LiveComponentRuntimeMetadata>> {
+        let _ = self.runtime_app_for_plan(plan)?;
         collect_live_component_runtime_metadata(plan)
     }
 
@@ -191,6 +209,31 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
     }
 }
 
+impl DefaultSiteControllerRuntime {
+    fn runtime_app(&self, plan: &SiteControllerPlan) -> Result<SiteControllerRuntimeApp> {
+        self.runtime_app_for_plan(
+            &crate::runtime_api::site_controller_runtime_plan_from_controller_plan(plan),
+        )
+    }
+
+    fn runtime_app_for_plan(
+        &self,
+        plan: &SiteControllerRuntimePlan,
+    ) -> Result<SiteControllerRuntimeApp> {
+        let key = Path::new(&plan.site_state_root).to_path_buf();
+        let mut runtime_apps = self
+            .runtime_apps
+            .lock()
+            .expect("site controller runtime app cache poisoned");
+        if let Some(app) = runtime_apps.get(&key) {
+            return Ok(app.clone());
+        }
+        let app = build_site_controller_runtime_app(plan.clone())?;
+        runtime_apps.insert(key, app.clone());
+        Ok(app)
+    }
+}
+
 pub(crate) async fn stop_bridge_proxies(
     bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
 ) -> Result<()> {
@@ -224,49 +267,6 @@ pub(super) fn build_site_controller_runtime_app(
         state_path,
         state: Arc::new(AsyncMutex::new(initial_state)),
     })
-}
-
-pub(crate) async fn site_controller_prepare_child(
-    plan: &SiteControllerPlan,
-    state: FrameworkControlState,
-    child: LiveChildRecord,
-) -> Result<()> {
-    let app = build_site_controller_runtime_app(
-        crate::runtime_api::site_controller_runtime_plan_from_controller_plan(plan),
-    )?;
-    site_controller_runtime_prepare_child(&app, &state, &child).await
-}
-
-pub(crate) async fn site_controller_publish_child(
-    plan: &SiteControllerPlan,
-    state: FrameworkControlState,
-    child: LiveChildRecord,
-) -> Result<()> {
-    let app = build_site_controller_runtime_app(
-        crate::runtime_api::site_controller_runtime_plan_from_controller_plan(plan),
-    )?;
-    site_controller_runtime_publish_child(&app, &state, &child).await
-}
-
-pub(crate) async fn site_controller_rollback_child(
-    plan: &SiteControllerPlan,
-    child_id: u64,
-) -> Result<()> {
-    let app = build_site_controller_runtime_app(
-        crate::runtime_api::site_controller_runtime_plan_from_controller_plan(plan),
-    )?;
-    site_controller_runtime_rollback_child(&app, child_id).await
-}
-
-pub(crate) async fn site_controller_destroy_child(
-    plan: &SiteControllerPlan,
-    state: FrameworkControlState,
-    child: LiveChildRecord,
-) -> Result<()> {
-    let app = build_site_controller_runtime_app(
-        crate::runtime_api::site_controller_runtime_plan_from_controller_plan(plan),
-    )?;
-    site_controller_runtime_destroy_child(&app, &state, &child).await
 }
 
 #[derive(Clone)]

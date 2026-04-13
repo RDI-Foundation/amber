@@ -16,6 +16,21 @@ fn site_controller_image_reference() -> Result<String> {
     Ok(site_controller_image_reference_from_overrides(&overrides))
 }
 
+pub(super) fn site_controller_local_router_control(kind: SiteKind, artifact_dir: &Path) -> String {
+    match kind {
+        SiteKind::Direct => format!(
+            "unix://{}",
+            direct_current_control_socket_path(artifact_dir).display()
+        ),
+        SiteKind::Vm => format!(
+            "unix://{}",
+            vm_current_control_socket_path(artifact_dir).display()
+        ),
+        SiteKind::Compose => "unix:///amber/control/router-control.sock".to_string(),
+        SiteKind::Kubernetes => "amber-router:24100".to_string(),
+    }
+}
+
 pub(crate) fn dry_run_run_plan(
     source_plan_path: Option<&Path>,
     run_plan: &RunPlan,
@@ -224,6 +239,7 @@ pub(super) fn materialize_launch_bundle(
         let route_listen_addr =
             site_controller_route_listen_addr(site.site_plan.site.kind).to_string();
         let mut peer_site_router_urls = BTreeMap::new();
+        let mut peer_router_identities = BTreeMap::new();
         let mut peer_router_mesh_addrs = BTreeMap::new();
         let mut controller_route_ports = Vec::new();
         let mut controller_routes = Vec::new();
@@ -237,6 +253,14 @@ pub(super) fn materialize_launch_bundle(
             peer_site_router_urls.insert(
                 peer_site_id.clone(),
                 format!("http://{peer_router_host}:{route_port}"),
+            );
+            peer_router_identities.insert(
+                peer_site_id.clone(),
+                planned_router_identity(
+                    run_id,
+                    &run_plan.mesh_scope,
+                    &peer_site_plan.router_identity_id,
+                ),
             );
             let peer_router_mesh_addr = planned_router_mesh_addrs
                 .get(peer_site_id)
@@ -273,6 +297,8 @@ pub(super) fn materialize_launch_bundle(
             )?;
         }
         site.base_supervisor_plan.controller_route_ports = controller_route_ports;
+        let local_router_control =
+            site_controller_local_router_control(site.site_plan.site.kind, &site.artifact_dir);
 
         amber_site_controller::write_site_controller_plan(
             &site.controller_plan_path,
@@ -284,12 +310,9 @@ pub(super) fn materialize_launch_bundle(
             &site.controller_url,
             &site.site_plan.router_identity_id,
             &peer_site_router_urls,
+            &peer_router_identities,
             &peer_router_mesh_addrs,
-            match site.site_plan.site.kind {
-                SiteKind::Compose => Some("unix:///amber/control/router-control.sock"),
-                SiteKind::Kubernetes => Some("amber-router:24100"),
-                SiteKind::Direct | SiteKind::Vm => None,
-            },
+            Some(local_router_control.as_str()),
             planned_router_mesh_addrs.get(site_id).map(String::as_str),
             &site.controller_state_path,
             bundle_root,
