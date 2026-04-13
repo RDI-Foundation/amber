@@ -1420,6 +1420,7 @@ mod tests {
             }],
             outbound: vec![OutboundRoute {
                 route_id: "out".to_string(),
+                rewrite_route_id: None,
                 slot: "compose".to_string(),
                 capability_kind: None,
                 capability_profile: None,

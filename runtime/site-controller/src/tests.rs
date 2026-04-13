@@ -3921,6 +3921,7 @@ async fn install_dynamic_caps_origin_fixture(app: &ControlStateApp) -> tokio::ta
             Vec::new(),
             vec![OutboundRoute {
                 route_id: "provider-route".to_string(),
+                rewrite_route_id: None,
                 slot: "upstream".to_string(),
                 capability_kind: Some("http".to_string()),
                 capability_profile: None,

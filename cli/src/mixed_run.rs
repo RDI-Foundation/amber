@@ -36,6 +36,7 @@ use amber_site_controller::{
 use base64::Engine as _;
 use miette::{Context as _, IntoDiagnostic as _, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use tokio::time::{Instant, sleep};
 use url::Url;
 
@@ -246,6 +247,8 @@ struct LaunchBundleObservability {
     state_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     requests_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    events_ndjson: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     launch_commands: Vec<LaunchCommandPreview>,
 }
@@ -321,6 +324,23 @@ pub(crate) struct ObservabilityReceipt {
     pub(crate) sink_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) requests_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) events_ndjson: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedTraceEvent {
+    pub(crate) schema: String,
+    pub(crate) version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observed_at_unix_nano: Option<u64>,
+    pub(crate) message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) severity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) attributes: BTreeMap<String, JsonValue>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -542,6 +562,7 @@ struct ObservabilitySinkPlan {
     listen_addr: String,
     advertise_endpoint: String,
     requests_log: String,
+    events_ndjson: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -575,6 +596,10 @@ struct RunOutsideProxyContext {
 #[derive(Clone, Debug)]
 struct RunOutsideExport {
     site_id: String,
+    component: String,
+    provide: String,
+    capability_kind: Option<String>,
+    capability_profile: Option<String>,
     protocol: String,
 }
 
@@ -1034,6 +1059,7 @@ pub(crate) async fn run_observability_sink(plan_path: PathBuf) -> Result<()> {
             endpoint: plan.advertise_endpoint.clone(),
             sink_pid: Some(std::process::id()),
             requests_log: Some(plan.requests_log.clone()),
+            events_ndjson: Some(plan.events_ndjson.clone()),
         },
     )?;
 

@@ -1421,6 +1421,7 @@ mod direct_input_tests {
                         inbound: Vec::new(),
                         outbound: vec![OutboundRoute {
                             route_id: "old".to_string(),
+                            rewrite_route_id: None,
                             slot: "api".to_string(),
                             capability_kind: Some("http".to_string()),
                             capability_profile: None,

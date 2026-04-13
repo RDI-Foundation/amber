@@ -1612,6 +1612,7 @@ fn inject_site_controller_peer_router_routes_into_plan(
         }
         router.config.outbound.push(OutboundRoute {
             route_id: site_controller_internal_route_id(&route.site_id),
+            rewrite_route_id: None,
             slot: route.site_id.clone(),
             capability_kind: None,
             capability_profile: None,
