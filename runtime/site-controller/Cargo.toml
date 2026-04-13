@@ -1,0 +1,32 @@
+[package]
+name = "amber-site-controller"
+edition = "2024"
+
+[[bin]]
+name = "amber-site-controller"
+path = "src/bin/amber-site-controller.rs"
+
+[dependencies]
+amber-compiler = { workspace = true }
+amber-manifest = { workspace = true }
+amber-mesh = { workspace = true }
+amber-proxy = { workspace = true }
+amber-resolver = { workspace = true }
+amber-scenario = { workspace = true }
+axum = { version = "0.8.6", features = ["http1", "json", "tokio"] }
+base64 = { workspace = true }
+libc = "0.2.177"
+miette = { workspace = true, features = ["fancy"] }
+reqwest = { workspace = true }
+regex = "1.11.1"
+rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = "0.10.9"
+tar = "0.4.44"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

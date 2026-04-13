@@ -1,13 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     future::Future,
-    io::Write as _,
-    net::{Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use amber_compiler::{
@@ -41,7 +39,7 @@ use amber_mesh::{
 use amber_proxy::{
     apply_route_overlay_with_retry, clear_external_slot_with_retry,
     register_export_peer_with_retry, register_external_slot_with_retry,
-    unregister_export_peer_with_retry,
+    revoke_route_overlay_with_retry, unregister_export_peer_with_retry,
 };
 use amber_resolver::{Backend, RemoteResolver, Resolution, Resolver};
 use amber_scenario::{
@@ -50,54 +48,65 @@ use amber_scenario::{
     ir::{BindingFromIr, BindingIr, ComponentExportTargetIr, ComponentIr, ManifestCatalogEntryIr},
 };
 use axum::{
-    Json, Router,
-    extract::{Path as AxumPath, State},
+    Json,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use base64::Engine as _;
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
 use reqwest::Client as ReqwestClient;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::{net::TcpListener, signal, sync::Mutex};
-
-use crate::mixed_run::{
-    BridgeProxyHandle, BridgeProxyKey, DesiredExportPeerOverlay, DesiredExternalSlotOverlay,
-    LaunchedSite, LiveComponentRuntimeMetadata, SiteActuatorPlan, SiteReceipt,
-    clear_desired_overlay_for_consumer, clear_desired_overlay_for_provider,
-    collect_live_component_runtime_metadata, host_service_bind_addr_for_consumer,
-    host_service_host_for_consumer, launched_site_from_receipt, load_live_site_router_mesh_config,
-    parse_control_endpoint, project_kubernetes_dynamic_child_artifact_files,
-    read_json as read_run_json, resolve_link_external_url_for_output,
-    router_mesh_addr_for_consumer, site_actuator_child_root_for_site, site_state_path,
-    stop_bridge_proxies, update_desired_overlay_for_consumer, update_desired_overlay_for_provider,
-};
+use tokio::{signal, sync::Mutex};
 
 mod api;
 mod ccs_api;
 mod control_state_api;
 mod control_state_mcp;
+mod default_runtime;
 mod dynamic_caps;
 mod http;
 mod mcp;
 mod mcp_common;
 mod orchestration;
 mod planner;
+mod runtime_api;
+mod site_controller;
 mod state;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use self::{
-    http::{run_framework_ccs, run_framework_control_state},
-    orchestration::{
-        SiteActuatorDestroyRequest, SiteActuatorPrepareRequest, SiteActuatorPublishRequest,
+pub use self::{
+    default_runtime::{
+        SiteControllerPeerRouterRoute, add_compose_router_published_route_ports,
+        assign_compose_egress_network_subnets, cleanup_dynamic_site_children,
+        host_service_bind_addr_for_consumer, inject_compose_site_controller,
+        inject_kubernetes_site_controller, inject_site_controller_peer_router_routes,
+        observability_endpoint_for_site, prepare_kubernetes_artifact_namespace,
+        router_mesh_addr_for_consumer, set_compose_router_published_mesh_port,
+        set_site_artifact_mesh_identity_seed, walk_files,
+    },
+    runtime_api::{
+        DesiredExportPeerOverlay, DesiredExternalSlotOverlay, DesiredRouteOverlay, LaunchedSite,
+        LiveComponentRuntimeMetadata, SiteControllerRuntimeFuture, SiteControllerRuntimePlan,
+        SiteReceipt, launched_site_from_receipt, parse_control_endpoint,
+        project_kubernetes_dynamic_child_artifact_files, site_controller_plan_path,
+        site_controller_runtime_child_root_for_site,
+        site_controller_runtime_plan_from_controller_plan, site_state_path,
     },
     state::{
-        DynamicInputRouteRecord, DynamicInputRouteTarget, DynamicProxyExportRecord,
-        DynamicSitePlanRecord, build_control_state, ccs_listen_addr_for_site, ccs_url_for_site,
-        control_state_service_url, generate_framework_auth_token, write_control_state,
-        write_control_state_service_plan, write_framework_ccs_plan,
+        DynamicInputDirectRecord, DynamicInputRouteRecord, DynamicInputRouteTarget,
+        DynamicProxyExportRecord, SITE_CONTROLLER_INTERNAL_CAPABILITY, SITE_CONTROLLER_PORT,
+        SITE_CONTROLLER_SERVICE_NAME, SiteControllerPlan, authority_url_for_listen_addr,
+        build_site_controller_state, generate_framework_auth_token,
+        site_controller_internal_route_id, write_control_state, write_site_controller_plan,
     },
 };
+
+pub async fn run_site_controller_default(plan_path: PathBuf) -> Result<()> {
+    site_controller::run_site_controller(
+        plan_path,
+        default_runtime::default_site_controller_runtime(),
+    )
+    .await
+}

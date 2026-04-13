@@ -54,10 +54,7 @@ mod state;
 use self::{artifacts::*, preview::*, state::*};
 pub(crate) use self::{
     preview::build_vm_site_launch_preview,
-    state::{
-        ensure_control_socket_link, vm_current_control_socket_path,
-        vm_endpoint_forward_ready_timeout, write_vm_runtime_state,
-    },
+    state::{vm_current_control_socket_path, vm_endpoint_forward_ready_timeout},
 };
 
 const VM_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);

@@ -739,27 +739,82 @@ fn write_dynamic_caps_component(
 }
 
 fn framework_control_state_path(run: &RunHandle) -> PathBuf {
-    run.run_root
-        .join("state")
-        .join("framework-component")
-        .join("control-state.json")
+    run.run_root.join("state")
 }
 
-fn framework_control_state_plan_path(run: &RunHandle) -> PathBuf {
-    run.run_root
-        .join("state")
-        .join("framework-component")
-        .join("control-state-plan.json")
+fn read_framework_control_state(control_state_root: &Path) -> Value {
+    let mut live_children = Vec::new();
+    let entries = fs::read_dir(control_state_root)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", control_state_root.display()));
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let state_path = entry.path().join("site-controller-state.json");
+        if !state_path.is_file() {
+            continue;
+        }
+        let state = read_json(&state_path);
+        if let Some(children) = state["live_children"].as_array() {
+            live_children.extend(children.iter().cloned());
+        }
+    }
+    json!({ "live_children": live_children })
 }
 
-fn framework_control_state_post(run: &RunHandle, path: &str, payload: &Value) -> (u16, String) {
-    let plan = read_json(&framework_control_state_plan_path(run));
-    let listen_addr = plan["listen_addr"]
+fn framework_site_controller_plan_path(run: &RunHandle) -> PathBuf {
+    let state_root = run.run_root.join("state");
+    let entries = fs::read_dir(&state_root).expect("run state directory should be readable");
+    let mut site_ids = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| entry.file_name().to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>();
+    site_ids.sort();
+    site_ids
+        .into_iter()
+        .map(|site_id| state_root.join(site_id).join("site-controller-plan.json"))
+        .find(|path| path.is_file())
+        .expect("run should materialize at least one site controller plan")
+}
+
+fn framework_site_controller_state_path(run: &RunHandle) -> PathBuf {
+    let state_root = run.run_root.join("state");
+    let entries = fs::read_dir(&state_root).expect("run state directory should be readable");
+    let mut site_ids = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| entry.file_name().to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>();
+    site_ids.sort();
+    site_ids
+        .into_iter()
+        .map(|site_id| state_root.join(site_id).join("site-controller-state.json"))
+        .find(|path| path.is_file())
+        .expect("run should materialize at least one site controller state file")
+}
+
+fn framework_controller_post(run: &RunHandle, path: &str, payload: &Value) -> (u16, String) {
+    let plan = read_json(&framework_site_controller_plan_path(run));
+    let authority_url = plan["authority_url"]
         .as_str()
-        .expect("framework control-state plan should publish listen_addr");
+        .expect("site controller plan should publish authority_url");
     let auth_token = plan["auth_token"]
         .as_str()
-        .expect("framework control-state plan should publish auth token");
+        .expect("site controller plan should publish auth token");
     let body = serde_json::to_string(payload).expect("request body should serialize");
     let output = std::process::Command::new("curl")
         .arg("-sS")
@@ -777,9 +832,9 @@ fn framework_control_state_post(run: &RunHandle, path: &str, payload: &Value) ->
         .arg("-")
         .arg("-w")
         .arg("\n%{http_code}")
-        .arg(format!("http://{listen_addr}{path}"))
+        .arg(format!("{}{path}", authority_url.trim_end_matches('/')))
         .output()
-        .expect("framework control-state request should complete");
+        .expect("site controller request should complete");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let (body, status) = stdout
         .rsplit_once('\n')
@@ -797,7 +852,7 @@ fn wait_for_live_child(control_state_path: &Path, name: &str) -> u64 {
     wait_for_condition(
         Duration::from_secs(60),
         || {
-            read_json(control_state_path)["live_children"]
+            read_framework_control_state(control_state_path)["live_children"]
                 .as_array()
                 .is_some_and(|children| {
                     children
@@ -807,7 +862,7 @@ fn wait_for_live_child(control_state_path: &Path, name: &str) -> u64 {
         },
         &format!("dynamic child `{name}` live in control state"),
     );
-    let control_state = read_json(control_state_path);
+    let control_state = read_framework_control_state(control_state_path);
     control_state["live_children"]
         .as_array()
         .expect("live children should be an array")
@@ -876,7 +931,7 @@ fn wait_for_framework_child_absent(
     wait_for_condition(
         timeout,
         || {
-            let no_live_child = read_json(control_state_path)["live_children"]
+            let no_live_child = read_framework_control_state(control_state_path)["live_children"]
                 .as_array()
                 .is_some_and(|children| children.iter().all(|child| child["name"] != child_name));
             no_live_child && child_roots.iter().all(|root| !root.exists())
@@ -1645,7 +1700,7 @@ fn framework_component_direct_create_destroy_live() {
         Duration::from_secs(60),
         || {
             !child_root.exists()
-                && read_json(&control_state_path)["live_children"]
+                && read_framework_control_state(&control_state_path)["live_children"]
                     .as_array()
                     .is_some_and(|children| children.iter().all(|child| child["name"] != "job-1"))
         },
@@ -3623,7 +3678,7 @@ fn framework_component_destroy_of_provider_keeps_consumer_live() {
         Duration::from_secs(60),
         || {
             !source_root.exists()
-                && read_json(&control_state_path)["live_children"]
+                && read_framework_control_state(&control_state_path)["live_children"]
                     .as_array()
                     .is_some_and(|children| children.iter().all(|child| child["name"] != "source"))
         },
@@ -5817,7 +5872,8 @@ fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
     wait_for_condition(
         Duration::from_secs(60),
         || {
-            read_json(&replay_control_state)["base_scenario"]["components"]
+            read_json(&framework_site_controller_state_path(&replay_run))["base_scenario"]
+                ["components"]
                 .as_array()
                 .is_some_and(|components| {
                     components
@@ -5829,9 +5885,9 @@ fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
     );
     wait_for_live_child(&replay_control_state, "job-replay");
     let replay_held = response_json_from(
-        framework_control_state_post(
+        framework_controller_post(
             &replay_run,
-            "/v1/control-state/dynamic-caps/held",
+            "/v1/controller/dynamic-caps/held",
             &json!({
                 "holder_component_id": "components./job-replay"
             }),
@@ -5871,9 +5927,9 @@ fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
         .expect("replay share should return a grant id");
 
     let replay_ref_detail = response_json_from(
-        framework_control_state_post(
+        framework_controller_post(
             &replay_run,
-            "/v1/control-state/dynamic-caps/inspect-ref",
+            "/v1/controller/dynamic-caps/inspect-ref",
             &json!({
                 "holder_component_id": "components./job-replay",
                 "ref": replay_ref
@@ -5893,9 +5949,9 @@ fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
         .to_string();
 
     let replay_held_detail = response_json_from(
-        framework_control_state_post(
+        framework_controller_post(
             &replay_run,
-            "/v1/control-state/dynamic-caps/held/detail",
+            "/v1/controller/dynamic-caps/held/detail",
             &json!({
                 "holder_component_id": "components./job-replay",
                 "held_id": replay_shared_held_id
@@ -5918,9 +5974,9 @@ fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
         "replay should either reuse the restored grant or create a new live one"
     );
 
-    let (old_ref_status, old_ref_body) = framework_control_state_post(
+    let (old_ref_status, old_ref_body) = framework_controller_post(
         &replay_run,
-        "/v1/control-state/dynamic-caps/inspect-ref",
+        "/v1/controller/dynamic-caps/inspect-ref",
         &json!({
             "holder_component_id": "components./job-replay",
             "ref": old_ref

@@ -26,9 +26,7 @@ RUN case "${TARGETARCH}" in \
 
 FROM base-builder AS builder
 
-# Prefetch Rust dependencies for better Docker layer caching.
 COPY Cargo.toml Cargo.lock ./
-COPY README.md ./
 COPY cli/Cargo.toml cli/
 COPY compiler/config/Cargo.toml compiler/config/
 COPY compiler/Cargo.toml compiler/
@@ -55,7 +53,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 COPY cli ./cli
 COPY compiler ./compiler
-COPY examples ./examples
 COPY images ./images
 COPY runtime/helper ./runtime/helper
 COPY runtime/mesh ./runtime/mesh
@@ -65,28 +62,23 @@ COPY runtime/site-controller ./runtime/site-controller
 COPY docker/images.json docker/images.json
 
 ARG BUILD_MODE=release
-ARG AMBER_BUILD_VERSION
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     target=$(cat /tmp/rust-target) && \
     if [ "$BUILD_MODE" = "release" ]; then \
-      AMBER_BUILD_VERSION="${AMBER_BUILD_VERSION}" cargo build --locked --release -p amber-cli -p amber-site-controller --target "${target}"; \
+      cargo build --locked --release -p amber-site-controller --target "${target}"; \
       build_dir=release; \
     else \
-      AMBER_BUILD_VERSION="${AMBER_BUILD_VERSION}" cargo build --locked -p amber-cli -p amber-site-controller --target "${target}"; \
+      cargo build --locked -p amber-site-controller --target "${target}"; \
       build_dir=debug; \
     fi && \
-    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber /out/amber && \
-    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-site-controller /out/amber-site-controller && \
-    install -d -m 0755 /out/workdir
+    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-site-controller /out/amber-site-controller
 
-FROM gcr.io/distroless/static-debian13 AS runtime
+FROM docker:28-cli AS runtime
 
-COPY --from=builder --chown=65532:65532 /out/workdir /app
-COPY --from=builder --chown=65532:65532 /out/amber /amber
-COPY --from=builder --chown=65532:65532 /out/amber-site-controller /amber-site-controller
+RUN apk add --no-cache kubectl
 
-USER 65532:65532
-WORKDIR /app
-ENTRYPOINT ["/amber"]
+COPY --from=builder /out/amber-site-controller /amber-site-controller
+
+ENTRYPOINT ["/amber-site-controller"]

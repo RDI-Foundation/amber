@@ -228,7 +228,10 @@ pub(super) fn build_supervisor_plan(
             .then(|| input.site_state_root.join("storage").display().to_string()),
         runtime_root: matches!(input.site_plan.site.kind, SiteKind::Direct | SiteKind::Vm)
             .then(|| input.site_state_root.join("runtime").display().to_string()),
-        router_mesh_port: if matches!(input.site_plan.site.kind, SiteKind::Direct | SiteKind::Vm) {
+        router_mesh_port: if matches!(
+            input.site_plan.site.kind,
+            SiteKind::Direct | SiteKind::Vm | SiteKind::Compose
+        ) {
             Some(reserve_loopback_port()?)
         } else {
             None
@@ -256,18 +259,13 @@ pub(super) fn build_supervisor_plan(
             None
         },
         observability_endpoint: input.observability_endpoint.map(ToOwned::to_owned),
-        framework_ccs_plan_path: input
-            .framework_ccs_plan_path
+        site_controller_plan_path: input
+            .site_controller_plan_path
             .map(|path| path.display().to_string()),
-        site_actuator_plan_path: input
-            .site_actuator_plan_path
-            .map(|path| path.display().to_string()),
+        site_controller_url: input.site_controller_url.map(ToOwned::to_owned),
+        controller_route_ports: Vec::new(),
         launch_env,
     })
-}
-
-pub(super) fn write_site_actuator_plan(path: &Path, plan: &SiteActuatorPlan) -> Result<()> {
-    write_json(path, plan)
 }
 
 pub(super) fn spawn_site_supervisor(site_state_root: &Path) -> Result<SupervisorChild> {
@@ -532,68 +530,6 @@ pub(crate) fn update_desired_links_for_provider(
     write_json(&path, &state)
 }
 
-pub(crate) fn update_desired_overlay_for_consumer(
-    site_state_root: &Path,
-    overlay_id: &str,
-    overlay: DesiredExternalSlotOverlay,
-) -> Result<()> {
-    let path = desired_links_path(site_state_root);
-    let mut state: DesiredLinkState = if path.is_file() {
-        read_json(&path, "desired links")?
-    } else {
-        empty_desired_link_state()
-    };
-    state
-        .external_slot_overlays
-        .insert(overlay_id.to_string(), overlay);
-    write_json(&path, &state)
-}
-
-pub(crate) fn update_desired_overlay_for_provider(
-    site_state_root: &Path,
-    overlay_id: &str,
-    overlay: DesiredExportPeerOverlay,
-) -> Result<()> {
-    let path = desired_links_path(site_state_root);
-    let mut state: DesiredLinkState = if path.is_file() {
-        read_json(&path, "desired links")?
-    } else {
-        empty_desired_link_state()
-    };
-    state
-        .export_peer_overlays
-        .insert(overlay_id.to_string(), overlay);
-    write_json(&path, &state)
-}
-
-pub(crate) fn clear_desired_overlay_for_consumer(
-    site_state_root: &Path,
-    overlay_id: &str,
-) -> Result<()> {
-    let path = desired_links_path(site_state_root);
-    let mut state: DesiredLinkState = if path.is_file() {
-        read_json(&path, "desired links")?
-    } else {
-        return Ok(());
-    };
-    state.external_slot_overlays.remove(overlay_id);
-    write_json(&path, &state)
-}
-
-pub(crate) fn clear_desired_overlay_for_provider(
-    site_state_root: &Path,
-    overlay_id: &str,
-) -> Result<()> {
-    let path = desired_links_path(site_state_root);
-    let mut state: DesiredLinkState = if path.is_file() {
-        read_json(&path, "desired links")?
-    } else {
-        return Ok(());
-    };
-    state.export_peer_overlays.remove(overlay_id);
-    write_json(&path, &state)
-}
-
 fn empty_desired_link_state() -> DesiredLinkState {
     DesiredLinkState {
         schema: DESIRED_LINKS_SCHEMA.to_string(),
@@ -650,6 +586,8 @@ pub(super) fn launched_site_from_state(
             router_mesh_addr: state.router_mesh_addr.clone(),
             router_identity_id: state.router_identity_id.clone(),
             router_public_key_b64: state.router_public_key_b64.clone(),
+            site_controller_pid: state.site_controller_pid,
+            site_controller_url: state.site_controller_url.clone(),
         },
         router_control,
         router_identity,
@@ -701,31 +639,23 @@ pub(super) async fn ensure_site_running(
 ) -> Result<()> {
     reap_child(&mut runtime.site_process)?;
     reap_child(&mut runtime.port_forward)?;
-    reap_child(&mut runtime.framework_ccs)?;
-    reap_child(&mut runtime.site_actuator)?;
+    reap_child(&mut runtime.site_controller)?;
 
-    if runtime.framework_ccs.is_none()
-        && let Some(plan_path) = plan.framework_ccs_plan_path.as_deref()
+    if matches!(plan.kind, SiteKind::Direct | SiteKind::Vm)
+        && runtime.site_controller.is_none()
+        && let Some(plan_path) = plan.site_controller_plan_path.as_deref()
     {
-        runtime.framework_ccs = Some(spawn_runtime_process(
+        let controller = super::site_controller_command()?;
+        runtime.site_controller = Some(spawn_runtime_process_with_executable(
+            &controller.executable,
             &PathBuf::from(&plan.site_state_root),
-            "framework-ccs.log",
+            "site-controller.log",
             &plan.launch_env,
             |cmd| {
-                cmd.arg("run-framework-ccs").arg("--plan").arg(plan_path);
-            },
-        )?);
-    }
-
-    if runtime.site_actuator.is_none()
-        && let Some(plan_path) = plan.site_actuator_plan_path.as_deref()
-    {
-        runtime.site_actuator = Some(spawn_runtime_process(
-            &PathBuf::from(&plan.site_state_root),
-            "site-actuator.log",
-            &plan.launch_env,
-            |cmd| {
-                cmd.arg("run-site-actuator").arg("--plan").arg(plan_path);
+                for arg in &controller.prefix_args {
+                    cmd.arg(arg);
+                }
+                cmd.arg("--plan").arg(plan_path);
             },
         )?);
     }
@@ -854,7 +784,10 @@ pub(super) async fn try_discover_site(
             try_discover_kubernetes_site(plan, runtime, stop_requested, run_root).await
         }
     }?;
-    if discovery.is_none() && plan.kind == SiteKind::Compose {
+    if discovery.is_none()
+        && plan.kind == SiteKind::Compose
+        && !compose_site_controller_started(plan)?
+    {
         runtime.site_started = false;
     }
     Ok(discovery)
@@ -896,6 +829,9 @@ pub(super) async fn try_discover_direct_site(
             Ok(None) | Err(_) => return Ok(None),
         };
         let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
+        if !local_site_controller_ready(plan, VM_LOCAL_TARGET_READY_TIMEOUT)? {
+            return Ok(None);
+        }
         return Ok(Some(RouterDiscovery {
             control_endpoint,
             router_identity,
@@ -937,6 +873,9 @@ pub(super) async fn try_discover_vm_site(
     };
     let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
     if !vm_component_targets_ready(plan, &artifact_dir)? {
+        return Ok(None);
+    }
+    if !local_site_controller_ready(plan, VM_LOCAL_TARGET_READY_TIMEOUT)? {
         return Ok(None);
     }
     Ok(Some(RouterDiscovery {
@@ -992,18 +931,127 @@ pub(super) fn mesh_config_local_targets_ready(path: &Path, timeout: Duration) ->
     Ok(true)
 }
 
+pub(super) fn local_site_controller_ready(
+    plan: &SiteSupervisorPlan,
+    timeout: Duration,
+) -> Result<bool> {
+    let Some(addr) = local_site_controller_addr(plan)? else {
+        return Ok(false);
+    };
+    Ok(wait_for_http_response(addr, timeout).is_ok())
+}
+
+pub(super) fn local_site_controller_addr(plan: &SiteSupervisorPlan) -> Result<Option<SocketAddr>> {
+    let Some(url) = plan.site_controller_url.as_deref() else {
+        return Ok(None);
+    };
+    let url = Url::parse(url)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid site controller url `{url}`"))?;
+    if url.scheme() != "http" {
+        return Ok(None);
+    }
+    let host = url.host_str().ok_or_else(|| {
+        miette::miette!(
+            "site controller url `{url}` for site `{}` is missing a host",
+            plan.site_id
+        )
+    })?;
+    let ip = match host {
+        "localhost" => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        _ => host.parse().into_diagnostic().wrap_err_with(|| {
+            format!(
+                "site controller url `{url}` for site `{}` has a non-IP host `{host}`",
+                plan.site_id
+            )
+        })?,
+    };
+    if !ip.is_loopback() {
+        return Ok(None);
+    }
+    let port = url.port_or_known_default().ok_or_else(|| {
+        miette::miette!(
+            "site controller url `{url}` for site `{}` is missing a port",
+            plan.site_id
+        )
+    })?;
+    Ok(Some(SocketAddr::new(ip, port)))
+}
+
+pub(super) fn compose_site_controller_container_name(plan: &SiteSupervisorPlan) -> Option<String> {
+    (plan.kind == SiteKind::Compose)
+        .then_some(plan.compose_project.as_deref()?)
+        .map(|project| {
+            format!(
+                "{project}-{}-1",
+                amber_site_controller::SITE_CONTROLLER_SERVICE_NAME
+            )
+        })
+}
+
+pub(super) fn parse_container_runtime_status(raw: &str) -> Option<(&str, Option<&str>)> {
+    let mut parts = raw.split_whitespace();
+    let status = parts.next()?;
+    let health = parts.next();
+    Some((status, health))
+}
+
+fn inspect_compose_site_controller_status(
+    plan: &SiteSupervisorPlan,
+) -> Result<Option<(String, Option<String>)>> {
+    let Some(container_name) = compose_site_controller_container_name(plan) else {
+        return Ok(None);
+    };
+    let output = Command::new("docker")
+        .arg("inspect")
+        .arg("--format")
+        .arg("{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}")
+        .arg(&container_name)
+        .output()
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!("failed to inspect compose site controller container `{container_name}`")
+        })?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_container_runtime_status(&stdout)
+        .map(|(status, health)| (status.to_string(), health.map(str::to_string))))
+}
+
+fn compose_site_controller_started(plan: &SiteSupervisorPlan) -> Result<bool> {
+    Ok(inspect_compose_site_controller_status(plan)?
+        .is_some_and(|(status, _)| matches!(status.as_str(), "created" | "running" | "restarting")))
+}
+
+fn compose_site_controller_ready(plan: &SiteSupervisorPlan) -> Result<bool> {
+    Ok(
+        inspect_compose_site_controller_status(plan)?.is_some_and(|(status, health)| {
+            status == "running" && health.as_deref().is_none_or(|health| health == "healthy")
+        }),
+    )
+}
+
 pub(super) async fn try_discover_compose_site(
     plan: &SiteSupervisorPlan,
     stop_requested: &AtomicBool,
     run_root: &Path,
 ) -> Result<Option<RouterDiscovery>> {
-    run_until_stop(
+    let Some(discovery) = run_until_stop(
         run_root,
         stop_requested,
         discover_router_for_output(&plan.artifact_dir, plan.compose_project.as_deref(), true),
     )
     .await
-    .wrap_err_with(|| format!("compose router discovery for site `{}`", plan.site_id))
+    .wrap_err_with(|| format!("compose router discovery for site `{}`", plan.site_id))?
+    else {
+        return Ok(None);
+    };
+    if !compose_site_controller_ready(plan)? {
+        return Ok(None);
+    }
+    Ok(Some(discovery))
 }
 
 pub(super) async fn try_discover_kubernetes_site(
@@ -1133,8 +1181,7 @@ pub(super) async fn cleanup_site(
 ) -> Result<()> {
     reap_child(&mut runtime.site_process)?;
     reap_child(&mut runtime.port_forward)?;
-    reap_child(&mut runtime.framework_ccs)?;
-    reap_child(&mut runtime.site_actuator)?;
+    reap_child(&mut runtime.site_controller)?;
 
     if let Some(child) = runtime.site_process.as_mut() {
         stop_child(child).await?;
@@ -1142,17 +1189,13 @@ pub(super) async fn cleanup_site(
     if let Some(child) = runtime.port_forward.as_mut() {
         stop_child(child).await?;
     }
-    if let Some(child) = runtime.framework_ccs.as_mut() {
-        stop_child(child).await?;
-    }
-    if let Some(child) = runtime.site_actuator.as_mut() {
+    if let Some(child) = runtime.site_controller.as_mut() {
         stop_child(child).await?;
     }
     runtime.site_process = None;
     runtime.site_started = false;
     runtime.port_forward = None;
-    runtime.framework_ccs = None;
-    runtime.site_actuator = None;
+    runtime.site_controller = None;
 
     match plan.kind {
         SiteKind::Compose => {
@@ -1238,6 +1281,8 @@ pub(super) fn build_site_state(
         router_mesh_addr,
         router_identity_id,
         router_public_key_b64,
+        site_controller_pid: runtime.site_controller.as_ref().map(Child::id),
+        site_controller_url: plan.site_controller_url.clone(),
         last_error,
     }
 }
@@ -1274,6 +1319,8 @@ pub(super) fn persist_site_state(
             router_mesh_addr: launched.receipt.router_mesh_addr.clone(),
             router_identity_id: launched.receipt.router_identity_id.clone(),
             router_public_key_b64: launched.receipt.router_public_key_b64.clone(),
+            site_controller_pid: launched.receipt.site_controller_pid,
+            site_controller_url: launched.receipt.site_controller_url.clone(),
             last_error,
         },
     )
@@ -1639,9 +1686,7 @@ pub(crate) fn spawn_detached_child(
     #[cfg(unix)]
     use std::os::unix::process::CommandExt as _;
 
-    let exe = env::current_exe()
-        .into_diagnostic()
-        .wrap_err("failed to resolve amber executable path")?;
+    let exe = super::amber_cli_executable()?;
     let log = fs::File::create(log_path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create log {}", log_path.display()))?;
@@ -1678,9 +1723,17 @@ pub(super) fn spawn_runtime_process(
     extra_env: &BTreeMap<String, String>,
     build: impl FnOnce(&mut Command),
 ) -> Result<Child> {
-    let exe = env::current_exe()
-        .into_diagnostic()
-        .wrap_err("failed to resolve amber executable path")?;
+    let exe = super::amber_cli_executable()?;
+    spawn_runtime_process_with_executable(&exe, site_state_root, log_name, extra_env, build)
+}
+
+pub(super) fn spawn_runtime_process_with_executable(
+    executable: &Path,
+    site_state_root: &Path,
+    log_name: &str,
+    extra_env: &BTreeMap<String, String>,
+    build: impl FnOnce(&mut Command),
+) -> Result<Child> {
     let log_path = site_state_root.join(log_name);
     let log = fs::File::create(&log_path)
         .into_diagnostic()
@@ -1689,7 +1742,7 @@ pub(super) fn spawn_runtime_process(
         .try_clone()
         .into_diagnostic()
         .wrap_err("failed to clone site log")?;
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(executable);
     cmd.envs(extra_env);
     cmd.stdout(Stdio::from(log));
     cmd.stderr(Stdio::from(log_err));
@@ -1725,9 +1778,11 @@ pub(super) fn spawn_port_forward(plan: &SiteSupervisorPlan) -> Result<Child> {
         .arg("0.0.0.0")
         .arg("deploy/amber-router")
         .arg(format!("{mesh_port}:24000"))
-        .arg(format!("{control_port}:24100"))
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
+        .arg(format!("{control_port}:24100"));
+    for port in &plan.controller_route_ports {
+        cmd.arg(format!("{port}:{port}"));
+    }
+    cmd.stdout(Stdio::from(log)).stderr(Stdio::from(log_err));
     cmd.spawn()
         .into_diagnostic()
         .wrap_err("failed to spawn kubectl port-forward")
@@ -1957,37 +2012,6 @@ pub(crate) fn host_service_bind_addr_for_consumer(
     port: u16,
 ) -> SocketAddr {
     host_proxy_bind_addr(consumer_needs_host_wide_listener(consumer_kind), port)
-}
-
-pub(crate) fn router_mesh_addr_for_consumer(
-    provider_kind: SiteKind,
-    consumer_kind: SiteKind,
-    router_mesh_addr: &str,
-) -> Result<String> {
-    match consumer_kind {
-        SiteKind::Compose | SiteKind::Kubernetes => {
-            let addr = router_mesh_addr
-                .parse::<SocketAddr>()
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!("invalid live router mesh address `{router_mesh_addr}`")
-                })?;
-            let host = container_host_for_consumer(provider_kind, consumer_kind);
-            Ok(format!("{host}:{}", addr.port()))
-        }
-        SiteKind::Direct | SiteKind::Vm => {
-            #[cfg(target_os = "linux")]
-            {
-                Ok(crate::direct_runtime::rewrite_peer_addr_for_slirp_gateway(
-                    router_mesh_addr,
-                ))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                Ok(router_mesh_addr.to_string())
-            }
-        }
-    }
 }
 
 pub(super) fn host_proxy_bind_addr(needs_host_wide_listener: bool, port: u16) -> SocketAddr {

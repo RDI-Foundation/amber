@@ -1838,76 +1838,60 @@ fn render_site_artifact_files(
     mesh_scope: &str,
     force_router: bool,
 ) -> Result<BTreeMap<String, String>, RunPlanError> {
-    let mut files = match site_kind {
+    let files = match site_kind {
         SiteKind::Direct => {
-            crate::targets::direct::emit_direct_artifact(compiled, force_router)
-                .map_err(|err| RunPlanError::Other(format!("failed to render direct site: {err}")))?
-                .files
+            crate::targets::direct::emit_direct_artifact_with_options(
+                compiled,
+                crate::targets::direct::DirectArtifactBuildOptions {
+                    force_router,
+                    router_identity_id,
+                    mesh_scope: Some(mesh_scope),
+                },
+            )
+            .map_err(|err| RunPlanError::Other(format!("failed to render direct site: {err}")))?
+            .files
         }
         SiteKind::Vm => {
-            crate::targets::vm::emit_vm_artifact(compiled, force_router)
-                .map_err(|err| RunPlanError::Other(format!("failed to render vm site: {err}")))?
-                .files
+            crate::targets::vm::emit_vm_artifact_with_options(
+                compiled,
+                crate::targets::vm::VmArtifactBuildOptions {
+                    force_router,
+                    router_identity_id,
+                    mesh_scope: Some(mesh_scope),
+                },
+            )
+            .map_err(|err| RunPlanError::Other(format!("failed to render vm site: {err}")))?
+            .files
         }
         SiteKind::Compose => {
-            crate::targets::mesh::docker_compose::emit_docker_compose_artifact(
+            crate::targets::mesh::docker_compose::emit_docker_compose_artifact_with_options(
                 compiled,
-                force_router,
+                crate::targets::mesh::docker_compose::DockerComposeArtifactBuildOptions {
+                    force_router,
+                    router_identity_id,
+                    mesh_scope: Some(mesh_scope),
+                },
             )
             .map_err(|err| RunPlanError::Other(format!("failed to render compose site: {err}")))?
             .files
         }
         SiteKind::Kubernetes => {
-            crate::targets::mesh::kubernetes::emit_kubernetes_artifact(compiled, force_router)
-                .map_err(|err| {
-                    RunPlanError::Other(format!("failed to render kubernetes site: {err}"))
-                })?
-                .files
+            crate::targets::mesh::kubernetes::emit_kubernetes_artifact_with_options(
+                compiled,
+                crate::targets::mesh::kubernetes::KubernetesArtifactBuildOptions {
+                    force_router,
+                    router_identity_id,
+                    mesh_scope: Some(mesh_scope),
+                },
+            )
+            .map_err(|err| RunPlanError::Other(format!("failed to render kubernetes site: {err}")))?
+            .files
         }
     };
-    rewrite_router_identity(site_kind, &mut files, router_identity_id);
-    rewrite_mesh_scope(
-        &mut files,
-        &scenario_mesh_scope(compiled.scenario_ir())?,
-        mesh_scope,
-    );
     Ok(files
         .into_iter()
         .map(|(path, contents)| (path.to_string_lossy().into_owned(), contents))
         .collect())
-}
-
-fn rewrite_router_identity(
-    site_kind: SiteKind,
-    files: &mut BTreeMap<std::path::PathBuf, String>,
-    router_identity_id: &str,
-) {
-    let existing_router_id = match site_kind {
-        SiteKind::Direct => crate::targets::direct::ROUTER_IDENTITY_ID,
-        SiteKind::Vm => crate::targets::vm::ROUTER_IDENTITY_ID,
-        SiteKind::Compose | SiteKind::Kubernetes => {
-            crate::targets::mesh::mesh_config::DEFAULT_ROUTER_ID
-        }
-    };
-    if existing_router_id == router_identity_id {
-        return;
-    }
-    for contents in files.values_mut() {
-        *contents = contents.replace(existing_router_id, router_identity_id);
-    }
-}
-
-fn rewrite_mesh_scope(
-    files: &mut BTreeMap<std::path::PathBuf, String>,
-    existing_mesh_scope: &str,
-    mesh_scope: &str,
-) {
-    if existing_mesh_scope == mesh_scope {
-        return;
-    }
-    for contents in files.values_mut() {
-        *contents = contents.replace(existing_mesh_scope, mesh_scope);
-    }
 }
 
 #[cfg(test)]
@@ -2615,6 +2599,43 @@ mod tests {
                 "site artifact for {site_id} should not retain its site-local mesh scope"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn compose_site_artifact_keeps_router_control_socket_paths() {
+        let dir = tmp_dir("run-plan-compose-router-control-");
+        let image_child = dir.path().join("image.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&image_child, image_server_manifest());
+        write(
+            &root,
+            r##"{
+  manifest_version: "0.3.0",
+  components: {
+    image: "./image.json5"
+  },
+  exports: {
+    image_api: "#image.api"
+  }
+}"##,
+        );
+
+        let compiled = compile(&root).await;
+        let plan = build_run_plan(&compiled, None).expect("run plan should build");
+        let compose_yaml = plan
+            .sites
+            .get("compose_local")
+            .and_then(|site| site.artifact_files.get("compose.yaml"))
+            .expect("compose site should have a compose artifact");
+
+        assert!(
+            compose_yaml
+                .contains("AMBER_ROUTER_CONTROL_SOCKET_PATH=/amber/control/router-control.sock")
+        );
+        assert!(compose_yaml.contains("control_socket: /router-control.sock"));
+        assert!(!compose_yaml.contains("/amber/control/site/compose_local/router-control.sock"));
+        assert!(!compose_yaml.contains("control_socket: /site/compose_local/router-control.sock"));
     }
 
     #[tokio::test]

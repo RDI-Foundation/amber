@@ -186,6 +186,14 @@ pub(crate) fn hashed_temp_socket_path(namespace: &str, kind: &str, path: &Path) 
     amber_mesh::stable_temp_socket_path(namespace, kind, path)
 }
 
+fn vm_component_control_socket_path(work_dir: &Path, component_id: usize) -> PathBuf {
+    hashed_temp_socket_path(
+        "amber-vm-control",
+        &format!("sidecar-{component_id}"),
+        work_dir,
+    )
+}
+
 pub(crate) fn assign_vm_runtime_ports(
     runtime_root: &Path,
     vm_plan: &VmPlan,
@@ -611,6 +619,33 @@ pub(crate) async fn spawn_component_sidecar(
                 work_dir.display()
             )
         })?;
+    let control_socket_path = vm_component_control_socket_path(&work_dir, component.id);
+    let control_socket_dir = control_socket_path
+        .parent()
+        .ok_or_else(|| miette::miette!("invalid vm sidecar control socket path"))?
+        .to_path_buf();
+    fs::create_dir_all(&control_socket_dir)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create vm sidecar control directory {}",
+                control_socket_dir.display()
+            )
+        })?;
+    if control_socket_path.exists() {
+        fs::remove_file(&control_socket_path)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to remove stale vm sidecar control socket {}",
+                    control_socket_path.display()
+                )
+            })?;
+    }
+    env_map.insert(
+        "AMBER_ROUTER_CONTROL_SOCKET_PATH".to_string(),
+        control_socket_path.display().to_string(),
+    );
     spawn_command(
         format!("{}-sidecar", component.log_name),
         vec![router_binary.to_string()],
@@ -1002,6 +1037,22 @@ mod tests {
         assert_eq!(
             persisted.component_mesh_port_by_id,
             replacement.component_mesh_port_by_id
+        );
+    }
+
+    #[test]
+    fn vm_component_control_socket_path_stays_short_on_long_work_dirs() {
+        let work_dir = Path::new(
+            "/Users/example/Developer/amber/target/cli-test-outputs/\
+             linux-vm-framework_component-very-long/state/runs/run-123/state/vm_local/runtime/\
+             work/sidecars/c2-web",
+        );
+        let socket = vm_component_control_socket_path(work_dir, 2);
+        let rendered = socket.as_os_str().to_string_lossy();
+
+        assert!(
+            rendered.len() < 104,
+            "vm sidecar control socket path must fit within unix socket limits: {rendered}",
         );
     }
 }

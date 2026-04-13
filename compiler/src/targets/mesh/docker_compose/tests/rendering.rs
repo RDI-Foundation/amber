@@ -125,6 +125,79 @@ fn compose_storage_volume_names_include_identity_hash() {
 }
 
 #[test]
+fn compose_sidecars_expose_control_socket_volume() {
+    let program = lower_test_program(
+        0,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["sh", "-lc", "sleep infinity"],
+            "env": {}
+        }),
+    );
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        metadata: None,
+        child_templates: BTreeMap::new(),
+        children: Vec::new(),
+    };
+    let artifact = render_compose(&compile_output(Scenario {
+        manifest_catalog: BTreeMap::new(),
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    }))
+    .expect("compose render ok");
+    let compose = parse_compose(&artifact);
+    let sidecar_name = compose
+        .services
+        .keys()
+        .find_map(|name| {
+            let name = name.as_str();
+            name.ends_with("-net").then_some(name)
+        })
+        .expect("sidecar service");
+    let sidecar = service(&compose, sidecar_name);
+    assert_eq!(
+        env_value(sidecar, "AMBER_ROUTER_CONTROL_SOCKET_PATH").as_deref(),
+        Some("/amber/control/router-control.sock")
+    );
+    assert!(
+        sidecar
+            .volumes
+            .iter()
+            .any(|mount| mount.ends_with(":/amber/control")),
+        "sidecar should mount a writable control socket volume: {:?}",
+        sidecar.volumes
+    );
+    let control_init_name = format!("{sidecar_name}-control-init");
+    assert_depends_on(
+        sidecar,
+        &control_init_name,
+        "service_completed_successfully",
+    );
+    let control_init_service = service(&compose, &control_init_name);
+    assert_eq!(control_init_service.user.as_deref(), Some("0:0"));
+    assert!(
+        control_init_service
+            .volumes
+            .iter()
+            .any(|mount| mount.ends_with(":/amber/control")),
+        "sidecar control init should mount the sidecar control volume: {:?}",
+        control_init_service.volumes
+    );
+}
+
+#[test]
 fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
     let program = lower_test_program(
         0,

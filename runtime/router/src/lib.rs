@@ -307,7 +307,7 @@ const AMBER_PEER_ID_HEADER: &str = "x-amber-peer-id";
 const AMBER_FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
 
 fn framework_component_auth_header_value() -> Option<HeaderValue> {
-    env::var(amber_mesh::FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV)
+    env::var(amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -319,6 +319,7 @@ struct OutboundHttpProxyState {
     upstream: Arc<Mutex<client_http1::SendRequest<BoxBody>>>,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     route_id: Arc<str>,
+    peer_id: Arc<str>,
     labels: HttpExchangeLabels,
     dynamic_caps: Option<Arc<DynamicCapsRuntime>>,
 }
@@ -1233,6 +1234,7 @@ async fn proxy_local_http_request(
 async fn proxy_local_http_to_noise(
     session: &mut NoiseSession,
     route_id: Arc<str>,
+    peer_id: Arc<str>,
     stream: tokio::net::TcpStream,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     labels: HttpExchangeLabels,
@@ -1259,6 +1261,7 @@ async fn proxy_local_http_to_noise(
         upstream: Arc::new(Mutex::new(sender)),
         plugins,
         route_id,
+        peer_id,
         labels,
         dynamic_caps,
     };
@@ -1470,6 +1473,16 @@ async fn proxy_http_request_to_noise(
         }
         let host_header = outgoing_host_header(&request_parts.uri, &request_parts.headers);
         sanitize_request_headers(&mut request_parts.headers, host_header.as_str());
+        request_parts.headers.insert(
+            header::HeaderName::from_static(AMBER_ROUTE_ID_HEADER),
+            HeaderValue::from_str(state.route_id.as_ref())
+                .expect("route id header value should be valid"),
+        );
+        request_parts.headers.insert(
+            header::HeaderName::from_static(AMBER_PEER_ID_HEADER),
+            HeaderValue::from_str(state.peer_id.as_ref())
+                .expect("peer id header value should be valid"),
+        );
         inject_trace_context(&span, &mut request_parts.headers);
         let upstream_uri = request_parts.uri.to_string();
 
@@ -1726,14 +1739,24 @@ async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Re
         };
 
         sanitize_request_headers(&mut parts.0.headers, &host_header);
-        if let Some(route_id) = state.route_id.as_ref() {
+        if let Some(route_id) = state.route_id.as_ref()
+            && !parts
+                .0
+                .headers
+                .contains_key(header::HeaderName::from_static(AMBER_ROUTE_ID_HEADER))
+        {
             parts.0.headers.insert(
                 header::HeaderName::from_static(AMBER_ROUTE_ID_HEADER),
                 HeaderValue::from_str(route_id.as_ref())
                     .expect("route id header value should be valid"),
             );
         }
-        if let Some(peer_id) = state.peer_id.as_ref() {
+        if let Some(peer_id) = state.peer_id.as_ref()
+            && !parts
+                .0
+                .headers
+                .contains_key(header::HeaderName::from_static(AMBER_PEER_ID_HEADER))
+        {
             parts.0.headers.insert(
                 header::HeaderName::from_static(AMBER_PEER_ID_HEADER),
                 HeaderValue::from_str(peer_id.as_ref())

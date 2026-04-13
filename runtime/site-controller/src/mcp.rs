@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use amber_manifest::ManifestRef;
+use amber_mesh::component_protocol::{CreateChildRequest, TemplateResolveRequest};
 use axum::http::request::Parts;
 use rmcp::{
     ErrorData as McpError, Json, RoleServer, ServerHandler,
@@ -23,21 +24,22 @@ use serde_json::Value;
 
 use super::{
     ccs_api::{
-        self, FrameworkComponentInspectRequest, FrameworkComponentInspectResponse,
+        FrameworkComponentInspectRequest, FrameworkComponentInspectResponse,
         FrameworkComponentMutateRequest, FrameworkComponentMutateResponse,
     },
-    http::*,
-    mcp_common::{McpOperationResponse, json_response, map_protocol_api_error, map_protocol_error},
-    planner::CcsApp,
-    state::{CapabilityInstanceRecord, FrameworkControlState},
-    *,
+    mcp_common::{McpOperationResponse, json_response, map_protocol_api_error},
+    planner::SiteControllerApp,
+    site_controller::{
+        authorize_public_request, execute_site_controller_framework_inspect,
+        execute_site_controller_framework_mutate,
+    },
 };
 
 const HELP_RESOURCE_URI: &str = "amber://framework-component";
 const OPERATION_RESOURCE_PREFIX: &str = "amber://framework-component/op/";
 
 pub(crate) fn service(
-    app: CcsApp,
+    app: SiteControllerApp,
 ) -> StreamableHttpService<FrameworkComponentMcp, LocalSessionManager> {
     StreamableHttpService::new(
         move || Ok(FrameworkComponentMcp::new(app.clone())),
@@ -48,12 +50,12 @@ pub(crate) fn service(
 
 #[derive(Clone)]
 pub(crate) struct FrameworkComponentMcp {
-    app: CcsApp,
+    app: SiteControllerApp,
     tool_router: ToolRouter<Self>,
 }
 
 impl FrameworkComponentMcp {
-    fn new(app: CcsApp) -> Self {
+    fn new(app: SiteControllerApp) -> Self {
         Self {
             app,
             tool_router: Self::tool_router(),
@@ -63,17 +65,23 @@ impl FrameworkComponentMcp {
     async fn authorize(
         &self,
         context: &RequestContext<RoleServer>,
-    ) -> Result<(CapabilityInstanceRecord, FrameworkControlState), McpError> {
+    ) -> Result<
+        (
+            super::state::CapabilityInstanceRecord,
+            super::state::FrameworkControlState,
+        ),
+        McpError,
+    > {
         let parts = context
             .extensions
             .get::<Parts>()
             .ok_or_else(|| McpError::invalid_request("missing HTTP request context", None))?;
-        authorize_request(&self.app, &parts.headers)
+        authorize_public_request(&self.app, &parts.headers)
             .await
             .map_err(map_protocol_api_error)
     }
 
-    fn render_help_resource(&self) -> String {
+    fn help_resource(&self) -> String {
         let mut out = String::from("# framework.component MCP\n\n");
         out.push_str("Tools:\n");
         out.push_str("- `amber.v1.framework_component.inspect`\n");
@@ -106,7 +114,7 @@ impl FrameworkComponentMcp {
         out
     }
 
-    fn render_operation_resource(&self, name: &str) -> Result<String, McpError> {
+    fn operation_resource(&self, name: &str) -> Result<String, McpError> {
         let doc = match name {
             "list_templates" => {
                 "# `list_templates`\n\nTool: `amber.v1.framework_component.inspect`\n\nArguments:\n\
@@ -259,9 +267,10 @@ impl FrameworkComponentMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<Json<McpOperationResponse>, McpError> {
         let (record, state) = self.authorize(&context).await?;
-        let response = ccs_api::execute_framework_component_inspect(
+        let response = execute_site_controller_framework_inspect(
+            &self.app,
+            &record,
             &state,
-            record.authority_realm_id,
             match args {
                 InspectArgs::ListTemplates => FrameworkComponentInspectRequest::ListTemplates,
                 InspectArgs::GetTemplate { template } => {
@@ -281,7 +290,7 @@ impl FrameworkComponentMcp {
             },
         )
         .await
-        .map_err(map_protocol_error)?;
+        .map_err(map_protocol_api_error)?;
         match response {
             FrameworkComponentInspectResponse::ListTemplates(data) => {
                 json_response("list_templates", data)
@@ -311,10 +320,11 @@ impl FrameworkComponentMcp {
         Parameters(args): Parameters<MutateArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<Json<McpOperationResponse>, McpError> {
-        let (record, _) = self.authorize(&context).await?;
-        let response = ccs_api::execute_framework_component_mutate(
+        let (record, state) = self.authorize(&context).await?;
+        let response = execute_site_controller_framework_mutate(
             &self.app,
-            &record.cap_instance_id,
+            &record,
+            &state,
             match args {
                 MutateArgs::CreateChild {
                     template,
@@ -374,7 +384,7 @@ impl ServerHandler for FrameworkComponentMcp {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ServerInfo, McpError> {
-        self.authorize(&context).await?;
+        let _ = self.authorize(&context).await?;
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
         }
@@ -386,7 +396,7 @@ impl ServerHandler for FrameworkComponentMcp {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        self.authorize(&context).await?;
+        let _ = self.authorize(&context).await?;
         Ok(ListResourcesResult {
             resources: vec![
                 RawResource::new(HELP_RESOURCE_URI, "framework.component MCP").no_annotation(),
@@ -401,7 +411,7 @@ impl ServerHandler for FrameworkComponentMcp {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
-        self.authorize(&context).await?;
+        let _ = self.authorize(&context).await?;
         Ok(ListResourceTemplatesResult {
             resource_templates: vec![
                 RawResourceTemplate::new(
@@ -420,19 +430,18 @@ impl ServerHandler for FrameworkComponentMcp {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        self.authorize(&context).await?;
+        let _ = self.authorize(&context).await?;
         let uri = request.uri;
         let text = if uri.as_str() == HELP_RESOURCE_URI {
-            self.render_help_resource()
+            self.help_resource()
         } else if let Some(name) = uri.as_str().strip_prefix(OPERATION_RESOURCE_PREFIX) {
-            self.render_operation_resource(name)?
+            self.operation_resource(name)?
         } else {
             return Err(McpError::resource_not_found(
-                format!("resource {} not found", uri),
+                format!("resource {uri} not found"),
                 None,
             ));
         };
-
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             text, uri,
         )]))

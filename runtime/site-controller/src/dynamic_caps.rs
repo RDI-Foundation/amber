@@ -77,6 +77,8 @@ pub(crate) enum DynamicCapabilityShareOutcome {
 
 #[derive(Clone, Debug)]
 pub(crate) struct DynamicCapabilityRevokeOutcome {
+    // Production code only needs to know whether revocation changed anything; tests assert the
+    // exact grant set to keep cascade revocation behavior pinned down.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) revoked_grant_ids: Vec<String>,
 }
@@ -113,6 +115,16 @@ pub(crate) struct ControlDynamicShareRequest {
     pub(crate) idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub(crate) options: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ControlDynamicGrantAuthoritySyncRequest {
+    pub(crate) authority_sites: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ControlDynamicGrantAuthoritySyncResponse {
+    pub(crate) synced: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -155,6 +167,16 @@ pub(crate) struct ControlDynamicResolveOriginRequest {
     pub(crate) holder_component_id: String,
     #[serde(flatten)]
     pub(crate) source: DynamicCapabilityControlSourceRequest,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct InternalDynamicResolveOriginRequest {
+    pub(crate) holder_component_id: String,
+    #[serde(flatten)]
+    pub(crate) source: DynamicCapabilityControlSourceRequest,
+    pub(crate) holder_peer_id: String,
+    pub(crate) holder_peer_key_b64: String,
+    pub(crate) holder_site_kind: SiteKind,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -212,6 +234,39 @@ pub(crate) fn root_authority_key(selector: &RootAuthoritySelectorIr) -> String {
         .encode(serde_json::to_vec(selector).expect("root authority selector should serialize"))
 }
 
+fn origin_overlay_suffix(
+    holder_component_id: &str,
+    root_authority_selector: &RootAuthoritySelectorIr,
+) -> String {
+    URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({
+            "holder_component_id": holder_component_id,
+            "root_authority_selector": root_authority_selector,
+        }))
+        .expect("dynamic capability origin overlay key should serialize"),
+    )
+}
+
+pub(crate) fn origin_overlay_id(
+    holder_component_id: &str,
+    root_authority_selector: &RootAuthoritySelectorIr,
+) -> String {
+    format!(
+        "dynamic-cap-origin-{}",
+        origin_overlay_suffix(holder_component_id, root_authority_selector)
+    )
+}
+
+pub(crate) fn origin_route_id(
+    holder_component_id: &str,
+    root_authority_selector: &RootAuthoritySelectorIr,
+) -> String {
+    format!(
+        "dynamic-cap-origin-route-{}",
+        origin_overlay_suffix(holder_component_id, root_authority_selector)
+    )
+}
+
 pub(crate) fn held_id_for_root(selector: &RootAuthoritySelectorIr) -> String {
     format!(
         "{DYNAMIC_CAPABILITY_ROOT_HELD_PREFIX}{}",
@@ -257,7 +312,7 @@ pub(crate) fn next_dynamic_grant_id(state: &mut FrameworkControlState) -> String
         "{DYNAMIC_CAPABILITY_GRANT_ID_PREFIX}{:016x}",
         state.next_dynamic_capability_grant_id
     );
-    state.next_dynamic_capability_grant_id += 1;
+    state.next_dynamic_capability_grant_id += state.id_stride.max(1);
     grant_id
 }
 
@@ -1313,6 +1368,15 @@ pub(crate) fn share_dynamic_capability(
         grant_id,
         r#ref: dynamic_ref,
     })
+}
+
+pub(crate) fn sync_dynamic_capability_grant_authority_sites(
+    state: &mut FrameworkControlState,
+    authority_sites: &BTreeMap<String, String>,
+) {
+    state
+        .dynamic_capability_grant_authority_sites
+        .extend(authority_sites.clone());
 }
 
 fn caller_has_revoke_authority(

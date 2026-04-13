@@ -428,9 +428,11 @@ pub(super) async fn handle_inbound(
             optional,
         } => match route.protocol {
             MeshProtocol::Http => {
-                let framework_route_id = (url_env == amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV)
+                let framework_route_id = (url_env
+                    == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV)
                     .then(|| Arc::<str>::from(route.route_id.as_str()));
-                let framework_peer_id = (url_env == amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV)
+                let framework_peer_id = (url_env
+                    == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV)
                     .then(|| Arc::<str>::from(remote_id.as_str()));
                 proxy_noise_to_external(
                     &mut session,
@@ -556,6 +558,7 @@ pub(super) async fn handle_inbound(
                     &mut session,
                     outbound,
                     route.route_id.clone().into(),
+                    remote_id.clone().into(),
                     plugins,
                     labels,
                 )
@@ -675,6 +678,7 @@ pub(super) async fn handle_outbound(
         proxy_local_http_to_noise(
             &mut outbound,
             route.route_id.clone().into(),
+            config.identity.id.clone().into(),
             stream,
             plugins,
             HttpExchangeLabels::outbound_from_route(config.identity.id.clone().into(), &route),
@@ -1320,10 +1324,18 @@ pub(super) async fn apply_route_overlay(
         let mut issuers = dynamic_issuers.write().await;
         remove_dynamic_issuer_grants(&mut issuers, &existing_overlay.static_issuer_grants);
         for peer in &existing_overlay.peers {
-            trust
-                .remove_peer(peer)
-                .await
-                .map_err(|err| format!("failed to replace overlay peer {}: {err}", peer.id))?;
+            if let Err(remove_err) = trust.remove_peer(peer).await {
+                trust
+                    .remove_dynamic_peer_by_id(&peer.id)
+                    .await
+                    .map_err(|cleanup_err| {
+                        format!(
+                            "failed to replace overlay peer {}: {remove_err}; fallback cleanup \
+                             failed: {cleanup_err}",
+                            peer.id
+                        )
+                    })?;
+            }
         }
     }
 
@@ -1373,7 +1385,9 @@ pub(super) async fn revoke_route_overlay(
     let removed = dynamic_route_overlays.write().await.remove(overlay_id);
     if let Some(overlay) = removed {
         for peer in &overlay.peers {
-            let _ = trust.remove_peer(peer).await;
+            if trust.remove_peer(peer).await.is_err() {
+                let _ = trust.remove_dynamic_peer_by_id(&peer.id).await;
+            }
         }
         let mut issuers = dynamic_issuers.write().await;
         for route_id in overlay.routes.keys() {

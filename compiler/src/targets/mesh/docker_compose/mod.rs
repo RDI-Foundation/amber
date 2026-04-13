@@ -99,12 +99,42 @@ const LOG_LABEL_SERVICE_NAME: &str = "amber_service_name";
 const LOG_LABEL_LIST: &str = "amber_component_moniker,amber_service_name";
 pub const COMPOSE_FILENAME: &str = GENERATED_COMPOSE_FILENAME;
 
+fn build_control_socket_init_service(volume_name: &str) -> Service {
+    let mut service = Service::new("busybox:1.36.1".to_string());
+    service.user = Some("0:0".to_string());
+    service.command = Some(vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        format!(
+            "mkdir -p {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} && chown \
+             {ROUTER_RUNTIME_UID}:{ROUTER_RUNTIME_GID} {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} \
+             && chmod 0700 {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
+        ),
+    ]);
+    service.volumes.push(format!(
+        "{volume_name}:{ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
+    ));
+    service.restart = Some("no".to_string());
+    service
+}
+
+fn component_control_init_service_name(service_name: &str) -> String {
+    format!("{service_name}-control-init")
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DockerComposeReporter;
 
 #[derive(Clone, Debug)]
 pub struct DockerComposeArtifact {
     pub files: BTreeMap<PathBuf, String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DockerComposeArtifactBuildOptions<'a> {
+    pub(crate) force_router: bool,
+    pub(crate) router_identity_id: &'a str,
+    pub(crate) mesh_scope: Option<&'a str>,
 }
 
 impl DockerComposeArtifact {
@@ -349,13 +379,34 @@ pub(crate) fn emit_docker_compose_artifact(
     compiled: &CompiledScenario,
     force_router: bool,
 ) -> Result<DockerComposeArtifact, ReporterError> {
-    render_docker_compose_inner(compiled.scenario(), force_router)
-        .map_err(DockerComposeError::into_reporter_error)
+    emit_docker_compose_artifact_with_options(
+        compiled,
+        DockerComposeArtifactBuildOptions {
+            force_router,
+            router_identity_id: crate::targets::mesh::mesh_config::DEFAULT_ROUTER_ID,
+            mesh_scope: None,
+        },
+    )
+}
+
+pub(crate) fn emit_docker_compose_artifact_with_options(
+    compiled: &CompiledScenario,
+    options: DockerComposeArtifactBuildOptions<'_>,
+) -> Result<DockerComposeArtifact, ReporterError> {
+    render_docker_compose_inner(
+        compiled.scenario(),
+        options.force_router,
+        options.router_identity_id,
+        options.mesh_scope,
+    )
+    .map_err(DockerComposeError::into_reporter_error)
 }
 
 fn render_docker_compose_inner(
     scenario: &Scenario,
     force_router: bool,
+    router_identity_id: &str,
+    mesh_scope: Option<&str>,
 ) -> DcResult<DockerComposeArtifact> {
     let transformed = rewrite_framework_docker_as_injected_component(scenario).map_err(dc_other)?;
     let s = &transformed.scenario;
@@ -435,6 +486,8 @@ fn render_docker_compose_inner(
         router_ports,
         addressing: &mesh_addressing,
         options: MeshConfigBuildOptions {
+            router_identity_id,
+            mesh_scope,
             force_router,
             ..default_mesh_config_build_options()
         },
@@ -629,22 +682,8 @@ fn render_docker_compose_inner(
             .entry(ROUTER_CONTROL_SOCKET_VOLUME_NAME.to_string())
             .or_insert_with(EmptyMap::default);
 
-        let mut control_init_service = Service::new("busybox:1.36.1".to_string());
-        control_init_service.user = Some("0:0".to_string());
-        control_init_service.command = Some(vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            format!(
-                "mkdir -p {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} && chown \
-                 {ROUTER_RUNTIME_UID}:{ROUTER_RUNTIME_GID} \
-                 {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} && chmod 0700 \
-                 {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
-            ),
-        ]);
-        control_init_service.volumes.push(format!(
-            "{ROUTER_CONTROL_SOCKET_VOLUME_NAME}:{ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
-        ));
-        control_init_service.restart = Some("no".to_string());
+        let control_init_service =
+            build_control_socket_init_service(ROUTER_CONTROL_SOCKET_VOLUME_NAME);
         compose.services.insert(
             ROUTER_CONTROL_INIT_SERVICE_NAME.to_string(),
             control_init_service,
@@ -742,6 +781,7 @@ fn render_docker_compose_inner(
         let mut sidecar_env_entries = vec![
             format!("AMBER_ROUTER_CONFIG_PATH={}", mesh_config_path()),
             format!("AMBER_ROUTER_IDENTITY_PATH={}", mesh_identity_path()),
+            format!("AMBER_ROUTER_CONTROL_SOCKET_PATH={ROUTER_CONTROL_SOCKET_PATH_IN_CONTAINER}"),
         ];
         sidecar_env_entries.extend(
             mesh_config_plan
@@ -765,15 +805,34 @@ fn render_docker_compose_inner(
         sidecar_service
             .volumes
             .push(format!("{sidecar_volume}:{MESH_CONFIG_DIR}:ro"));
+        let sidecar_control_volume = component_control_socket_volume_expr(&svc.sidecar);
+        compose
+            .volumes
+            .entry(sidecar_control_volume.clone())
+            .or_insert_with(EmptyMap::default);
+        sidecar_service.volumes.push(format!(
+            "{sidecar_control_volume}:{ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
+        ));
+        let sidecar_control_init_service_name = component_control_init_service_name(&svc.sidecar);
         sidecar_service.depends_on = build_depends_on(
             false,
-            vec![(
-                PROVISIONER_SERVICE_NAME.to_string(),
-                "service_completed_successfully",
-            )],
+            vec![
+                (
+                    PROVISIONER_SERVICE_NAME.to_string(),
+                    "service_completed_successfully",
+                ),
+                (
+                    sidecar_control_init_service_name.clone(),
+                    "service_completed_successfully",
+                ),
+            ],
         );
         apply_default_service_hardening(&mut sidecar_service);
         apply_internal_service_rootfs_hardening(&mut sidecar_service);
+        compose.services.insert(
+            sidecar_control_init_service_name,
+            build_control_socket_init_service(&sidecar_control_volume),
+        );
         compose
             .services
             .insert(svc.sidecar.clone(), sidecar_service);
@@ -1538,6 +1597,10 @@ fn compose_control_socket_volume_expr() -> String {
         "${{{}:-default}}_{}",
         COMPOSE_PROJECT_NAME_ENV, ROUTER_CONTROL_SOCKET_VOLUME_NAME
     )
+}
+
+fn component_control_socket_volume_expr(service_name: &str) -> String {
+    format!("{service_name}-control")
 }
 
 fn sanitize_service_suffix(s: &str) -> String {

@@ -17,7 +17,7 @@
       "name": "amber-router",
       "context": ".",
       "dockerfile": "docker/amber-router/Dockerfile",
-      "version": "v0.1.x"
+      "version": "v0.2.x"
     },
     {
       "name": "amber-docker-gateway",
@@ -35,6 +35,12 @@
       "name": "amber-manager",
       "context": ".",
       "dockerfile": "docker/amber-manager/Dockerfile",
+      "version": "v0.1.x"
+    },
+    {
+      "name": "amber-site-controller",
+      "context": ".",
+      "dockerfile": "docker/amber-site-controller/Dockerfile",
       "version": "v0.1.x"
     }
   ]

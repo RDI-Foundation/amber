@@ -770,11 +770,11 @@ fn kubernetes_templates_dynamic_caps_sidecar_control_env() {
         .get(&PathBuf::from(super::COMPONENT_SIDECAR_ENV_FILE))
         .expect("component sidecar env template");
     assert!(
-        sidecar_env.contains("AMBER_DYNAMIC_CAPS_CONTROL_URL="),
+        sidecar_env.contains("AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL="),
         "{sidecar_env}"
     );
     assert!(
-        sidecar_env.contains("AMBER_DYNAMIC_CAPS_CONTROL_AUTH_TOKEN="),
+        sidecar_env.contains("AMBER_FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN="),
         "{sidecar_env}"
     );
     assert!(

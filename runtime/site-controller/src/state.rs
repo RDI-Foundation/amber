@@ -2,15 +2,20 @@ use super::{http::*, orchestration::*, planner::*, *};
 
 pub(super) const CONTROL_STATE_SCHEMA: &str = "amber.framework_component.control_state";
 pub(super) const CONTROL_STATE_VERSION: u32 = 1;
-pub(super) const CONTROL_SERVICE_PLAN_SCHEMA: &str =
-    "amber.framework_component.control_service_plan";
-pub(super) const CONTROL_SERVICE_PLAN_VERSION: u32 = 1;
-pub(super) const CCS_PLAN_SCHEMA: &str = "amber.framework_component.ccs_plan";
-pub(super) const CCS_PLAN_VERSION: u32 = 1;
-pub(super) const CONTROL_SERVICE_PATH: &str = "/v1/control-state";
+pub(super) const SITE_CONTROLLER_PLAN_SCHEMA: &str =
+    "amber.framework_component.site_controller_plan";
+pub(super) const SITE_CONTROLLER_PLAN_VERSION: u32 = 1;
+pub(super) const SITE_CONTROLLER_STATE_PATH: &str = "/v1/controller/state";
 pub(super) const FRAMEWORK_ROUTE_ID_HEADER: &str = "x-amber-route-id";
 pub(super) const FRAMEWORK_PEER_ID_HEADER: &str = "x-amber-peer-id";
 pub(super) const FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
+pub const SITE_CONTROLLER_INTERNAL_CAPABILITY: &str = "amber.internal.site_controller";
+pub const SITE_CONTROLLER_SERVICE_NAME: &str = "amber-site-controller";
+pub const SITE_CONTROLLER_PORT: u16 = 4100;
+
+pub fn site_controller_internal_route_id(site_id: &str) -> String {
+    format!("site-controller:{site_id}")
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct FrozenPlacementState {
@@ -64,8 +69,6 @@ pub(crate) struct LiveChildRecord {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) assignments: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) site_plans: Vec<DynamicSitePlanRecord>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) overlay_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) overlays: Vec<DynamicOverlayRecord>,
@@ -86,52 +89,46 @@ pub(crate) struct PendingDestroyRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct DynamicSitePlanRecord {
-    pub(crate) site_id: String,
-    pub(crate) kind: SiteKind,
-    pub(crate) router_identity_id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) component_ids: Vec<usize>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) assigned_components: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) artifact_files: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) desired_artifact_files: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) proxy_exports: BTreeMap<String, DynamicProxyExportRecord>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) routed_inputs: Vec<DynamicInputRouteRecord>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct DynamicProxyExportRecord {
-    pub(crate) component_id: usize,
-    pub(crate) component: String,
-    pub(crate) provide: String,
-    pub(crate) protocol: String,
-    pub(crate) capability_kind: String,
+pub struct DynamicInputDirectRecord {
+    pub component: String,
+    pub slot: String,
+    pub provider_component: String,
+    pub protocol: String,
+    pub capability_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) capability_profile: Option<String>,
-    pub(crate) target_port: u16,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct DynamicInputRouteRecord {
-    pub(crate) component: String,
-    pub(crate) slot: String,
-    pub(crate) provider_component: String,
-    pub(crate) protocol: String,
-    pub(crate) capability_kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) capability_profile: Option<String>,
+    pub capability_profile: Option<String>,
     #[serde(flatten)]
-    pub(crate) target: DynamicInputRouteTarget,
+    pub target: DynamicInputRouteTarget,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DynamicProxyExportRecord {
+    pub component_id: usize,
+    pub component: String,
+    pub provide: String,
+    pub protocol: String,
+    pub capability_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_profile: Option<String>,
+    pub target_port: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DynamicInputRouteRecord {
+    pub component: String,
+    pub slot: String,
+    pub provider_component: String,
+    pub protocol: String,
+    pub capability_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_profile: Option<String>,
+    #[serde(flatten)]
+    pub target: DynamicInputRouteTarget,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "route_kind", rename_all = "snake_case")]
-pub(crate) enum DynamicInputRouteTarget {
+pub enum DynamicInputRouteTarget {
     ComponentProvide { provide: String },
 }
 
@@ -211,7 +208,7 @@ pub(crate) struct ControlJournalEntry {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct FrameworkControlState {
+pub struct FrameworkControlState {
     pub(crate) schema: String,
     pub(crate) version: u32,
     pub(crate) run_id: String,
@@ -225,6 +222,8 @@ pub(crate) struct FrameworkControlState {
     pub(crate) next_child_id: u64,
     #[serde(default)]
     pub(crate) next_tx_id: u64,
+    #[serde(default = "default_framework_id_stride")]
+    pub(crate) id_stride: u64,
     #[serde(default)]
     pub(crate) next_component_id: usize,
     #[serde(default)]
@@ -237,6 +236,8 @@ pub(crate) struct FrameworkControlState {
     pub(crate) next_dynamic_capability_grant_id: u64,
     #[serde(default)]
     pub(crate) dynamic_capability_grants: BTreeMap<String, dynamic_caps::DynamicGrantRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) dynamic_capability_grant_authority_sites: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) dynamic_capability_journal: Vec<dynamic_caps::DynamicCapabilityJournalEntry>,
     #[serde(default)]
@@ -247,33 +248,175 @@ pub(crate) struct FrameworkControlState {
     pub(crate) pending_destroys: Vec<PendingDestroyRecord>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct FrameworkControlStateServicePlan {
-    pub(crate) schema: String,
-    pub(crate) version: u32,
-    pub(crate) listen_addr: SocketAddr,
-    pub(crate) state_path: String,
-    pub(crate) run_root: String,
-    pub(crate) state_root: String,
-    pub(crate) mesh_scope: String,
-    pub(crate) auth_token: String,
+fn default_framework_id_stride() -> u64 {
+    1
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct FrameworkCcsPlan {
-    pub(crate) schema: String,
-    pub(crate) version: u32,
-    pub(crate) site_id: String,
-    pub(crate) site_state_root: String,
-    pub(crate) listen_addr: SocketAddr,
-    pub(crate) control_state_url: String,
-    pub(crate) router_auth_token: String,
-    pub(crate) control_state_auth_token: String,
+pub struct SiteControllerPlan {
+    pub schema: String,
+    pub version: u32,
+    pub run_id: String,
+    pub mesh_scope: String,
+    pub site_id: String,
+    pub kind: SiteKind,
+    pub listen_addr: SocketAddr,
+    pub authority_url: String,
+    pub router_identity_id: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peer_site_router_urls: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peer_router_identities: BTreeMap<String, amber_mesh::MeshIdentityPublic>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peer_router_mesh_addrs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_router_control: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_router_mesh_addr: Option<String>,
+    pub state_path: String,
+    pub run_root: String,
+    pub state_root: String,
+    pub site_state_root: String,
+    pub artifact_dir: String,
+    pub auth_token: String,
+    pub dynamic_caps_token_verify_key_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_mesh_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubernetes_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub launch_env: BTreeMap<String, String>,
 }
 
+#[cfg(test)]
 pub(crate) fn build_control_state(
     run_id: &str,
     run_plan: &RunPlan,
+) -> Result<FrameworkControlState> {
+    build_control_state_with_signing_seed(
+        run_id,
+        run_plan,
+        &amber_mesh::dynamic_caps::signing_seed_b64(
+            &amber_mesh::dynamic_caps::signing_key_from_seed(
+                amber_mesh::dynamic_caps::generate_dynamic_capability_signing_seed(),
+            ),
+        ),
+    )
+}
+
+pub fn build_site_controller_state(
+    run_id: &str,
+    run_plan: &RunPlan,
+    site_id: &str,
+    site_index: usize,
+    site_count: usize,
+    dynamic_capability_signing_seed_b64: &str,
+) -> Result<FrameworkControlState> {
+    let mut state = build_control_state_with_signing_seed(
+        run_id,
+        run_plan,
+        dynamic_capability_signing_seed_b64,
+    )?;
+    localize_framework_control_state(&mut state, site_id)?;
+    let site_offset = site_index as u64;
+    let id_stride = site_count.max(1) as u64;
+    state.next_child_id = localized_last_allocated_counter(
+        site_offset,
+        id_stride,
+        state
+            .live_children
+            .iter()
+            .map(|child| child.child_id)
+            .chain(
+                state
+                    .pending_creates
+                    .iter()
+                    .map(|record| record.child.child_id),
+            )
+            .chain(
+                state
+                    .pending_destroys
+                    .iter()
+                    .map(|record| record.child.child_id),
+            ),
+    );
+    state.next_tx_id = localized_last_allocated_counter(
+        site_offset,
+        id_stride,
+        state
+            .pending_creates
+            .iter()
+            .map(|record| record.tx_id)
+            .chain(state.pending_destroys.iter().map(|record| record.tx_id))
+            .chain(state.journal.iter().map(|entry| entry.tx_id)),
+    );
+    state.next_dynamic_capability_grant_id = localized_next_available_counter(
+        site_offset,
+        id_stride,
+        state
+            .dynamic_capability_grants
+            .keys()
+            .filter_map(|grant_id| dynamic_capability_grant_counter(grant_id))
+            .chain(
+                state
+                    .dynamic_capability_journal
+                    .iter()
+                    .filter_map(|entry| entry.grant_id.as_deref())
+                    .filter_map(dynamic_capability_grant_counter),
+            ),
+    );
+    state.id_stride = id_stride;
+    Ok(state)
+}
+
+fn localized_last_allocated_counter(
+    site_offset: u64,
+    id_stride: u64,
+    used_ids: impl Iterator<Item = u64>,
+) -> u64 {
+    let max_used_id = used_ids.max();
+    match max_used_id {
+        Some(max_used_id) if max_used_id > site_offset => {
+            site_offset + ((max_used_id - site_offset) / id_stride.max(1)) * id_stride.max(1)
+        }
+        _ => site_offset,
+    }
+}
+
+fn localized_next_available_counter(
+    site_offset: u64,
+    id_stride: u64,
+    used_ids: impl Iterator<Item = u64>,
+) -> u64 {
+    let max_used_id = used_ids.max();
+    match max_used_id {
+        Some(max_used_id) if max_used_id >= site_offset => {
+            site_offset + (((max_used_id - site_offset) / id_stride.max(1)) + 1) * id_stride.max(1)
+        }
+        _ => site_offset,
+    }
+}
+
+fn dynamic_capability_grant_counter(grant_id: &str) -> Option<u64> {
+    grant_id
+        .strip_prefix(dynamic_caps::DYNAMIC_CAPABILITY_GRANT_ID_PREFIX)
+        .and_then(|suffix| u64::from_str_radix(suffix, 16).ok())
+}
+
+fn build_control_state_with_signing_seed(
+    run_id: &str,
+    run_plan: &RunPlan,
+    dynamic_capability_signing_seed_b64: &str,
 ) -> Result<FrameworkControlState> {
     let scenario = Scenario::try_from(run_plan.base_scenario.clone())
         .into_diagnostic()
@@ -304,16 +447,14 @@ pub(crate) fn build_control_state(
         generation: 0,
         next_child_id: 0,
         next_tx_id: 0,
+        id_stride: default_framework_id_stride(),
         next_component_id,
         capability_instances: BTreeMap::new(),
         journal: Vec::new(),
-        dynamic_capability_signing_seed_b64: amber_mesh::dynamic_caps::signing_seed_b64(
-            &amber_mesh::dynamic_caps::signing_key_from_seed(
-                amber_mesh::dynamic_caps::generate_dynamic_capability_signing_seed(),
-            ),
-        ),
+        dynamic_capability_signing_seed_b64: dynamic_capability_signing_seed_b64.to_string(),
         next_dynamic_capability_grant_id: 0,
         dynamic_capability_grants: BTreeMap::new(),
+        dynamic_capability_grant_authority_sites: BTreeMap::new(),
         dynamic_capability_journal: Vec::new(),
         live_children: Vec::new(),
         pending_creates: Vec::new(),
@@ -329,6 +470,159 @@ pub(crate) fn build_control_state(
     dynamic_caps::reconcile_dynamic_capability_grants(&mut state)
         .map_err(|err| miette::miette!(err.message.clone()))?;
     Ok(state)
+}
+
+pub(crate) fn localize_framework_control_state(
+    state: &mut FrameworkControlState,
+    site_id: &str,
+) -> Result<()> {
+    let local_child_ids = state
+        .live_children
+        .iter()
+        .chain(state.pending_creates.iter().map(|record| &record.child))
+        .chain(state.pending_destroys.iter().map(|record| &record.child))
+        .filter_map(|child| {
+            child_authority_site_id(state, child)
+                .ok()
+                .filter(|authority_site_id| authority_site_id == site_id)
+                .map(|_| child.child_id)
+        })
+        .collect::<BTreeSet<_>>();
+    state
+        .live_children
+        .retain(|child| local_child_ids.contains(&child.child_id));
+    state
+        .pending_creates
+        .retain(|record| local_child_ids.contains(&record.child.child_id));
+    state
+        .pending_destroys
+        .retain(|record| local_child_ids.contains(&record.child.child_id));
+    state
+        .journal
+        .retain(|entry| local_child_ids.contains(&entry.child_id));
+
+    let roots = dynamic_caps::derive_root_authorities(state)
+        .map_err(|err| miette::miette!(err.message.clone()))?;
+    let local_grant_authority_sites = state
+        .dynamic_capability_grants
+        .iter()
+        .filter_map(|(grant_id, grant)| {
+            let authority_site_id = roots
+                .get(&dynamic_caps::root_authority_key(
+                    &grant.root_authority_selector,
+                ))
+                .and_then(|root| component_site_id(state, &root.holder_component_id).ok())?;
+            let holder_site_id = component_site_id(state, &grant.holder_component_id).ok()?;
+            (holder_site_id == site_id && authority_site_id != site_id)
+                .then_some((grant_id.clone(), authority_site_id))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let local_grant_ids = state
+        .dynamic_capability_grants
+        .iter()
+        .filter_map(|(grant_id, grant)| {
+            roots
+                .get(&dynamic_caps::root_authority_key(
+                    &grant.root_authority_selector,
+                ))
+                .and_then(|root| component_site_id(state, &root.holder_component_id).ok())
+                .filter(|root_site_id| root_site_id == site_id)
+                .map(|_| grant_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    state
+        .dynamic_capability_grants
+        .retain(|grant_id, _| local_grant_ids.contains(grant_id));
+    state.dynamic_capability_grant_authority_sites = local_grant_authority_sites;
+    state.dynamic_capability_journal.retain(|entry| {
+        entry
+            .grant_id
+            .as_ref()
+            .is_none_or(|grant_id| local_grant_ids.contains(grant_id))
+    });
+    Ok(())
+}
+
+fn child_authority_site_id(
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    let authority_moniker = decode_live_scenario(state)?
+        .component(ComponentId(child.authority_realm_id))
+        .moniker
+        .to_string();
+    site_id_for_moniker(
+        state,
+        &authority_moniker,
+        &format!("authority realm `{authority_moniker}`"),
+    )
+    .or_else(|_| child_runtime_site_id(child))
+}
+
+fn component_site_id(
+    state: &FrameworkControlState,
+    logical_component_id: &str,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    let moniker = dynamic_caps::moniker_from_logical_component_id(logical_component_id)?;
+    let moniker = moniker.to_string();
+    site_id_for_moniker(
+        state,
+        &moniker,
+        &format!("component `{logical_component_id}`"),
+    )
+}
+
+fn site_id_for_moniker(
+    state: &FrameworkControlState,
+    moniker: &str,
+    subject: &str,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    let components = planned_component_site_map(state);
+    if let Some(site_id) = components.get(moniker) {
+        return Ok(site_id.clone());
+    }
+
+    let descendant_sites = components
+        .iter()
+        .filter(|(assigned_moniker, _)| moniker_contains(assigned_moniker, moniker))
+        .map(|(_, site_id)| site_id.clone())
+        .collect::<BTreeSet<_>>();
+    if descendant_sites.len() == 1 {
+        return Ok(descendant_sites
+            .into_iter()
+            .next()
+            .expect("single descendant site should be present"));
+    }
+
+    Err(protocol_error(
+        ProtocolErrorCode::ControlStateUnavailable,
+        &if descendant_sites.is_empty() {
+            format!("{subject} is missing a site assignment")
+        } else {
+            format!(
+                "{subject} is missing a site assignment and spans multiple sites: {}",
+                descendant_sites.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        },
+    ))
+}
+
+fn planned_component_site_map(state: &FrameworkControlState) -> BTreeMap<String, String> {
+    let mut components = state.placement.placement_components.clone();
+    components.extend(state.placement.assignments.clone());
+    for child in visible_child_records(state) {
+        components.extend(child.assignments.clone());
+    }
+    components
+}
+
+fn moniker_contains(candidate: &str, realm: &str) -> bool {
+    if realm == "/" {
+        return true;
+    }
+    candidate
+        .strip_prefix(realm)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -529,7 +823,6 @@ pub(super) fn restore_framework_children_from_snapshot(
             fragment: Some(child.fragment),
             input_bindings: child.input_bindings,
             assignments: child.assignments,
-            site_plans: Vec::new(),
             overlay_ids: Vec::new(),
             overlays: Vec::new(),
             outputs: child.outputs,
@@ -776,7 +1069,7 @@ fn remap_output_handle_for_snapshot(
     })
 }
 
-pub(crate) fn generate_framework_auth_token(mesh_scope: &str, purpose: &str) -> String {
+pub fn generate_framework_auth_token(mesh_scope: &str, purpose: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(
         MeshIdentity::generate(
             format!("/framework/{purpose}"),
@@ -786,23 +1079,16 @@ pub(crate) fn generate_framework_auth_token(mesh_scope: &str, purpose: &str) -> 
     )
 }
 
-pub(crate) fn control_state_service_url(listen_addr: SocketAddr) -> String {
-    format!("http://{listen_addr}")
-}
-
-pub(crate) fn ccs_listen_addr_for_site(kind: SiteKind, port: u16) -> SocketAddr {
-    host_service_bind_addr_for_consumer(kind, port)
-}
-
-pub(crate) fn ccs_url_for_site(kind: SiteKind, port: u16) -> String {
-    let host = match kind {
-        SiteKind::Direct | SiteKind::Vm => Ipv4Addr::LOCALHOST.to_string(),
-        SiteKind::Compose | SiteKind::Kubernetes => host_service_host_for_consumer(kind),
+pub fn authority_url_for_listen_addr(listen_addr: SocketAddr) -> String {
+    let dial_addr = if listen_addr.ip().is_unspecified() {
+        SocketAddr::from(([127, 0, 0, 1], listen_addr.port()))
+    } else {
+        listen_addr
     };
-    format!("http://{host}:{port}")
+    format!("http://{dial_addr}")
 }
 
-pub(crate) fn write_control_state(path: &Path, state: &FrameworkControlState) -> Result<()> {
+pub fn write_control_state(path: &Path, state: &FrameworkControlState) -> Result<()> {
     write_json(path, state)
 }
 
@@ -937,48 +1223,176 @@ pub(super) fn child_destroy_tx_id(
         })
 }
 
-pub(crate) fn write_control_state_service_plan(
+#[allow(clippy::too_many_arguments)]
+pub fn write_site_controller_plan(
     path: &Path,
+    run_id: &str,
+    mesh_scope: &str,
+    site_id: &str,
+    kind: SiteKind,
     listen_addr: SocketAddr,
+    authority_url: &str,
+    router_identity_id: &str,
+    peer_site_router_urls: &BTreeMap<String, String>,
+    peer_router_identities: &BTreeMap<String, amber_mesh::MeshIdentityPublic>,
+    peer_router_mesh_addrs: &BTreeMap<String, String>,
+    local_router_control: Option<&str>,
+    published_router_mesh_addr: Option<&str>,
     state_path: &Path,
     run_root: &Path,
     state_root: &Path,
-    mesh_scope: &str,
+    site_state_root: &Path,
+    artifact_dir: &Path,
     auth_token: &str,
-) -> Result<FrameworkControlStateServicePlan> {
-    let plan = FrameworkControlStateServicePlan {
-        schema: CONTROL_SERVICE_PLAN_SCHEMA.to_string(),
-        version: CONTROL_SERVICE_PLAN_VERSION,
+    dynamic_caps_token_verify_key_b64: &str,
+    storage_root: Option<&str>,
+    runtime_root: Option<&str>,
+    router_mesh_port: Option<u16>,
+    compose_project: Option<&str>,
+    kubernetes_namespace: Option<&str>,
+    context: Option<&str>,
+    observability_endpoint: Option<&str>,
+    launch_env: &BTreeMap<String, String>,
+) -> Result<SiteControllerPlan> {
+    let plan = SiteControllerPlan {
+        schema: SITE_CONTROLLER_PLAN_SCHEMA.to_string(),
+        version: SITE_CONTROLLER_PLAN_VERSION,
+        run_id: run_id.to_string(),
+        mesh_scope: mesh_scope.to_string(),
+        site_id: site_id.to_string(),
+        kind,
         listen_addr,
+        authority_url: authority_url.to_string(),
+        router_identity_id: router_identity_id.to_string(),
+        peer_site_router_urls: peer_site_router_urls.clone(),
+        peer_router_identities: peer_router_identities.clone(),
+        peer_router_mesh_addrs: peer_router_mesh_addrs.clone(),
+        local_router_control: local_router_control.map(str::to_string),
+        published_router_mesh_addr: published_router_mesh_addr.map(str::to_string),
         state_path: state_path.display().to_string(),
         run_root: run_root.display().to_string(),
         state_root: state_root.display().to_string(),
-        mesh_scope: mesh_scope.to_string(),
+        site_state_root: site_state_root.display().to_string(),
+        artifact_dir: artifact_dir.display().to_string(),
         auth_token: auth_token.to_string(),
+        dynamic_caps_token_verify_key_b64: dynamic_caps_token_verify_key_b64.to_string(),
+        storage_root: storage_root.map(str::to_string),
+        runtime_root: runtime_root.map(str::to_string),
+        router_mesh_port,
+        compose_project: compose_project.map(str::to_string),
+        kubernetes_namespace: kubernetes_namespace.map(str::to_string),
+        context: context.map(str::to_string),
+        observability_endpoint: observability_endpoint.map(str::to_string),
+        launch_env: launch_env.clone(),
     };
     write_json(path, &plan)?;
     Ok(plan)
 }
 
-pub(crate) fn write_framework_ccs_plan(
-    path: &Path,
-    site_id: &str,
-    site_state_root: &Path,
-    listen_addr: SocketAddr,
-    control_state_url: &str,
-    router_auth_token: &str,
-    control_state_auth_token: &str,
-) -> Result<FrameworkCcsPlan> {
-    let plan = FrameworkCcsPlan {
-        schema: CCS_PLAN_SCHEMA.to_string(),
-        version: CCS_PLAN_VERSION,
-        site_id: site_id.to_string(),
-        site_state_root: site_state_root.display().to_string(),
-        listen_addr,
-        control_state_url: control_state_url.to_string(),
-        router_auth_token: router_auth_token.to_string(),
-        control_state_auth_token: control_state_auth_token.to_string(),
-    };
-    write_json(path, &plan)?;
-    Ok(plan)
+pub(crate) fn site_id_for_authority_realm(
+    state: &FrameworkControlState,
+    authority_realm_id: usize,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    let authority_moniker = decode_live_scenario(state)?
+        .component(ComponentId(authority_realm_id))
+        .moniker
+        .to_string();
+    site_id_for_moniker(
+        state,
+        authority_moniker.as_str(),
+        &format!("authority realm `{authority_moniker}`"),
+    )
+}
+
+pub(crate) fn framework_authority_site_id(
+    state: &FrameworkControlState,
+    record: &CapabilityInstanceRecord,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    if let Ok(site_id) = site_id_for_authority_realm(state, record.authority_realm_id) {
+        return Ok(site_id);
+    }
+    let authority = record.authority_realm_moniker.as_str();
+    let recipient = record.recipient_component_moniker.as_str();
+    if authority != "/"
+        && recipient != authority
+        && !recipient.starts_with(&format!("{authority}/"))
+    {
+        return Err(protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "framework.component recipient `{recipient}` is not inside authority realm \
+                 `{authority}`"
+            ),
+        ));
+    }
+    let assignments = planned_component_site_map(state);
+    let recipient_segments = recipient
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let authority_depth = authority
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count();
+    for depth in authority_depth..=recipient_segments.len() {
+        let moniker = if depth == 0 {
+            "/".to_string()
+        } else {
+            format!("/{}", recipient_segments[..depth].join("/"))
+        };
+        if let Some(site_id) = assignments.get(&moniker) {
+            return Ok(site_id.clone());
+        }
+    }
+    Err(protocol_error(
+        ProtocolErrorCode::ControlStateUnavailable,
+        &format!(
+            "framework.component authority realm `{authority}` has no assigned component on the \
+             path to recipient `{recipient}`"
+        ),
+    ))
+}
+
+pub(crate) fn site_id_for_dynamic_grant(
+    state: &FrameworkControlState,
+    grant_id: &str,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    if let Some(grant) = state.dynamic_capability_grants.get(grant_id) {
+        return site_id_for_root_authority_selector(state, &grant.root_authority_selector);
+    }
+    state
+        .dynamic_capability_grant_authority_sites
+        .get(grant_id)
+        .cloned()
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::UnknownSource,
+                &format!("dynamic grant `{grant_id}` is not live"),
+            )
+        })
+}
+
+pub(crate) fn site_id_for_logical_component(
+    state: &FrameworkControlState,
+    logical_component_id: &str,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    component_site_id(state, logical_component_id)
+}
+
+pub(crate) fn site_id_for_root_authority_selector(
+    state: &FrameworkControlState,
+    selector: &RootAuthoritySelectorIr,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    let roots = dynamic_caps::derive_root_authorities(state)?;
+    let root = roots
+        .get(&dynamic_caps::root_authority_key(selector))
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::UnknownSource,
+                "dynamic capability root authority is not live",
+            )
+        })?;
+    site_id_for_logical_component(state, &root.holder_component_id)
 }

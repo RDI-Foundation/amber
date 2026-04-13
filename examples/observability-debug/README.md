@@ -1,16 +1,17 @@
 # Observability Debug Tutorial
 
-This example is for reading a scenario the way a user experiences it.
+This example is for debugging an Amber scenario as a user thinks about it:
 
-The scenario has two components and one external upstream:
+- components: `client`, `server`
+- user-facing edge refs: `/client.server_api -> /server.api`, `/client.ext_api -> external.ext_api`, `public`
 
-- `public -> /server`
-- `/client.server_api -> /server.api`
-- `/client.ext_api -> external.ext_api`
+The dashboard should not force you to think about Amber's internal mesh. Instead, it gives you three resources:
 
-The important output is Amber's interaction trace stream. `amber run`, `amber attach`, and
-`amber logs` render that stream for humans, and the same data is persisted for tooling in
-`observability/events.ndjson` under the run root.
+- `amber.<run>.client`: the client program's stdout/stderr
+- `amber.<run>.server`: the server program's stdout/stderr
+- `amber.<run>.bindings`: structured request/response telemetry for the scenario's routed edges
+
+`<run>` is the Compose project name. If you do not set one, it defaults to `default`.
 
 ## Prereqs
 
@@ -18,52 +19,55 @@ The important output is Amber's interaction trace stream. `amber run`, `amber at
 - `amber` CLI on `PATH`
 - `python3` on the host
 
-## 1) Start the local upstream
+## 1) Start the dashboard
+
+```sh
+docker rm -f amber-dashboard >/dev/null 2>&1 || true
+amber dashboard --detach
+```
+
+Dashboard UI: `http://127.0.0.1:18888`
+
+## 2) Compile + start the scenario
+
+```sh
+OUT=/tmp/amber-observability-debug
+rm -rf "$OUT"
+amber compile examples/observability-debug/scenario.json5 --docker-compose "$OUT"
+COMPOSE_PROJECT_NAME=amberdemo docker compose -f "$OUT/compose.yaml" up -d
+```
+
+If you are validating local framework changes, set `AMBER_DEV_IMAGE_TAGS` when you run `amber compile`. For this example, router-only changes need `router=<tag>`. If your changes affect provisioning or generated mesh config metadata, use `router=<tag>,provisioner=<tag>` so the provisioned sidecar config matches the runtime you are testing. If your changes affect the site controller image used for compose or Kubernetes sites, add `site_controller=<tag>` as well.
+
+## 3) Start the local upstream (Terminal A)
 
 ```sh
 python3 examples/observability-debug/upstream-sse.py --port 38081
 ```
 
-## 2) Start Amber
-
-Run the scenario in the foreground:
+## 4) Wire the external slot and export (Terminal B)
 
 ```sh
-cd examples/observability-debug
-amber run .
+OUT=/tmp/amber-observability-debug
+amber proxy "$OUT" \
+  --project-name amberdemo \
+  --slot ext_api=127.0.0.1:38081 \
+  --export public=127.0.0.1:38080
 ```
 
-When Amber prompts for the `ext_api` slot, provide:
+This enables two manifest-level edges:
 
-```text
-http://127.0.0.1:38081
-```
+- `/client -> ext_api`
+- `public -> /server`
 
-Amber prints the run id, run root, exported localhost URLs, and then tails the interaction stream.
+Brief `502` or `503` responses are expected until the slot is registered and the upstream is reachable.
 
-If you prefer a managed background run:
-
-```sh
-cd examples/observability-debug
-amber run . --detach
-amber attach <run-id>
-```
-
-`amber ps` lists active runs, `amber logs <run-id>` replays the persisted interaction story, and
-the run root contains `observability/events.ndjson` for machine tooling.
-
-If you are validating local runtime image changes, set `AMBER_DEV_IMAGE_TAGS` before `amber run`.
-For router-only changes, `router=<tag>` is usually enough. If you changed provisioning or generated
-mesh metadata too, also include `provisioner=<tag>`.
-
-## 3) Generate host traffic
-
-In another terminal, use the `public` URL printed by Amber:
+## 5) Generate explicit host traffic (Terminal C)
 
 ```sh
 curl -sS \
   -H 'x-amber-tutorial: host-export' \
-  http://127.0.0.1:<public-port>/rpc
+  http://127.0.0.1:38080/rpc
 ```
 
 Expected response:
@@ -72,41 +76,97 @@ Expected response:
 {"jsonrpc":"2.0","id":"server-static","method":"tools/list","result":{"source":"server","ok":true}}
 ```
 
-The `client` also generates traffic in a loop, so the interaction stream should cover all three
-manifest-level stories.
+The `client` also generates traffic in a loop, so after this call you have all three stories in the dashboard:
 
-## 4) Read the interaction story
+- `public -> /server`
+- `/client.server_api -> /server.api`
+- `/client.ext_api -> external.ext_api`, including SSE
 
-Look for these edges:
+## 6) Read the telemetry
+
+Open `http://127.0.0.1:18888`.
+
+### Component resources
+
+`amber.amberdemo.client` shows the client program's own logs, for example:
+
+- `[client] internal rpc -> server`
+- `[client] external rpc -> upstream`
+- `[client] external sse -> upstream`
+
+`amber.amberdemo.server` shows the server program's own logs, for example:
+
+- `[server] listening on :9000`
+- `[server] received GET /rpc x-amber-tutorial=host-export`
+- `[server] responded 200 /rpc id=server-static`
+
+### Edge resource
+
+`amber.amberdemo.bindings` is the important one. It contains the request/response lifecycle for user-facing edges.
+
+Look for these edge refs:
 
 - `public`
 - `/client.server_api -> /server.api`
 - `/client.ext_api -> external.ext_api`
 
-You should see protocol-aware lines such as:
+A novice should be able to read the logs as a story.
 
-- `get agent card`
-- `list tools`
-- `call tool ...`
-- `progress update`
+Examples you should see:
 
-Useful things to verify:
+- `request received from public by /server [headers]`
+- `response sent from /server to public: tools/list result (id=server-static) [body]`
+- `request sent from /client.server_api to /server.api [headers]`
+- `response received by /client.server_api from /server.api: tools/list result (id=server-static) [body]`
+- `request sent from /client.ext_api to external.ext_api: tools/call (id=external-1) [body]`
+- `response received by /client.ext_api from external.ext_api: notifications/progress response (id=sse-2) [stream event]`
 
-- related events share a trace id
-- the renderer uses scenario edges and components instead of mesh/router internals
-- request, response, and stream phases are still visible, but secondary to the semantic action
+Important details:
 
-If you started the run detached, `amber logs <run-id>` shows the same interaction stream from the
-persisted `events.ndjson` file.
+- the same request/response chain shares a `traceId`
+- request and response logs use slot/capability edge refs instead of mesh/router route ids
+- protocol-aware fields are extracted when Amber can understand them: JSON-RPC method/id, MCP tool/progress fields, SSE event ids, and so on
+
+## API checks
+
+List the resources the tutorial should create:
+
+```sh
+curl -sS http://127.0.0.1:18888/api/telemetry/resources | jq .
+```
+
+Show the `public` edge story:
+
+```sh
+curl -sS 'http://127.0.0.1:18888/api/telemetry/logs?resource=amber.amberdemo.bindings&limit=500' \
+  | jq -r '
+      .data.resourceLogs[]?.scopeLogs[]?.logRecords[]?
+      | [
+          ([.attributes[]? | select(.key == "event") | .value.stringValue][0] // ""),
+          (.body.stringValue // ""),
+          (.traceId // "")
+        ]
+      | @tsv' \
+  | rg 'public|host-export'
+```
+
+Show the internal client/server edge story:
+
+```sh
+curl -sS 'http://127.0.0.1:18888/api/telemetry/traces?resource=amber.amberdemo.bindings&limit=200' \
+  | jq -r '
+      .data.resourceSpans[]?.scopeSpans[]?.spans[]?
+      | select((.attributes[]? | select(.key == "amber_edge_ref") | .value.stringValue) == "/client.server_api -> /server.api")
+      | [.traceId, .name, ([.events[]?.name] | join(" | "))]
+      | @tsv'
+```
 
 ## Cleanup
 
-For a foreground run, press `Ctrl-C` in the `amber run` terminal.
-
-For a detached run:
-
 ```sh
-amber stop <run-id>
+OUT=/tmp/amber-observability-debug
+COMPOSE_PROJECT_NAME=amberdemo docker compose -f "$OUT/compose.yaml" down -v
+docker rm -f amber-dashboard >/dev/null 2>&1 || true
+pkill -f 'upstream-sse.py --port 38081' >/dev/null 2>&1 || true
+pkill -f 'amber proxy /tmp/amber-observability-debug' >/dev/null 2>&1 || true
 ```
-
-Then stop the upstream process if it is still running.

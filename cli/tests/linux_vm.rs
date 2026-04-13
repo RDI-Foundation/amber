@@ -10,6 +10,7 @@ mod outputs_root_support;
 mod workspace_root_support;
 
 use std::{
+    collections::BTreeMap,
     env, fs,
     hash::{Hash as _, Hasher as _},
     net::{SocketAddr, TcpListener},
@@ -75,7 +76,7 @@ impl ProvisionProfile {
                 guest_packages: "build-essential ca-certificates curl git jq pkg-config libssl-dev bubblewrap \
                                  slirp4netns docker.io",
                 profile_setup: format!(
-                    "if ! docker compose version >/dev/null 2>&1; then\n\
+                     "if ! docker compose version >/dev/null 2>&1; then\n\
                        sudo apt-get install -y --no-install-recommends docker-compose-v2 || sudo apt-get install -y --no-install-recommends docker-compose-plugin\n\
                      fi\n\
                      if ! docker buildx version >/dev/null 2>&1; then\n\
@@ -710,7 +711,8 @@ impl LinuxVmHarness {
         self.run_guest_checked(
             "prepare linux guest snapshot",
             "set -euxo pipefail\n. \"$HOME/.cargo/env\" || true\nsudo cloud-init clean --logs \
-             --machine-id\nsudo rm -rf \"$HOME/amber\" \"$HOME/amber-target\"\nsudo sync\n",
+             --machine-id\nsudo rm -rf \"$HOME/amber\" \"$HOME/amber-target\" \
+             \"$HOME/linux-vm-test-logs\"\nsudo sync\n",
         )
     }
 
@@ -767,8 +769,23 @@ impl LinuxVmHarness {
         )
     }
 
-    fn run_test_command(&self, label: &str, command: &str) -> Result<(), String> {
+    fn run_test_command(
+        &self,
+        label: &str,
+        command: &str,
+        extra_env: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
         let arch = guest_arch();
+        let extra_exports = extra_env
+            .iter()
+            .map(|(name, value)| format!("export {name}={}", shell_escape(value)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let extra_exports = if extra_exports.is_empty() {
+            String::new()
+        } else {
+            format!("{extra_exports}\n")
+        };
         self.run_guest_checked(
             label,
             &format!(
@@ -776,9 +793,22 @@ impl LinuxVmHarness {
                  AMBER_TEST_KEEP_OUTPUTS=1\nexport \
                  AMBER_VM_SMOKE_BASE_IMAGE=\"$HOME/{image_filename}\"\nexport \
                  AMBER_MIXED_RUN_BASE_IMAGE=\"$HOME/{image_filename}\"\nexport \
-                 CARGO_TARGET_DIR=\"$HOME/amber-target\"\n{command}\n",
+                 CARGO_TARGET_DIR=\"$HOME/amber-target\"\nexport CARGO_TERM_QUIET=true\nexport \
+                 CARGO_TERM_PROGRESS_WHEN=never\n{extra_exports}log_dir=\"$HOME/\
+                 linux-vm-test-logs\"\nmkdir -p \
+                 \"$log_dir\"\nstdout_log=\"$log_dir/{label}.stdout.log\"\nstderr_log=\"$log_dir/\
+                 {label}.stderr.log\"\nif {command} >\"$stdout_log\" 2>\"$stderr_log\"; then\ncat \
+                 \"$stdout_log\"\nelse\nstatus=$?\necho \"===== guest test panic lines \
+                 =====\"\ngrep -nE \"panicked at|assertion.*failed|thread '.*' panicked\" \
+                 \"$stdout_log\" \"$stderr_log\" || true\necho \"===== guest test kind load lines \
+                 =====\"\ngrep -n \"kind load docker-image\" \"$stdout_log\" \"$stderr_log\" || \
+                 true\necho \"===== guest test stdout tail ($stdout_log) =====\"\ntail -n 300 \
+                 \"$stdout_log\" || true\necho \"===== guest test stderr tail ($stderr_log) \
+                 =====\"\ntail -n 500 \"$stderr_log\" || true\nexit \"$status\"\nfi\n",
                 guest = shell_escape(&self.guest_workspace),
                 image_filename = arch.cloud_image_filename,
+                extra_exports = extra_exports,
+                label = label,
                 command = command,
             ),
         )
@@ -795,11 +825,21 @@ impl LinuxVmHarness {
              $latest\"\nfind \"$latest\" -maxdepth 3 -type f | sort\nfor state_root in \
              \"$latest/state\" \"$latest/replay-state\"; do\nif [ ! -d \"$state_root\" ]; \
              then\ncontinue\nfi\necho \"===== state root: $state_root =====\"\nwhile IFS= read -r \
-             path; do\necho \"----- $path -----\"\nsed -n '1,220p' \"$path\"\ndone < <(find \
+             path; do\necho \"----- $path -----\"\nsed -n '1,260p' \"$path\"\ndone < <(find \
              \"$state_root\" -type f \\( -name 'manager-state.json' -o -name \
              'direct-runtime-state.json' -o -name 'vm-runtime-state.json' -o -name \
+             'site-controller-state.json' -o -name 'site-controller-runtime-state.json' -o -name \
              'supervisor.log' -o -name 'port-forward.log' -o -name 'site.log' -o -name \
-             'control-state.log' \\) 2>/dev/null | sort)\ndone\n"
+             'site-controller.log' -o -name 'site-controller-plan.json' -o -name \
+             'site-controller-runtime-plan.json' \\) 2>/dev/null | \
+             sort)\ndone\nruns_root=\"$(find {guest_workspace} -path '*/.amber-runs/runs/run-*' \
+             -type d | sort | tail -n 1)\"\nif [ -n \"$runs_root\" ]; then\necho \"latest guest \
+             run root: $runs_root\"\nfind \"$runs_root/state\" -maxdepth 2 -type f \\( -name \
+             'manager-state.json' -o -name 'supervisor.log' -o -name 'port-forward.log' -o -name \
+             'site.log' -o -name 'site-controller.log' -o -name 'site-controller-state.json' -o \
+             -name 'site-controller-runtime-state.json' -o -name 'site-controller-plan.json' -o \
+             -name 'site-controller-runtime-plan.json' \\) | sort | while IFS= read -r path; \
+             do\necho \"----- $path -----\"\nsed -n '1,260p' \"$path\"\ndone\nfi\n"
         );
         self.ssh_output(&script)
             .ok()
@@ -850,7 +890,7 @@ fn run_linux_guest_test(
         let provisioned_image = ensure_provisioned_image(profile)?;
         let harness = LinuxVmHarness::start(output_dir.path(), &provisioned_image)?;
         harness.copy_workspace()?;
-        harness.run_test_command(prefix, command)
+        harness.run_test_command(prefix, command, &BTreeMap::new())
     })();
     if result.is_err() || env::var_os("AMBER_TEST_KEEP_OUTPUTS").is_some() {
         output_dir.preserve();
@@ -864,6 +904,8 @@ fn run_linux_guest_test(
 
 fn ensure_provisioned_image(profile: ProvisionProfile) -> Result<PathBuf, String> {
     let cache_path = provisioned_cache_path(profile);
+    // Keep only the provisioned base image as a persistent cache. It saves the expensive OS/tool
+    // setup without accumulating workspace-dependent snapshots or large build trees under target/.
     if cache_path.is_file() && env::var_os("AMBER_LINUX_VM_REFRESH_CACHE").is_none() {
         return Ok(cache_path);
     }
@@ -975,10 +1017,92 @@ fn linux_vm_runs_framework_component_live_tests() {
 }
 
 #[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component direct \
+            create/destroy live test inside the guest"]
+fn linux_vm_runs_framework_component_direct_create_destroy_live() {
+    run_linux_guest_mixed_run_test("framework_component_direct_create_destroy_live")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component bounded \
+            template replay live test inside the guest"]
+fn linux_vm_runs_framework_component_bounded_template_frozen_source_replay_live() {
+    run_linux_guest_mixed_run_test(
+        "framework_component_bounded_template_frozen_source_replay_live",
+    )
+    .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component \
+            cross-backend matrix live test inside the guest"]
+fn linux_vm_runs_framework_component_cross_backend_matrix_live() {
+    run_linux_guest_mixed_run_test("framework_component_cross_backend_matrix_live")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component \
+            delegated-realm cross-site live test inside the guest"]
+fn linux_vm_runs_framework_component_delegated_realm_cross_site_live() {
+    run_linux_guest_mixed_run_test("framework_component_delegated_realm_cross_site_live")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component \
+            direct-parent compose-child live test inside the guest"]
+fn linux_vm_runs_framework_component_direct_parent_compose_child_live() {
+    run_linux_guest_mixed_run_test("framework_component_direct_parent_compose_child_live")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component \
+            dynamic-child teardown live test inside the guest"]
+fn linux_vm_runs_framework_component_dynamic_children_teardown_with_run_live() {
+    run_linux_guest_mixed_run_test("framework_component_dynamic_children_teardown_with_run_live")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component kind \
+            creator after compose churn live test inside the guest"]
+fn linux_vm_runs_framework_component_kind_creator_after_compose_churn_live() {
+    run_linux_guest_mixed_run_test("framework_component_kind_creator_after_compose_churn_live")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component kind \
+            creator compose-child live test inside the guest"]
+fn linux_vm_runs_framework_component_kind_creator_compose_child_live() {
+    run_linux_guest_mixed_run_test("framework_component_kind_creator_compose_child_live")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component kind \
+            root-export live test inside the guest"]
+fn linux_vm_runs_framework_component_kind_root_export_live() {
+    run_linux_guest_mixed_run_test("framework_component_kind_root_export_live")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
 #[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability live tests \
             inside the guest"]
 fn linux_vm_runs_dynamic_capability_live_tests() {
     run_linux_guest_mixed_run_filter("dynamic_capabilities_").unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability dynamic \
+            child post-create share live test inside the guest"]
+fn linux_vm_runs_dynamic_capabilities_dynamic_child_post_create_share_live() {
+    run_linux_guest_mixed_run_test("dynamic_capabilities_dynamic_child_post_create_share_live")
+        .unwrap_or_else(|err| panic!("{err}"));
 }
 
 #[test]

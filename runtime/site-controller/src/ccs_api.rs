@@ -1,11 +1,4 @@
-use super::{
-    api::*,
-    http::{forward_create_child, forward_destroy_child},
-    orchestration::ProtocolApiError,
-    planner::CcsApp,
-    state::FrameworkControlState,
-    *,
-};
+use super::{api::*, state::FrameworkControlState, *};
 
 pub(crate) enum FrameworkComponentInspectRequest {
     ListTemplates,
@@ -87,27 +80,6 @@ pub(crate) async fn execute_framework_component_inspect(
         }
         FrameworkComponentInspectRequest::GetSnapshot => {
             FrameworkComponentInspectResponse::GetSnapshot(snapshot(state, authority_realm_id)?)
-        }
-    })
-}
-
-pub(crate) async fn execute_framework_component_mutate(
-    app: &CcsApp,
-    cap_instance_id: &str,
-    request: FrameworkComponentMutateRequest,
-) -> std::result::Result<FrameworkComponentMutateResponse, ProtocolApiError> {
-    Ok(match request {
-        FrameworkComponentMutateRequest::CreateChild(request) => {
-            FrameworkComponentMutateResponse::CreateChild(
-                forward_create_child(app, cap_instance_id, request).await?,
-            )
-        }
-        FrameworkComponentMutateRequest::DestroyChild { child } => {
-            forward_destroy_child(app, cap_instance_id, &child).await?;
-            FrameworkComponentMutateResponse::DestroyChild(DestroyChildResponse {
-                child,
-                destroyed: true,
-            })
         }
     })
 }

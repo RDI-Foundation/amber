@@ -10,12 +10,14 @@ path = "src/main.rs"
 amber-compiler = { workspace = true }
 amber-config = { workspace = true }
 amber-helper = { path = "../runtime/helper" }
+amber-images = { workspace = true }
 amber-manifest = { workspace = true }
 amber-mesh = { workspace = true }
 amber-proxy = { workspace = true }
 amber-resolver = { workspace = true }
 amber-router = { workspace = true }
 amber-scenario = { workspace = true }
+amber-site-controller = { workspace = true }
 amber-template = { workspace = true }
 axum = { version = "0.8.6", features = ["http1", "json", "tokio"] }
 base64 = { workspace = true }
@@ -51,3 +53,4 @@ serde_yaml = { workspace = true }
 similar = "2.7.0"
 strip-ansi-escapes = "0.2"
 tempfile = { workspace = true }
+time = { version = "0.3.44", features = ["parsing"] }

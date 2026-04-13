@@ -1087,10 +1087,10 @@ fn rewrite_loopback_url_for_slirp_gateway_rewrites_loopback_only() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn rewrite_sidecar_env_passthrough_for_slirp_rewrites_only_dynamic_caps_control_url() {
+fn rewrite_sidecar_env_passthrough_for_slirp_rewrites_only_controller_url() {
     assert_eq!(
         rewrite_sidecar_env_passthrough_for_slirp(
-            amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV,
+            amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV,
             "http://127.0.0.1:25000/v1/control-state"
         ),
         "http://10.0.2.2:25000/v1/control-state"

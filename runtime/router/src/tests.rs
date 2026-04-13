@@ -1177,6 +1177,91 @@ async fn revoke_route_overlay_allows_same_peer_id_with_new_key_after_cleanup() {
 }
 
 #[tokio::test]
+async fn revoke_route_overlay_cleans_up_stale_dynamic_peer_registration_by_id() {
+    let config = test_mesh_config();
+    let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
+    let trust = TrustBundle::new(&config).expect("trust");
+    let dynamic_route_overlays: DynamicRouteOverlays = Arc::new(RwLock::new(HashMap::new()));
+    let dynamic_issuers: DynamicIssuers = Arc::new(RwLock::new(HashMap::new()));
+    let original_peer = test_peer("dynamic-peer");
+    let stale_peer = test_peer("dynamic-peer");
+    let replacement_peer = test_peer("dynamic-peer");
+    assert_ne!(
+        original_peer.public_key, stale_peer.public_key,
+        "test peers should use distinct keys for the same peer id"
+    );
+    assert_ne!(
+        stale_peer.public_key, replacement_peer.public_key,
+        "replacement test peer should also use a distinct key"
+    );
+
+    apply_route_overlay(
+        "overlay-a",
+        ControlRouteOverlay {
+            peers: vec![ControlRouteOverlayPeer {
+                peer_id: original_peer.id.clone(),
+                peer_key: base64::engine::general_purpose::STANDARD
+                    .encode(original_peer.public_key),
+            }],
+            inbound_routes: vec![inbound_route(
+                "dynamic-route",
+                "dynamic",
+                MeshProtocol::Http,
+                InboundTarget::Local { port: 8080 },
+                &["dynamic-peer"],
+            )],
+        },
+        &trust,
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await
+    .expect("first overlay should apply");
+
+    trust
+        .remove_dynamic_peer_by_id("dynamic-peer")
+        .await
+        .expect("simulated drift cleanup should remove the original registration");
+    trust
+        .insert_peer(&stale_peer)
+        .await
+        .expect("simulated stale dynamic registration should install");
+
+    revoke_route_overlay(
+        "overlay-a",
+        &trust,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await;
+
+    apply_route_overlay(
+        "overlay-b",
+        ControlRouteOverlay {
+            peers: vec![ControlRouteOverlayPeer {
+                peer_id: replacement_peer.id.clone(),
+                peer_key: base64::engine::general_purpose::STANDARD
+                    .encode(replacement_peer.public_key),
+            }],
+            inbound_routes: vec![inbound_route(
+                "dynamic-route",
+                "dynamic",
+                MeshProtocol::Http,
+                InboundTarget::Local { port: 8080 },
+                &["dynamic-peer"],
+            )],
+        },
+        &trust,
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await
+    .expect("overlay revoke should clear a stale dynamic peer registration by id");
+}
+
+#[tokio::test]
 async fn apply_route_overlay_rejects_header_invalid_peer_id() {
     let config = test_mesh_config();
     let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
@@ -1714,7 +1799,7 @@ fn resolve_http_external_target_with_override_rejects_loopback_ip_literals() {
 fn resolve_http_external_target_with_override_accepts_framework_loopback_ip_literals() {
     let target = ExternalTarget {
         name: "component".to_string(),
-        url_env: amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV.to_string(),
+        url_env: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV.to_string(),
         optional: false,
         url_override: None,
     };
@@ -2087,4 +2172,224 @@ async fn late_mesh_slot_registration_succeeds_on_same_http_connection() {
     let _ = client_task.await;
     let _ = proxy_task.await;
     let _ = mesh_server_task.await;
+}
+
+#[tokio::test]
+async fn outbound_http_proxy_overwrites_internal_framework_auth_headers() {
+    let captured = Arc::new(StdMutex::new(None::<(String, String)>));
+    let (upstream_client, upstream_server) = duplex(64 * 1024);
+    let captured_upstream = captured.clone();
+    let upstream_task = tokio::spawn(async move {
+        let service = service_fn(move |req: Request<Incoming>| {
+            let captured = captured_upstream.clone();
+            async move {
+                let route_id = req
+                    .headers()
+                    .get(AMBER_ROUTE_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let peer_id = req
+                    .headers()
+                    .get(AMBER_PEER_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                *captured.lock().expect("capture lock") = Some((route_id, peer_id));
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(empty_box_body())
+                        .expect("upstream response should build"),
+                )
+            }
+        });
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(upstream_server), service)
+            .await
+            .expect("upstream server should complete");
+    });
+
+    let (sender, conn) = client_http1::handshake(TokioIo::new(upstream_client))
+        .await
+        .expect("upstream handshake should succeed");
+    let upstream_conn_task = tokio::spawn(async move {
+        conn.await.expect("upstream connection should complete");
+    });
+
+    let state = OutboundHttpProxyState {
+        upstream: Arc::new(Mutex::new(sender)),
+        plugins: Arc::from(Vec::<Arc<dyn HttpExchangePlugin>>::new()),
+        route_id: Arc::<str>::from("framework-route"),
+        peer_id: Arc::<str>::from("/component/delegate"),
+        labels: test_http_exchange_labels(),
+        dynamic_caps: None,
+    };
+
+    let (proxy_client, proxy_server) = duplex(64 * 1024);
+    let proxy_task = tokio::spawn(async move {
+        let service = service_fn(move |req: Request<Incoming>| {
+            let state = state.clone();
+            async move {
+                Ok::<_, std::convert::Infallible>(proxy_outbound_http_request(state, req).await)
+            }
+        });
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(proxy_server), service)
+            .await
+            .expect("proxy server should complete");
+    });
+
+    let (mut client, conn) = client_http1::handshake(TokioIo::new(proxy_client))
+        .await
+        .expect("proxy handshake should succeed");
+    let proxy_conn_task = tokio::spawn(async move {
+        conn.await.expect("proxy connection should complete");
+    });
+
+    let response = client
+        .send_request(
+            Request::builder()
+                .uri("/framework/create")
+                .header(AMBER_ROUTE_ID_HEADER, "spoofed-route")
+                .header(AMBER_PEER_ID_HEADER, "/spoofed/peer")
+                .body(empty_box_body())
+                .expect("request should build"),
+        )
+        .await
+        .expect("proxy request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    drop(client);
+
+    assert_eq!(
+        *captured.lock().expect("capture lock"),
+        Some((
+            "framework-route".to_string(),
+            "/component/delegate".to_string(),
+        )),
+        "router-generated internal auth headers must overwrite caller-supplied values",
+    );
+
+    proxy_task.await.expect("proxy task should join");
+    proxy_conn_task
+        .await
+        .expect("proxy connection task should join");
+    upstream_task.await.expect("upstream task should join");
+    upstream_conn_task
+        .await
+        .expect("upstream connection task should join");
+}
+
+#[tokio::test]
+async fn framework_external_proxy_preserves_forwarded_internal_auth_headers() {
+    let captured = Arc::new(StdMutex::new(None::<(String, String)>));
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("controller listener should bind");
+    let addr = listener.local_addr().expect("listener addr");
+    let captured_upstream = captured.clone();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("controller should accept");
+        let service = service_fn(move |req: Request<Incoming>| {
+            let captured = captured_upstream.clone();
+            async move {
+                let route_id = req
+                    .headers()
+                    .get(AMBER_ROUTE_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let peer_id = req
+                    .headers()
+                    .get(AMBER_PEER_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                *captured.lock().expect("capture lock") = Some((route_id, peer_id));
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(empty_box_body())
+                        .expect("controller response should build"),
+                )
+            }
+        });
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .await
+            .expect("controller server should complete");
+    });
+
+    let (client, vetted_external_addrs) = build_client();
+    let external_overrides: ExternalOverrides = Arc::new(RwLock::new(HashMap::from([(
+        "framework".to_string(),
+        format!("http://127.0.0.1:{}/", addr.port()),
+    )])));
+    let state = HttpProxyState {
+        client,
+        target: ExternalTarget {
+            name: "framework".to_string(),
+            url_env: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV.to_string(),
+            optional: false,
+            url_override: None,
+        },
+        labels: test_http_exchange_labels(),
+        config: Arc::new(test_mesh_config()),
+        external_overrides,
+        vetted_external_addrs,
+        mesh_upstream: Arc::new(Mutex::new(None)),
+        route_id: Some(Arc::<str>::from("site-router-route")),
+        peer_id: Some(Arc::<str>::from("/site/source/router")),
+    };
+
+    let (proxy_client, proxy_server) = duplex(64 * 1024);
+    let proxy_task = tokio::spawn(async move {
+        let service = service_fn(move |req: Request<Incoming>| {
+            let state = state.clone();
+            async move { Ok::<_, std::convert::Infallible>(proxy_http_request(state, req).await) }
+        });
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(proxy_server), service)
+            .await
+            .expect("proxy server should complete");
+    });
+
+    let (mut client, conn) = client_http1::handshake(TokioIo::new(proxy_client))
+        .await
+        .expect("proxy handshake should succeed");
+    let proxy_conn_task = tokio::spawn(async move {
+        conn.await.expect("proxy connection should complete");
+    });
+
+    let response = client
+        .send_request(
+            Request::builder()
+                .uri("/v1/children")
+                .header(AMBER_ROUTE_ID_HEADER, "forwarded-framework-route")
+                .header(AMBER_PEER_ID_HEADER, "/component/delegate")
+                .body(empty_box_body())
+                .expect("request should build"),
+        )
+        .await
+        .expect("proxy request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    drop(client);
+
+    assert_eq!(
+        *captured.lock().expect("capture lock"),
+        Some((
+            "forwarded-framework-route".to_string(),
+            "/component/delegate".to_string(),
+        )),
+        "destination router must preserve forwarded framework auth headers instead of replacing \
+         them with the intermediate site-router identity",
+    );
+
+    proxy_task.await.expect("proxy task should join");
+    proxy_conn_task
+        .await
+        .expect("proxy connection task should join");
+    upstream_task.await.expect("upstream task should join");
 }
