@@ -94,6 +94,7 @@ fn docker_smoke_component_reaches_public_internet_by_default() {
         bindings: Vec::new(),
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
+        governance: None,
     };
 
     let output = compile_output(scenario);
@@ -363,6 +364,7 @@ fn docker_smoke_component_default_egress_blocks_host_access() {
         bindings: Vec::new(),
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
+        governance: None,
     };
 
     let output = compile_output(scenario);
@@ -577,6 +579,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
+        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(client)],
         bindings: vec![BindingEdge {
@@ -877,6 +880,7 @@ sleep infinity
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
+        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(agent_a), Some(agent_b), Some(client_c)],
         bindings: vec![
@@ -1148,6 +1152,7 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
+        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![BindingEdge {
@@ -1348,6 +1353,7 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
+        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![

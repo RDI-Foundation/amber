@@ -16,21 +16,23 @@ use std::{
 use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
-    ExportName, ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, ProgramConfigUseSite, framework_capability, span_for_json_pointer,
+    ComponentDecl, ComponentRef, ExportName, ExportTarget, InterpolatedPart, InterpolatedString,
+    InterpolationSource, Manifest, ManifestDigest, ManifestRef, PolicyRef, ProgramConfigUseSite,
+    RawManifest, framework_capability, span_for_json_pointer,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
-    FrameworkRef, ManifestCatalogEntry, ProgramMount, ProvideRef,
-    ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
-    StorageResourceParams as ScenarioStorageResourceParams, TemplateBinding, TemplateConfigField,
-    graph::component_path_for,
+    FrameworkRef, Governance, GovernanceScenario, GovernedScope, ManifestCatalogEntry,
+    ProgramMount, ProvideRef, ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario,
+    ScenarioExport, SlotRef, StorageResourceParams as ScenarioStorageResourceParams,
+    TemplateBinding, TemplateConfigField, graph::component_path_for,
 };
 use jsonschema::Validator;
 use miette::{Diagnostic, NamedSource, SourceSpan};
 pub use provenance::{ComponentProvenance, Provenance};
 use serde_json::Value;
 use thiserror::Error;
+use url::Url;
 
 use self::{
     bindings::*,
@@ -87,6 +89,13 @@ fn component_local_name(component: &Component) -> &str {
         .moniker
         .local_name()
         .expect("component should have a local name")
+}
+
+#[derive(Clone, Debug)]
+struct ScopeBuild {
+    root_moniker: amber_scenario::Moniker,
+    uses: BTreeMap<String, ResolvedNode>,
+    policies: Vec<PolicyRef>,
 }
 
 #[allow(unused_assignments)]
@@ -410,6 +419,7 @@ struct FlattenState<'a> {
     out: &'a mut Vec<Option<Component>>,
     provenance: &'a mut Provenance,
     link_index: &'a mut Vec<LinkIndex>,
+    scope_builds: &'a mut Vec<ScopeBuild>,
 }
 
 pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Provenance), Error> {
@@ -417,6 +427,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     let mut link_index = Vec::new();
     let mut provenance = Provenance::default();
     let mut manifest_catalog = BTreeMap::new();
+    let mut scope_builds = Vec::new();
     let root = flatten(
         &tree.root,
         None,
@@ -427,6 +438,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             out: &mut components,
             provenance: &mut provenance,
             link_index: &mut link_index,
+            scope_builds: &mut scope_builds,
         },
     );
 
@@ -770,7 +782,9 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         bindings: binding_edges,
         exports,
         manifest_catalog,
+        governance: None,
     };
+    scenario.governance = build_governance(&scope_builds, store)?;
     scenario.normalize_order();
 
     if !errors.is_empty() {
@@ -786,6 +800,99 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     scenario.assert_invariants();
 
     Ok((scenario, provenance))
+}
+
+fn build_governance(
+    scope_builds: &[ScopeBuild],
+    store: &DigestStore,
+) -> Result<Option<Governance>, Error> {
+    if scope_builds.is_empty() {
+        return Ok(None);
+    }
+
+    let governance_root_url = Url::parse("governance://root").expect("valid governance root url");
+    let governance_root_ref = ManifestRef::new(governance_root_url.clone(), None);
+
+    let mut governance_children = BTreeMap::new();
+    let mut governance_root_components = BTreeMap::new();
+    let mut governance_root_exports = BTreeMap::new();
+    let mut scopes = Vec::with_capacity(scope_builds.len());
+
+    for (scope_index, scope) in scope_builds.iter().enumerate() {
+        let mut use_child_names = BTreeMap::new();
+        for (use_index, (use_name, use_node)) in scope.uses.iter().enumerate() {
+            let child_name = format!("use_{scope_index}_{use_index}");
+            let mut child_node = use_node.clone();
+            child_node.name = child_name.clone();
+            governance_children.insert(child_name.clone(), child_node.clone());
+            let manifest_ref =
+                ManifestRef::new(child_node.resolved_url.clone(), Some(child_node.digest));
+            let component_ref = match child_node.config.clone() {
+                Some(config) => ComponentRef::builder()
+                    .manifest(manifest_ref)
+                    .config(config)
+                    .build(),
+                None => ComponentRef::builder().manifest(manifest_ref).build(),
+            };
+            governance_root_components
+                .insert(child_name.clone(), ComponentDecl::Object(component_ref));
+            use_child_names.insert(use_name.clone(), child_name);
+        }
+
+        let mut policies = Vec::with_capacity(scope.policies.len());
+        for (policy_index, policy) in scope.policies.iter().enumerate() {
+            let child_name = use_child_names
+                .get(policy.alias.as_str())
+                .expect("resolved policy alias should match a resolved use");
+            let export_name = ExportName::try_from(format!("policy_{scope_index}_{policy_index}"))
+                .expect("synthetic governance export names are valid");
+            governance_root_exports.insert(
+                export_name.to_string(),
+                format!("#{child_name}.{}", policy.export)
+                    .parse()
+                    .expect("synthetic governance exports should be valid"),
+            );
+            policies.push(export_name);
+        }
+
+        scopes.push(GovernedScope {
+            root_moniker: scope.root_moniker.clone(),
+            policies,
+        });
+    }
+
+    let mut raw_manifest = RawManifest::from(&Manifest::empty());
+    raw_manifest.components = governance_root_components;
+    raw_manifest.exports = governance_root_exports;
+    let root_manifest: Manifest = raw_manifest
+        .try_into()
+        .expect("synthetic governance root manifest should be valid");
+    let root_digest = root_manifest.digest();
+    store.put(root_digest, Arc::new(root_manifest));
+
+    let governance_tree = ResolvedTree {
+        root: ResolvedNode {
+            name: "governance".to_string(),
+            declared_ref: governance_root_ref.clone(),
+            digest: root_digest,
+            resolved_url: governance_root_url,
+            observed_url: None,
+            config: None,
+            children: governance_children,
+            uses: BTreeMap::new(),
+            policies: Vec::new(),
+            child_templates: BTreeMap::new(),
+        },
+    };
+
+    // Governance scenarios are linked like ordinary trees. This does not recurse because the
+    // frontend rejects `use` subtrees that declare nested `use` or `policies`, so this synthetic
+    // tree contains no governed scopes of its own.
+    let (scenario, _) = link(governance_tree, store)?;
+    Ok(Some(Governance {
+        governance_scenario: GovernanceScenario::from_scenario(scenario),
+        scopes,
+    }))
 }
 
 fn flatten(
@@ -804,8 +911,19 @@ fn flatten(
         Arc::from(format!("{parent_path}/{}", node.name))
     };
 
-    let moniker = Arc::clone(&authored_moniker).into();
+    let moniker: amber_scenario::Moniker = Arc::clone(&authored_moniker).into();
     let child_templates = lower_child_templates(node, state.store, state.manifest_catalog);
+    if !node.policies.is_empty() {
+        state.scope_builds.push(ScopeBuild {
+            root_moniker: moniker.clone(),
+            uses: node.uses.clone(),
+            policies: node
+                .policies
+                .iter()
+                .map(|policy| policy.reference.clone())
+                .collect(),
+        });
+    }
 
     state.out.push(Some(Component {
         id,

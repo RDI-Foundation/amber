@@ -417,6 +417,7 @@ async fn compile_dynamic_caps_binding_state() -> FrameworkControlState {
         ],
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
+        governance: None,
     };
     let placement = PlacementFile {
         schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
@@ -907,6 +908,7 @@ async fn compile_dynamic_caps_external_root_state() -> FrameworkControlState {
         }],
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
+        governance: None,
     };
     let placement = PlacementFile {
         schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
@@ -4169,6 +4171,7 @@ fn shared_cross_site_link_is_retained_while_another_child_still_needs_it() {
             bindings: Vec::new(),
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
+            governance: None,
         },
         run_links: Vec::new(),
         placement: FrozenPlacementState {

@@ -8,7 +8,7 @@ mod tests;
 
 use amber_manifest::{ExperimentalFeature, Manifest, ManifestRef};
 use amber_resolver::Resolver;
-use amber_scenario::{BindingFrom, ComponentId, Scenario};
+use amber_scenario::{BindingFrom, ComponentId, GovernanceScenario, Scenario};
 use lint::{ManifestLint, lint_manifest};
 use miette::{Diagnostic, Report};
 use thiserror::Error;
@@ -139,12 +139,22 @@ impl Compiler {
             &self.store,
         ));
 
-        let (scenario, provenance) = mir::optimize_linked_scenario(
+        let (mut scenario, provenance) = mir::optimize_linked_scenario(
             scenario,
             provenance,
             &self.store,
             mir::OptimizeOptions { dce: opts.dce },
         )?;
+        if let Some(mut governance) = scenario.governance.take() {
+            let (governance_scenario, _) = mir::optimize_linked_scenario(
+                governance.governance_scenario.into_scenario(),
+                Provenance::default(),
+                &self.store,
+                mir::OptimizeOptions { dce: opts.dce },
+            )?;
+            governance.governance_scenario = GovernanceScenario::from_scenario(governance_scenario);
+            scenario.governance = Some(governance);
+        }
         let config_analysis = config::analysis::ScenarioConfigAnalysis::from_scenario(&scenario)
             .expect("linked scenario should produce valid config analysis");
 

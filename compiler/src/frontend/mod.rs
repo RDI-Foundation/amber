@@ -197,6 +197,22 @@ pub enum Error {
         #[related]
         related: Vec<RelatedManifestSpan>,
     },
+
+    #[error("use `#{name}` contains governance declarations in its subtree: {message}")]
+    #[diagnostic(
+        code(compiler::use_contains_governance),
+        help("Governance `use` components must be self-contained.")
+    )]
+    UseContainsGovernance {
+        name: Box<str>,
+        message: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "use declared here")]
+        span: Option<SourceSpan>,
+        #[related]
+        related: Vec<RelatedManifestSpan>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -520,6 +536,12 @@ async fn resolve_component(
                     use_name.as_str(),
                     use_node.digest,
                     &use_node.resolved_url,
+                )?;
+                validate_use_subtree_has_no_governance(
+                    &svc,
+                    &manifest_url,
+                    use_name.as_str(),
+                    &use_node,
                 )?;
                 Ok::<(String, ResolvedNode), Error>((use_name, use_node))
             }
@@ -964,6 +986,95 @@ fn validate_use_root_slots(
         span,
         related,
     })
+}
+
+fn validate_use_subtree_has_no_governance(
+    svc: &ResolveService,
+    manifest_url: &Url,
+    use_name: &str,
+    use_node: &ResolvedNode,
+) -> Result<(), Error> {
+    let Some((offending_url, span, message, label)) =
+        first_governance_in_use_subtree(svc, use_node)
+    else {
+        return Ok(());
+    };
+
+    let (src, use_span) = use_manifest_decl_site(svc, manifest_url, use_name);
+    let related = svc
+        .store
+        .get_source(&offending_url)
+        .map(|stored| {
+            vec![RelatedManifestSpan {
+                message: format!("use `#{use_name}` resolves to governance here"),
+                src: NamedSource::new(display_url(&offending_url), stored.source)
+                    .with_language("json5"),
+                span,
+                label: label.to_string(),
+            }]
+        })
+        .unwrap_or_default();
+
+    Err(Error::UseContainsGovernance {
+        name: use_name.into(),
+        message: message.into(),
+        src,
+        span: use_span,
+        related,
+    })
+}
+
+fn first_governance_in_use_subtree(
+    svc: &ResolveService,
+    node: &ResolvedNode,
+) -> Option<(Url, SourceSpan, &'static str, &'static str)> {
+    let manifest = svc.store.get(&node.digest)?;
+    let stored = svc.store.get_source(&node.resolved_url);
+
+    if !manifest.uses().is_empty() {
+        let span = stored
+            .as_ref()
+            .and_then(|stored| {
+                stored
+                    .spans
+                    .uses
+                    .values()
+                    .next()
+                    .map(|component| component.name)
+            })
+            .unwrap_or((0usize, 0usize).into());
+        return Some((
+            node.resolved_url.clone(),
+            span,
+            "nested `use` is not supported",
+            "nested `use` declared here",
+        ));
+    }
+    if !manifest.policies().is_empty() {
+        let span = stored
+            .as_ref()
+            .and_then(|stored| stored.spans.policies.first().map(|policy| policy.whole))
+            .unwrap_or((0usize, 0usize).into());
+        return Some((
+            node.resolved_url.clone(),
+            span,
+            "`policies` is not supported",
+            "`policies` declared here",
+        ));
+    }
+
+    for child in node.children.values() {
+        if let Some(found) = first_governance_in_use_subtree(svc, child) {
+            return Some(found);
+        }
+    }
+    for used in node.uses.values() {
+        if let Some(found) = first_governance_in_use_subtree(svc, used) {
+            return Some(found);
+        }
+    }
+
+    None
 }
 
 fn validate_child_experimental_features(

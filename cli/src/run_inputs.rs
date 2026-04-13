@@ -1736,6 +1736,7 @@ mod tests {
                 bindings: Vec::new(),
                 exports: Vec::new(),
                 manifest_catalog: BTreeMap::new(),
+                governance: None,
             },
             artifact_files,
         }
@@ -1799,6 +1800,7 @@ mod tests {
                 bindings: Vec::new(),
                 exports: Vec::new(),
                 manifest_catalog: BTreeMap::new(),
+                governance: None,
             },
             offered_sites: BTreeMap::from([(
                 "direct_local".to_string(),

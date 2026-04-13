@@ -222,6 +222,7 @@ mod tests {
             bindings,
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
+            governance: None,
         };
 
         let order = topo_order(&scenario).unwrap();
@@ -276,6 +277,7 @@ mod tests {
             bindings,
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
+            governance: None,
         };
 
         let cycle = topo_order(&scenario).unwrap_err().cycle;
@@ -318,6 +320,7 @@ mod tests {
             bindings,
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
+            governance: None,
         };
 
         let order = topo_order(&scenario).unwrap();

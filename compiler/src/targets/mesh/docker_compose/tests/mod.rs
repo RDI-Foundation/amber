@@ -470,6 +470,7 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
 
     Scenario {
         manifest_catalog: BTreeMap::new(),
+        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),

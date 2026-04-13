@@ -1162,3 +1162,144 @@ async fn policy_ref_rejects_slot_exports() {
         other => panic!("expected InvalidPolicyExport error, got: {other}"),
     }
 }
+
+#[tokio::test]
+async fn compile_attaches_governance_scenario_for_policy_uses() {
+    let dir = tmp_dir("scenario-governance-ir");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+    let wrapper_path = dir.path().join("wrapper.json5");
+
+    write_file(&child_path, r#"{ manifest_version: "0.1.0" }"#);
+    write_file(
+        &wrapper_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "wrapper",
+            entrypoint: ["wrapper"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { rewrite: { kind: "http", profile: "policy", endpoint: "api" } },
+          exports: { rewrite: "rewrite" },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              use: {{
+                wrapper: "{wrapper}",
+              }},
+              policies: ["#wrapper.rewrite"],
+              components: {{
+                child: "{child}",
+              }},
+            }}
+            "##,
+            wrapper = file_url(&wrapper_path),
+            child = file_url(&child_path),
+        ),
+    );
+
+    let output = default_compiler()
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .unwrap();
+
+    let governance = output
+        .scenario
+        .governance
+        .as_ref()
+        .expect("governance should be attached");
+    assert_eq!(governance.scopes.len(), 1);
+    assert_eq!(governance.scopes[0].root_moniker.as_str(), "/");
+    assert_eq!(governance.scopes[0].policies.len(), 1);
+    assert_eq!(governance.scopes[0].policies[0].as_str(), "policy_0_0");
+    assert_eq!(governance.governance_scenario.exports[0].name, "policy_0_0");
+    assert_eq!(
+        governance
+            .governance_scenario
+            .components
+            .iter()
+            .flatten()
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn used_manifest_rejects_nested_governance() {
+    let dir = tmp_dir("scenario-use-nested-governance");
+    let root_path = dir.path().join("root.json5");
+    let wrapper_path = dir.path().join("wrapper.json5");
+    let nested_path = dir.path().join("nested.json5");
+
+    write_file(&nested_path, r#"{ manifest_version: "0.1.0" }"#);
+    write_file(
+        &wrapper_path,
+        &format!(
+            r#"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              use: {{
+                nested: "{nested}",
+              }},
+              program: {{
+                image: "wrapper",
+                entrypoint: ["wrapper"],
+                network: {{ endpoints: [{{ name: "api", port: 80 }}] }},
+              }},
+              provides: {{ rewrite: {{ kind: "http", profile: "policy", endpoint: "api" }} }},
+              exports: {{ rewrite: "rewrite" }},
+            }}
+            "#,
+            nested = file_url(&nested_path),
+        ),
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              use: {{
+                wrapper: "{wrapper}",
+              }},
+              policies: ["#wrapper.rewrite"],
+            }}
+            "##,
+            wrapper = file_url(&wrapper_path),
+        ),
+    );
+
+    let err = default_compiler()
+        .resolve_tree(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options().resolve,
+        )
+        .await
+        .unwrap_err();
+
+    match err {
+        crate::Error::Frontend(crate::frontend::Error::UseContainsGovernance {
+            name,
+            message,
+            ..
+        }) => {
+            assert_eq!(name.as_ref(), "wrapper");
+            assert_eq!(message.as_ref(), "nested `use` is not supported");
+        }
+        other => panic!("expected UseContainsGovernance error, got: {other}"),
+    }
+}

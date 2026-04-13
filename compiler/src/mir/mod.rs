@@ -111,6 +111,7 @@ fn take_scenario(scenario: &mut Scenario) -> Scenario {
             bindings: Vec::new(),
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
+            governance: None,
         },
     )
 }
@@ -589,6 +590,7 @@ fn prune_and_rebuild_scenario(
         bindings,
         exports,
         manifest_catalog,
+        governance,
     } = scenario;
 
     debug_assert_eq!(removed.len(), components.len());
@@ -658,6 +660,7 @@ fn prune_and_rebuild_scenario(
         bindings: new_bindings,
         exports,
         manifest_catalog,
+        governance,
     };
     scenario.normalize_order();
     scenario
@@ -1177,6 +1180,7 @@ mod tests {
             ],
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
+            governance: None,
         };
         scenario.normalize_order();
 

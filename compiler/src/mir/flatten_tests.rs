@@ -148,6 +148,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
 
     let mut scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
+        governance: None,
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
@@ -321,6 +322,7 @@ fn flatten_keeps_resource_owners() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
+        governance: None,
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
@@ -452,6 +454,7 @@ fn flatten_allows_same_name_siblings() {
 
     let mut scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
+        governance: None,
         root: ComponentId(0),
         components,
         bindings: Vec::new(),
@@ -589,6 +592,7 @@ fn flatten_keeps_realm_significant_template_owner_nodes() {
         bindings: Vec::new(),
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
+        governance: None,
     };
 
     let scenario = flatten_routing_only(scenario, &store).unwrap();

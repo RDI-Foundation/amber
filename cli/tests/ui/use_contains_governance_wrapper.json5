@@ -1,0 +1,18 @@
+{
+  manifest_version: "0.1.0",
+  experimental_features: ["governance"],
+  use: {
+    nested: "./use_contains_governance_nested.json5",
+  },
+  program: {
+    image: "wrapper",
+    entrypoint: ["wrapper"],
+    network: { endpoints: [{ name: "api", port: 80 }] },
+  },
+  provides: {
+    rewrite: { kind: "http", profile: "policy", endpoint: "api" },
+  },
+  exports: {
+    rewrite: "rewrite",
+  },
+}

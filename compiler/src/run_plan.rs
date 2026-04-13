@@ -93,6 +93,7 @@ fn default_base_scenario() -> ScenarioIr {
         bindings: Vec::new(),
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
+        governance: None,
     }
 }
 
@@ -1700,6 +1701,7 @@ fn build_site_scenario(
         bindings,
         exports,
         manifest_catalog: scenario.manifest_catalog.clone(),
+        governance: None,
     };
     site_scenario.normalize_order();
     Ok(site_scenario)
