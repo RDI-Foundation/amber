@@ -63,10 +63,23 @@ pub(crate) fn spawn_run_outside_proxy(
     slot_bindings: &BTreeMap<String, String>,
     export_bindings: &BTreeMap<String, SocketAddr>,
 ) -> Result<Child> {
+    clear_run_outside_proxy_state(run_root)?;
     let plan_path = write_run_outside_proxy_plan(run_root, slot_bindings, export_bindings)?;
     spawn_detached_child(run_root, &run_root.join("outside-proxy.log"), |cmd| {
         cmd.arg("run-outside-proxy").arg("--plan").arg(&plan_path);
     })
+}
+
+pub(crate) fn clear_run_outside_proxy_state(run_root: &Path) -> Result<()> {
+    let state_path = outside_proxy_state_path(run_root);
+    match fs::remove_file(&state_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(miette::miette!(
+            "failed to remove outside proxy state {}: {err}",
+            state_path.display()
+        )),
+    }
 }
 
 pub(crate) fn write_run_outside_proxy_plan(
@@ -302,7 +315,7 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
         },
     )?;
 
-    tokio::select! {
+    let result = tokio::select! {
         result = router => {
             match result {
                 Ok(Ok(())) => Ok(()),
@@ -314,7 +327,9 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
             signal.into_diagnostic().wrap_err("failed to wait for Ctrl-C")?;
             Ok(())
         }
-    }
+    };
+    let _ = clear_run_outside_proxy_state(&run_root);
+    result
 }
 
 pub(super) async fn stop_site_from_receipt(

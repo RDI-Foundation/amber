@@ -123,6 +123,78 @@ fn attached_run_overview_stays_focused_on_identity_and_exports() {
     assert!(!rendered.contains("Ctrl-C"), "{rendered}");
 }
 
+#[cfg(unix)]
+#[test]
+fn cleanup_temporary_run_outside_proxy_removes_state_file() {
+    let temp = tempfile::tempdir().expect("tempdir should exist");
+    let run_root = temp.path();
+    let state_path = run_root.join("outside-proxy-state.json");
+    fs::write(&state_path, "{}").expect("state file should exist");
+    let mut proxy_child = Some(
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("proxy child should spawn"),
+    );
+
+    cleanup_temporary_run_outside_proxy(run_root, &mut proxy_child)
+        .expect("cleanup should succeed");
+
+    assert!(
+        proxy_child.is_none(),
+        "cleanup should take ownership of the child"
+    );
+    assert!(
+        !state_path.exists(),
+        "cleanup should remove stale outside proxy state"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn detached_run_ready_waits_past_old_timeout_until_receipt_exists() {
+    let temp = tempfile::tempdir().expect("tempdir should exist");
+    let run_root = temp.path().join("run-123");
+    fs::create_dir_all(&run_root).expect("run root should exist");
+    let log_path = run_root.join("coordinator.log");
+    fs::write(&log_path, "").expect("log path should exist");
+    let receipt_path = run_root.join("receipt.json");
+    let run_root_for_wait = run_root.clone();
+    let log_path_for_wait = log_path.clone();
+    let wait_task = tokio::spawn(async move {
+        let mut coordinator = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .expect("coordinator should spawn");
+        let result = wait_for_detached_run_ready(
+            &mut coordinator,
+            "run-123",
+            &run_root_for_wait,
+            &log_path_for_wait,
+        )
+        .await;
+        let _ = coordinator.kill();
+        let _ = coordinator.wait();
+        result
+    });
+    let receipt_task = tokio::spawn(async move {
+        sleep(Duration::from_secs(31)).await;
+        fs::write(receipt_path, "{}").expect("receipt should be written");
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::task::yield_now().await;
+
+    wait_task
+        .await
+        .expect("wait task should join")
+        .expect("detached run should keep waiting until the receipt exists");
+    receipt_task.await.expect("receipt task should join");
+}
+
 #[test]
 fn proxy_console_is_quiet_by_default() {
     assert_eq!(

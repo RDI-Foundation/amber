@@ -1730,7 +1730,6 @@ async fn wait_for_detached_run_ready(
     log_path: &Path,
 ) -> Result<()> {
     let receipt_path = run_root.join("receipt.json");
-    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if receipt_path.is_file() {
             return Ok(());
@@ -1738,12 +1737,6 @@ async fn wait_for_detached_run_ready(
         if let Some(status) = coordinator.try_wait().into_diagnostic()? {
             return Err(miette::miette!(
                 "detached run `{run_id}` exited before it became ready (status {status}); see {}",
-                log_path.display()
-            ));
-        }
-        if Instant::now() >= deadline {
-            return Err(miette::miette!(
-                "timed out waiting for detached run `{run_id}` to become ready; see {}",
                 log_path.display()
             ));
         }
@@ -2000,6 +1993,17 @@ async fn stop_run_with_cleanup_notice(
     }
 }
 
+fn cleanup_temporary_run_outside_proxy(
+    run_root: &Path,
+    proxy_child: &mut Option<Child>,
+) -> Result<()> {
+    if let Some(mut proxy_child) = proxy_child.take() {
+        let _ = proxy_child.kill();
+        let _ = proxy_child.wait();
+    }
+    mixed_run::clear_run_outside_proxy_state(run_root)
+}
+
 enum AttachedRunStorage {
     Persistent(PathBuf),
     Managed(PathBuf),
@@ -2080,10 +2084,7 @@ async fn run_attached_mixed_run(
         if proxy_child.is_some()
             && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
         {
-            if let Some(proxy_child) = proxy_child.as_mut() {
-                let _ = proxy_child.kill();
-                let _ = proxy_child.wait();
-            }
+            cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child)?;
             let _ = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
             return Err(err);
         }
@@ -2129,12 +2130,10 @@ async fn run_attached_mixed_run(
         },
     )
     .await;
+    let proxy_cleanup_result = cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
     let stop_result = stop_run_with_cleanup_notice(&receipt.run_id, storage_root_override).await;
-    if let Some(proxy_child) = proxy_child.as_mut() {
-        let _ = proxy_child.kill();
-        let _ = proxy_child.wait();
-    }
     result?;
+    proxy_cleanup_result?;
     stop_result?;
     attached_storage.cleanup_run_root(&run_root)
 }
@@ -2162,10 +2161,7 @@ async fn attach(args: AttachArgs) -> Result<()> {
     if proxy_child.is_some()
         && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
     {
-        if let Some(proxy_child) = proxy_child.as_mut() {
-            let _ = proxy_child.kill();
-            let _ = proxy_child.wait();
-        }
+        cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child)?;
         return Err(err);
     }
 
@@ -2187,11 +2183,10 @@ async fn attach(args: AttachArgs) -> Result<()> {
         },
     )
     .await;
-    if let Some(proxy_child) = proxy_child.as_mut() {
-        let _ = proxy_child.kill();
-        let _ = proxy_child.wait();
-    }
-    result
+    let cleanup_result = cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
+    result?;
+    cleanup_result?;
+    Ok(())
 }
 
 fn ps(args: PsArgs) -> Result<()> {

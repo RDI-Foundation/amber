@@ -35,7 +35,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = "0.10.9"
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "test-util", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
