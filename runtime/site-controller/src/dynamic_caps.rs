@@ -77,6 +77,8 @@ pub(crate) enum DynamicCapabilityShareOutcome {
 
 #[derive(Clone, Debug)]
 pub(crate) struct DynamicCapabilityRevokeOutcome {
+    // Production code only needs to know whether revocation changed anything; tests assert the
+    // exact grant set to keep cascade revocation behavior pinned down.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) revoked_grant_ids: Vec<String>,
 }
@@ -155,6 +157,16 @@ pub(crate) struct ControlDynamicResolveOriginRequest {
     pub(crate) holder_component_id: String,
     #[serde(flatten)]
     pub(crate) source: DynamicCapabilityControlSourceRequest,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct InternalDynamicResolveOriginRequest {
+    pub(crate) holder_component_id: String,
+    #[serde(flatten)]
+    pub(crate) source: DynamicCapabilityControlSourceRequest,
+    pub(crate) holder_peer_id: String,
+    pub(crate) holder_peer_key_b64: String,
+    pub(crate) holder_site_kind: SiteKind,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

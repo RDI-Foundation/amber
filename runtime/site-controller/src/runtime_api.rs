@@ -8,13 +8,13 @@ use std::{
 };
 
 use amber_compiler::run_plan::{RunLink, SiteKind};
-use amber_mesh::{MeshConfigPublic, MeshIdentityPublic};
+use amber_mesh::{InboundRoute, MeshConfigPublic, MeshIdentityPublic, MeshPeer};
 use amber_proxy::ControlEndpoint;
 use base64::Engine as _;
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
 use serde::{Deserialize, Serialize};
 
-use super::state::{DynamicSitePlanRecord, SiteControllerPlan};
+use super::state::{FrameworkControlState, LiveChildRecord, SiteControllerPlan};
 
 const KUBERNETES_MESH_PROVISION_CONFIGMAP_PATH: &str = "01-configmaps/amber-mesh-provision.yaml";
 const KUBERNETES_PROVISIONER_JOB_PATH: &str = "02-rbac/amber-provisioner-job.yaml";
@@ -27,7 +27,7 @@ const SITE_CONTROLLER_RUNTIME_PLAN_VERSION: u32 = 1;
 
 pub type SiteControllerRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
-pub trait SiteControllerRuntime: Send + Sync {
+pub(crate) trait SiteControllerRuntime: Send + Sync {
     fn cleanup<'a>(&'a self) -> SiteControllerRuntimeFuture<'a, ()>;
 
     fn resolve_link_external_url<'a>(
@@ -42,15 +42,15 @@ pub trait SiteControllerRuntime: Send + Sync {
     fn prepare_child<'a>(
         &'a self,
         plan: &'a SiteControllerPlan,
-        child_id: u64,
-        site_plan: DynamicSitePlanRecord,
+        state: FrameworkControlState,
+        child: LiveChildRecord,
     ) -> SiteControllerRuntimeFuture<'a, ()>;
 
     fn publish_child<'a>(
         &'a self,
         plan: &'a SiteControllerPlan,
-        child_id: u64,
-        site_plan: DynamicSitePlanRecord,
+        state: FrameworkControlState,
+        child: LiveChildRecord,
     ) -> SiteControllerRuntimeFuture<'a, ()>;
 
     fn rollback_child<'a>(
@@ -62,8 +62,8 @@ pub trait SiteControllerRuntime: Send + Sync {
     fn destroy_child<'a>(
         &'a self,
         plan: &'a SiteControllerPlan,
-        child_id: u64,
-        desired_site_plan: Option<DynamicSitePlanRecord>,
+        state: FrameworkControlState,
+        child: LiveChildRecord,
     ) -> SiteControllerRuntimeFuture<'a, ()>;
 
     fn collect_live_component_runtime_metadata(
@@ -110,7 +110,7 @@ pub trait SiteControllerRuntime: Send + Sync {
     ) -> Result<()>;
 }
 
-pub type SharedSiteControllerRuntime = Arc<dyn SiteControllerRuntime>;
+pub(crate) type SharedSiteControllerRuntime = Arc<dyn SiteControllerRuntime>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SiteReceipt {
@@ -151,6 +151,8 @@ pub struct SiteControllerRuntimePlan {
     pub site_id: String,
     pub kind: SiteKind,
     pub router_identity_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_router_control: Option<String>,
     pub artifact_dir: String,
     pub site_state_root: String,
     pub listen_addr: SocketAddr,
@@ -176,6 +178,7 @@ pub struct SiteControllerRuntimePlan {
 pub struct LiveComponentRuntimeMetadata {
     pub moniker: String,
     pub host_mesh_addr: String,
+    pub control_endpoint: Option<ControlEndpoint>,
     pub mesh_config: MeshConfigPublic,
 }
 
@@ -193,6 +196,14 @@ pub struct DesiredExportPeerOverlay {
     pub protocol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DesiredRouteOverlay {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<MeshPeer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbound_routes: Vec<InboundRoute>,
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +226,7 @@ pub fn site_controller_runtime_plan_from_controller_plan(
         site_id: plan.site_id.clone(),
         kind: plan.kind,
         router_identity_id: plan.router_identity_id.clone(),
+        local_router_control: plan.local_router_control.clone(),
         artifact_dir: plan.artifact_dir.clone(),
         site_state_root: plan.site_state_root.clone(),
         listen_addr: plan.listen_addr,

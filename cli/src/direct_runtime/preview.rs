@@ -120,27 +120,64 @@ pub(crate) fn build_direct_site_launch_preview(
         direct_plan,
         mesh_plan,
     } = load_direct_runtime_inputs(&plan_path)?;
-    let runtime_state = materialize_direct_runtime(
+    let mut inspectability_warnings = Vec::new();
+    let runtime_state = match materialize_direct_runtime(
         &plan_root,
         runtime_root,
         &direct_plan,
         &mesh_plan,
         router_mesh_port,
         true,
-    )?;
-    #[cfg(target_os = "linux")]
-    configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
-    #[cfg(not(target_os = "linux"))]
-    configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
+    ) {
+        Ok(runtime_state) => {
+            #[cfg(target_os = "linux")]
+            configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
+            #[cfg(not(target_os = "linux"))]
+            configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
+            runtime_state
+        }
+        Err(err) if missing_existing_peer_identity(&err) => {
+            // Dry-run preview can still show the local process shape before peer-site routers
+            // exist; the missing identities only block full mesh config materialization.
+            inspectability_warnings.push(format!(
+                "preview is missing one or more peer-site router identities, so mesh configs \
+                 remain unresolved until those sites are running: {err}"
+            ));
+            let (preview_peer_identities, preview_peer_ports) =
+                preview_placeholder_peer_mesh_state(&mesh_plan);
+            materialize_direct_runtime_with_existing(
+                &plan_root,
+                runtime_root,
+                &direct_plan,
+                &mesh_plan,
+                router_mesh_port,
+                DirectExistingMeshState {
+                    reuse_existing: false,
+                    peer_ports_by_id: &preview_peer_ports,
+                    peer_identities_by_id: &preview_peer_identities,
+                },
+            )?
+        }
+        Err(err) => return Err(err),
+    };
 
     let router_binary = resolve_runtime_binary("amber-router")?;
     let mut processes = Vec::new();
     let mut router_public_key_b64 = None;
     if let Some(router) = direct_plan.router.as_ref() {
-        let router_config = read_mesh_config_public(&runtime_root.join(&router.mesh_config_path))?;
-        router_public_key_b64 = Some(
-            base64::engine::general_purpose::STANDARD.encode(router_config.identity.public_key),
-        );
+        let router_config_path = runtime_root.join(&router.mesh_config_path);
+        match read_mesh_config_public(&router_config_path) {
+            Ok(router_config) => {
+                router_public_key_b64 = Some(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(router_config.identity.public_key),
+                );
+            }
+            Err(err) => inspectability_warnings.push(format!(
+                "failed to inspect direct router mesh config {}: {err}",
+                router_config_path.display()
+            )),
+        }
         let paths = DirectControlSocketPaths {
             artifact_link: resolve_direct_artifact_path(&plan_root, &router.control_socket_path),
             current_link: direct_current_control_socket_path(&plan_root),
@@ -302,7 +339,54 @@ pub(crate) fn build_direct_site_launch_preview(
     Ok(DirectSiteLaunchPreview {
         router_public_key_b64,
         processes,
+        inspectability_warnings,
     })
+}
+
+fn missing_existing_peer_identity(err: &miette::Report) -> bool {
+    err.to_string()
+        .contains("mesh provision plan requires existing peer identity")
+}
+
+fn preview_placeholder_peer_mesh_state(
+    mesh_plan: &MeshProvisionPlan,
+) -> (BTreeMap<String, MeshIdentityPublic>, BTreeMap<String, u16>) {
+    let target_ids = mesh_plan
+        .targets
+        .iter()
+        .map(|target| target.config.identity.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mesh_scope = mesh_plan
+        .targets
+        .first()
+        .and_then(|target| target.config.identity.mesh_scope.clone());
+    let peer_ids = mesh_plan
+        .targets
+        .iter()
+        .flat_map(|target| target.config.peers.iter())
+        .filter(|peer| !target_ids.contains(peer.id.as_str()))
+        .map(|peer| peer.id.clone())
+        .collect::<BTreeSet<_>>();
+    let peer_identities = peer_ids
+        .iter()
+        .map(|peer| {
+            let identity = MeshIdentity::generate(peer.clone(), mesh_scope.clone());
+            (
+                peer.clone(),
+                MeshIdentityPublic {
+                    id: identity.id,
+                    public_key: identity.public_key,
+                    mesh_scope: identity.mesh_scope,
+                },
+            )
+        })
+        .collect();
+    let peer_ports = peer_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, peer_id)| (peer_id, 39_000 + index as u16))
+        .collect();
+    (peer_identities, peer_ports)
 }
 
 pub(crate) fn load_direct_runtime_inputs(plan_path: &Path) -> Result<DirectRuntimeInputs> {

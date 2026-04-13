@@ -877,11 +877,7 @@ async fn main() -> Result<()> {
                 }
                 Command::RunSiteSupervisor(args) => mixed_run::run_site_supervisor(args.plan).await,
                 Command::RunSiteController(args) => {
-                    amber_site_controller::run_site_controller(
-                        args.plan,
-                        mixed_run::site_controller_runtime(),
-                    )
-                    .await
+                    amber_site_controller::run_site_controller_default(args.plan).await
                 }
                 Command::RunDetachedCoordinator(args) => run_detached_coordinator(args).await,
                 Command::RunObservabilitySink(args) => {

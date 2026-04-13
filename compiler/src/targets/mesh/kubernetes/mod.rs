@@ -111,6 +111,13 @@ pub struct KubernetesArtifact {
     pub files: BTreeMap<PathBuf, String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KubernetesArtifactBuildOptions<'a> {
+    pub(crate) force_router: bool,
+    pub(crate) router_identity_id: &'a str,
+    pub(crate) mesh_scope: Option<&'a str>,
+}
+
 impl Reporter for KubernetesReporter {
     type Artifact = KubernetesArtifact;
 
@@ -172,6 +179,20 @@ pub(crate) fn emit_kubernetes_artifact(
     compiled: &CompiledScenario,
     force_router: bool,
 ) -> KubernetesResult<KubernetesArtifact> {
+    emit_kubernetes_artifact_with_options(
+        compiled,
+        KubernetesArtifactBuildOptions {
+            force_router,
+            router_identity_id: crate::targets::mesh::mesh_config::DEFAULT_ROUTER_ID,
+            mesh_scope: None,
+        },
+    )
+}
+
+pub(crate) fn emit_kubernetes_artifact_with_options(
+    compiled: &CompiledScenario,
+    options: KubernetesArtifactBuildOptions<'_>,
+) -> KubernetesResult<KubernetesArtifact> {
     let s = compiled.scenario();
     let scenario_digest =
         scenario_ir_digest(s).map_err(|err| ReporterError::new(err.to_string()))?;
@@ -223,7 +244,7 @@ pub(crate) fn emit_kubernetes_artifact(
             }
         });
     let provisioner_job_name = provisioner_job_name(&scenario_digest);
-    let needs_router = mesh_plan.needs_router() || force_router;
+    let needs_router = mesh_plan.needs_router() || options.force_router;
 
     let route_ports = allocate_local_route_ports(s, &endpoint_plan, &mesh_plan)
         .map_err(|e| ReporterError::new(e.to_string()))?;
@@ -274,7 +295,9 @@ pub(crate) fn emit_kubernetes_artifact(
         router_ports,
         addressing: &mesh_addressing,
         options: MeshConfigBuildOptions {
-            force_router,
+            router_identity_id: options.router_identity_id,
+            mesh_scope: options.mesh_scope,
+            force_router: options.force_router,
             ..default_mesh_config_build_options()
         },
     })

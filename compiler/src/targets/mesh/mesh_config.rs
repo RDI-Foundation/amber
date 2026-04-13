@@ -23,6 +23,7 @@ pub(crate) const DEFAULT_ROUTER_ID: &str = "/router";
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MeshConfigBuildOptions<'a> {
     pub(crate) router_identity_id: &'a str,
+    pub(crate) mesh_scope: Option<&'a str>,
     pub(crate) component_mesh_listen_addr: &'a str,
     pub(crate) router_mesh_listen_addr: &'a str,
     pub(crate) router_control_listen_addr: &'a str,
@@ -32,6 +33,7 @@ pub(crate) struct MeshConfigBuildOptions<'a> {
 pub(crate) fn default_mesh_config_build_options() -> MeshConfigBuildOptions<'static> {
     MeshConfigBuildOptions {
         router_identity_id: DEFAULT_ROUTER_ID,
+        mesh_scope: None,
         component_mesh_listen_addr: "0.0.0.0",
         router_mesh_listen_addr: "0.0.0.0",
         router_control_listen_addr: "0.0.0.0",
@@ -142,7 +144,10 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         return Err(MeshError::new("router ports missing"));
     }
 
-    let mesh_scope = scenario_mesh_scope(scenario)?;
+    let mesh_scope = match options.mesh_scope {
+        Some(mesh_scope) => mesh_scope.to_string(),
+        None => scenario_mesh_scope(scenario)?,
+    };
 
     let mut identities_by_component: HashMap<ComponentId, MeshIdentityTemplate> = HashMap::new();
     for &id in mesh_plan.program_components() {
@@ -420,6 +425,14 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
 
     let mut router_env_passthrough = Vec::new();
     let router_config = if needs_router {
+        push_env_passthrough_once(
+            &mut router_env_passthrough,
+            FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV,
+        );
+        push_env_passthrough_once(
+            &mut router_env_passthrough,
+            FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV,
+        );
         let router_identity = router_identity.expect("router identity should exist");
         let router_ports = router_ports.expect("router ports missing");
         let router_mesh_port = router_ports.mesh;
@@ -497,16 +510,6 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             .framework_bindings()
             .filter(|binding| binding.capability.as_str() == "component")
             .collect::<Vec<_>>();
-        if !framework_bindings.is_empty() {
-            push_env_passthrough_once(
-                &mut router_env_passthrough,
-                FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV,
-            );
-            push_env_passthrough_once(
-                &mut router_env_passthrough,
-                FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV,
-            );
-        }
         for binding in framework_bindings {
             let slot_decl = scenario
                 .component(binding.consumer)

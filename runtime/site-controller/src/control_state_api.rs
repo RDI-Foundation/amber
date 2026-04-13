@@ -3,11 +3,11 @@ use base64::Engine as _;
 use super::{
     dynamic_caps,
     orchestration::{
-        ProtocolApiError, dynamic_capability_component_runtime_endpoint, load_site_manager_state,
-        load_site_runtime_plan, publish_dynamic_capability_origin,
+        ProtocolApiError, load_site_manager_state, local_router_identity_for_overlay,
+        publish_dynamic_capability_origin,
     },
-    planner::{ControlStateApp, protocol_error},
-    state::persist_control_state_update,
+    planner::{ControlStateApp, live_assignment_map, protocol_error},
+    state::{FrameworkControlState, persist_control_state_update},
     *,
 };
 
@@ -157,9 +157,56 @@ pub(crate) async fn execute_dynamic_caps_mutate(
     })
 }
 
-async fn resolve_dynamic_capability_origin(
+pub(crate) fn local_component_runtime(
     app: &ControlStateApp,
-    request: dynamic_caps::ControlDynamicResolveOriginRequest,
+    state: &FrameworkControlState,
+    logical_component_id: &str,
+) -> std::result::Result<LiveComponentRuntimeMetadata, ProtocolErrorResponse> {
+    let moniker = dynamic_caps::moniker_from_logical_component_id(logical_component_id)?;
+    let assignments = live_assignment_map(state);
+    let site_id = assignments.get(moniker).ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::OriginUnavailable,
+            &format!("live component `{logical_component_id}` is not assigned to a live site"),
+        )
+    })?;
+    if site_id != &app.controller_plan.site_id {
+        return Err(protocol_error(
+            ProtocolErrorCode::OriginUnavailable,
+            &format!(
+                "live component `{logical_component_id}` is assigned to site `{site_id}`, not \
+                 local site `{}`",
+                app.controller_plan.site_id
+            ),
+        ));
+    }
+    let site_plan = site_controller_runtime_plan_from_controller_plan(&app.controller_plan);
+    app.runtime
+        .collect_live_component_runtime_metadata(&site_plan)
+        .map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "failed to resolve live runtime metadata for component \
+                     `{logical_component_id}` on site `{site_id}`: {err}"
+                ),
+            )
+        })?
+        .remove(moniker)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "live runtime metadata for component `{logical_component_id}` is unavailable \
+                     on site `{site_id}`"
+                ),
+            )
+        })
+}
+
+pub(crate) async fn resolve_dynamic_capability_origin_internal(
+    app: &ControlStateApp,
+    request: dynamic_caps::InternalDynamicResolveOriginRequest,
 ) -> std::result::Result<dynamic_caps::ControlDynamicResolveOriginResponse, ProtocolApiError> {
     let state = app.control_state.lock().await.clone();
     let source_key = dynamic_caps::source_key_from_control_request(&request.source);
@@ -179,38 +226,9 @@ async fn resolve_dynamic_capability_origin(
                 "dynamic capability root authority is no longer live",
             ))
         })?;
-    let holder_runtime =
-        dynamic_capability_component_runtime_endpoint(app, &state, &request.holder_component_id)?;
-    let holder_plan = load_site_runtime_plan(app, &holder_runtime.site_id)?;
-    let origin_runtime =
-        dynamic_capability_component_runtime_endpoint(app, &state, &root.holder_component_id)?;
-    let origin_site_id = origin_runtime.site_id.clone();
-    let origin_plan = load_site_runtime_plan(app, &origin_site_id)?;
-    let origin_manager_state = load_site_manager_state(app, &origin_site_id)?;
-    let origin_peer_id = origin_manager_state
-        .router_identity_id
-        .clone()
-        .ok_or_else(|| {
-            ProtocolApiError::from(protocol_error(
-                ProtocolErrorCode::OriginUnavailable,
-                &format!(
-                    "site `{origin_site_id}` does not expose a live router identity for dynamic \
-                     capability publication"
-                ),
-            ))
-        })?;
-    let origin_peer_key_b64 = origin_manager_state
-        .router_public_key_b64
-        .clone()
-        .ok_or_else(|| {
-            ProtocolApiError::from(protocol_error(
-                ProtocolErrorCode::OriginUnavailable,
-                &format!(
-                    "site `{origin_site_id}` does not expose a live router public key for dynamic \
-                     capability publication"
-                ),
-            ))
-        })?;
+    let _origin_runtime = local_component_runtime(app, &state, &root.holder_component_id)?;
+    let origin_manager_state = load_site_manager_state(app, &app.controller_plan.site_id)?;
+    let origin_peer = local_router_identity_for_overlay(app).await?;
     let origin_peer_addr = origin_manager_state
         .router_mesh_addr
         .as_deref()
@@ -218,20 +236,26 @@ async fn resolve_dynamic_capability_origin(
             ProtocolApiError::from(protocol_error(
                 ProtocolErrorCode::OriginUnavailable,
                 &format!(
-                    "site `{origin_site_id}` does not expose a live router mesh address for \
-                     dynamic capability publication"
+                    "site `{}` does not expose a live router mesh address for dynamic capability \
+                     publication",
+                    app.controller_plan.site_id
                 ),
             ))
         })
         .and_then(|router_mesh_addr| {
             app.runtime
-                .router_mesh_addr_for_consumer(origin_plan.kind, holder_plan.kind, router_mesh_addr)
+                .router_mesh_addr_for_consumer(
+                    app.controller_plan.kind,
+                    request.holder_site_kind,
+                    router_mesh_addr,
+                )
                 .map_err(|err| {
                     ProtocolApiError::from(protocol_error(
                         ProtocolErrorCode::OriginUnavailable,
                         &format!(
-                            "site `{origin_site_id}` exposes an invalid live router mesh address \
-                             for dynamic capability publication: {err}"
+                            "site `{}` exposes an invalid live router mesh address for dynamic \
+                             capability publication: {err}",
+                            app.controller_plan.site_id
                         ),
                     ))
                 })
@@ -246,15 +270,14 @@ async fn resolve_dynamic_capability_origin(
     );
     let publish = publish_dynamic_capability_origin(
         app,
-        &origin_site_id,
+        &app.controller_plan.site_id,
         &dynamic_caps::PublishDynamicCapabilityOriginRequest {
             overlay_id,
             route_id: route_id.clone(),
             root_authority_selector: resolved_source.root_authority_selector.clone(),
             allowed_peers: vec![dynamic_caps::DynamicCapabilityAllowedPeer {
-                peer_id: holder_runtime.runtime.mesh_config.identity.id.clone(),
-                peer_key_b64: base64::engine::general_purpose::STANDARD
-                    .encode(holder_runtime.runtime.mesh_config.identity.public_key),
+                peer_id: request.holder_peer_id.clone(),
+                peer_key_b64: request.holder_peer_key_b64.clone(),
             }],
         },
     )
@@ -273,8 +296,31 @@ async fn resolve_dynamic_capability_origin(
         origin_route_id: publish.route_id,
         origin_capability: publish.capability,
         origin_protocol: publish.protocol,
-        origin_peer_id,
-        origin_peer_key_b64,
+        origin_peer_id: origin_peer.id,
+        origin_peer_key_b64: base64::engine::general_purpose::STANDARD
+            .encode(origin_peer.public_key),
         origin_peer_addr,
     })
+}
+
+async fn resolve_dynamic_capability_origin(
+    app: &ControlStateApp,
+    request: dynamic_caps::ControlDynamicResolveOriginRequest,
+) -> std::result::Result<dynamic_caps::ControlDynamicResolveOriginResponse, ProtocolApiError> {
+    let holder_runtime = {
+        let state = app.control_state.lock().await.clone();
+        local_component_runtime(app, &state, &request.holder_component_id)?
+    };
+    resolve_dynamic_capability_origin_internal(
+        app,
+        dynamic_caps::InternalDynamicResolveOriginRequest {
+            holder_component_id: request.holder_component_id,
+            source: request.source,
+            holder_peer_id: holder_runtime.mesh_config.identity.id.clone(),
+            holder_peer_key_b64: base64::engine::general_purpose::STANDARD
+                .encode(holder_runtime.mesh_config.identity.public_key),
+            holder_site_kind: app.controller_plan.kind,
+        },
+    )
+    .await
 }

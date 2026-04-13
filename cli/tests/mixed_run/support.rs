@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER};
+use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER, AMBER_SITE_CONTROLLER};
 use cloud_image_support::default_host_arch_cloud_image_filename;
 use outputs_root_support::cli_test_outputs_root;
 use serde_json::{Value, json};
@@ -691,6 +691,10 @@ pub(crate) fn ensure_amber_internal_images() {
             AMBER_HELPER.reference,
             &root.join("docker/amber-helper/Dockerfile"),
         );
+        ensure_docker_image(
+            AMBER_SITE_CONTROLLER.reference,
+            &root.join("docker/amber-site-controller/Dockerfile"),
+        );
     });
 }
 
@@ -831,6 +835,7 @@ pub(crate) fn ensure_kind_internal_images(kind_cluster: &KindCluster) {
     load_kind_image(&name, AMBER_ROUTER.reference);
     load_kind_image(&name, AMBER_PROVISIONER.reference);
     load_kind_image(&name, AMBER_HELPER.reference);
+    load_kind_image(&name, AMBER_SITE_CONTROLLER.reference);
     // The public test workload image is registry-pullable inside the kind cluster, so keep kind
     // image preloading focused on the Amber images that only exist locally.
     loaded

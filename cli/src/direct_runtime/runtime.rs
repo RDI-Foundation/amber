@@ -111,6 +111,8 @@ pub(crate) struct DirectSiteLaunchPreview {
     pub(crate) router_public_key_b64: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) processes: Vec<DirectLaunchProcessPreview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) inspectability_warnings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -184,10 +186,12 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
         args.existing_peer_ports.as_deref(),
         "direct existing peer ports",
     )?;
-    let existing_peer_identities_by_id = read_existing_peer_identities(
+    let discovered_peer_identities_by_id = read_existing_peer_identities(
         args.existing_peer_identities.as_deref(),
         "direct existing peer identities",
     )?;
+    let existing_peer_identities_by_id =
+        merge_existing_mesh_peer_identities(&mesh_plan, &discovered_peer_identities_by_id)?;
 
     let supervision = async {
         let mut sandbox = DirectSandbox::detect(&runtime_root);
@@ -405,6 +409,33 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                         work_dir.display()
                     )
                 })?;
+            let control_socket_path = direct_component_control_socket_path(&work_dir, component.id);
+            let control_socket_dir = control_socket_path
+                .parent()
+                .ok_or_else(|| miette::miette!("invalid sidecar control socket path"))?
+                .to_path_buf();
+            fs::create_dir_all(&control_socket_dir)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to create sidecar control directory {}",
+                        control_socket_dir.display()
+                    )
+                })?;
+            if control_socket_path.exists() {
+                fs::remove_file(&control_socket_path)
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to remove stale sidecar control socket {}",
+                            control_socket_path.display()
+                        )
+                    })?;
+            }
+            env.insert(
+                "AMBER_ROUTER_CONTROL_SOCKET_PATH".to_string(),
+                control_socket_path.display().to_string(),
+            );
             let spec = ProcessSpec {
                 name: component.sidecar.log_name.clone(),
                 program: router_binary.clone(),
@@ -419,7 +450,7 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                     dest: runtime_root.join("mesh"),
                 }],
                 writable_dirs: Vec::new(),
-                bind_dirs: Vec::new(),
+                bind_dirs: vec![control_socket_dir],
                 bind_mounts: Vec::new(),
                 hidden_paths: Vec::new(),
                 network: {
@@ -572,6 +603,36 @@ pub(crate) fn read_existing_peer_identities(
     Ok(identities)
 }
 
+fn merge_existing_mesh_peer_identities(
+    mesh_plan: &MeshProvisionPlan,
+    discovered_peer_identities_by_id: &BTreeMap<String, MeshIdentityPublic>,
+) -> Result<BTreeMap<String, MeshIdentityPublic>> {
+    let mut merged = mesh_plan
+        .existing_peer_identities
+        .iter()
+        .cloned()
+        .map(|identity| (identity.id.clone(), identity))
+        .collect::<BTreeMap<_, _>>();
+
+    for (peer_id, discovered_identity) in discovered_peer_identities_by_id {
+        if let Some(embedded_identity) = merged.get(peer_id) {
+            if embedded_identity.id != discovered_identity.id
+                || embedded_identity.public_key != discovered_identity.public_key
+                || embedded_identity.mesh_scope != discovered_identity.mesh_scope
+            {
+                return Err(miette::miette!(
+                    "existing peer identity `{peer_id}` from the direct runtime arguments does \
+                     not match the embedded mesh provision plan"
+                ));
+            }
+            continue;
+        }
+        merged.insert(peer_id.clone(), discovered_identity.clone());
+    }
+
+    Ok(merged)
+}
+
 pub(crate) fn project_existing_direct_peer_identities(
     runtime_root: &Path,
     direct_plan: &DirectPlan,
@@ -682,6 +743,14 @@ pub(crate) fn direct_current_control_socket_path(plan_root: &Path) -> PathBuf {
 
 pub(crate) fn direct_runtime_control_socket_path(runtime_root: &Path) -> PathBuf {
     amber_mesh::stable_temp_socket_path("amber-direct-control", "runtime", runtime_root)
+}
+
+fn direct_component_control_socket_path(work_dir: &Path, component_id: usize) -> PathBuf {
+    amber_mesh::stable_temp_socket_path(
+        "amber-direct-control",
+        &format!("sidecar-{component_id}"),
+        work_dir,
+    )
 }
 
 #[cfg(unix)]
@@ -977,13 +1046,14 @@ pub(crate) fn rewrite_direct_mesh_peer_addrs(
     mesh_port_by_peer_id: &HashMap<String, u16>,
 ) -> Result<()> {
     for route in &mut config.outbound {
-        let port = mesh_port_by_peer_id
-            .get(route.peer_id.as_str())
-            .copied()
-            .ok_or_else(|| miette::miette!("missing mesh port for peer {}", route.peer_id))?;
         let addr = route.peer_addr.parse::<SocketAddr>().map_err(|err| {
             miette::miette!("invalid mesh peer address {}: {err}", route.peer_addr)
         })?;
+        let port = mesh_port_by_peer_id
+            .get(route.peer_id.as_str())
+            .copied()
+            .or_else(|| (addr.port() != 0).then_some(addr.port()))
+            .ok_or_else(|| miette::miette!("missing mesh port for peer {}", route.peer_id))?;
         route.peer_addr = SocketAddr::new(addr.ip(), port).to_string();
     }
 
@@ -992,13 +1062,14 @@ pub(crate) fn rewrite_direct_mesh_peer_addrs(
             peer_addr, peer_id, ..
         } = &mut route.target
         {
-            let port = mesh_port_by_peer_id
-                .get(peer_id.as_str())
-                .copied()
-                .ok_or_else(|| miette::miette!("missing mesh port for peer {}", peer_id))?;
             let addr = peer_addr
                 .parse::<SocketAddr>()
                 .map_err(|err| miette::miette!("invalid mesh peer address {}: {err}", peer_addr))?;
+            let port = mesh_port_by_peer_id
+                .get(peer_id.as_str())
+                .copied()
+                .or_else(|| (addr.port() != 0).then_some(addr.port()))
+                .ok_or_else(|| miette::miette!("missing mesh port for peer {}", peer_id))?;
             peer_addr.clear();
             peer_addr.push_str(&SocketAddr::new(addr.ip(), port).to_string());
         }
@@ -1091,7 +1162,6 @@ pub(crate) fn materialize_direct_runtime(
     reuse_existing: bool,
 ) -> Result<DirectRuntimeState> {
     let empty_peer_ports = BTreeMap::new();
-    let empty_peer_identities = BTreeMap::new();
     materialize_direct_runtime_with_existing(
         plan_root,
         runtime_root,
@@ -1101,7 +1171,7 @@ pub(crate) fn materialize_direct_runtime(
         DirectExistingMeshState {
             reuse_existing,
             peer_ports_by_id: &empty_peer_ports,
-            peer_identities_by_id: &empty_peer_identities,
+            peer_identities_by_id: &BTreeMap::new(),
         },
     )
 }
@@ -1127,8 +1197,10 @@ pub(crate) fn materialize_direct_runtime_with_existing(
     if runtime_state_path.exists() {
         let _ = fs::remove_file(&runtime_state_path);
     }
+    let merged_peer_identities =
+        merge_existing_mesh_peer_identities(mesh_plan, existing.peer_identities_by_id)?;
     let existing_mesh_peer_identities =
-        required_existing_mesh_peer_identities(mesh_plan, existing.peer_identities_by_id)?;
+        required_existing_mesh_peer_identities(mesh_plan, &merged_peer_identities)?;
     provision_mesh_filesystem_with_peer_identities(
         mesh_plan,
         runtime_root,
@@ -1261,4 +1333,129 @@ pub(crate) fn write_mesh_config_public(path: &Path, config: &MeshConfigPublic) -
     fs::write(path, json)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write mesh config {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use amber_mesh::{InboundRoute, MeshPeer};
+
+    use super::*;
+
+    fn mesh_identity_public(id: &str, public_key: [u8; 32]) -> MeshIdentityPublic {
+        MeshIdentityPublic {
+            id: id.to_string(),
+            public_key,
+            mesh_scope: Some("amber.test".to_string()),
+        }
+    }
+
+    #[test]
+    fn merge_existing_mesh_peer_identities_keeps_embedded_plan_identities() {
+        let embedded_identity = mesh_identity_public("/site/compose/router", [7; 32]);
+        let mesh_plan = MeshProvisionPlan {
+            version: MESH_PROVISION_PLAN_VERSION.to_string(),
+            identity_seed: None,
+            existing_peer_identities: vec![embedded_identity.clone()],
+            targets: Vec::new(),
+        };
+
+        let merged =
+            merge_existing_mesh_peer_identities(&mesh_plan, &BTreeMap::new()).expect("merge");
+
+        let merged_identity = merged
+            .get("/site/compose/router")
+            .expect("embedded identity should remain available");
+        assert_eq!(merged_identity.id, embedded_identity.id);
+        assert_eq!(merged_identity.public_key, embedded_identity.public_key);
+        assert_eq!(merged_identity.mesh_scope, embedded_identity.mesh_scope);
+    }
+
+    #[test]
+    fn merge_existing_mesh_peer_identities_rejects_conflicts() {
+        let mesh_plan = MeshProvisionPlan {
+            version: MESH_PROVISION_PLAN_VERSION.to_string(),
+            identity_seed: None,
+            existing_peer_identities: vec![mesh_identity_public("/peer", [1; 32])],
+            targets: Vec::new(),
+        };
+        let discovered =
+            BTreeMap::from([("/peer".to_string(), mesh_identity_public("/peer", [2; 32]))]);
+
+        let err = merge_existing_mesh_peer_identities(&mesh_plan, &discovered)
+            .expect_err("conflicting embedded and discovered identities should fail");
+
+        assert!(
+            err.to_string()
+                .contains("does not match the embedded mesh provision plan"),
+            "unexpected merge error: {err}",
+        );
+    }
+
+    #[test]
+    fn rewrite_direct_mesh_peer_addrs_preserves_authored_external_peer_ports() {
+        let mut config = MeshConfigPublic {
+            identity: mesh_identity_public("/site/direct/router", [3; 32]),
+            mesh_listen: "127.0.0.1:24000".parse().expect("mesh listen"),
+            control_listen: None,
+            dynamic_caps_listen: None,
+            control_allow: None,
+            peers: vec![MeshPeer {
+                id: "/site/compose/router".to_string(),
+                public_key: [4; 32],
+            }],
+            inbound: vec![InboundRoute {
+                route_id: "in".to_string(),
+                capability: "site-controller".to_string(),
+                capability_kind: None,
+                capability_profile: None,
+                protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
+                target: InboundTarget::MeshForward {
+                    peer_addr: "127.0.0.1:32002".to_string(),
+                    peer_id: "/site/compose/router".to_string(),
+                    route_id: "route".to_string(),
+                    capability: "site-controller".to_string(),
+                },
+                allowed_issuers: Vec::new(),
+            }],
+            outbound: vec![OutboundRoute {
+                route_id: "out".to_string(),
+                slot: "compose".to_string(),
+                capability_kind: None,
+                capability_profile: None,
+                listen_port: 25000,
+                listen_addr: None,
+                protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
+                peer_addr: "127.0.0.1:32001".to_string(),
+                peer_id: "/site/compose/router".to_string(),
+                capability: "site-controller".to_string(),
+            }],
+            transport: amber_mesh::TransportConfig::NoiseIk {},
+        };
+
+        rewrite_direct_mesh_peer_addrs(&mut config, &HashMap::new()).expect("rewrite");
+
+        assert_eq!(config.outbound[0].peer_addr, "127.0.0.1:32001");
+        let InboundTarget::MeshForward { peer_addr, .. } = &config.inbound[0].target else {
+            panic!("expected mesh forward route");
+        };
+        assert_eq!(peer_addr, "127.0.0.1:32002");
+    }
+
+    #[test]
+    fn direct_component_control_socket_path_stays_short_on_long_work_dirs() {
+        let work_dir = Path::new(
+            "/Users/example/Developer/amber/target/cli-test-outputs/\
+             mixed-run-doc-example-detach-very-long/state/runs/run-123/state/direct_local/runtime/\
+             work/components/c2-web",
+        );
+        let socket = direct_component_control_socket_path(work_dir, 2);
+        let rendered = socket.as_os_str().to_string_lossy();
+
+        assert!(
+            rendered.len() < 104,
+            "direct sidecar control socket path must fit within unix socket limits: {rendered}",
+        );
+    }
 }

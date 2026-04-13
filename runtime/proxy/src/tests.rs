@@ -471,7 +471,7 @@ fn resolve_control_endpoint_preserves_nested_compose_volume_socket_path() {
                 mesh_port: 24000,
                 control_port: 24100,
                 compose_project: None,
-                control_socket: Some("/site/compose_local/router-control.sock".to_string()),
+                control_socket: Some("/router-control.sock".to_string()),
                 control_socket_volume: Some(
                     "${COMPOSE_PROJECT_NAME:-default}_amber-router-control".to_string(),
                 ),
@@ -492,7 +492,7 @@ fn resolve_control_endpoint_preserves_nested_compose_volume_socket_path() {
         panic!("expected compose volume socket endpoint");
     };
     assert_eq!(volume, "mixed-stack_amber-router-control");
-    assert_eq!(socket_path, "/site/compose_local/router-control.sock");
+    assert_eq!(socket_path, "/router-control.sock");
 }
 
 #[test]
@@ -505,7 +505,7 @@ fn resolve_control_endpoint_prefers_router_metadata_compose_project() {
                 mesh_port: 24000,
                 control_port: 24100,
                 compose_project: Some("dynamic-stack".to_string()),
-                control_socket: Some("/site/compose_local/router-control.sock".to_string()),
+                control_socket: Some("/router-control.sock".to_string()),
                 control_socket_volume: Some(
                     "${COMPOSE_PROJECT_NAME:-default}_amber-router-control".to_string(),
                 ),
@@ -525,7 +525,7 @@ fn resolve_control_endpoint_prefers_router_metadata_compose_project() {
         panic!("expected compose volume socket endpoint");
     };
     assert_eq!(volume, "dynamic-stack_amber-router-control");
-    assert_eq!(socket_path, "/site/compose_local/router-control.sock");
+    assert_eq!(socket_path, "/router-control.sock");
 }
 
 #[test]

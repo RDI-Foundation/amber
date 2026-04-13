@@ -1017,6 +1017,14 @@ fn linux_vm_runs_framework_component_live_tests() {
 }
 
 #[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component direct \
+            create/destroy live test inside the guest"]
+fn linux_vm_runs_framework_component_direct_create_destroy_live() {
+    run_linux_guest_mixed_run_test("framework_component_direct_create_destroy_live")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
 #[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component bounded \
             template replay live test inside the guest"]
 fn linux_vm_runs_framework_component_bounded_template_frozen_source_replay_live() {
@@ -1087,6 +1095,14 @@ fn linux_vm_runs_framework_component_kind_root_export_live() {
             inside the guest"]
 fn linux_vm_runs_dynamic_capability_live_tests() {
     run_linux_guest_mixed_run_filter("dynamic_capabilities_").unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability dynamic \
+            child post-create share live test inside the guest"]
+fn linux_vm_runs_dynamic_capabilities_dynamic_child_post_create_share_live() {
+    run_linux_guest_mixed_run_test("dynamic_capabilities_dynamic_child_post_create_share_live")
+        .unwrap_or_else(|err| panic!("{err}"));
 }
 
 #[test]

@@ -5,35 +5,9 @@ use amber_mesh::{
     InboundRoute, InboundTarget, MeshConfigPublic, MeshPeer, OutboundRoute,
     router_external_route_id,
 };
+use amber_proxy::{ControlEndpoint, fetch_router_identity};
 
 use super::{http::*, planner::*, state::*, *};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct SiteControllerPrepareRequest {
-    pub(crate) site_plan: DynamicSitePlanRecord,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct SiteControllerPublishRequest {
-    pub(crate) site_plan: DynamicSitePlanRecord,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub(crate) struct SiteControllerDestroyRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) desired_site_plan: Option<DynamicSitePlanRecord>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct ControlCreateChildRequest {
-    pub(super) cap_instance_id: String,
-    pub(super) request: CreateChildRequest,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct ControlDestroyChildRequest {
-    pub(super) cap_instance_id: String,
-}
 
 #[derive(Debug)]
 pub(super) struct ProtocolApiError(pub(super) ProtocolErrorResponse);
@@ -114,6 +88,58 @@ impl IntoResponse for ProtocolApiError {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ResolveExternalLinkUrlRequest {
+    pub(crate) child_id: u64,
+    pub(crate) link: RunLink,
+    pub(crate) consumer_kind: SiteKind,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ResolveExternalLinkUrlResponse {
+    pub(crate) external_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PublishExternalSlotOverlayRequest {
+    pub(crate) overlay_id: String,
+    pub(crate) slot_name: String,
+    pub(crate) url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ClearExternalSlotOverlayRequest {
+    pub(crate) overlay_id: String,
+    pub(crate) slot_name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PublishExportPeerOverlayRequest {
+    pub(crate) overlay_id: String,
+    pub(crate) export_name: String,
+    pub(crate) peer_id: String,
+    pub(crate) peer_key_b64: String,
+    pub(crate) protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) route_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ClearExportPeerOverlayRequest {
+    pub(crate) overlay_id: String,
+    pub(crate) export_name: String,
+    pub(crate) peer_id: String,
+    pub(crate) peer_key_b64: String,
+    pub(crate) protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) route_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RevokeDynamicCapabilityOriginOverlaysRequest {
+    pub(crate) overlay_ids: Vec<String>,
+}
+
 pub(super) fn control_state_step_error(
     step: &str,
     err: impl std::fmt::Display,
@@ -136,14 +162,6 @@ pub(super) fn controller_protocol_error(
     )
 }
 
-pub(super) fn site_state_root_for(app: &ControlStateApp, site_id: &str) -> PathBuf {
-    Path::new(&app.state_root).join(site_id)
-}
-
-pub(super) fn site_controller_plan_path_for_site(app: &ControlStateApp, site_id: &str) -> PathBuf {
-    site_controller_plan_path(&site_state_root_for(app, site_id))
-}
-
 pub(super) fn site_receipt_from_manager_state(state: &SiteManagerStateView) -> SiteReceipt {
     SiteReceipt {
         kind: state.kind,
@@ -163,65 +181,60 @@ pub(super) fn site_receipt_from_manager_state(state: &SiteManagerStateView) -> S
     }
 }
 
-pub(super) fn full_site_plan_record(
-    site_id: &str,
-    site_plan: &amber_compiler::run_plan::RunSitePlan,
-) -> DynamicSitePlanRecord {
-    DynamicSitePlanRecord {
-        site_id: site_id.to_string(),
-        kind: site_plan.site.kind,
-        router_identity_id: site_plan.router_identity_id.clone(),
-        component_ids: site_plan
-            .scenario_ir
-            .components
-            .iter()
-            .map(|component| component.id)
-            .collect(),
-        assigned_components: site_plan.assigned_components.clone(),
-        artifact_files: site_plan.artifact_files.clone(),
-        desired_artifact_files: site_plan.artifact_files.clone(),
-        proxy_exports: BTreeMap::new(),
-        routed_inputs: Vec::new(),
-    }
-}
-
-pub(super) fn desired_site_plan_map(
-    state: &FrameworkControlState,
-    site_ids: &BTreeSet<String>,
-) -> std::result::Result<BTreeMap<String, DynamicSitePlanRecord>, ProtocolErrorResponse> {
-    let planned = build_site_plan_subset(
-        &decode_live_scenario(state)?,
-        &placement_file_from_state(state),
-        &run_plan_activation_from_state(state),
-        &live_assignment_map(state),
-        site_ids,
-    )
-    .map_err(|err| {
-        protocol_error(
-            ProtocolErrorCode::ControlStateUnavailable,
-            &format!("failed to rebuild desired site plans for affected sites: {err}"),
-        )
-    })?;
-    Ok(planned
-        .iter()
-        .map(|(site_id, site_plan)| (site_id.clone(), full_site_plan_record(site_id, site_plan)))
-        .collect())
-}
-
 pub(super) fn load_site_manager_state(
     app: &ControlStateApp,
     site_id: &str,
 ) -> std::result::Result<SiteManagerStateView, ProtocolErrorResponse> {
-    read_json(
-        &site_state_path(&app.state_root, site_id),
-        "site manager state",
-    )
-    .map_err(|err| {
-        protocol_error(
-            ProtocolErrorCode::SiteNotActive,
-            &format!("site `{site_id}` manager state is unavailable: {err}"),
-        )
-    })
+    let state_path = site_state_path(&app.state_root, site_id);
+    if state_path.is_file() {
+        return read_json(&state_path, "site manager state").map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::SiteNotActive,
+                &format!("site `{site_id}` manager state is unavailable: {err}"),
+            )
+        });
+    }
+    if site_id == app.controller_plan.site_id {
+        return Ok(local_site_manager_state_view(app));
+    }
+    Err(protocol_error(
+        ProtocolErrorCode::SiteNotActive,
+        &format!(
+            "site `{site_id}` manager state is unavailable: {}",
+            state_path.display()
+        ),
+    ))
+}
+
+fn local_site_manager_state_view(app: &ControlStateApp) -> SiteManagerStateView {
+    let runtime_plan = site_controller_runtime_plan_from_controller_plan(&app.controller_plan);
+    let router_identity = app
+        .runtime
+        .load_live_site_router_mesh_config(&runtime_plan)
+        .ok()
+        .map(|router_mesh| {
+            (
+                router_mesh.identity.id,
+                base64::engine::general_purpose::STANDARD.encode(router_mesh.identity.public_key),
+            )
+        });
+    SiteManagerStateView {
+        status: "running".to_string(),
+        kind: app.controller_plan.kind,
+        artifact_dir: app.controller_plan.artifact_dir.clone(),
+        supervisor_pid: 0,
+        process_pid: None,
+        compose_project: app.controller_plan.compose_project.clone(),
+        kubernetes_namespace: app.controller_plan.kubernetes_namespace.clone(),
+        port_forward_pid: None,
+        context: app.controller_plan.context.clone(),
+        router_control: app.controller_plan.local_router_control.clone(),
+        router_mesh_addr: app.controller_plan.published_router_mesh_addr.clone(),
+        router_identity_id: router_identity.as_ref().map(|(id, _)| id.clone()),
+        router_public_key_b64: router_identity.map(|(_, public_key_b64)| public_key_b64),
+        site_controller_pid: None,
+        site_controller_url: Some(app.controller_plan.authority_url.clone()),
+    }
 }
 
 pub(super) fn load_launched_site(
@@ -244,47 +257,572 @@ pub(super) fn load_launched_site(
     })
 }
 
-pub(super) fn load_site_controller_plan(
+fn framework_route_overlay_id(authority_site_id: &str) -> String {
+    format!("framework-component-routes:{authority_site_id}")
+}
+
+fn framework_component_route(
+    record: &CapabilityInstanceRecord,
+    allowed_issuers: Vec<String>,
+    target: InboundTarget,
+) -> InboundRoute {
+    InboundRoute {
+        route_id: record.route_id.clone(),
+        capability: record.capability.clone(),
+        capability_kind: Some("component".to_string()),
+        capability_profile: None,
+        protocol: MeshProtocol::Http,
+        http_plugins: Vec::new(),
+        target,
+        allowed_issuers,
+    }
+}
+
+fn framework_controller_external_target() -> InboundTarget {
+    InboundTarget::External {
+        url_env: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV.to_string(),
+        optional: false,
+    }
+}
+
+async fn peer_router_identity_for_overlay(
     app: &ControlStateApp,
     site_id: &str,
-) -> std::result::Result<SiteControllerPlan, ProtocolErrorResponse> {
-    if site_id == app.controller_plan.site_id {
-        return Ok(app.controller_plan.as_ref().clone());
+) -> std::result::Result<MeshPeer, ProtocolErrorResponse> {
+    let site_app = SiteControllerApp {
+        control: app.clone(),
+        router_auth_token: app.control_state_auth_token.clone(),
+    };
+    let identity = super::site_controller::peer_router_identity_via_router(&site_app, site_id)
+        .await
+        .map_err(|err| err.0)?;
+    Ok(MeshPeer {
+        id: identity.id,
+        public_key: identity.public_key,
+    })
+}
+
+fn peer_router_mesh_addr_for_overlay(
+    app: &ControlStateApp,
+    site_id: &str,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    app.controller_plan
+        .peer_router_mesh_addrs
+        .get(site_id)
+        .cloned()
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "site controller `{}` has no mesh address for peer site `{site_id}`",
+                    app.controller_plan.site_id
+                ),
+            )
+        })
+}
+
+fn local_router_control_endpoint(
+    app: &ControlStateApp,
+) -> std::result::Result<ControlEndpoint, ProtocolErrorResponse> {
+    if let Some(raw) = app.controller_plan.local_router_control.as_deref() {
+        return parse_control_endpoint(raw).map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("local router control endpoint is invalid: {err}"),
+            )
+        });
     }
-    let path = site_controller_plan_path_for_site(app, site_id);
-    read_json(&path, "site controller plan").map_err(|err| {
+    let state = load_site_manager_state(app, &app.controller_plan.site_id)?;
+    let raw = state.router_control.ok_or_else(|| {
         protocol_error(
-            ProtocolErrorCode::SiteNotActive,
-            &format!("site `{site_id}` controller plan is unavailable: {err}"),
+            ProtocolErrorCode::ControlStateUnavailable,
+            "local router control endpoint is unavailable",
+        )
+    })?;
+    parse_control_endpoint(&raw).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("local router control endpoint is invalid: {err}"),
         )
     })
 }
 
-pub(super) fn load_site_runtime_plan(
+pub(super) async fn local_router_identity_for_overlay(
+    app: &ControlStateApp,
+) -> std::result::Result<MeshPeer, ProtocolErrorResponse> {
+    let state = load_site_manager_state(app, &app.controller_plan.site_id)?;
+    if let (Some(id), Some(public_key_b64)) =
+        (state.router_identity_id, state.router_public_key_b64)
+        && let Ok(decoded) =
+            base64::engine::general_purpose::STANDARD.decode(public_key_b64.as_bytes())
+        && let Ok(public_key) = decoded.as_slice().try_into()
+    {
+        return Ok(MeshPeer { id, public_key });
+    }
+    if let Ok(router_mesh) = app.runtime.load_live_site_router_mesh_config(
+        &site_controller_runtime_plan_from_controller_plan(&app.controller_plan),
+    ) {
+        return Ok(MeshPeer {
+            id: router_mesh.identity.id,
+            public_key: router_mesh.identity.public_key,
+        });
+    }
+    let identity = fetch_router_identity(&local_router_control_endpoint(app)?)
+        .await
+        .map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("failed to read local router identity: {err}"),
+            )
+        })?;
+    Ok(MeshPeer {
+        id: identity.id,
+        public_key: identity.public_key,
+    })
+}
+
+fn local_site_state_root(app: &ControlStateApp) -> &Path {
+    Path::new(&app.controller_plan.site_state_root)
+}
+
+fn local_site_kind_from_state(
+    state: &FrameworkControlState,
+    site_id: &str,
+) -> std::result::Result<SiteKind, ProtocolErrorResponse> {
+    state
+        .placement
+        .offered_sites
+        .get(site_id)
+        .map(|site| site.kind)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("site `{site_id}` is missing from offered sites"),
+            )
+        })
+}
+
+pub(super) async fn resolve_external_link_url_local(
+    app: &ControlStateApp,
+    request: &ResolveExternalLinkUrlRequest,
+) -> std::result::Result<ResolveExternalLinkUrlResponse, ProtocolErrorResponse> {
+    if request.link.provider_site != app.controller_plan.site_id {
+        return Err(controller_protocol_error(
+            ProtocolErrorCode::PublishFailed,
+            &request.link.provider_site,
+            "resolve provider link url",
+            format!(
+                "controller `{}` only resolves provider surfaces for its own site",
+                app.controller_plan.site_id
+            ),
+        ));
+    }
+    let child = {
+        let state = app.control_state.lock().await;
+        cloned_child_record(&state, request.child_id)?
+    };
+    let provider = load_launched_site(app, &app.controller_plan.site_id)?;
+    let provider_output_dir = provider_output_dir_for_link(
+        app,
+        &child,
+        Path::new(&provider.receipt.artifact_dir),
+        &request.link,
+    );
+    let external_url = app
+        .runtime
+        .resolve_link_external_url(
+            &provider,
+            &provider_output_dir,
+            &request.link,
+            request.consumer_kind,
+            &app.run_root,
+        )
+        .await
+        .map_err(|err| {
+            controller_protocol_error(
+                ProtocolErrorCode::PublishFailed,
+                &request.link.provider_site,
+                "compute external slot overlay",
+                err,
+            )
+        })?;
+    Ok(ResolveExternalLinkUrlResponse { external_url })
+}
+
+pub(super) async fn publish_external_slot_overlay_local(
+    app: &ControlStateApp,
+    request: &PublishExternalSlotOverlayRequest,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    register_external_slot_with_retry(
+        &local_router_control_endpoint(app)?,
+        &request.slot_name,
+        &request.url,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|err| {
+        controller_protocol_error(
+            ProtocolErrorCode::PublishFailed,
+            &app.controller_plan.site_id,
+            "publish external slot overlay",
+            err,
+        )
+    })?;
+    app.runtime
+        .update_desired_overlay_for_consumer(
+            local_site_state_root(app),
+            &request.overlay_id,
+            DesiredExternalSlotOverlay {
+                slot_name: request.slot_name.clone(),
+                url: request.url.clone(),
+            },
+        )
+        .map_err(|err| {
+            controller_protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &app.controller_plan.site_id,
+                "persist desired external slot overlay",
+                err,
+            )
+        })
+}
+
+pub(super) async fn clear_external_slot_overlay_local(
+    app: &ControlStateApp,
+    request: &ClearExternalSlotOverlayRequest,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    app.runtime
+        .clear_desired_overlay_for_consumer(local_site_state_root(app), &request.overlay_id)
+        .map_err(|err| {
+            controller_protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &app.controller_plan.site_id,
+                "persist external slot overlay removal",
+                err,
+            )
+        })?;
+    clear_external_slot_with_retry(
+        &local_router_control_endpoint(app)?,
+        &request.slot_name,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|err| {
+        controller_protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &app.controller_plan.site_id,
+            "retract external slot overlay",
+            err,
+        )
+    })
+}
+
+pub(super) async fn publish_export_peer_overlay_local(
+    app: &ControlStateApp,
+    request: &PublishExportPeerOverlayRequest,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    register_export_peer_with_retry(
+        &local_router_control_endpoint(app)?,
+        &request.export_name,
+        &request.peer_id,
+        &request.peer_key_b64,
+        &request.protocol,
+        request.route_id.as_deref(),
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|err| {
+        controller_protocol_error(
+            ProtocolErrorCode::PublishFailed,
+            &app.controller_plan.site_id,
+            "publish export-peer overlay",
+            err,
+        )
+    })?;
+    app.runtime
+        .update_desired_overlay_for_provider(
+            local_site_state_root(app),
+            &request.overlay_id,
+            DesiredExportPeerOverlay {
+                export_name: request.export_name.clone(),
+                peer_id: request.peer_id.clone(),
+                peer_key_b64: request.peer_key_b64.clone(),
+                protocol: request.protocol.clone(),
+                route_id: request.route_id.clone(),
+            },
+        )
+        .map_err(|err| {
+            controller_protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &app.controller_plan.site_id,
+                "persist desired export-peer overlay",
+                err,
+            )
+        })
+}
+
+pub(super) async fn clear_export_peer_overlay_local(
+    app: &ControlStateApp,
+    request: &ClearExportPeerOverlayRequest,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    app.runtime
+        .clear_desired_overlay_for_provider(local_site_state_root(app), &request.overlay_id)
+        .map_err(|err| {
+            controller_protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &app.controller_plan.site_id,
+                "persist export-peer overlay removal",
+                err,
+            )
+        })?;
+    unregister_export_peer_with_retry(
+        &local_router_control_endpoint(app)?,
+        &request.export_name,
+        &request.peer_id,
+        &request.peer_key_b64,
+        &request.protocol,
+        request.route_id.as_deref(),
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|err| {
+        controller_protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &app.controller_plan.site_id,
+            "retract export-peer overlay",
+            err,
+        )
+    })
+}
+
+pub(super) async fn revoke_dynamic_capability_origin_overlays_local(
+    app: &ControlStateApp,
+    request: &RevokeDynamicCapabilityOriginOverlaysRequest,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let endpoint = local_router_control_endpoint(app)?;
+    for overlay_id in &request.overlay_ids {
+        revoke_route_overlay_with_retry(&endpoint, overlay_id, Duration::from_secs(30))
+            .await
+            .map_err(|err| {
+                controller_protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &app.controller_plan.site_id,
+                    "retract dynamic capability origin overlays",
+                    err,
+                )
+            })?;
+    }
+    Ok(())
+}
+
+pub(super) async fn framework_route_overlay_payload(
+    app: &ControlStateApp,
+) -> std::result::Result<Option<DesiredRouteOverlay>, ProtocolErrorResponse> {
+    let state = app.control_state.lock().await.clone();
+    let local_site_id = app.controller_plan.site_id.clone();
+    let mut overlay = DesiredRouteOverlay {
+        peers: Vec::new(),
+        inbound_routes: Vec::new(),
+    };
+
+    for record in state.capability_instances.values() {
+        let authority_site_id = site_id_for_authority_realm(&state, record.authority_realm_id)?;
+        let consumer_site_id = record.recipient_site_id.clone();
+
+        if authority_site_id == local_site_id {
+            if consumer_site_id == local_site_id {
+                overlay.inbound_routes.push(framework_component_route(
+                    record,
+                    vec![record.recipient_peer_id.clone()],
+                    framework_controller_external_target(),
+                ));
+                continue;
+            }
+            let consumer_peer = peer_router_identity_for_overlay(app, &consumer_site_id).await?;
+            if !overlay.peers.iter().any(|peer| peer.id == consumer_peer.id) {
+                overlay.peers.push(consumer_peer.clone());
+            }
+            overlay.inbound_routes.push(framework_component_route(
+                record,
+                vec![consumer_peer.id],
+                framework_controller_external_target(),
+            ));
+            continue;
+        }
+
+        if consumer_site_id != local_site_id {
+            continue;
+        }
+
+        let authority_peer = peer_router_identity_for_overlay(app, &authority_site_id).await?;
+        if !overlay
+            .peers
+            .iter()
+            .any(|peer| peer.id == authority_peer.id)
+        {
+            overlay.peers.push(authority_peer.clone());
+        }
+        overlay.inbound_routes.push(framework_component_route(
+            record,
+            vec![record.recipient_peer_id.clone()],
+            InboundTarget::MeshForward {
+                peer_addr: peer_router_mesh_addr_for_overlay(app, &authority_site_id)?,
+                peer_id: authority_peer.id,
+                route_id: record.route_id.clone(),
+                capability: record.capability.clone(),
+            },
+        ));
+    }
+
+    if overlay.peers.is_empty() && overlay.inbound_routes.is_empty() {
+        return Ok(None);
+    }
+    overlay.peers.sort_by(|left, right| left.id.cmp(&right.id));
+    overlay
+        .inbound_routes
+        .sort_by(|left, right| left.route_id.cmp(&right.route_id));
+    Ok(Some(overlay))
+}
+
+pub(super) async fn reconcile_local_framework_routes(
+    app: &ControlStateApp,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let overlay_id = framework_route_overlay_id(&app.controller_plan.site_id);
+    let endpoint = local_router_control_endpoint(app)?;
+    if let Some(overlay) = framework_route_overlay_payload(app).await? {
+        apply_route_overlay_with_retry(
+            &endpoint,
+            &overlay_id,
+            &overlay.peers,
+            &overlay.inbound_routes,
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|err| {
+            controller_protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &app.controller_plan.site_id,
+                "publish framework route overlay",
+                err,
+            )
+        })?;
+    } else {
+        revoke_route_overlay_with_retry(&endpoint, &overlay_id, Duration::from_secs(30))
+            .await
+            .map_err(|err| {
+                controller_protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &app.controller_plan.site_id,
+                    "retract framework route overlay",
+                    err,
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
+fn peer_site_router_url(
     app: &ControlStateApp,
     site_id: &str,
-) -> std::result::Result<SiteControllerRuntimePlan, ProtocolErrorResponse> {
-    Ok(site_controller_runtime_plan_from_controller_plan(
-        &load_site_controller_plan(app, site_id)?,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    if site_id == app.controller_plan.site_id {
+        return Ok(app.controller_plan.authority_url.clone());
+    }
+    app.controller_plan
+        .peer_site_router_urls
+        .get(site_id)
+        .cloned()
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::OriginUnavailable,
+                &format!(
+                    "site controller `{}` has no router forward path to peer site `{site_id}`",
+                    app.controller_plan.site_id
+                ),
+            )
+        })
+}
+
+async fn peer_controller_post_json_via_router<TReq: Serialize, TResp: for<'de> Deserialize<'de>>(
+    app: &ControlStateApp,
+    site_id: &str,
+    path: &str,
+    body: &TReq,
+    code: ProtocolErrorCode,
+    action: &str,
+) -> std::result::Result<TResp, ProtocolErrorResponse> {
+    let response = app
+        .client
+        .post(format!(
+            "{}{}",
+            peer_site_router_url(app, site_id)?.trim_end_matches('/'),
+            path
+        ))
+        .header(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER, "1")
+        .json(body)
+        .send()
+        .await
+        .map_err(|err| controller_protocol_error(code, site_id, action, err))?;
+    if response.status().is_success() {
+        return response
+            .json()
+            .await
+            .map_err(|err| controller_protocol_error(code, site_id, action, err));
+    }
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|err| controller_protocol_error(code, site_id, action, err))?;
+    if let Ok(protocol_error) = serde_json::from_slice::<ProtocolErrorResponse>(&body) {
+        return Err(protocol_error);
+    }
+    Err(controller_protocol_error(
+        code,
+        site_id,
+        action,
+        format!("peer controller returned {status}"),
     ))
 }
 
-fn controller_authority_url<'a>(
-    app: &'a ControlStateApp,
+async fn peer_controller_post_no_content_via_router<TReq: Serialize>(
+    app: &ControlStateApp,
     site_id: &str,
-) -> std::result::Result<&'a str, ProtocolErrorResponse> {
-    if site_id == app.controller_plan.site_id {
-        return Ok(app.controller_plan.authority_url.as_str());
+    path: &str,
+    body: &TReq,
+    code: ProtocolErrorCode,
+    action: &str,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let response = app
+        .client
+        .post(format!(
+            "{}{}",
+            peer_site_router_url(app, site_id)?.trim_end_matches('/'),
+            path
+        ))
+        .header(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER, "1")
+        .json(body)
+        .send()
+        .await
+        .map_err(|err| controller_protocol_error(code, site_id, action, err))?;
+    if response.status().is_success() {
+        return Ok(());
     }
-    app.peer_controllers
-        .get(site_id)
-        .map(|controller| controller.authority_url.as_str())
-        .ok_or_else(|| {
-            protocol_error(
-                ProtocolErrorCode::SiteNotActive,
-                &format!("site `{site_id}` controller metadata is unavailable"),
-            )
-        })
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|err| controller_protocol_error(code, site_id, action, err))?;
+    if let Ok(protocol_error) = serde_json::from_slice::<ProtocolErrorResponse>(&body) {
+        return Err(protocol_error);
+    }
+    Err(controller_protocol_error(
+        code,
+        site_id,
+        action,
+        format!("peer controller returned {status}"),
+    ))
 }
 
 pub(super) fn load_site_runtime_plan_at(
@@ -330,14 +868,25 @@ pub(super) async fn publish_dynamic_capability_origin(
     request: &dynamic_caps::PublishDynamicCapabilityOriginRequest,
 ) -> std::result::Result<dynamic_caps::PublishDynamicCapabilityOriginResponse, ProtocolErrorResponse>
 {
+    if site_id == app.controller_plan.site_id {
+        return publish_dynamic_capability_origin_local(
+            &LocalDynamicCapabilityOriginApp {
+                site_state_root: PathBuf::from(&app.controller_plan.site_state_root),
+                runtime: app.runtime.clone(),
+            },
+            request.clone(),
+        )
+        .await
+        .map_err(|err| err.0);
+    }
     let url = format!(
         "{}/v1/internal/dynamic-caps/origins/publish",
-        controller_authority_url(app, site_id)?.trim_end_matches('/')
+        peer_site_router_url(app, site_id)?.trim_end_matches('/')
     );
     let response = app
         .client
         .post(url)
-        .header(FRAMEWORK_AUTH_HEADER, app.control_state_auth_token.as_ref())
+        .header(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER, "1")
         .json(request)
         .send()
         .await
@@ -345,8 +894,8 @@ pub(super) async fn publish_dynamic_capability_origin(
             protocol_error(
                 ProtocolErrorCode::OriginUnavailable,
                 &format!(
-                    "failed to reach site controller on site `{site_id}` while publishing dynamic \
-                     capability origin: {err}"
+                    "failed to reach site controller on site `{site_id}` through the site router \
+                     while publishing dynamic capability origin: {err}"
                 ),
             )
         })?;
@@ -355,8 +904,8 @@ pub(super) async fn publish_dynamic_capability_origin(
             protocol_error(
                 ProtocolErrorCode::OriginUnavailable,
                 &format!(
-                    "site controller on site `{site_id}` returned invalid JSON while publishing \
-                     dynamic capability origin: {err}"
+                    "site controller on site `{site_id}` returned invalid JSON through the site \
+                     router while publishing dynamic capability origin: {err}"
                 ),
             )
         });
@@ -366,8 +915,8 @@ pub(super) async fn publish_dynamic_capability_origin(
         protocol_error(
             ProtocolErrorCode::OriginUnavailable,
             &format!(
-                "failed to read site controller error response on site `{site_id}` while \
-                 publishing dynamic capability origin: {err}"
+                "failed to read site controller error response on site `{site_id}` through the \
+                 site router while publishing dynamic capability origin: {err}"
             ),
         )
     })?;
@@ -377,58 +926,10 @@ pub(super) async fn publish_dynamic_capability_origin(
     Err(protocol_error(
         ProtocolErrorCode::OriginUnavailable,
         &format!(
-            "site controller on site `{site_id}` returned {status} while publishing dynamic \
-             capability origin"
+            "site controller on site `{site_id}` returned {status} through the site router while \
+             publishing dynamic capability origin"
         ),
     ))
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct DynamicCapabilityRuntimeEndpoint {
-    pub(super) site_id: String,
-    pub(super) runtime: LiveComponentRuntimeMetadata,
-}
-
-pub(super) fn dynamic_capability_component_runtime_endpoint(
-    app: &ControlStateApp,
-    state: &FrameworkControlState,
-    logical_component_id: &str,
-) -> std::result::Result<DynamicCapabilityRuntimeEndpoint, ProtocolErrorResponse> {
-    let moniker = dynamic_caps::moniker_from_logical_component_id(logical_component_id)?;
-    let assignments = live_assignment_map(state);
-    let site_id = assignments.get(moniker).ok_or_else(|| {
-        protocol_error(
-            ProtocolErrorCode::OriginUnavailable,
-            &format!("live component `{logical_component_id}` is not assigned to a live site"),
-        )
-    })?;
-    let site_plan = load_site_runtime_plan(app, site_id)?;
-    let runtime = app
-        .runtime
-        .collect_live_component_runtime_metadata(&site_plan)
-        .map_err(|err| {
-            protocol_error(
-                ProtocolErrorCode::OriginUnavailable,
-                &format!(
-                    "failed to resolve live runtime metadata for component \
-                     `{logical_component_id}` on site `{site_id}`: {err}"
-                ),
-            )
-        })?
-        .remove(moniker)
-        .ok_or_else(|| {
-            protocol_error(
-                ProtocolErrorCode::OriginUnavailable,
-                &format!(
-                    "live runtime metadata for component `{logical_component_id}` is unavailable \
-                     on site `{site_id}`"
-                ),
-            )
-        })?;
-    Ok(DynamicCapabilityRuntimeEndpoint {
-        site_id: site_id.clone(),
-        runtime,
-    })
 }
 
 pub(super) fn dynamic_capability_origin_route_surface(
@@ -784,152 +1285,66 @@ pub(super) async fn publish_dynamic_capability_origin_local(
     })
 }
 
-pub(super) async fn call_site_controller<B: Serialize>(
-    app: &ControlStateApp,
-    site_id: &str,
-    path: &str,
-    body: Option<&B>,
-    error_code: ProtocolErrorCode,
-    action: &str,
-) -> std::result::Result<(), ProtocolErrorResponse> {
-    if site_id == app.controller_plan.site_id {
-        let local_child_id = || -> std::result::Result<u64, ProtocolErrorResponse> {
-            path.rsplit('/')
-                .nth(1)
-                .ok_or_else(|| {
-                    controller_protocol_error(
-                        error_code,
-                        site_id,
-                        action,
-                        format!("site controller path `{path}` is malformed"),
-                    )
-                })?
-                .parse()
-                .map_err(|err| {
-                    controller_protocol_error(
-                        error_code,
-                        site_id,
-                        action,
-                        format!("site controller child id in `{path}` is malformed: {err}"),
-                    )
-                })
-        };
-        match path {
-            path if path.ends_with("/prepare") => {
-                let request = serde_json::to_value(body).expect("site op body should serialize");
-                let request = serde_json::from_value::<SiteControllerPrepareRequest>(request)
-                    .expect("prepare request should deserialize");
-                return app
-                    .runtime
-                    .prepare_child(&app.controller_plan, local_child_id()?, request.site_plan)
-                    .await
-                    .map_err(|err| controller_protocol_error(error_code, site_id, action, err));
-            }
-            path if path.ends_with("/publish") => {
-                let request = serde_json::to_value(body).expect("site op body should serialize");
-                let request = serde_json::from_value::<SiteControllerPublishRequest>(request)
-                    .expect("publish request should deserialize");
-                return app
-                    .runtime
-                    .publish_child(&app.controller_plan, local_child_id()?, request.site_plan)
-                    .await
-                    .map_err(|err| controller_protocol_error(error_code, site_id, action, err));
-            }
-            path if path.ends_with("/destroy") => {
-                let request = serde_json::to_value(body).expect("site op body should serialize");
-                let request = serde_json::from_value::<SiteControllerDestroyRequest>(request)
-                    .expect("destroy request should deserialize");
-                return app
-                    .runtime
-                    .destroy_child(
-                        &app.controller_plan,
-                        local_child_id()?,
-                        request.desired_site_plan,
-                    )
-                    .await
-                    .map_err(|err| controller_protocol_error(error_code, site_id, action, err));
-            }
-            _ => {}
-        }
-    } else {
-        let controller = app.peer_controllers.get(site_id).ok_or_else(|| {
-            controller_protocol_error(
-                error_code,
-                site_id,
-                action,
-                "site controller is not present in peer metadata",
-            )
-        })?;
-        let url = format!("{}{}", controller.authority_url.trim_end_matches('/'), path);
-        let request = app
-            .client
-            .post(url)
-            .header(FRAMEWORK_AUTH_HEADER, app.control_state_auth_token.as_ref());
-        let request = if let Some(body) = body {
-            request.json(body)
-        } else {
-            request
-        };
-        let response = request
-            .send()
-            .await
-            .map_err(|err| controller_protocol_error(error_code, site_id, action, err))?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(controller_protocol_error(
-            error_code,
-            site_id,
-            action,
-            format!("HTTP {status}: {}", body.trim()),
-        ));
-    }
-    Err(controller_protocol_error(
-        error_code,
-        site_id,
-        action,
-        format!("unsupported site controller action path `{path}`"),
-    ))
-}
-
 pub(super) async fn prepare_child_on_site(
     app: &ControlStateApp,
-    child_id: u64,
-    site_plan: &DynamicSitePlanRecord,
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    let path = format!("/v1/controller/site/children/{child_id}/prepare");
-    call_site_controller(
-        app,
-        &site_plan.site_id,
-        &path,
-        Some(&SiteControllerPrepareRequest {
-            site_plan: site_plan.clone(),
-        }),
-        ProtocolErrorCode::PrepareFailed,
-        "prepare child",
-    )
-    .await
+    let site_id = child_runtime_site_id(child)?;
+    if site_id != app.controller_plan.site_id {
+        return Err(controller_protocol_error(
+            ProtocolErrorCode::PrepareFailed,
+            &site_id,
+            "prepare child",
+            format!(
+                "dynamic child `{}` targeted site `{}` but controller `{}` only creates local \
+                 children",
+                child.name, site_id, app.controller_plan.site_id
+            ),
+        ));
+    }
+    app.runtime
+        .prepare_child(&app.controller_plan, state.clone(), child.clone())
+        .await
+        .map_err(|err| {
+            controller_protocol_error(
+                ProtocolErrorCode::PrepareFailed,
+                &site_id,
+                "prepare child",
+                err,
+            )
+        })
 }
 
 pub(super) async fn publish_child_on_site(
     app: &ControlStateApp,
-    child_id: u64,
-    site_plan: &DynamicSitePlanRecord,
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    let path = format!("/v1/controller/site/children/{child_id}/publish");
-    call_site_controller(
-        app,
-        &site_plan.site_id,
-        &path,
-        Some(&SiteControllerPublishRequest {
-            site_plan: site_plan.clone(),
-        }),
-        ProtocolErrorCode::PublishFailed,
-        "publish child",
-    )
-    .await
+    let site_id = child_runtime_site_id(child)?;
+    if site_id != app.controller_plan.site_id {
+        return Err(controller_protocol_error(
+            ProtocolErrorCode::PublishFailed,
+            &site_id,
+            "publish child",
+            format!(
+                "dynamic child `{}` targeted site `{}` but controller `{}` only publishes local \
+                 children",
+                child.name, site_id, app.controller_plan.site_id
+            ),
+        ));
+    }
+    app.runtime
+        .publish_child(&app.controller_plan, state.clone(), child.clone())
+        .await
+        .map_err(|err| {
+            controller_protocol_error(
+                ProtocolErrorCode::PublishFailed,
+                &site_id,
+                "publish child",
+                err,
+            )
+        })
 }
 
 fn site_controller_child_needs_prepare(err: &ProtocolErrorResponse, child_id: u64) -> bool {
@@ -941,14 +1356,14 @@ fn site_controller_child_needs_prepare(err: &ProtocolErrorResponse, child_id: u6
 
 pub(super) async fn publish_child_on_site_with_prepare_retry(
     app: &ControlStateApp,
-    child_id: u64,
-    site_plan: &DynamicSitePlanRecord,
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    match publish_child_on_site(app, child_id, site_plan).await {
+    match publish_child_on_site(app, state, child).await {
         Ok(()) => Ok(()),
-        Err(err) if site_controller_child_needs_prepare(&err, child_id) => {
-            prepare_child_on_site(app, child_id, site_plan).await?;
-            publish_child_on_site(app, child_id, site_plan).await
+        Err(err) if site_controller_child_needs_prepare(&err, child.child_id) => {
+            prepare_child_on_site(app, state, child).await?;
+            publish_child_on_site(app, state, child).await
         }
         Err(err) => Err(err),
     }
@@ -959,56 +1374,47 @@ pub(super) async fn rollback_child_on_site(
     child_id: u64,
     site_id: &str,
 ) -> Result<()> {
-    if site_id == app.controller_plan.site_id {
-        return app
-            .runtime
-            .rollback_child(&app.controller_plan, child_id)
-            .await;
+    if site_id != app.controller_plan.site_id {
+        return Err(miette::miette!(
+            "dynamic child plan targeted site `{site_id}` but controller `{}` only rolls back \
+             local children",
+            app.controller_plan.site_id
+        ));
     }
-    let path = format!("/v1/controller/site/children/{child_id}/rollback");
-    let controller = app
-        .peer_controllers
-        .get(site_id)
-        .ok_or_else(|| miette::miette!("site `{site_id}` controller metadata is unavailable"))?;
-    let response = app
-        .client
-        .post(format!(
-            "{}{}",
-            controller.authority_url.trim_end_matches('/'),
-            path
-        ))
-        .header(FRAMEWORK_AUTH_HEADER, app.control_state_auth_token.as_ref())
-        .send()
+    app.runtime
+        .rollback_child(&app.controller_plan, child_id)
         .await
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to rollback child on site `{site_id}`"))?;
-    if response.status().is_success() {
-        return Ok(());
-    }
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    Err(miette::miette!(
-        "failed to rollback child on site `{site_id}`: HTTP {status}: {}",
-        body.trim()
-    ))
 }
 
 pub(super) async fn destroy_child_on_site(
     app: &ControlStateApp,
-    child_id: u64,
-    site_id: &str,
-    desired_site_plan: Option<DynamicSitePlanRecord>,
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    let path = format!("/v1/controller/site/children/{child_id}/destroy");
-    call_site_controller(
-        app,
-        site_id,
-        &path,
-        Some(&SiteControllerDestroyRequest { desired_site_plan }),
-        ProtocolErrorCode::ControlStateUnavailable,
-        "destroy child",
-    )
-    .await
+    let site_id = child_runtime_site_id(child)?;
+    if site_id != app.controller_plan.site_id {
+        return Err(controller_protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &site_id,
+            "destroy child",
+            format!(
+                "dynamic child `{}` targeted site `{site_id}` but controller `{}` only destroys \
+                 local children",
+                child.name, app.controller_plan.site_id
+            ),
+        ));
+    }
+    app.runtime
+        .destroy_child(&app.controller_plan, state.clone(), child.clone())
+        .await
+        .map_err(|err| {
+            controller_protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &site_id,
+                "destroy child",
+                err,
+            )
+        })
 }
 
 pub(super) async fn publish_external_slot_overlay(
@@ -1019,60 +1425,49 @@ pub(super) async fn publish_external_slot_overlay(
     let overlay_id = overlay_id_for_link_action(child, link, |action| {
         matches!(action, DynamicOverlayAction::ExternalSlot { .. })
     })?;
-    let provider = load_launched_site(app, &link.provider_site)?;
-    let consumer = load_launched_site(app, &link.consumer_site)?;
-    let provider_output_dir =
-        provider_output_dir_for_link(app, child, Path::new(&provider.receipt.artifact_dir), link);
-    let external_url = app
-        .runtime
-        .resolve_link_external_url(
-            &provider,
-            &provider_output_dir,
-            link,
-            consumer.receipt.kind,
-            &app.run_root,
+    let consumer_kind = {
+        let state = app.control_state.lock().await;
+        local_site_kind_from_state(&state, &link.consumer_site)?
+    };
+    let resolve_request = ResolveExternalLinkUrlRequest {
+        child_id: child.child_id,
+        link: link.clone(),
+        consumer_kind,
+    };
+    let external_url = if link.provider_site == app.controller_plan.site_id {
+        resolve_external_link_url_local(app, &resolve_request)
+            .await?
+            .external_url
+    } else {
+        peer_controller_post_json_via_router::<_, ResolveExternalLinkUrlResponse>(
+            app,
+            &link.provider_site,
+            "/v1/internal/link-overlays/external-url",
+            &resolve_request,
+            ProtocolErrorCode::PublishFailed,
+            "resolve provider link url",
+        )
+        .await?
+        .external_url
+    };
+    let publish_request = PublishExternalSlotOverlayRequest {
+        overlay_id: overlay_id.to_string(),
+        slot_name: link.external_slot_name.clone(),
+        url: external_url,
+    };
+    if link.consumer_site == app.controller_plan.site_id {
+        publish_external_slot_overlay_local(app, &publish_request).await
+    } else {
+        peer_controller_post_no_content_via_router(
+            app,
+            &link.consumer_site,
+            "/v1/internal/link-overlays/external-slot/publish",
+            &publish_request,
+            ProtocolErrorCode::PublishFailed,
+            "publish external slot overlay",
         )
         .await
-        .map_err(|err| {
-            controller_protocol_error(
-                ProtocolErrorCode::PublishFailed,
-                &link.consumer_site,
-                "compute external slot overlay",
-                err,
-            )
-        })?;
-    register_external_slot_with_retry(
-        &consumer.router_control,
-        &link.external_slot_name,
-        &external_url,
-        Duration::from_secs(30),
-    )
-    .await
-    .map_err(|err| {
-        controller_protocol_error(
-            ProtocolErrorCode::PublishFailed,
-            &link.consumer_site,
-            "publish external slot overlay",
-            err,
-        )
-    })?;
-    app.runtime
-        .update_desired_overlay_for_consumer(
-            &site_state_root_for(app, &link.consumer_site),
-            overlay_id,
-            DesiredExternalSlotOverlay {
-                slot_name: link.external_slot_name.clone(),
-                url: external_url,
-            },
-        )
-        .map_err(|err| {
-            controller_protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
-                &link.consumer_site,
-                "persist desired external slot overlay",
-                err,
-            )
-        })
+    }
 }
 
 pub(super) async fn publish_export_peer_overlay(
@@ -1083,49 +1478,34 @@ pub(super) async fn publish_export_peer_overlay(
     let overlay_id = overlay_id_for_link_action(child, link, |action| {
         matches!(action, DynamicOverlayAction::ExportPeer { .. })
     })?;
-    let provider = load_launched_site(app, &link.provider_site)?;
-    let consumer = load_launched_site(app, &link.consumer_site)?;
-    let consumer_key =
-        base64::engine::general_purpose::STANDARD.encode(consumer.router_identity.public_key);
     let route_id = export_peer_route_id(child, link)?;
-    register_export_peer_with_retry(
-        &provider.router_control,
-        &link.export_name,
-        &consumer.router_identity.id,
-        &consumer_key,
-        &link.protocol.to_string(),
-        Some(&route_id),
-        Duration::from_secs(30),
-    )
-    .await
-    .map_err(|err| {
-        controller_protocol_error(
-            ProtocolErrorCode::PublishFailed,
+    let consumer_identity = if link.consumer_site == app.controller_plan.site_id {
+        local_router_identity_for_overlay(app).await?
+    } else {
+        peer_router_identity_for_overlay(app, &link.consumer_site).await?
+    };
+    let publish_request = PublishExportPeerOverlayRequest {
+        overlay_id: overlay_id.to_string(),
+        export_name: link.export_name.clone(),
+        peer_id: consumer_identity.id,
+        peer_key_b64: base64::engine::general_purpose::STANDARD
+            .encode(consumer_identity.public_key),
+        protocol: link.protocol.to_string(),
+        route_id: Some(route_id),
+    };
+    if link.provider_site == app.controller_plan.site_id {
+        publish_export_peer_overlay_local(app, &publish_request).await
+    } else {
+        peer_controller_post_no_content_via_router(
+            app,
             &link.provider_site,
+            "/v1/internal/link-overlays/export-peer/publish",
+            &publish_request,
+            ProtocolErrorCode::PublishFailed,
             "publish export-peer overlay",
-            err,
         )
-    })?;
-    app.runtime
-        .update_desired_overlay_for_provider(
-            &site_state_root_for(app, &link.provider_site),
-            overlay_id,
-            DesiredExportPeerOverlay {
-                export_name: link.export_name.clone(),
-                peer_id: consumer.router_identity.id,
-                peer_key_b64: consumer_key,
-                protocol: link.protocol.to_string(),
-                route_id: Some(route_id),
-            },
-        )
-        .map_err(|err| {
-            controller_protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
-                &link.provider_site,
-                "persist desired export-peer overlay",
-                err,
-            )
-        })
+        .await
+    }
 }
 
 pub(super) fn child_link_records(child: &LiveChildRecord) -> Vec<RunLink> {
@@ -1187,11 +1567,8 @@ pub(super) fn provider_output_dir_for_link(
     if !provider_in_child {
         return provider_artifact_dir.to_path_buf();
     }
-    site_controller_runtime_child_root_for_site(
-        &site_state_root_for(app, &link.provider_site),
-        child.child_id,
-    )
-    .join("artifact")
+    site_controller_runtime_child_root_for_site(local_site_state_root(app), child.child_id)
+        .join("artifact")
 }
 
 pub(super) fn export_peer_route_id(
@@ -1282,40 +1659,29 @@ pub(super) async fn clear_external_slot_overlay(
     let overlay_id = overlay_id_for_link_action(child, link, |action| {
         matches!(action, DynamicOverlayAction::ExternalSlot { .. })
     })?;
-    app.runtime
-        .clear_desired_overlay_for_consumer(
-            &site_state_root_for(app, &link.consumer_site),
-            overlay_id,
-        )
-        .map_err(|err| {
-            controller_protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
-                &link.consumer_site,
-                "persist external slot overlay removal",
-                err,
-            )
-        })?;
     {
         let state = app.control_state.lock().await;
         if link_still_required(&state, child_id, link) {
             return Ok(());
         }
     }
-    let consumer = load_launched_site(app, &link.consumer_site)?;
-    clear_external_slot_with_retry(
-        &consumer.router_control,
-        &link.external_slot_name,
-        Duration::from_secs(30),
-    )
-    .await
-    .map_err(|err| {
-        controller_protocol_error(
-            ProtocolErrorCode::ControlStateUnavailable,
+    let clear_request = ClearExternalSlotOverlayRequest {
+        overlay_id: overlay_id.to_string(),
+        slot_name: link.external_slot_name.clone(),
+    };
+    if link.consumer_site == app.controller_plan.site_id {
+        clear_external_slot_overlay_local(app, &clear_request).await
+    } else {
+        peer_controller_post_no_content_via_router(
+            app,
             &link.consumer_site,
+            "/v1/internal/link-overlays/external-slot/clear",
+            &clear_request,
+            ProtocolErrorCode::ControlStateUnavailable,
             "retract external slot overlay",
-            err,
         )
-    })
+        .await
+    }
 }
 
 pub(super) async fn clear_export_peer_overlay(
@@ -1327,48 +1693,40 @@ pub(super) async fn clear_export_peer_overlay(
     let overlay_id = overlay_id_for_link_action(child, link, |action| {
         matches!(action, DynamicOverlayAction::ExportPeer { .. })
     })?;
-    app.runtime
-        .clear_desired_overlay_for_provider(
-            &site_state_root_for(app, &link.provider_site),
-            overlay_id,
-        )
-        .map_err(|err| {
-            controller_protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
-                &link.provider_site,
-                "persist export-peer overlay removal",
-                err,
-            )
-        })?;
     {
         let state = app.control_state.lock().await;
         if link_still_required(&state, child_id, link) {
             return Ok(());
         }
     }
-    let provider = load_launched_site(app, &link.provider_site)?;
-    let consumer = load_launched_site(app, &link.consumer_site)?;
-    let consumer_key =
-        base64::engine::general_purpose::STANDARD.encode(consumer.router_identity.public_key);
     let route_id = export_peer_route_id(child, link)?;
-    unregister_export_peer_with_retry(
-        &provider.router_control,
-        &link.export_name,
-        &consumer.router_identity.id,
-        &consumer_key,
-        &link.protocol.to_string(),
-        Some(&route_id),
-        Duration::from_secs(30),
-    )
-    .await
-    .map_err(|err| {
-        controller_protocol_error(
-            ProtocolErrorCode::ControlStateUnavailable,
+    let consumer_identity = if link.consumer_site == app.controller_plan.site_id {
+        local_router_identity_for_overlay(app).await?
+    } else {
+        peer_router_identity_for_overlay(app, &link.consumer_site).await?
+    };
+    let clear_request = ClearExportPeerOverlayRequest {
+        overlay_id: overlay_id.to_string(),
+        export_name: link.export_name.clone(),
+        peer_id: consumer_identity.id,
+        peer_key_b64: base64::engine::general_purpose::STANDARD
+            .encode(consumer_identity.public_key),
+        protocol: link.protocol.to_string(),
+        route_id: Some(route_id),
+    };
+    if link.provider_site == app.controller_plan.site_id {
+        clear_export_peer_overlay_local(app, &clear_request).await
+    } else {
+        peer_controller_post_no_content_via_router(
+            app,
             &link.provider_site,
+            "/v1/internal/link-overlays/export-peer/clear",
+            &clear_request,
+            ProtocolErrorCode::ControlStateUnavailable,
             "retract export-peer overlay",
-            err,
         )
-    })
+        .await
+    }
 }
 
 pub(super) async fn publish_child_overlays(
@@ -1434,112 +1792,25 @@ pub(super) async fn retract_dynamic_capability_origin_overlays(
     };
 
     for (site_id, overlay_ids) in overlays_by_site {
-        let router_control = load_site_manager_state(app, &site_id)?
-            .router_control
-            .ok_or_else(|| {
-                controller_protocol_error(
-                    ProtocolErrorCode::ControlStateUnavailable,
-                    &site_id,
-                    "retract dynamic capability origin overlays",
-                    "site router control endpoint is unavailable",
-                )
-            })?;
-        let endpoint = parse_control_endpoint(&router_control).map_err(|err| {
-            controller_protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
+        let revoke_request = RevokeDynamicCapabilityOriginOverlaysRequest {
+            overlay_ids: overlay_ids.into_iter().collect(),
+        };
+        if site_id == app.controller_plan.site_id {
+            revoke_dynamic_capability_origin_overlays_local(app, &revoke_request).await?;
+        } else {
+            peer_controller_post_no_content_via_router(
+                app,
                 &site_id,
+                "/v1/internal/dynamic-caps/origins/revoke",
+                &revoke_request,
+                ProtocolErrorCode::ControlStateUnavailable,
                 "retract dynamic capability origin overlays",
-                format!("site router control endpoint is invalid: {err}"),
             )
-        })?;
-        for overlay_id in overlay_ids {
-            revoke_route_overlay_with_retry(&endpoint, &overlay_id, Duration::from_secs(30))
-                .await
-                .map_err(|err| {
-                    controller_protocol_error(
-                        ProtocolErrorCode::ControlStateUnavailable,
-                        &site_id,
-                        "retract dynamic capability origin overlays",
-                        err,
-                    )
-                })?;
+            .await?;
         }
     }
 
     Ok(())
-}
-
-pub(super) fn child_site_publish_waves(child: &LiveChildRecord) -> Vec<Vec<String>> {
-    let site_ids = child
-        .site_plans
-        .iter()
-        .map(|site_plan| site_plan.site_id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut incoming = site_ids
-        .iter()
-        .map(|site_id| (site_id.clone(), BTreeSet::<String>::new()))
-        .collect::<BTreeMap<_, _>>();
-    let mut outgoing = site_ids
-        .iter()
-        .map(|site_id| (site_id.clone(), BTreeSet::<String>::new()))
-        .collect::<BTreeMap<_, _>>();
-    for link in child_link_records(child) {
-        if link.weak || link.provider_site == link.consumer_site {
-            continue;
-        }
-        if !site_ids.contains(&link.provider_site) || !site_ids.contains(&link.consumer_site) {
-            continue;
-        }
-        incoming
-            .get_mut(&link.consumer_site)
-            .expect("consumer site should be tracked")
-            .insert(link.provider_site.clone());
-        outgoing
-            .get_mut(&link.provider_site)
-            .expect("provider site should be tracked")
-            .insert(link.consumer_site.clone());
-    }
-
-    let mut ready = incoming
-        .iter()
-        .filter(|(_, deps)| deps.is_empty())
-        .map(|(site_id, _)| site_id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut waves = Vec::new();
-    let mut scheduled = BTreeSet::new();
-    while !ready.is_empty() {
-        let wave = ready.iter().cloned().collect::<Vec<_>>();
-        let mut next_ready = BTreeSet::new();
-        for site_id in &wave {
-            if !scheduled.insert(site_id.clone()) {
-                continue;
-            }
-            for consumer in outgoing
-                .get(site_id)
-                .into_iter()
-                .flat_map(|sites| sites.iter())
-            {
-                let deps = incoming
-                    .get_mut(consumer)
-                    .expect("consumer dependencies should be tracked");
-                deps.remove(site_id);
-                if deps.is_empty() {
-                    next_ready.insert(consumer.clone());
-                }
-            }
-        }
-        waves.push(wave);
-        ready = next_ready;
-    }
-
-    let remaining = site_ids
-        .into_iter()
-        .filter(|site_id| scheduled.insert(site_id.clone()))
-        .collect::<Vec<_>>();
-    if !remaining.is_empty() {
-        waves.push(remaining);
-    }
-    waves
 }
 
 pub(super) fn cloned_child_record(
@@ -1560,10 +1831,10 @@ pub(super) fn cloned_child_record(
 pub(super) async fn rollback_prepared_sites(
     app: &ControlStateApp,
     child_id: u64,
-    prepared_sites: &[String],
+    prepared: bool,
 ) -> Result<()> {
-    for site_id in prepared_sites {
-        rollback_child_on_site(app, child_id, site_id).await?;
+    if prepared {
+        rollback_child_on_site(app, child_id, &app.controller_plan.site_id).await?;
     }
     Ok(())
 }
@@ -1595,123 +1866,41 @@ pub(super) async fn continue_create_committed_hidden(
         child
     };
 
-    let site_plans = child
-        .site_plans
-        .iter()
-        .map(|site_plan| (site_plan.site_id.clone(), site_plan.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let child_sites = site_plans.keys().cloned().collect::<BTreeSet<_>>();
-    let links = child_link_records(&child);
-    let mut published_child_sites = BTreeSet::new();
-    let mut published_links = Vec::new();
-    for wave in child_site_publish_waves(&child) {
-        for site_id in &wave {
-            for link in links.iter().filter(|link| link.consumer_site == *site_id) {
-                let provider_ready = !child_sites.contains(&link.provider_site)
-                    || published_child_sites.contains(&link.provider_site);
-                if provider_ready {
-                    publish_link_overlays(app, &child, link).await?;
-                    published_links.push(link.clone());
-                }
+    let state = app.control_state.lock().await.clone();
+    let published_links = child_link_records(&child);
+    for link in &published_links {
+        publish_link_overlays(app, &child, link).await?;
+    }
+    if let Err(err) = publish_child_on_site_with_prepare_retry(app, &state, &child).await {
+        let mut cleanup_error = None;
+        for link in published_links.iter().rev() {
+            if let Err(retract_err) = retract_link_overlays(app, &child, link).await
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(retract_err);
             }
         }
-        let mut publish_tasks = tokio::task::JoinSet::new();
-        for site_id in &wave {
-            let app = app.clone();
-            let child_id = child.child_id;
-            let site_plan = site_plans
-                .get(site_id)
-                .expect("site plan should exist for wave site")
-                .clone();
-            let site_id = site_id.clone();
-            publish_tasks.spawn(async move {
-                publish_child_on_site_with_prepare_retry(&app, child_id, &site_plan)
-                    .await
-                    .map(|_| site_id)
-            });
+        if let Err(destroy_err) = destroy_child_on_site(app, &state, &child).await
+            && cleanup_error.is_none()
+        {
+            cleanup_error = Some(destroy_err);
         }
-        let mut first_error = None;
-        let mut published_wave_sites = Vec::new();
-        while let Some(result) = publish_tasks.join_next().await {
-            match result {
-                Ok(Ok(site_id)) => published_wave_sites.push(site_id),
-                Ok(Err(err)) if first_error.is_none() => first_error = Some(err),
-                Ok(Err(_)) => {}
-                Err(err) if first_error.is_none() => {
-                    first_error = Some(protocol_error(
-                        ProtocolErrorCode::PublishFailed,
-                        &format!("site publish task failed: {err}"),
-                    ));
-                }
-                Err(_) => {}
-            }
+        if let Some(cleanup_error) = cleanup_error {
+            return Err(protocol_error(
+                ProtocolErrorCode::PublishFailed,
+                &format!("{}; cleanup failed: {}", err.message, cleanup_error.message),
+            ));
         }
-        if let Some(err) = first_error {
-            let desired_site_plans = {
-                let state = app.control_state.lock().await;
-                desired_site_plan_map(&state, &child_sites)?
-            };
-            let mut cleanup_error = None;
-            for link in published_links.iter().rev() {
-                if let Err(retract_err) = retract_link_overlays(app, &child, link).await
-                    && cleanup_error.is_none()
-                {
-                    cleanup_error = Some(retract_err);
-                }
-            }
-
-            let mut destroy_tasks = tokio::task::JoinSet::new();
-            for site_id in &child_sites {
-                let app = app.clone();
-                let desired_site_plan = desired_site_plans.get(site_id).cloned();
-                let site_id = site_id.clone();
-                destroy_tasks.spawn(async move {
-                    destroy_child_on_site(&app, child.child_id, &site_id, desired_site_plan).await
-                });
-            }
-            while let Some(result) = destroy_tasks.join_next().await {
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(destroy_err)) if cleanup_error.is_none() => {
-                        cleanup_error = Some(destroy_err);
-                    }
-                    Ok(Err(_)) => {}
-                    Err(join_err) if cleanup_error.is_none() => {
-                        cleanup_error = Some(protocol_error(
-                            ProtocolErrorCode::PublishFailed,
-                            &format!("site destroy task failed: {join_err}"),
-                        ));
-                    }
-                    Err(_) => {}
-                }
-            }
-
-            if let Some(cleanup_error) = cleanup_error {
-                return Err(protocol_error(
-                    ProtocolErrorCode::PublishFailed,
-                    &format!("{}; cleanup failed: {}", err.message, cleanup_error.message),
-                ));
-            }
-
-            let mut state = app.control_state.lock().await;
-            if child_record_location(&state, child.child_id).is_ok() {
-                let tx_id = child_create_tx_id(&state, child.child_id)?;
-                persist_control_state_update(
-                    &mut state,
-                    &app.state_path,
-                    "create_aborted",
-                    |state| {
-                        append_journal_entry(state, tx_id, &child, ChildState::CreateAborted);
-                        remove_child_record(state, child.child_id)?;
-                        Ok(())
-                    },
-                )?;
-            }
-            return Err(err);
+        let mut state = app.control_state.lock().await;
+        if child_record_location(&state, child.child_id).is_ok() {
+            let tx_id = child_create_tx_id(&state, child.child_id)?;
+            persist_control_state_update(&mut state, &app.state_path, "create_aborted", |state| {
+                append_journal_entry(state, tx_id, &child, ChildState::CreateAborted);
+                remove_child_record(state, child.child_id)?;
+                Ok(())
+            })?;
         }
-        for site_id in published_wave_sites {
-            published_child_sites.insert(site_id);
-        }
+        return Err(err);
     }
     publish_child_overlays(app, &child).await?;
 
@@ -1743,43 +1932,8 @@ pub(super) async fn continue_destroy_retracted(
         }
         child
     };
-    let desired_site_plans = {
-        let state = app.control_state.lock().await;
-        desired_site_plan_map(
-            &state,
-            &child
-                .site_plans
-                .iter()
-                .map(|site_plan| site_plan.site_id.clone())
-                .collect(),
-        )?
-    };
-    let mut destroy_tasks = tokio::task::JoinSet::new();
-    for site_plan in child.site_plans.clone() {
-        let app = app.clone();
-        let desired_site_plan = desired_site_plans.get(&site_plan.site_id).cloned();
-        destroy_tasks.spawn(async move {
-            destroy_child_on_site(&app, child.child_id, &site_plan.site_id, desired_site_plan).await
-        });
-    }
-    let mut first_error = None;
-    while let Some(result) = destroy_tasks.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) if first_error.is_none() => first_error = Some(err),
-            Ok(Err(_)) => {}
-            Err(err) if first_error.is_none() => {
-                first_error = Some(protocol_error(
-                    ProtocolErrorCode::PublishFailed,
-                    &format!("site destroy task failed: {err}"),
-                ));
-            }
-            Err(_) => {}
-        }
-    }
-    if let Some(err) = first_error {
-        return Err(err);
-    }
+    let state = app.control_state.lock().await.clone();
+    destroy_child_on_site(app, &state, &child).await?;
 
     let mut state = app.control_state.lock().await;
     let child = cloned_child_record(&state, child_id)?;
@@ -1849,11 +2003,12 @@ pub(super) async fn execute_create_child(
         (tx_id, child)
     };
     let (tx_id, child) = child;
+    reconcile_local_framework_routes(app).await?;
 
-    let mut prepared_sites = Vec::new();
-    for site_plan in &child.site_plans {
-        if let Err(err) = prepare_child_on_site(app, child.child_id, site_plan).await {
-            let rollback_err = rollback_prepared_sites(app, child.child_id, &prepared_sites).await;
+    let state = app.control_state.lock().await.clone();
+    if let Err(err) = prepare_child_on_site(app, &state, &child).await {
+        let rollback_err = rollback_prepared_sites(app, child.child_id, false).await;
+        let should_reconcile = {
             let mut state = app.control_state.lock().await;
             if state
                 .pending_creates
@@ -1871,18 +2026,23 @@ pub(super) async fn execute_create_child(
                         Ok(())
                     },
                 )?;
-            }
-            let err = if let Err(rollback_err) = rollback_err {
-                protocol_error(
-                    ProtocolErrorCode::PrepareFailed,
-                    &format!("{}; rollback failed: {rollback_err}", err.message),
-                )
+                true
             } else {
-                err
-            };
-            return Err(err.into());
+                false
+            }
+        };
+        if should_reconcile {
+            reconcile_local_framework_routes(app).await?;
         }
-        prepared_sites.push(site_plan.site_id.clone());
+        let err = if let Err(rollback_err) = rollback_err {
+            protocol_error(
+                ProtocolErrorCode::PrepareFailed,
+                &format!("{}; rollback failed: {rollback_err}", err.message),
+            )
+        } else {
+            err
+        };
+        return Err(err.into());
     }
 
     {
@@ -1927,7 +2087,7 @@ pub(super) async fn execute_destroy_child(
     child_name: &str,
 ) -> std::result::Result<(), ProtocolApiError> {
     let _authority_guard = acquire_authority_lock(app, authority_realm_id).await;
-    let next = {
+    let (next, reconcile_routes) = {
         let mut state = app.control_state.lock().await;
         let Some(child) = state
             .live_children
@@ -1953,10 +2113,10 @@ pub(super) async fn execute_destroy_child(
                         Ok(())
                     },
                 )?;
-                (child.child_id, ChildState::DestroyRequested)
+                ((child.child_id, ChildState::DestroyRequested), true)
             }
-            ChildState::DestroyRequested => (child.child_id, ChildState::DestroyRequested),
-            ChildState::DestroyRetracted => (child.child_id, ChildState::DestroyRetracted),
+            ChildState::DestroyRequested => ((child.child_id, ChildState::DestroyRequested), false),
+            ChildState::DestroyRetracted => ((child.child_id, ChildState::DestroyRetracted), false),
             ChildState::DestroyCommitted | ChildState::CreateAborted => return Ok(()),
             _ => {
                 return Err(protocol_error(
@@ -1967,6 +2127,9 @@ pub(super) async fn execute_destroy_child(
             }
         }
     };
+    if reconcile_routes {
+        reconcile_local_framework_routes(app).await?;
+    }
     match next.1 {
         ChildState::DestroyRequested => continue_destroy_requested(app, next.0).await?,
         ChildState::DestroyRetracted => continue_destroy_retracted(app, next.0).await?,
@@ -2001,12 +2164,7 @@ pub(super) async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
                 }
             }
             ChildState::CreatePrepared => {
-                let prepared_sites = child
-                    .site_plans
-                    .iter()
-                    .map(|site_plan| site_plan.site_id.clone())
-                    .collect::<Vec<_>>();
-                rollback_prepared_sites(app, child.child_id, &prepared_sites)
+                rollback_prepared_sites(app, child.child_id, true)
                     .await
                     .wrap_err_with(|| {
                         format!(
@@ -2053,5 +2211,8 @@ pub(super) async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
             ChildState::CreateAborted | ChildState::DestroyCommitted => {}
         }
     }
+    reconcile_local_framework_routes(app)
+        .await
+        .map_err(|err| miette::miette!(err.message))?;
     Ok(())
 }

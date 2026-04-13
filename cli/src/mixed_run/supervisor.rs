@@ -228,7 +228,10 @@ pub(super) fn build_supervisor_plan(
             .then(|| input.site_state_root.join("storage").display().to_string()),
         runtime_root: matches!(input.site_plan.site.kind, SiteKind::Direct | SiteKind::Vm)
             .then(|| input.site_state_root.join("runtime").display().to_string()),
-        router_mesh_port: if matches!(input.site_plan.site.kind, SiteKind::Direct | SiteKind::Vm) {
+        router_mesh_port: if matches!(
+            input.site_plan.site.kind,
+            SiteKind::Direct | SiteKind::Vm | SiteKind::Compose
+        ) {
             Some(reserve_loopback_port()?)
         } else {
             None
@@ -260,6 +263,7 @@ pub(super) fn build_supervisor_plan(
             .site_controller_plan_path
             .map(|path| path.display().to_string()),
         site_controller_url: input.site_controller_url.map(ToOwned::to_owned),
+        controller_route_ports: Vec::new(),
         launch_env,
     })
 }
@@ -526,68 +530,6 @@ pub(crate) fn update_desired_links_for_provider(
     write_json(&path, &state)
 }
 
-pub(crate) fn update_desired_overlay_for_consumer(
-    site_state_root: &Path,
-    overlay_id: &str,
-    overlay: DesiredExternalSlotOverlay,
-) -> Result<()> {
-    let path = desired_links_path(site_state_root);
-    let mut state: DesiredLinkState = if path.is_file() {
-        read_json(&path, "desired links")?
-    } else {
-        empty_desired_link_state()
-    };
-    state
-        .external_slot_overlays
-        .insert(overlay_id.to_string(), overlay);
-    write_json(&path, &state)
-}
-
-pub(crate) fn update_desired_overlay_for_provider(
-    site_state_root: &Path,
-    overlay_id: &str,
-    overlay: DesiredExportPeerOverlay,
-) -> Result<()> {
-    let path = desired_links_path(site_state_root);
-    let mut state: DesiredLinkState = if path.is_file() {
-        read_json(&path, "desired links")?
-    } else {
-        empty_desired_link_state()
-    };
-    state
-        .export_peer_overlays
-        .insert(overlay_id.to_string(), overlay);
-    write_json(&path, &state)
-}
-
-pub(crate) fn clear_desired_overlay_for_consumer(
-    site_state_root: &Path,
-    overlay_id: &str,
-) -> Result<()> {
-    let path = desired_links_path(site_state_root);
-    let mut state: DesiredLinkState = if path.is_file() {
-        read_json(&path, "desired links")?
-    } else {
-        return Ok(());
-    };
-    state.external_slot_overlays.remove(overlay_id);
-    write_json(&path, &state)
-}
-
-pub(crate) fn clear_desired_overlay_for_provider(
-    site_state_root: &Path,
-    overlay_id: &str,
-) -> Result<()> {
-    let path = desired_links_path(site_state_root);
-    let mut state: DesiredLinkState = if path.is_file() {
-        read_json(&path, "desired links")?
-    } else {
-        return Ok(());
-    };
-    state.export_peer_overlays.remove(overlay_id);
-    write_json(&path, &state)
-}
-
 fn empty_desired_link_state() -> DesiredLinkState {
     DesiredLinkState {
         schema: DESIRED_LINKS_SCHEMA.to_string(),
@@ -699,7 +641,8 @@ pub(super) async fn ensure_site_running(
     reap_child(&mut runtime.port_forward)?;
     reap_child(&mut runtime.site_controller)?;
 
-    if runtime.site_controller.is_none()
+    if matches!(plan.kind, SiteKind::Direct | SiteKind::Vm)
+        && runtime.site_controller.is_none()
         && let Some(plan_path) = plan.site_controller_plan_path.as_deref()
     {
         let controller = super::site_controller_command()?;
@@ -1717,9 +1660,11 @@ pub(super) fn spawn_port_forward(plan: &SiteSupervisorPlan) -> Result<Child> {
         .arg("0.0.0.0")
         .arg("deploy/amber-router")
         .arg(format!("{mesh_port}:24000"))
-        .arg(format!("{control_port}:24100"))
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
+        .arg(format!("{control_port}:24100"));
+    for port in &plan.controller_route_ports {
+        cmd.arg(format!("{port}:{port}"));
+    }
+    cmd.stdout(Stdio::from(log)).stderr(Stdio::from(log_err));
     cmd.spawn()
         .into_diagnostic()
         .wrap_err("failed to spawn kubectl port-forward")
@@ -1949,37 +1894,6 @@ pub(crate) fn host_service_bind_addr_for_consumer(
     port: u16,
 ) -> SocketAddr {
     host_proxy_bind_addr(consumer_needs_host_wide_listener(consumer_kind), port)
-}
-
-pub(crate) fn router_mesh_addr_for_consumer(
-    provider_kind: SiteKind,
-    consumer_kind: SiteKind,
-    router_mesh_addr: &str,
-) -> Result<String> {
-    match consumer_kind {
-        SiteKind::Compose | SiteKind::Kubernetes => {
-            let addr = router_mesh_addr
-                .parse::<SocketAddr>()
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!("invalid live router mesh address `{router_mesh_addr}`")
-                })?;
-            let host = container_host_for_consumer(provider_kind, consumer_kind);
-            Ok(format!("{host}:{}", addr.port()))
-        }
-        SiteKind::Direct | SiteKind::Vm => {
-            #[cfg(target_os = "linux")]
-            {
-                Ok(crate::direct_runtime::rewrite_peer_addr_for_slirp_gateway(
-                    router_mesh_addr,
-                ))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                Ok(router_mesh_addr.to_string())
-            }
-        }
-    }
 }
 
 pub(super) fn host_proxy_bind_addr(needs_host_wide_listener: bool, port: u16) -> SocketAddr {

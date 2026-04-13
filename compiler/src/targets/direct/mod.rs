@@ -63,6 +63,13 @@ pub struct DirectArtifact {
     pub files: BTreeMap<PathBuf, String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirectArtifactBuildOptions<'a> {
+    pub(crate) force_router: bool,
+    pub(crate) router_identity_id: &'a str,
+    pub(crate) mesh_scope: Option<&'a str>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DirectPlan {
     pub version: String,
@@ -209,6 +216,20 @@ pub(crate) fn emit_direct_artifact(
     compiled: &CompiledScenario,
     force_router: bool,
 ) -> Result<DirectArtifact, MeshError> {
+    emit_direct_artifact_with_options(
+        compiled,
+        DirectArtifactBuildOptions {
+            force_router,
+            router_identity_id: ROUTER_IDENTITY_ID,
+            mesh_scope: None,
+        },
+    )
+}
+
+pub(crate) fn emit_direct_artifact_with_options(
+    compiled: &CompiledScenario,
+    options: DirectArtifactBuildOptions<'_>,
+) -> Result<DirectArtifact, MeshError> {
     let scenario = compiled.scenario();
     let endpoint_plan = crate::targets::program_config::build_endpoint_plan(scenario)?;
     let mesh_plan = build_mesh_plan(
@@ -235,7 +256,7 @@ pub(crate) fn emit_direct_artifact(
     let route_ports = placeholder_local_route_ports(scenario, &endpoint_plan, &mesh_plan);
     let mesh_ports_by_component = placeholder_mesh_ports(program_components);
 
-    let needs_router = mesh_plan.needs_router() || force_router;
+    let needs_router = mesh_plan.needs_router() || options.force_router;
     let router_ports = needs_router.then_some(RouterPorts {
         mesh: 0,
         control: 0,
@@ -279,11 +300,12 @@ pub(crate) fn emit_direct_artifact(
         router_ports,
         addressing: &mesh_addressing,
         options: MeshConfigBuildOptions {
-            router_identity_id: ROUTER_IDENTITY_ID,
+            router_identity_id: options.router_identity_id,
+            mesh_scope: options.mesh_scope,
             component_mesh_listen_addr: "127.0.0.1",
             router_mesh_listen_addr: "127.0.0.1",
             router_control_listen_addr: "127.0.0.1",
-            force_router,
+            force_router: options.force_router,
         },
     })?;
 
@@ -325,7 +347,7 @@ pub(crate) fn emit_direct_artifact(
     })?;
 
     let router_plan = router_ports.map(|ports| DirectRouterPlan {
-        identity_id: ROUTER_IDENTITY_ID.to_string(),
+        identity_id: options.router_identity_id.to_string(),
         mesh_port: ports.mesh,
         control_port: 0,
         control_socket_path: DIRECT_CONTROL_SOCKET_RELATIVE_PATH.to_string(),

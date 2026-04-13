@@ -36,6 +36,12 @@
       "context": ".",
       "dockerfile": "docker/amber-manager/Dockerfile",
       "version": "v0.1.x"
+    },
+    {
+      "name": "amber-site-controller",
+      "context": ".",
+      "dockerfile": "docker/amber-site-controller/Dockerfile",
+      "version": "v0.1.x"
     }
   ]
 }

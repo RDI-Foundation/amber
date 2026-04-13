@@ -9,6 +9,13 @@ pub(super) const SITE_CONTROLLER_STATE_PATH: &str = "/v1/controller/state";
 pub(super) const FRAMEWORK_ROUTE_ID_HEADER: &str = "x-amber-route-id";
 pub(super) const FRAMEWORK_PEER_ID_HEADER: &str = "x-amber-peer-id";
 pub(super) const FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
+pub const SITE_CONTROLLER_INTERNAL_CAPABILITY: &str = "amber.internal.site_controller";
+pub const SITE_CONTROLLER_SERVICE_NAME: &str = "amber-site-controller";
+pub const SITE_CONTROLLER_PORT: u16 = 4100;
+
+pub fn site_controller_internal_route_id(site_id: &str) -> String {
+    format!("site-controller:{site_id}")
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct FrozenPlacementState {
@@ -62,8 +69,6 @@ pub(crate) struct LiveChildRecord {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) assignments: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) site_plans: Vec<DynamicSitePlanRecord>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) overlay_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) overlays: Vec<DynamicOverlayRecord>,
@@ -84,22 +89,16 @@ pub(crate) struct PendingDestroyRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DynamicSitePlanRecord {
-    pub site_id: String,
-    pub kind: SiteKind,
-    pub router_identity_id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub component_ids: Vec<usize>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub assigned_components: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub artifact_files: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub desired_artifact_files: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub proxy_exports: BTreeMap<String, DynamicProxyExportRecord>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub routed_inputs: Vec<DynamicInputRouteRecord>,
+pub struct DynamicInputDirectRecord {
+    pub component: String,
+    pub slot: String,
+    pub provider_component: String,
+    pub protocol: String,
+    pub capability_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_profile: Option<String>,
+    #[serde(flatten)]
+    pub target: DynamicInputRouteTarget,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -252,13 +251,6 @@ fn default_framework_id_stride() -> u64 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SiteControllerPeerPlan {
-    pub site_id: String,
-    pub kind: SiteKind,
-    pub authority_url: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SiteControllerPlan {
     pub schema: String,
     pub version: u32,
@@ -269,6 +261,14 @@ pub struct SiteControllerPlan {
     pub listen_addr: SocketAddr,
     pub authority_url: String,
     pub router_identity_id: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peer_site_router_urls: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peer_router_mesh_addrs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_router_control: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_router_mesh_addr: Option<String>,
     pub state_path: String,
     pub run_root: String,
     pub state_root: String,
@@ -276,8 +276,6 @@ pub struct SiteControllerPlan {
     pub artifact_dir: String,
     pub auth_token: String,
     pub dynamic_caps_token_verify_key_b64: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub peer_controllers: BTreeMap<String, SiteControllerPeerPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -795,7 +793,6 @@ pub(super) fn restore_framework_children_from_snapshot(
             fragment: Some(child.fragment),
             input_bindings: child.input_bindings,
             assignments: child.assignments,
-            site_plans: Vec::new(),
             overlay_ids: Vec::new(),
             overlays: Vec::new(),
             outputs: child.outputs,
@@ -1206,6 +1203,10 @@ pub fn write_site_controller_plan(
     listen_addr: SocketAddr,
     authority_url: &str,
     router_identity_id: &str,
+    peer_site_router_urls: &BTreeMap<String, String>,
+    peer_router_mesh_addrs: &BTreeMap<String, String>,
+    local_router_control: Option<&str>,
+    published_router_mesh_addr: Option<&str>,
     state_path: &Path,
     run_root: &Path,
     state_root: &Path,
@@ -1213,7 +1214,6 @@ pub fn write_site_controller_plan(
     artifact_dir: &Path,
     auth_token: &str,
     dynamic_caps_token_verify_key_b64: &str,
-    peer_controllers: BTreeMap<String, SiteControllerPeerPlan>,
     storage_root: Option<&str>,
     runtime_root: Option<&str>,
     router_mesh_port: Option<u16>,
@@ -1233,6 +1233,10 @@ pub fn write_site_controller_plan(
         listen_addr,
         authority_url: authority_url.to_string(),
         router_identity_id: router_identity_id.to_string(),
+        peer_site_router_urls: peer_site_router_urls.clone(),
+        peer_router_mesh_addrs: peer_router_mesh_addrs.clone(),
+        local_router_control: local_router_control.map(str::to_string),
+        published_router_mesh_addr: published_router_mesh_addr.map(str::to_string),
         state_path: state_path.display().to_string(),
         run_root: run_root.display().to_string(),
         state_root: state_root.display().to_string(),
@@ -1240,7 +1244,6 @@ pub fn write_site_controller_plan(
         artifact_dir: artifact_dir.display().to_string(),
         auth_token: auth_token.to_string(),
         dynamic_caps_token_verify_key_b64: dynamic_caps_token_verify_key_b64.to_string(),
-        peer_controllers,
         storage_root: storage_root.map(str::to_string),
         runtime_root: runtime_root.map(str::to_string),
         router_mesh_port,
