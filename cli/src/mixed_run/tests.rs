@@ -24,6 +24,14 @@ fn site_state_paths_are_site_scoped() {
         site_controller_plan_path(Path::new("/tmp/amber-run/state/site-a")),
         Path::new("/tmp/amber-run/state/site-a/site-controller-plan.json")
     );
+    assert_eq!(
+        site_existing_peer_ports_path(Path::new("/tmp/amber-run/state/site-a")),
+        Path::new("/tmp/amber-run/state/site-a/existing-peer-ports.json")
+    );
+    assert_eq!(
+        site_existing_peer_identities_path(Path::new("/tmp/amber-run/state/site-a")),
+        Path::new("/tmp/amber-run/state/site-a/existing-peer-identities.json")
+    );
 }
 
 #[test]
@@ -65,6 +73,55 @@ fn site_controller_local_router_control_uses_backend_local_control_targets() {
         launch_bundle::site_controller_local_router_control(SiteKind::Vm, artifact_dir)
             .starts_with("unix://"),
         "vm site controllers should know their local router control socket up front"
+    );
+}
+
+#[test]
+fn site_controller_peer_router_urls_are_local_to_the_controller_site() {
+    assert_eq!(
+        amber_site_controller::site_controller_peer_router_url(SiteKind::Direct, 37046),
+        "http://127.0.0.1:37046"
+    );
+    assert_eq!(
+        amber_site_controller::site_controller_peer_router_url(SiteKind::Vm, 37046),
+        "http://127.0.0.1:37046"
+    );
+    assert_eq!(
+        amber_site_controller::site_controller_peer_router_url(SiteKind::Compose, 37046),
+        "http://amber-router:37046"
+    );
+    assert_eq!(
+        amber_site_controller::site_controller_peer_router_url(SiteKind::Kubernetes, 37046),
+        "http://amber-router:37046"
+    );
+}
+
+#[test]
+fn site_controller_image_includes_the_amber_cli_binary() {
+    let dockerfile = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker/amber-site-controller/Dockerfile"),
+    )
+    .expect("site-controller Dockerfile should read");
+    assert!(
+        dockerfile.contains("cargo build --locked --release -p amber-cli -p amber-site-controller")
+            || dockerfile.contains("cargo build --locked -p amber-cli -p amber-site-controller"),
+        "site-controller image must build the amber CLI so containerized controllers can spawn \
+         amber subcommands:\n{dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("COPY --from=builder /out/amber /usr/local/bin/amber"),
+        "site-controller image must ship the amber CLI binary alongside \
+         amber-site-controller:\n{dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("COPY examples ./examples"),
+        "site-controller image must include the examples tree so amber-cli can satisfy \
+         cli/build.rs:\n{dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("COPY README.md ./"),
+        "site-controller image must include the workspace README because amber-cli embeds \
+         it:\n{dockerfile}"
     );
 }
 
@@ -117,7 +174,6 @@ fn local_site_controller_addr_requires_loopback_http() {
         observability_endpoint: None,
         site_controller_plan_path: None,
         site_controller_url: Some("http://127.0.0.1:24200".to_string()),
-        controller_route_ports: Vec::new(),
         launch_env: BTreeMap::new(),
     };
 
@@ -169,7 +225,6 @@ fn local_site_controller_ready_waits_for_http_listener() {
         observability_endpoint: None,
         site_controller_plan_path: None,
         site_controller_url: Some(format!("http://127.0.0.1:{}", addr.port())),
-        controller_route_ports: Vec::new(),
         launch_env: BTreeMap::new(),
     };
 
@@ -218,7 +273,6 @@ fn compose_site_controller_container_name_uses_compose_project() {
         observability_endpoint: None,
         site_controller_plan_path: None,
         site_controller_url: Some("http://amber-site-controller:4100".to_string()),
-        controller_route_ports: vec![60066],
         launch_env: BTreeMap::new(),
     };
 
@@ -226,4 +280,30 @@ fn compose_site_controller_container_name_uses_compose_project() {
         supervisor::compose_site_controller_container_name(&plan).as_deref(),
         Some("amber_run_compose-site-amber-site-controller-1")
     );
+}
+
+#[test]
+fn reserve_loopback_port_keeps_allocations_unique_within_one_process() {
+    let mut ports = BTreeSet::new();
+    for _ in 0..64 {
+        let port = reserve_loopback_port().expect("loopback port reservation should succeed");
+        assert!(
+            ports.insert(port),
+            "loopback port allocator reused {port} within one process"
+        );
+    }
+}
+
+#[test]
+fn reserve_loopback_port_shares_allocator_with_site_controller_runtime() {
+    let mixed_run_port =
+        reserve_loopback_port().expect("mixed-run loopback port reservation should succeed");
+    for _ in 0..32 {
+        let runtime_port = amber_site_controller::reserve_loopback_port()
+            .expect("site-controller loopback port reservation should succeed");
+        assert_ne!(
+            runtime_port, mixed_run_port,
+            "mixed-run and site-controller loopback reservations must use the same shared pool",
+        );
+    }
 }

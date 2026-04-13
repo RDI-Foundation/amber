@@ -20,7 +20,7 @@ use std::{
     future::Future,
     io,
     io::{IsTerminal as _, Write as _},
-    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Stdio},
 };

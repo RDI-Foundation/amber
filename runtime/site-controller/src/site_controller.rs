@@ -35,12 +35,15 @@ use super::{
     orchestration::{
         ClearExportPeerOverlayRequest, ClearExternalSlotOverlayRequest, ProtocolApiError,
         PublishExportPeerOverlayRequest, PublishExternalSlotOverlayRequest,
-        ResolveExternalLinkUrlRequest, ResolveExternalLinkUrlResponse,
-        RevokeDynamicCapabilityOriginOverlaysRequest, clear_export_peer_overlay_local,
-        clear_external_slot_overlay_local, execute_create_child, execute_destroy_child,
+        RemoteChildRollbackRequest, RemoteChildRuntimeRequest, ResolveExternalLinkUrlRequest,
+        ResolveExternalLinkUrlResponse, RevokeDynamicCapabilityOriginOverlaysRequest,
+        clear_export_peer_overlay_local, clear_external_slot_overlay_local,
+        destroy_child_on_local_site, execute_create_child, execute_destroy_child,
+        prepare_child_on_local_site, publish_child_on_local_site,
         publish_dynamic_capability_origin_local, publish_export_peer_overlay_local,
         publish_external_slot_overlay_local, recover_control_state,
         resolve_external_link_url_local, revoke_dynamic_capability_origin_overlays_local,
+        rollback_child_on_site,
     },
     planner::{
         ControlStateApp, LocalDynamicCapabilityOriginApp, SiteControllerApp, protocol_error,
@@ -158,6 +161,22 @@ pub(crate) fn site_controller_router(app_state: SiteControllerApp) -> Router {
         .route(
             "/v1/internal/link-overlays/external-url",
             post(resolve_external_link_url),
+        )
+        .route(
+            "/v1/internal/children/prepare",
+            post(prepare_child_runtime_route),
+        )
+        .route(
+            "/v1/internal/children/publish",
+            post(publish_child_runtime_route),
+        )
+        .route(
+            "/v1/internal/children/rollback",
+            post(rollback_child_runtime_route),
+        )
+        .route(
+            "/v1/internal/children/destroy",
+            post(destroy_child_runtime_route),
         )
         .route(
             "/v1/internal/link-overlays/external-slot/publish",
@@ -1110,6 +1129,62 @@ async fn resolve_external_link_url(
             .await
             .map_err(ProtocolApiError::from)?,
     ))
+}
+
+async fn prepare_child_runtime_route(
+    State(app): State<SiteControllerApp>,
+    headers: HeaderMap,
+    Json(request): Json<RemoteChildRuntimeRequest>,
+) -> std::result::Result<StatusCode, ProtocolApiError> {
+    authorize_local_controller_request(&app, &headers)?;
+    ensure_controller_ready(&app)?;
+    let site_id = app.control.controller_plan.site_id.clone();
+    prepare_child_on_local_site(&app.control, &request.state, &request.child, &site_id)
+        .await
+        .map_err(ProtocolApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn publish_child_runtime_route(
+    State(app): State<SiteControllerApp>,
+    headers: HeaderMap,
+    Json(request): Json<RemoteChildRuntimeRequest>,
+) -> std::result::Result<StatusCode, ProtocolApiError> {
+    authorize_local_controller_request(&app, &headers)?;
+    ensure_controller_ready(&app)?;
+    let site_id = app.control.controller_plan.site_id.clone();
+    publish_child_on_local_site(&app.control, &request.state, &request.child, &site_id)
+        .await
+        .map_err(ProtocolApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn rollback_child_runtime_route(
+    State(app): State<SiteControllerApp>,
+    headers: HeaderMap,
+    Json(request): Json<RemoteChildRollbackRequest>,
+) -> std::result::Result<StatusCode, ProtocolApiError> {
+    authorize_local_controller_request(&app, &headers)?;
+    ensure_controller_ready(&app)?;
+    let site_id = app.control.controller_plan.site_id.clone();
+    rollback_child_on_site(&app.control, request.child_id, &site_id)
+        .await
+        .map_err(|err| ProtocolApiError::control_state_unavailable(err.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn destroy_child_runtime_route(
+    State(app): State<SiteControllerApp>,
+    headers: HeaderMap,
+    Json(request): Json<RemoteChildRuntimeRequest>,
+) -> std::result::Result<StatusCode, ProtocolApiError> {
+    authorize_local_controller_request(&app, &headers)?;
+    ensure_controller_ready(&app)?;
+    let site_id = app.control.controller_plan.site_id.clone();
+    destroy_child_on_local_site(&app.control, &request.state, &request.child, &site_id)
+        .await
+        .map_err(ProtocolApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn publish_external_slot_overlay_route(

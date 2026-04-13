@@ -201,8 +201,40 @@ pub(crate) fn temp_output_dir(prefix: &str) -> TestTempDir {
 }
 
 pub(crate) fn pick_free_port() -> u16 {
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-    listener.local_addr().unwrap().port()
+    const TEST_PORT_RANGE_START: u16 = 20000;
+    const TEST_PORT_RANGE_END: u16 = 30000;
+    static RESERVED_TEST_PORTS: OnceLock<Mutex<BTreeSet<u16>>> = OnceLock::new();
+
+    let reserved = RESERVED_TEST_PORTS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let mut reserved = reserved
+        .lock()
+        .expect("test port allocator should not be poisoned");
+    let span = u32::from(TEST_PORT_RANGE_END - TEST_PORT_RANGE_START);
+    let mut next =
+        TEST_PORT_RANGE_START + (std::process::id() % span) as u16 + reserved.len() as u16;
+    for _ in 0..usize::from(TEST_PORT_RANGE_END - TEST_PORT_RANGE_START) {
+        if next >= TEST_PORT_RANGE_END {
+            next = TEST_PORT_RANGE_START;
+        }
+        let port = next;
+        next += 1;
+        if reserved.contains(&port) {
+            continue;
+        }
+        match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))) {
+            Ok(listener) => {
+                drop(listener);
+                reserved.insert(port);
+                return port;
+            }
+            Err(_) => continue,
+        }
+    }
+    panic!(
+        "failed to allocate a unique mixed-run test port in {}-{}",
+        TEST_PORT_RANGE_START,
+        TEST_PORT_RANGE_END - 1
+    );
 }
 
 pub(crate) fn docker_host_ip() -> String {

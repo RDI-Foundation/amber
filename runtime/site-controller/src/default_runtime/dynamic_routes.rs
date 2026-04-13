@@ -1678,7 +1678,7 @@ mod direct_input_tests {
     }
 
     #[test]
-    fn compose_router_port_helpers_rewrite_mesh_publish_and_add_controller_ports() {
+    fn compose_router_port_helpers_rewrite_mesh_publish() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("compose.yaml"),
@@ -1693,22 +1693,12 @@ services:
         .expect("compose yaml should write");
 
         set_compose_router_published_mesh_port(temp.path(), 34000).expect("rewrite mesh port");
-        add_compose_router_published_route_ports(temp.path(), &[34001, 34002])
-            .expect("append controller ports");
 
         let rendered =
             fs::read_to_string(temp.path().join("compose.yaml")).expect("compose yaml should read");
         assert!(
             rendered.contains("0.0.0.0:34000:24000"),
             "mesh port should be rewritten to a deterministic host publish:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("127.0.0.1:34001:34001"),
-            "controller route port 34001 should be published on loopback:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("127.0.0.1:34002:34002"),
-            "controller route port 34002 should be published on loopback:\n{rendered}"
         );
     }
 }

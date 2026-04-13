@@ -27,6 +27,7 @@ RUN case "${TARGETARCH}" in \
 FROM base-builder AS builder
 
 COPY Cargo.toml Cargo.lock ./
+COPY README.md ./
 COPY cli/Cargo.toml cli/
 COPY compiler/config/Cargo.toml compiler/config/
 COPY compiler/Cargo.toml compiler/
@@ -53,6 +54,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 COPY cli ./cli
 COPY compiler ./compiler
+COPY examples ./examples
 COPY images ./images
 COPY runtime/helper ./runtime/helper
 COPY runtime/mesh ./runtime/mesh
@@ -67,18 +69,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     target=$(cat /tmp/rust-target) && \
     if [ "$BUILD_MODE" = "release" ]; then \
-      cargo build --locked --release -p amber-site-controller --target "${target}"; \
+      cargo build --locked --release -p amber-cli -p amber-site-controller --target "${target}"; \
       build_dir=release; \
     else \
-      cargo build --locked -p amber-site-controller --target "${target}"; \
+      cargo build --locked -p amber-cli -p amber-site-controller --target "${target}"; \
       build_dir=debug; \
     fi && \
+    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber /out/amber && \
     install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-site-controller /out/amber-site-controller
 
 FROM docker:28-cli AS runtime
 
 RUN apk add --no-cache kubectl
 
-COPY --from=builder /out/amber-site-controller /amber-site-controller
+COPY --from=builder /out/amber /usr/local/bin/amber
+COPY --from=builder /out/amber-site-controller /usr/local/bin/amber-site-controller
 
-ENTRYPOINT ["/amber-site-controller"]
+ENTRYPOINT ["/usr/local/bin/amber-site-controller"]

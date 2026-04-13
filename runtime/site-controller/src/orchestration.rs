@@ -140,6 +140,17 @@ pub(crate) struct RevokeDynamicCapabilityOriginOverlaysRequest {
     pub(crate) overlay_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RemoteChildRuntimeRequest {
+    pub(crate) state: FrameworkControlState,
+    pub(crate) child: LiveChildRecord,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RemoteChildRollbackRequest {
+    pub(crate) child_id: u64,
+}
+
 pub(super) fn control_state_step_error(
     step: &str,
     err: impl std::fmt::Display,
@@ -762,6 +773,45 @@ fn peer_site_router_url(
         })
 }
 
+const PEER_CONTROLLER_REQUEST_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_CONTROLLER_REQUEST_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+fn should_retry_peer_controller_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+async fn post_json_with_retry<TReq: Serialize>(
+    client: &ReqwestClient,
+    url: &str,
+    body: &TReq,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    let deadline = tokio::time::Instant::now() + PEER_CONTROLLER_REQUEST_RETRY_TIMEOUT;
+    loop {
+        match client
+            .post(url)
+            .header(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER, "1")
+            .json(body)
+            .send()
+            .await
+        {
+            Ok(response)
+                if should_retry_peer_controller_status(response.status())
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(PEER_CONTROLLER_REQUEST_RETRY_DELAY).await;
+            }
+            Ok(response) => return Ok(response),
+            Err(err) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(PEER_CONTROLLER_REQUEST_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 async fn peer_controller_post_json_via_router<TReq: Serialize, TResp: for<'de> Deserialize<'de>>(
     app: &ControlStateApp,
     site_id: &str,
@@ -770,18 +820,17 @@ async fn peer_controller_post_json_via_router<TReq: Serialize, TResp: for<'de> D
     code: ProtocolErrorCode,
     action: &str,
 ) -> std::result::Result<TResp, ProtocolErrorResponse> {
-    let response = app
-        .client
-        .post(format!(
+    let response = post_json_with_retry(
+        &app.client,
+        &format!(
             "{}{}",
             peer_site_router_url(app, site_id)?.trim_end_matches('/'),
             path
-        ))
-        .header(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER, "1")
-        .json(body)
-        .send()
-        .await
-        .map_err(|err| controller_protocol_error(code, site_id, action, err))?;
+        ),
+        body,
+    )
+    .await
+    .map_err(|err| controller_protocol_error(code, site_id, action, err))?;
     if response.status().is_success() {
         return response
             .json()
@@ -812,18 +861,17 @@ async fn peer_controller_post_no_content_via_router<TReq: Serialize>(
     code: ProtocolErrorCode,
     action: &str,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    let response = app
-        .client
-        .post(format!(
+    let response = post_json_with_retry(
+        &app.client,
+        &format!(
             "{}{}",
             peer_site_router_url(app, site_id)?.trim_end_matches('/'),
             path
-        ))
-        .header(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER, "1")
-        .json(body)
-        .send()
-        .await
-        .map_err(|err| controller_protocol_error(code, site_id, action, err))?;
+        ),
+        body,
+    )
+    .await
+    .map_err(|err| controller_protocol_error(code, site_id, action, err))?;
     if response.status().is_success() {
         return Ok(());
     }
@@ -1307,27 +1355,38 @@ pub(super) async fn prepare_child_on_site(
     app: &ControlStateApp,
     state: &FrameworkControlState,
     child: &LiveChildRecord,
+    site_id: &str,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    let site_id = child_runtime_site_id(child)?;
     if site_id != app.controller_plan.site_id {
-        return Err(controller_protocol_error(
+        return peer_controller_post_no_content_via_router(
+            app,
+            site_id,
+            "/v1/internal/children/prepare",
+            &RemoteChildRuntimeRequest {
+                state: state.clone(),
+                child: child.clone(),
+            },
             ProtocolErrorCode::PrepareFailed,
-            &site_id,
             "prepare child",
-            format!(
-                "dynamic child `{}` targeted site `{}` but controller `{}` only creates local \
-                 children",
-                child.name, site_id, app.controller_plan.site_id
-            ),
-        ));
+        )
+        .await;
     }
+    prepare_child_on_local_site(app, state, child, site_id).await
+}
+
+pub(super) async fn prepare_child_on_local_site(
+    app: &ControlStateApp,
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
+    site_id: &str,
+) -> std::result::Result<(), ProtocolErrorResponse> {
     app.runtime
         .prepare_child(&app.controller_plan, state.clone(), child.clone())
         .await
         .map_err(|err| {
             controller_protocol_error(
                 ProtocolErrorCode::PrepareFailed,
-                &site_id,
+                site_id,
                 "prepare child",
                 err,
             )
@@ -1338,27 +1397,38 @@ pub(super) async fn publish_child_on_site(
     app: &ControlStateApp,
     state: &FrameworkControlState,
     child: &LiveChildRecord,
+    site_id: &str,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    let site_id = child_runtime_site_id(child)?;
     if site_id != app.controller_plan.site_id {
-        return Err(controller_protocol_error(
+        return peer_controller_post_no_content_via_router(
+            app,
+            site_id,
+            "/v1/internal/children/publish",
+            &RemoteChildRuntimeRequest {
+                state: state.clone(),
+                child: child.clone(),
+            },
             ProtocolErrorCode::PublishFailed,
-            &site_id,
             "publish child",
-            format!(
-                "dynamic child `{}` targeted site `{}` but controller `{}` only publishes local \
-                 children",
-                child.name, site_id, app.controller_plan.site_id
-            ),
-        ));
+        )
+        .await;
     }
+    publish_child_on_local_site(app, state, child, site_id).await
+}
+
+pub(super) async fn publish_child_on_local_site(
+    app: &ControlStateApp,
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
+    site_id: &str,
+) -> std::result::Result<(), ProtocolErrorResponse> {
     app.runtime
         .publish_child(&app.controller_plan, state.clone(), child.clone())
         .await
         .map_err(|err| {
             controller_protocol_error(
                 ProtocolErrorCode::PublishFailed,
-                &site_id,
+                site_id,
                 "publish child",
                 err,
             )
@@ -1376,12 +1446,13 @@ pub(super) async fn publish_child_on_site_with_prepare_retry(
     app: &ControlStateApp,
     state: &FrameworkControlState,
     child: &LiveChildRecord,
+    site_id: &str,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    match publish_child_on_site(app, state, child).await {
+    match publish_child_on_site(app, state, child, site_id).await {
         Ok(()) => Ok(()),
         Err(err) if site_controller_child_needs_prepare(&err, child.child_id) => {
-            prepare_child_on_site(app, state, child).await?;
-            publish_child_on_site(app, state, child).await
+            prepare_child_on_site(app, state, child, site_id).await?;
+            publish_child_on_site(app, state, child, site_id).await
         }
         Err(err) => Err(err),
     }
@@ -1393,11 +1464,16 @@ pub(super) async fn rollback_child_on_site(
     site_id: &str,
 ) -> Result<()> {
     if site_id != app.controller_plan.site_id {
-        return Err(miette::miette!(
-            "dynamic child plan targeted site `{site_id}` but controller `{}` only rolls back \
-             local children",
-            app.controller_plan.site_id
-        ));
+        return peer_controller_post_no_content_via_router(
+            app,
+            site_id,
+            "/v1/internal/children/rollback",
+            &RemoteChildRollbackRequest { child_id },
+            ProtocolErrorCode::ControlStateUnavailable,
+            "rollback child",
+        )
+        .await
+        .map_err(|err| miette::miette!(err.message));
     }
     app.runtime
         .rollback_child(&app.controller_plan, child_id)
@@ -1408,31 +1484,75 @@ pub(super) async fn destroy_child_on_site(
     app: &ControlStateApp,
     state: &FrameworkControlState,
     child: &LiveChildRecord,
+    site_id: &str,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    let site_id = child_runtime_site_id(child)?;
     if site_id != app.controller_plan.site_id {
-        return Err(controller_protocol_error(
+        return peer_controller_post_no_content_via_router(
+            app,
+            site_id,
+            "/v1/internal/children/destroy",
+            &RemoteChildRuntimeRequest {
+                state: state.clone(),
+                child: child.clone(),
+            },
             ProtocolErrorCode::ControlStateUnavailable,
-            &site_id,
             "destroy child",
-            format!(
-                "dynamic child `{}` targeted site `{site_id}` but controller `{}` only destroys \
-                 local children",
-                child.name, app.controller_plan.site_id
-            ),
-        ));
+        )
+        .await;
     }
+    destroy_child_on_local_site(app, state, child, site_id).await
+}
+
+pub(super) async fn destroy_child_on_local_site(
+    app: &ControlStateApp,
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
+    site_id: &str,
+) -> std::result::Result<(), ProtocolErrorResponse> {
     app.runtime
         .destroy_child(&app.controller_plan, state.clone(), child.clone())
         .await
         .map_err(|err| {
             controller_protocol_error(
                 ProtocolErrorCode::ControlStateUnavailable,
-                &site_id,
+                site_id,
                 "destroy child",
                 err,
             )
         })
+}
+
+pub(super) async fn prepare_child_on_sites(
+    app: &ControlStateApp,
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    for site_id in child_runtime_site_ids(child)? {
+        prepare_child_on_site(app, state, child, &site_id).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn publish_child_on_sites_with_prepare_retry(
+    app: &ControlStateApp,
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    for site_id in child_runtime_site_ids(child)? {
+        publish_child_on_site_with_prepare_retry(app, state, child, &site_id).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn destroy_child_on_sites(
+    app: &ControlStateApp,
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    for site_id in child_runtime_site_ids(child)? {
+        destroy_child_on_site(app, state, child, &site_id).await?;
+    }
+    Ok(())
 }
 
 pub(super) async fn publish_external_slot_overlay(
@@ -1747,16 +1867,6 @@ pub(super) async fn clear_export_peer_overlay(
     }
 }
 
-pub(super) async fn publish_child_overlays(
-    app: &ControlStateApp,
-    child: &LiveChildRecord,
-) -> std::result::Result<(), ProtocolErrorResponse> {
-    for link in child_link_records(child) {
-        publish_link_overlays(app, child, &link).await?;
-    }
-    Ok(())
-}
-
 pub(super) async fn retract_child_overlays(
     app: &ControlStateApp,
     child: &LiveChildRecord,
@@ -1846,13 +1956,13 @@ pub(super) fn cloned_child_record(
         })
 }
 
-pub(super) async fn rollback_prepared_sites(
-    app: &ControlStateApp,
-    child_id: u64,
-    prepared: bool,
-) -> Result<()> {
-    if prepared {
-        rollback_child_on_site(app, child_id, &app.controller_plan.site_id).await?;
+pub(super) async fn rollback_prepared_sites(app: &ControlStateApp, child_id: u64) -> Result<()> {
+    let child = {
+        let state = app.control_state.lock().await;
+        cloned_child_record(&state, child_id).map_err(|err| miette::miette!(err.message))?
+    };
+    for site_id in child_runtime_site_ids(&child).map_err(|err| miette::miette!(err.message))? {
+        rollback_child_on_site(app, child_id, &site_id).await?;
     }
     Ok(())
 }
@@ -1885,24 +1995,8 @@ pub(super) async fn continue_create_committed_hidden(
     };
 
     let state = app.control_state.lock().await.clone();
-    let published_links = child_link_records(&child);
-    for link in &published_links {
-        publish_link_overlays(app, &child, link).await?;
-    }
-    if let Err(err) = publish_child_on_site_with_prepare_retry(app, &state, &child).await {
-        let mut cleanup_error = None;
-        for link in published_links.iter().rev() {
-            if let Err(retract_err) = retract_link_overlays(app, &child, link).await
-                && cleanup_error.is_none()
-            {
-                cleanup_error = Some(retract_err);
-            }
-        }
-        if let Err(destroy_err) = destroy_child_on_site(app, &state, &child).await
-            && cleanup_error.is_none()
-        {
-            cleanup_error = Some(destroy_err);
-        }
+    if let Err(err) = publish_child_on_sites_with_prepare_retry(app, &state, &child).await {
+        let cleanup_error = destroy_child_on_sites(app, &state, &child).await.err();
         if let Some(cleanup_error) = cleanup_error {
             return Err(protocol_error(
                 ProtocolErrorCode::PublishFailed,
@@ -1920,7 +2014,47 @@ pub(super) async fn continue_create_committed_hidden(
         }
         return Err(err);
     }
-    publish_child_overlays(app, &child).await?;
+    let published_links = child_link_records(&child);
+    let mut applied_links = Vec::new();
+    for link in &published_links {
+        if let Err(err) = publish_link_overlays(app, &child, link).await {
+            let mut cleanup_error = None;
+            for published_link in applied_links.iter().rev() {
+                if let Err(retract_err) = retract_link_overlays(app, &child, published_link).await
+                    && cleanup_error.is_none()
+                {
+                    cleanup_error = Some(retract_err);
+                }
+            }
+            if let Err(destroy_err) = destroy_child_on_sites(app, &state, &child).await
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(destroy_err);
+            }
+            if let Some(cleanup_error) = cleanup_error {
+                return Err(protocol_error(
+                    ProtocolErrorCode::PublishFailed,
+                    &format!("{}; cleanup failed: {}", err.message, cleanup_error.message),
+                ));
+            }
+            let mut state = app.control_state.lock().await;
+            if child_record_location(&state, child.child_id).is_ok() {
+                let tx_id = child_create_tx_id(&state, child.child_id)?;
+                persist_control_state_update(
+                    &mut state,
+                    &app.state_path,
+                    "create_aborted",
+                    |state| {
+                        append_journal_entry(state, tx_id, &child, ChildState::CreateAborted);
+                        remove_child_record(state, child.child_id)?;
+                        Ok(())
+                    },
+                )?;
+            }
+            return Err(err);
+        }
+        applied_links.push(link.clone());
+    }
 
     let mut state = app.control_state.lock().await;
     let child = cloned_child_record(&state, child_id)?;
@@ -1951,7 +2085,7 @@ pub(super) async fn continue_destroy_retracted(
         child
     };
     let state = app.control_state.lock().await.clone();
-    destroy_child_on_site(app, &state, &child).await?;
+    destroy_child_on_sites(app, &state, &child).await?;
 
     let mut state = app.control_state.lock().await;
     let child = cloned_child_record(&state, child_id)?;
@@ -2024,8 +2158,8 @@ pub(super) async fn execute_create_child(
     reconcile_local_framework_routes(app).await?;
 
     let state = app.control_state.lock().await.clone();
-    if let Err(err) = prepare_child_on_site(app, &state, &child).await {
-        let rollback_err = rollback_prepared_sites(app, child.child_id, false).await;
+    if let Err(err) = prepare_child_on_sites(app, &state, &child).await {
+        let rollback_err = rollback_prepared_sites(app, child.child_id).await;
         let should_reconcile = {
             let mut state = app.control_state.lock().await;
             if state
@@ -2182,7 +2316,7 @@ pub(super) async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
                 }
             }
             ChildState::CreatePrepared => {
-                rollback_prepared_sites(app, child.child_id, true)
+                rollback_prepared_sites(app, child.child_id)
                     .await
                     .wrap_err_with(|| {
                         format!(
@@ -2233,4 +2367,57 @@ pub(super) async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
         .await
         .map_err(|err| miette::miette!(err.message))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{Json, Router, extract::State, response::Response, routing::post};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn post_json_with_retry_tolerates_transient_service_unavailable() {
+        async fn handler(State(attempts): State<Arc<AtomicUsize>>) -> Response {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt < 2 {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ok": false})))
+                    .into_response();
+            }
+            (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/retry", post(handler))
+            .with_state(attempts.clone());
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let serve = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let response = post_json_with_retry(
+            &ReqwestClient::new(),
+            &format!("http://{addr}/retry"),
+            &json!({"hello": "world"}),
+        )
+        .await
+        .expect("request should eventually succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        serve.abort();
+        let _ = serve.await;
+    }
 }

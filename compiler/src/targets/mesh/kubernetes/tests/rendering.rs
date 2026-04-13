@@ -163,6 +163,16 @@ fn kubernetes_emits_router_for_external_slots() {
         .get(&PathBuf::from("04-services/amber-router.yaml"))
         .expect("router service");
     assert!(router_service.contains("port: 24000"), "{router_service}");
+    assert!(router_service.contains("port: 24100"), "{router_service}");
+    assert!(router_service.contains("name: control"), "{router_service}");
+    let mesh_provision = artifact
+        .files
+        .get(&PathBuf::from("01-configmaps/amber-mesh-provision.yaml"))
+        .expect("mesh provision configmap");
+    assert!(
+        mesh_provision.contains("\"control_listen\": \"0.0.0.0:24100\""),
+        "{mesh_provision}"
+    );
 
     let router_env = artifact
         .files

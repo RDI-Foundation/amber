@@ -314,16 +314,7 @@ pub(crate) fn emit_kubernetes_artifact_with_options(
             name: mesh_secret_name(ROUTER_NAME),
             namespace: None,
         },
-        |router_config| {
-            if let Some(control_listen) = router_config.control_listen {
-                router_config.control_listen = Some(
-                    format!("127.0.0.1:{}", control_listen.port())
-                        .parse()
-                        .expect("control listen"),
-                );
-            }
-            router_config.control_allow = Some(vec!["127.0.0.1".to_string(), "::1".to_string()]);
-        },
+        |_| {},
     )
     .map_err(|err| ReporterError::new(err.to_string()))?;
 
@@ -1155,6 +1146,12 @@ pub(crate) fn emit_kubernetes_artifact_with_options(
         );
 
         if !router_service_ports.is_empty() {
+            router_service_ports.push(ServicePort {
+                name: "control".to_string(),
+                port: ROUTER_CONTROL_PORT_BASE,
+                target_port: ROUTER_CONTROL_PORT_BASE,
+                protocol: "TCP",
+            });
             let service = Service::new(
                 ROUTER_NAME,
                 &namespace,

@@ -1484,16 +1484,6 @@ pub fn set_compose_router_published_mesh_port(artifact_root: &Path, host_port: u
     set_compose_router_published_port(artifact_root, "0.0.0.0", host_port, 24000, false)
 }
 
-pub fn add_compose_router_published_route_ports(
-    artifact_root: &Path,
-    route_ports: &[u16],
-) -> Result<()> {
-    for port in route_ports {
-        set_compose_router_published_port(artifact_root, "127.0.0.1", *port, *port, true)?;
-    }
-    Ok(())
-}
-
 fn set_compose_router_published_port(
     artifact_root: &Path,
     host_ip: &str,

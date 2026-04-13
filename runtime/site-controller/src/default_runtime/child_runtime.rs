@@ -281,15 +281,7 @@ fn local_child_runtime_spec(
     state: &FrameworkControlState,
     child: &LiveChildRecord,
 ) -> Result<LocalChildRuntimeSpec> {
-    let site_id = child_runtime_site_id(child).map_err(|err| miette::miette!(err.message))?;
-    if site_id != plan.site_id {
-        return Err(miette::miette!(
-            "dynamic child `{}` targeted site `{site_id}` but runtime plan belongs to site `{}`",
-            child.name,
-            plan.site_id
-        ));
-    }
-    build_local_child_runtime_spec(state, child, &site_id)
+    build_local_child_runtime_spec(state, child, &plan.site_id)
         .map_err(|err| miette::miette!(err.message))
 }
 
@@ -1017,12 +1009,15 @@ pub(super) async fn site_controller_runtime_destroy_child(
     state: &FrameworkControlState,
     child: &LiveChildRecord,
 ) -> Result<()> {
-    let site_id = child_runtime_site_id(child).map_err(|err| miette::miette!(err.message))?;
     let child_id = child.child_id;
     let child = {
         let state = app.state.lock().await;
         state.children.get(&child_id).cloned()
     };
+    if child.is_none() {
+        remove_dir_if_exists(&site_controller_runtime_child_root(&app.plan, child_id))?;
+        return Ok(());
+    }
     if let Some(child) = child.as_ref()
         && matches!(
             app.plan.kind,
@@ -1118,7 +1113,7 @@ pub(super) async fn site_controller_runtime_destroy_child(
             .await?;
         }
         SiteKind::Direct | SiteKind::Vm => {
-            let site_artifact_files = build_desired_site_artifact_files(state, &site_id)
+            let site_artifact_files = build_desired_site_artifact_files(state, &app.plan.site_id)
                 .map_err(|err| miette::miette!(err.message))?;
             reconcile_site_proxy_metadata(Path::new(&app.plan.artifact_dir), &site_artifact_files)?;
         }

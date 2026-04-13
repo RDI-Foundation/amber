@@ -56,13 +56,13 @@ pub use self::{
     compose_controller::inject_compose_site_controller,
     kubernetes_controller::inject_kubernetes_site_controller,
     site_artifacts::{
-        SiteControllerPeerRouterRoute, add_compose_router_published_route_ports,
-        inject_site_controller_peer_router_routes, set_compose_router_published_mesh_port,
-        set_site_artifact_mesh_identity_seed,
+        SiteControllerPeerRouterRoute, inject_site_controller_peer_router_routes,
+        set_compose_router_published_mesh_port, set_site_artifact_mesh_identity_seed,
     },
     site_runtime_support::{
         host_service_bind_addr_for_consumer, observability_endpoint_for_site,
-        prepare_kubernetes_artifact_namespace, router_mesh_addr_for_consumer, walk_files,
+        prepare_kubernetes_artifact_namespace, reserve_loopback_port,
+        router_mesh_addr_for_consumer, site_controller_peer_router_url, walk_files,
     },
 };
 use self::{
@@ -81,7 +81,6 @@ use crate::{
     http::{read_json, write_json},
     planner::{
         LocalChildRuntimeSpec, build_desired_site_artifact_files, build_local_child_runtime_spec,
-        child_runtime_site_id,
     },
     runtime_api::{SharedSiteControllerRuntime, SiteControllerRuntime},
     state::{FrameworkControlState, LiveChildRecord},
@@ -198,8 +197,6 @@ struct SiteSupervisorPlan {
     site_controller_plan_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     site_controller_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    controller_route_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     launch_env: BTreeMap<String, String>,
 }

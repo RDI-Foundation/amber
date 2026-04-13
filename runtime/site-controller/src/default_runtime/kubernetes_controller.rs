@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write as _,
     net::SocketAddr,
@@ -15,6 +15,7 @@ use super::*;
 const KUBERNETES_ROUTER_NAME: &str = "amber-router";
 const KUBERNETES_ROUTER_MESH_PORT: u16 = 24000;
 const KUBERNETES_ROUTER_CONTROL_PORT: u16 = 24100;
+const KUBERNETES_ROUTER_SERVICE_PATH: &str = "04-services/amber-router.yaml";
 const KUBERNETES_ROUTER_NETPOL_PATH: &str = "05-networkpolicies/amber-router-netpol.yaml";
 const KUBERNETES_CONTROLLER_SEED_CONFIGMAP_PATH: &str =
     "01-configmaps/amber-site-controller-seed.yaml";
@@ -179,7 +180,7 @@ pub fn inject_kubernetes_site_controller(
                         "containers": [{
                             "name": SITE_CONTROLLER_SERVICE_NAME,
                             "image": controller_image,
-                            "command": ["--plan", KUBERNETES_CONTROLLER_PLAN_PATH],
+                            "args": ["--plan", KUBERNETES_CONTROLLER_PLAN_PATH],
                             "ports": [{
                                 "name": "http",
                                 "containerPort": SITE_CONTROLLER_PORT,
@@ -239,7 +240,10 @@ pub fn inject_kubernetes_site_controller(
             KUBERNETES_CONTROLLER_SERVICE_PATH,
         ],
     )?;
-    ensure_kubernetes_router_allows_site_controller_control(artifact_root)
+    ensure_kubernetes_router_allows_site_controller_ingress(
+        artifact_root,
+        &peer_router_route_ports(&embedded_plan)?,
+    )
 }
 
 fn build_embedded_kubernetes_controller_plan(plan: &SiteControllerPlan) -> SiteControllerPlan {
@@ -342,7 +346,81 @@ fn add_kubernetes_resource_paths(artifact_root: &Path, paths: &[&str]) -> Result
         .wrap_err_with(|| format!("failed to write {}", kustomization_path.display()))
 }
 
-fn ensure_kubernetes_router_allows_site_controller_control(artifact_root: &Path) -> Result<()> {
+fn peer_router_route_ports(plan: &SiteControllerPlan) -> Result<BTreeSet<u16>> {
+    plan.peer_site_router_urls
+        .values()
+        .map(|url| {
+            let parsed = Url::parse(url)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("invalid peer router url `{url}`"))?;
+            parsed
+                .port()
+                .ok_or_else(|| miette::miette!("peer router url `{url}` is missing a route port"))
+        })
+        .collect()
+}
+
+fn ensure_kubernetes_router_service_ports(
+    artifact_root: &Path,
+    route_ports: &BTreeSet<u16>,
+) -> Result<()> {
+    if route_ports.is_empty() {
+        return Ok(());
+    }
+    let path = artifact_root.join(KUBERNETES_ROUTER_SERVICE_PATH);
+    let raw = fs::read_to_string(&path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    let mut document: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid {}", path.display()))?;
+    let ports = document
+        .as_mapping_mut()
+        .and_then(|root| root.get_mut(yaml_string("spec")))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .and_then(|spec| spec.get_mut(yaml_string("ports")))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or_else(|| {
+            miette::miette!("router service {} is missing spec.ports", path.display())
+        })?;
+    let existing = ports
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .as_mapping()
+                .and_then(|mapping| mapping.get(yaml_string("port")))
+                .and_then(serde_yaml::Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+        })
+        .collect::<BTreeSet<_>>();
+    for port in route_ports {
+        if existing.contains(port) {
+            continue;
+        }
+        ports.push(
+            serde_yaml::to_value(json!({
+                "name": format!("controller-route-{port}"),
+                "port": port,
+                "targetPort": port,
+                "protocol": "TCP",
+            }))
+            .into_diagnostic()
+            .wrap_err("failed to serialize router service route port")?,
+        );
+    }
+    let rendered = serde_yaml::to_string(&document)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to serialize {}", path.display()))?;
+    fs::write(&path, rendered)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))
+}
+
+fn ensure_kubernetes_router_allows_site_controller_ingress(
+    artifact_root: &Path,
+    route_ports: &BTreeSet<u16>,
+) -> Result<()> {
+    ensure_kubernetes_router_service_ports(artifact_root, route_ports)?;
     let path = artifact_root.join(KUBERNETES_ROUTER_NETPOL_PATH);
     let raw = fs::read_to_string(&path)
         .into_diagnostic()
@@ -363,43 +441,62 @@ fn ensure_kubernetes_router_allows_site_controller_control(artifact_root: &Path)
             )
         })?;
     let controller_selector = kubernetes_controller_selector();
-    let exists = ingress.iter().any(|rule| {
+    let controller_component = controller_selector
+        .get("amber.io/component")
+        .expect("selector must contain component");
+    let mut required_ports = BTreeSet::from([KUBERNETES_ROUTER_CONTROL_PORT]);
+    required_ports.extend(route_ports.iter().copied());
+    if let Some(rule) = ingress.iter_mut().find(|rule| {
         rule.as_mapping()
-            .and_then(|mapping| mapping.get(yaml_string("ports")))
+            .and_then(|mapping| mapping.get(yaml_string("from")))
             .and_then(serde_yaml::Value::as_sequence)
-            .is_some_and(|ports| {
-                ports.iter().any(|port| {
-                    port.as_mapping()
-                        .and_then(|entry| entry.get(yaml_string("port")))
-                        .and_then(serde_yaml::Value::as_i64)
-                        == Some(i64::from(KUBERNETES_ROUTER_CONTROL_PORT))
+            .is_some_and(|from| {
+                from.iter().any(|peer| {
+                    peer.as_mapping()
+                        .and_then(|mapping| mapping.get(yaml_string("podSelector")))
+                        .and_then(serde_yaml::Value::as_mapping)
+                        .and_then(|selector_value| selector_value.get(yaml_string("matchLabels")))
+                        .and_then(serde_yaml::Value::as_mapping)
+                        .is_some_and(|labels| {
+                            labels.get(yaml_string("amber.io/component"))
+                                == Some(&yaml_string(controller_component))
+                        })
                 })
             })
-            && rule
-                .as_mapping()
-                .and_then(|mapping| mapping.get(yaml_string("from")))
-                .and_then(serde_yaml::Value::as_sequence)
-                .is_some_and(|from| {
-                    from.iter().any(|peer| {
-                        peer.as_mapping()
-                            .and_then(|mapping| mapping.get(yaml_string("podSelector")))
-                            .and_then(serde_yaml::Value::as_mapping)
-                            .and_then(|selector_value| {
-                                selector_value.get(yaml_string("matchLabels"))
-                            })
-                            .and_then(serde_yaml::Value::as_mapping)
-                            .is_some_and(|labels| {
-                                labels.get(yaml_string("amber.io/component"))
-                                    == Some(&yaml_string(
-                                        controller_selector
-                                            .get("amber.io/component")
-                                            .expect("selector must contain component"),
-                                    ))
-                            })
-                    })
-                })
-    });
-    if !exists {
+    }) {
+        let ports = rule
+            .as_mapping_mut()
+            .and_then(|mapping| mapping.get_mut(yaml_string("ports")))
+            .and_then(serde_yaml::Value::as_sequence_mut)
+            .ok_or_else(|| {
+                miette::miette!(
+                    "router network policy {} controller ingress rule is missing ports",
+                    path.display()
+                )
+            })?;
+        let existing_ports = ports
+            .iter()
+            .filter_map(|port| {
+                port.as_mapping()
+                    .and_then(|entry| entry.get(yaml_string("port")))
+                    .and_then(serde_yaml::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+            })
+            .collect::<BTreeSet<_>>();
+        for port in required_ports {
+            if existing_ports.contains(&port) {
+                continue;
+            }
+            ports.push(
+                serde_yaml::to_value(json!({
+                    "protocol": "TCP",
+                    "port": port,
+                }))
+                .into_diagnostic()
+                .wrap_err("failed to serialize site controller router ingress port")?,
+            );
+        }
+    } else {
         ingress.push(
             serde_yaml::to_value(json!({
                 "from": [{
@@ -407,10 +504,10 @@ fn ensure_kubernetes_router_allows_site_controller_control(artifact_root: &Path)
                         "matchLabels": controller_selector,
                     }
                 }],
-                "ports": [{
+                "ports": required_ports.into_iter().map(|port| json!({
                     "protocol": "TCP",
-                    "port": KUBERNETES_ROUTER_CONTROL_PORT,
-                }]
+                    "port": port,
+                })).collect::<Vec<_>>()
             }))
             .into_diagnostic()
             .wrap_err("failed to serialize site controller router ingress rule")?,

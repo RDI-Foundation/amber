@@ -241,18 +241,18 @@ pub(super) fn materialize_launch_bundle(
         let mut peer_site_router_urls = BTreeMap::new();
         let mut peer_router_identities = BTreeMap::new();
         let mut peer_router_mesh_addrs = BTreeMap::new();
-        let mut controller_route_ports = Vec::new();
         let mut controller_routes = Vec::new();
-        let peer_router_host = host_service_host_for_consumer(site.site_plan.site.kind);
         for (peer_site_id, peer_site_plan) in &run_plan.sites {
             if peer_site_id == site_id {
                 continue;
             }
             let route_port = reserve_loopback_port()?;
-            controller_route_ports.push(route_port);
             peer_site_router_urls.insert(
                 peer_site_id.clone(),
-                format!("http://{peer_router_host}:{route_port}"),
+                amber_site_controller::site_controller_peer_router_url(
+                    site.site_plan.site.kind,
+                    route_port,
+                ),
             );
             peer_router_identities.insert(
                 peer_site_id.clone(),
@@ -284,19 +284,21 @@ pub(super) fn materialize_launch_bundle(
             });
         }
 
+        write_json(
+            &site_existing_peer_ports_path(&site.site_state_root),
+            &peer_router_ports_by_identity(&peer_router_identities, &peer_router_mesh_addrs)?,
+        )?;
+        write_json(
+            &site_existing_peer_identities_path(&site.site_state_root),
+            &peer_router_identities_by_id(&peer_router_identities),
+        )?;
+
         amber_site_controller::inject_site_controller_peer_router_routes(
             &site.artifact_dir,
             site_id,
             &allowed_issuers,
             &controller_routes,
         )?;
-        if site.site_plan.site.kind == SiteKind::Compose {
-            amber_site_controller::add_compose_router_published_route_ports(
-                &site.artifact_dir,
-                &controller_route_ports,
-            )?;
-        }
-        site.base_supervisor_plan.controller_route_ports = controller_route_ports;
         let local_router_control =
             site_controller_local_router_control(site.site_plan.site.kind, &site.artifact_dir);
 
@@ -405,6 +407,36 @@ fn planned_router_identity(
         Some(mesh_scope.to_string()),
         identity_seed,
     ))
+}
+
+fn peer_router_ports_by_identity(
+    peer_router_identities: &BTreeMap<String, amber_mesh::MeshIdentityPublic>,
+    peer_router_mesh_addrs: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, u16>> {
+    peer_router_identities
+        .iter()
+        .map(|(site_id, identity)| {
+            let addr = peer_router_mesh_addrs.get(site_id).ok_or_else(|| {
+                miette::miette!("missing planned router mesh address for peer site `{site_id}`")
+            })?;
+            let port = addr
+                .parse::<SocketAddr>()
+                .into_diagnostic()
+                .wrap_err_with(|| format!("invalid planned router mesh address `{addr}`"))?
+                .port();
+            Ok((identity.id.clone(), port))
+        })
+        .collect()
+}
+
+fn peer_router_identities_by_id(
+    peer_router_identities: &BTreeMap<String, amber_mesh::MeshIdentityPublic>,
+) -> BTreeMap<String, amber_mesh::MeshIdentityPublic> {
+    peer_router_identities
+        .values()
+        .cloned()
+        .map(|identity| (identity.id.clone(), identity))
+        .collect()
 }
 
 pub(super) fn build_launch_bundle_manifest(

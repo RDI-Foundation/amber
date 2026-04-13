@@ -137,23 +137,6 @@ pub(super) fn rebuild_live_child_runtime_metadata(
             &format!("child placement could not be satisfied: {err}"),
         )
     })?;
-    let fragment_sites = fragment
-        .components
-        .iter()
-        .filter_map(|component| planned.assignments.get(component.moniker.as_str()))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    if fragment_sites.len() > 1 {
-        return Err(protocol_error(
-            ProtocolErrorCode::PlacementUnsatisfied,
-            &format!(
-                "dynamic child `{}` spans multiple sites ({}) but site controllers only create \
-                 children within a single site",
-                child.name,
-                fragment_sites.into_iter().collect::<Vec<_>>().join(", ")
-            ),
-        ));
-    }
     child.assignments = planned.assignments;
     child.overlays = dynamic_overlay_records(&planned.incident_links, fragment);
     let mut live_assignments = existing_assignments.clone();
@@ -1490,9 +1473,9 @@ fn build_local_child_runtime_spec_from_site_plan(
     })
 }
 
-pub(super) fn child_runtime_site_id(
+pub(super) fn child_runtime_site_ids(
     child: &LiveChildRecord,
-) -> std::result::Result<String, ProtocolErrorResponse> {
+) -> std::result::Result<Vec<String>, ProtocolErrorResponse> {
     let fragment = child.fragment.as_ref().ok_or_else(|| {
         protocol_error(
             ProtocolErrorCode::ControlStateUnavailable,
@@ -1508,18 +1491,27 @@ pub(super) fn child_runtime_site_id(
         .filter_map(|component| child.assignments.get(component.moniker.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
-    match site_ids.len() {
-        1 => Ok(site_ids
-            .into_iter()
-            .next()
-            .expect("single child site id should be present")),
-        0 => Err(protocol_error(
+    if site_ids.is_empty() {
+        return Err(protocol_error(
             ProtocolErrorCode::ControlStateUnavailable,
             &format!(
                 "dynamic child `{}` has no site assignment for any fragment component",
                 child.name
             ),
-        )),
+        ));
+    }
+    Ok(site_ids.into_iter().collect())
+}
+
+pub(super) fn child_runtime_site_id(
+    child: &LiveChildRecord,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    let site_ids = child_runtime_site_ids(child)?;
+    match site_ids.len() {
+        1 => Ok(site_ids
+            .into_iter()
+            .next()
+            .expect("single child site id should be present")),
         _ => Err(protocol_error(
             ProtocolErrorCode::PlacementUnsatisfied,
             &format!(

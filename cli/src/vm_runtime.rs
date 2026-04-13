@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     hash::{Hash as _, Hasher as _},
     io::{Seek as _, SeekFrom, Write as _},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitStatus, Stdio},
 };

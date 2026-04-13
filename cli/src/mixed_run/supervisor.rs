@@ -263,7 +263,6 @@ pub(super) fn build_supervisor_plan(
             .site_controller_plan_path
             .map(|path| path.display().to_string()),
         site_controller_url: input.site_controller_url.map(ToOwned::to_owned),
-        controller_route_ports: Vec::new(),
         launch_env,
     })
 }
@@ -665,6 +664,10 @@ pub(super) async fn ensure_site_running(
             if runtime.site_process.is_none() {
                 runtime.last_start_attempt = Some(Instant::now());
                 runtime.ready_since = None;
+                let existing_peer_ports_path =
+                    site_existing_peer_ports_path(Path::new(&plan.site_state_root));
+                let existing_peer_identities_path =
+                    site_existing_peer_identities_path(Path::new(&plan.site_state_root));
                 runtime.site_process = Some(spawn_runtime_process(
                     &PathBuf::from(&plan.site_state_root),
                     "site.log",
@@ -684,6 +687,14 @@ pub(super) async fn ensure_site_running(
                         if let Some(port) = plan.router_mesh_port {
                             cmd.arg("--router-mesh-port").arg(port.to_string());
                         }
+                        if existing_peer_ports_path.is_file() {
+                            cmd.arg("--existing-peer-ports")
+                                .arg(&existing_peer_ports_path);
+                        }
+                        if existing_peer_identities_path.is_file() {
+                            cmd.arg("--existing-peer-identities")
+                                .arg(&existing_peer_identities_path);
+                        }
                     },
                 )?);
             }
@@ -692,6 +703,10 @@ pub(super) async fn ensure_site_running(
             if runtime.site_process.is_none() {
                 runtime.last_start_attempt = Some(Instant::now());
                 runtime.ready_since = None;
+                let existing_peer_ports_path =
+                    site_existing_peer_ports_path(Path::new(&plan.site_state_root));
+                let existing_peer_identities_path =
+                    site_existing_peer_identities_path(Path::new(&plan.site_state_root));
                 runtime.site_process = Some(spawn_runtime_process(
                     &PathBuf::from(&plan.site_state_root),
                     "site.log",
@@ -710,6 +725,14 @@ pub(super) async fn ensure_site_running(
                         }
                         if let Some(port) = plan.router_mesh_port {
                             cmd.arg("--router-mesh-port").arg(port.to_string());
+                        }
+                        if existing_peer_ports_path.is_file() {
+                            cmd.arg("--existing-peer-ports")
+                                .arg(&existing_peer_ports_path);
+                        }
+                        if existing_peer_identities_path.is_file() {
+                            cmd.arg("--existing-peer-identities")
+                                .arg(&existing_peer_identities_path);
                         }
                     },
                 )?);
@@ -1779,9 +1802,6 @@ pub(super) fn spawn_port_forward(plan: &SiteSupervisorPlan) -> Result<Child> {
         .arg("deploy/amber-router")
         .arg(format!("{mesh_port}:24000"))
         .arg(format!("{control_port}:24100"));
-    for port in &plan.controller_route_ports {
-        cmd.arg(format!("{port}:{port}"));
-    }
     cmd.stdout(Stdio::from(log)).stderr(Stdio::from(log_err));
     cmd.spawn()
         .into_diagnostic()

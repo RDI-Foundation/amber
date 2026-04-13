@@ -379,7 +379,7 @@ pub(crate) fn allocate_runtime_port(
         ));
     }
     for _ in 0..256 {
-        let port = pick_free_port()?;
+        let port = amber_site_controller::reserve_loopback_port()?;
         if reserved.insert(port) {
             return Ok(port);
         }
@@ -387,12 +387,6 @@ pub(crate) fn allocate_runtime_port(
     Err(miette::miette!(
         "ran out of ports while allocating vm runtime ports"
     ))
-}
-
-pub(crate) fn pick_free_port() -> Result<u16> {
-    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-        .into_diagnostic()?;
-    Ok(listener.local_addr().into_diagnostic()?.port())
 }
 
 pub(crate) fn rewrite_mesh_peer_addrs(
@@ -1054,5 +1048,22 @@ mod tests {
             rendered.len() < 104,
             "vm sidecar control socket path must fit within unix socket limits: {rendered}",
         );
+    }
+
+    #[test]
+    fn allocate_runtime_port_avoids_shared_loopback_reservations() {
+        let reserved_port =
+            amber_site_controller::reserve_loopback_port().expect("shared loopback port");
+        let mut reserved = BTreeSet::new();
+
+        for _ in 0..32 {
+            let port = allocate_runtime_port(&mut reserved, None)
+                .expect("vm runtime port allocation should succeed");
+            assert_ne!(
+                port, reserved_port,
+                "vm runtime should not reuse loopback ports already reserved by mixed-run \
+                 infrastructure",
+            );
+        }
     }
 }

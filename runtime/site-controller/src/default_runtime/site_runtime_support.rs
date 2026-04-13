@@ -76,7 +76,6 @@ pub(super) fn site_supervisor_plan_for_site_runtime(
         observability_endpoint: plan.observability_endpoint.clone(),
         site_controller_plan_path: None,
         site_controller_url: None,
-        controller_route_ports: Vec::new(),
         launch_env: plan.launch_env.clone(),
     }
 }
@@ -230,11 +229,42 @@ pub fn observability_endpoint_for_site(kind: SiteKind, endpoint: &str) -> Result
     Ok(url.to_string())
 }
 
-pub(crate) fn reserve_loopback_port() -> Result<u16> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .into_diagnostic()
-        .wrap_err("failed to allocate a loopback port")?;
-    Ok(listener.local_addr().into_diagnostic()?.port())
+pub fn reserve_loopback_port() -> Result<u16> {
+    const LOOPBACK_PORT_RANGE_START: u16 = 30000;
+    const LOOPBACK_PORT_RANGE_END: u16 = 60000;
+    static RESERVED_LOOPBACK_PORTS: OnceLock<std::sync::Mutex<BTreeSet<u16>>> = OnceLock::new();
+
+    let reserved = RESERVED_LOOPBACK_PORTS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()));
+    let mut reserved = reserved
+        .lock()
+        .expect("loopback port allocator should not be poisoned");
+    let span = u32::from(LOOPBACK_PORT_RANGE_END - LOOPBACK_PORT_RANGE_START);
+    let mut next =
+        LOOPBACK_PORT_RANGE_START + (std::process::id() % span) as u16 + reserved.len() as u16;
+    for _ in 0..usize::from(LOOPBACK_PORT_RANGE_END - LOOPBACK_PORT_RANGE_START) {
+        if next >= LOOPBACK_PORT_RANGE_END {
+            next = LOOPBACK_PORT_RANGE_START;
+        }
+        let port = next;
+        next += 1;
+        if reserved.contains(&port) {
+            continue;
+        }
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => {
+                drop(listener);
+                reserved.insert(port);
+                return Ok(port);
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Err(miette::miette!(
+        "failed to allocate a unique loopback port in {}-{}",
+        LOOPBACK_PORT_RANGE_START,
+        LOOPBACK_PORT_RANGE_END - 1
+    ))
 }
 
 pub(super) fn site_supervisor_plan_path(site_state_root: &Path) -> PathBuf {
@@ -410,6 +440,9 @@ pub(super) fn kubectl_command(context: Option<&str>) -> Command {
 }
 
 pub(super) fn ensure_kubernetes_namespace(plan: &SiteSupervisorPlan) -> Result<()> {
+    if !should_prepare_kubernetes_namespace(plan, is_in_cluster_kubernetes_runtime()) {
+        return Ok(());
+    }
     let namespace = required_str(plan.kubernetes_namespace.as_deref(), "kubernetes namespace")?;
     let deadline = Instant::now() + Duration::from_secs(60);
     let context = plan.context.as_deref();
@@ -470,6 +503,17 @@ pub(super) fn ensure_kubernetes_namespace(plan: &SiteSupervisorPlan) -> Result<(
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+fn should_prepare_kubernetes_namespace(
+    plan: &SiteSupervisorPlan,
+    in_cluster_runtime: bool,
+) -> bool {
+    plan.context.is_some() || !in_cluster_runtime
+}
+
+fn is_in_cluster_kubernetes_runtime() -> bool {
+    env::var_os("KUBERNETES_SERVICE_HOST").is_some()
 }
 
 pub(super) fn ensure_kubernetes_workloads_ready(plan: &SiteSupervisorPlan) -> Result<()> {
@@ -1045,6 +1089,14 @@ pub(crate) fn host_service_host_for_consumer(consumer_kind: SiteKind) -> String 
     }
 }
 
+pub fn site_controller_peer_router_url(controller_site_kind: SiteKind, route_port: u16) -> String {
+    let host = match controller_site_kind {
+        SiteKind::Direct | SiteKind::Vm => "127.0.0.1",
+        SiteKind::Compose | SiteKind::Kubernetes => KUBERNETES_ROUTER_COMPONENT_NAME,
+    };
+    format!("http://{host}:{route_port}")
+}
+
 pub(super) fn consumer_needs_host_wide_listener(consumer_kind: SiteKind) -> bool {
     matches!(consumer_kind, SiteKind::Compose | SiteKind::Kubernetes)
 }
@@ -1222,8 +1274,43 @@ pub(super) fn resolve_desktop_container_host_ip() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use amber_compiler::run_plan::SiteKind;
+
     #[cfg(unix)]
     use super::parse_process_status_code;
+    use super::{
+        SITE_PLAN_SCHEMA, SITE_PLAN_VERSION, SiteSupervisorPlan,
+        should_prepare_kubernetes_namespace,
+    };
+
+    fn kubernetes_supervisor_plan(context: Option<&str>) -> SiteSupervisorPlan {
+        SiteSupervisorPlan {
+            schema: SITE_PLAN_SCHEMA.to_string(),
+            version: SITE_PLAN_VERSION,
+            run_id: "run-1".to_string(),
+            mesh_scope: "test".to_string(),
+            run_root: "/tmp/run".to_string(),
+            coordinator_pid: 0,
+            site_id: "kind_local".to_string(),
+            kind: SiteKind::Kubernetes,
+            artifact_dir: "/tmp/artifact".to_string(),
+            site_state_root: "/tmp/state".to_string(),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: None,
+            compose_project: None,
+            kubernetes_namespace: Some("amber-test-kind-local".to_string()),
+            context: context.map(str::to_string),
+            port_forward_mesh_port: None,
+            port_forward_control_port: None,
+            observability_endpoint: None,
+            site_controller_plan_path: None,
+            site_controller_url: None,
+            launch_env: BTreeMap::new(),
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1231,5 +1318,24 @@ mod tests {
         assert_eq!(parse_process_status_code("S+\n"), Some('S'));
         assert_eq!(parse_process_status_code("z\n"), Some('Z'));
         assert_eq!(parse_process_status_code(""), None);
+    }
+
+    #[test]
+    fn in_cluster_kubernetes_controller_skips_namespace_bootstrap() {
+        let plan = kubernetes_supervisor_plan(None);
+        assert!(
+            !should_prepare_kubernetes_namespace(&plan, true),
+            "in-cluster site controllers should not perform cluster-scoped namespace probes"
+        );
+    }
+
+    #[test]
+    fn external_kubernetes_supervisor_still_prepares_namespace() {
+        let plan = kubernetes_supervisor_plan(Some("kind-test"));
+        assert!(
+            should_prepare_kubernetes_namespace(&plan, true),
+            "external site supervisors still need to prepare the namespace before applying \
+             artifacts"
+        );
     }
 }

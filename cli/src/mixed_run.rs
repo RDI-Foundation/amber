@@ -75,7 +75,6 @@ const OUTSIDE_PROXY_PLAN_SCHEMA: &str = "amber.run.outside_proxy";
 const OUTSIDE_PROXY_PLAN_VERSION: u32 = 1;
 const OUTSIDE_PROXY_STATE_SCHEMA: &str = "amber.run.outside_proxy_state";
 const OUTSIDE_PROXY_STATE_VERSION: u32 = 1;
-
 const ROUTER_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
@@ -452,8 +451,6 @@ pub(crate) struct SiteSupervisorPlan {
     site_controller_plan_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     site_controller_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    controller_route_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     launch_env: BTreeMap<String, String>,
 }
@@ -1083,10 +1080,7 @@ pub(crate) async fn run_observability_sink(plan_path: PathBuf) -> Result<()> {
 }
 
 pub(crate) fn reserve_loopback_port() -> Result<u16> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .into_diagnostic()
-        .wrap_err("failed to allocate a loopback port")?;
-    Ok(listener.local_addr().into_diagnostic()?.port())
+    amber_site_controller::reserve_loopback_port()
 }
 
 pub(crate) fn new_run_id() -> String {
@@ -1123,6 +1117,14 @@ fn site_supervisor_plan_path(site_state_root: &Path) -> PathBuf {
 
 pub(crate) fn site_controller_plan_path(site_state_root: &Path) -> PathBuf {
     site_state_root.join("site-controller-plan.json")
+}
+
+pub(crate) fn site_existing_peer_ports_path(site_state_root: &Path) -> PathBuf {
+    site_state_root.join("existing-peer-ports.json")
+}
+
+pub(crate) fn site_existing_peer_identities_path(site_state_root: &Path) -> PathBuf {
+    site_state_root.join("existing-peer-identities.json")
 }
 
 pub(crate) fn desired_links_path(site_state_root: &Path) -> PathBuf {

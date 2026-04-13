@@ -78,13 +78,13 @@ mod tests;
 
 pub use self::{
     default_runtime::{
-        SiteControllerPeerRouterRoute, add_compose_router_published_route_ports,
-        assign_compose_egress_network_subnets, cleanup_dynamic_site_children,
-        host_service_bind_addr_for_consumer, inject_compose_site_controller,
-        inject_kubernetes_site_controller, inject_site_controller_peer_router_routes,
-        observability_endpoint_for_site, prepare_kubernetes_artifact_namespace,
+        SiteControllerPeerRouterRoute, assign_compose_egress_network_subnets,
+        cleanup_dynamic_site_children, host_service_bind_addr_for_consumer,
+        inject_compose_site_controller, inject_kubernetes_site_controller,
+        inject_site_controller_peer_router_routes, observability_endpoint_for_site,
+        prepare_kubernetes_artifact_namespace, reserve_loopback_port,
         router_mesh_addr_for_consumer, set_compose_router_published_mesh_port,
-        set_site_artifact_mesh_identity_seed, walk_files,
+        set_site_artifact_mesh_identity_seed, site_controller_peer_router_url, walk_files,
     },
     runtime_api::{
         DesiredExportPeerOverlay, DesiredExternalSlotOverlay, DesiredRouteOverlay, LaunchedSite,
