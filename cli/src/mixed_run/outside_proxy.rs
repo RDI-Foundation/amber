@@ -63,10 +63,23 @@ pub(crate) fn spawn_run_outside_proxy(
     slot_bindings: &BTreeMap<String, String>,
     export_bindings: &BTreeMap<String, SocketAddr>,
 ) -> Result<Child> {
+    clear_run_outside_proxy_state(run_root)?;
     let plan_path = write_run_outside_proxy_plan(run_root, slot_bindings, export_bindings)?;
     spawn_detached_child(run_root, &run_root.join("outside-proxy.log"), |cmd| {
         cmd.arg("run-outside-proxy").arg("--plan").arg(&plan_path);
     })
+}
+
+pub(crate) fn clear_run_outside_proxy_state(run_root: &Path) -> Result<()> {
+    let state_path = outside_proxy_state_path(run_root);
+    match fs::remove_file(&state_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(miette::miette!(
+            "failed to remove outside proxy state {}: {err}",
+            state_path.display()
+        )),
+    }
 }
 
 pub(crate) fn write_run_outside_proxy_plan(
@@ -226,6 +239,10 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
             .get(&export.site_id)
             .expect("provider site should exist");
         let protocol = mesh_protocol_for_export(&export.protocol)?;
+        let http_plugins = amber_mesh::http_route_plugins_for_capability_kind(
+            export.capability_kind.as_deref(),
+            protocol,
+        );
         let peer_key =
             base64::engine::general_purpose::STANDARD.encode(outside_identity.public_key);
         register_export_peer_with_retry(
@@ -246,13 +263,18 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
             });
         outbound.push(OutboundRoute {
             route_id: router_export_route_id(export_name, protocol),
+            rewrite_route_id: Some(amber_mesh::public_export_rewrite_route_id(
+                &export.component,
+                &export.provide,
+                protocol,
+            )),
             slot: export_name.clone(),
-            capability_kind: None,
-            capability_profile: None,
+            capability_kind: export.capability_kind.clone(),
+            capability_profile: export.capability_profile.clone(),
             listen_port: listen.port(),
             listen_addr: Some(listen.ip().to_string()),
             protocol,
-            http_plugins: Vec::new(),
+            http_plugins,
             peer_addr: provider.router_addr.to_string(),
             peer_id: provider.router_identity.id.clone(),
             capability: export_name.clone(),
@@ -293,7 +315,7 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
         },
     )?;
 
-    tokio::select! {
+    let result = tokio::select! {
         result = router => {
             match result {
                 Ok(Ok(())) => Ok(()),
@@ -305,7 +327,9 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
             signal.into_diagnostic().wrap_err("failed to wait for Ctrl-C")?;
             Ok(())
         }
-    }
+    };
+    let _ = clear_run_outside_proxy_state(&run_root);
+    result
 }
 
 pub(super) async fn stop_site_from_receipt(
@@ -482,6 +506,10 @@ pub(super) fn build_run_outside_proxy_context(
                         name.clone(),
                         RunOutsideExport {
                             site_id: site_id.clone(),
+                            component: export.component,
+                            provide: export.provide,
+                            capability_kind: export.capability_kind,
+                            capability_profile: export.capability_profile,
                             protocol: export.protocol,
                         },
                     );

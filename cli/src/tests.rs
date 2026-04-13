@@ -1,6 +1,26 @@
+use std::{collections::BTreeMap, path::Path};
+
 use clap::CommandFactory as _;
 
 use super::*;
+
+#[derive(Default)]
+struct RecordingStatusIndicator {
+    shown_frames: Vec<usize>,
+    cleared: bool,
+}
+
+impl StatusIndicator for RecordingStatusIndicator {
+    fn show(&mut self, frame_index: usize) -> Result<()> {
+        self.shown_frames.push(frame_index);
+        Ok(())
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        self.cleared = true;
+        Ok(())
+    }
+}
 
 fn encode_json_b64(value: &serde_json::Value) -> String {
     base64::engine::general_purpose::STANDARD
@@ -32,9 +52,147 @@ fn verbosity_levels_follow_v_flag_ladder() {
 }
 
 #[test]
+fn managed_run_observability_defaults_to_local() {
+    assert_eq!(managed_run_observability(None), Some("local"));
+    assert_eq!(managed_run_observability(Some("")), Some("local"));
+    assert_eq!(managed_run_observability(Some("  ")), Some("local"));
+}
+
+#[test]
+fn managed_run_observability_accepts_explicit_modes() {
+    assert_eq!(managed_run_observability(Some("local")), Some("local"));
+    assert_eq!(managed_run_observability(Some("off")), None);
+    assert_eq!(managed_run_observability(Some("none")), None);
+    assert_eq!(
+        managed_run_observability(Some("http://127.0.0.1:4318")),
+        Some("http://127.0.0.1:4318")
+    );
+}
+
+#[test]
 fn cli_version_comes_from_build_metadata() {
     let cli = Cli::command();
     assert_eq!(cli.get_version(), Some(CLI_VERSION));
+}
+
+#[test]
+fn top_level_help_groups_authoring_and_runtime_workflows() {
+    let mut cli = Cli::command();
+    let mut help = Vec::new();
+    cli.write_long_help(&mut help)
+        .expect("top-level help should render");
+    let help = String::from_utf8(help).expect("help should be utf-8");
+
+    assert!(help.contains("Authoring And Inspection:"), "{help}");
+    assert!(help.contains("Runtime:"), "{help}");
+    assert!(help.contains("Compile To Explicit Artifacts:"), "{help}");
+    assert!(
+        help.contains("run      Run a manifest, run plan, or Amber runtime artifact"),
+        "{help}"
+    );
+    assert!(
+        help.contains("proxy    Bridge scenario exports and external slots to the host"),
+        "{help}"
+    );
+    assert!(
+        help.find("run      Run a manifest, run plan, or Amber runtime artifact")
+            < help.find("compile  Compile a manifest into Scenario IR and runtime artifacts"),
+        "{help}"
+    );
+}
+
+#[test]
+fn attached_run_overview_stays_focused_on_identity_and_exports() {
+    let mut output = Vec::new();
+    print_run_session_overview(
+        &mut output,
+        AttachedSessionMode::ForegroundRun,
+        "run-123",
+        Path::new("/tmp/run-123"),
+        &RunInterface::default(),
+        &BTreeMap::new(),
+    )
+    .expect("overview should render");
+    let rendered = String::from_utf8(output).expect("overview should be utf-8");
+
+    assert!(rendered.contains("run-123"), "{rendered}");
+    assert!(rendered.contains("/tmp/run-123"), "{rendered}");
+    assert!(rendered.contains("none declared\n\n"), "{rendered}");
+    assert!(!rendered.contains("amber logs -f"), "{rendered}");
+    assert!(!rendered.contains("amber stop"), "{rendered}");
+    assert!(!rendered.contains("Ctrl-C"), "{rendered}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_temporary_run_outside_proxy_removes_state_file() {
+    let temp = tempfile::tempdir().expect("tempdir should exist");
+    let run_root = temp.path();
+    let state_path = run_root.join("outside-proxy-state.json");
+    fs::write(&state_path, "{}").expect("state file should exist");
+    let mut proxy_child = Some(
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("proxy child should spawn"),
+    );
+
+    cleanup_temporary_run_outside_proxy(run_root, &mut proxy_child)
+        .expect("cleanup should succeed");
+
+    assert!(
+        proxy_child.is_none(),
+        "cleanup should take ownership of the child"
+    );
+    assert!(
+        !state_path.exists(),
+        "cleanup should remove stale outside proxy state"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn detached_run_ready_waits_past_old_timeout_until_receipt_exists() {
+    let temp = tempfile::tempdir().expect("tempdir should exist");
+    let run_root = temp.path().join("run-123");
+    fs::create_dir_all(&run_root).expect("run root should exist");
+    let log_path = run_root.join("coordinator.log");
+    fs::write(&log_path, "").expect("log path should exist");
+    let receipt_path = run_root.join("receipt.json");
+    let run_root_for_wait = run_root.clone();
+    let log_path_for_wait = log_path.clone();
+    let wait_task = tokio::spawn(async move {
+        let mut coordinator = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .expect("coordinator should spawn");
+        let result = wait_for_detached_run_ready(
+            &mut coordinator,
+            "run-123",
+            &run_root_for_wait,
+            &log_path_for_wait,
+        )
+        .await;
+        let _ = coordinator.kill();
+        let _ = coordinator.wait();
+        result
+    });
+    let receipt_task = tokio::spawn(async move {
+        sleep(Duration::from_secs(31)).await;
+        fs::write(receipt_path, "{}").expect("receipt should be written");
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::task::yield_now().await;
+
+    wait_task
+        .await
+        .expect("wait task should join")
+        .expect("detached run should keep waiting until the receipt exists");
+    receipt_task.await.expect("receipt task should join");
 }
 
 #[test]
@@ -184,6 +342,69 @@ fn build_runtime_template_context_uses_runtime_slot_ports() {
     );
 }
 
+#[tokio::test]
+async fn await_with_status_indicator_is_silent_for_fast_future() {
+    let mut indicator = RecordingStatusIndicator::default();
+
+    let (result, shown) = await_with_status_indicator(
+        async { 7usize },
+        Some(Duration::from_millis(50)),
+        Duration::from_millis(5),
+        &mut indicator,
+    )
+    .await
+    .expect("helper should succeed");
+
+    assert_eq!(result, 7);
+    assert!(!shown);
+    assert!(indicator.shown_frames.is_empty());
+    assert!(!indicator.cleared);
+}
+
+#[tokio::test]
+async fn await_with_status_indicator_renders_and_clears_for_slow_future() {
+    let mut indicator = RecordingStatusIndicator::default();
+
+    let (result, shown) = await_with_status_indicator(
+        async {
+            sleep(Duration::from_millis(30)).await;
+            11usize
+        },
+        Some(Duration::from_millis(1)),
+        Duration::from_millis(5),
+        &mut indicator,
+    )
+    .await
+    .expect("helper should succeed");
+
+    assert_eq!(result, 11);
+    assert!(shown);
+    assert_eq!(indicator.shown_frames.first().copied(), Some(0));
+    assert!(indicator.cleared);
+}
+
+#[tokio::test]
+async fn await_with_status_indicator_can_start_immediately() {
+    let mut indicator = RecordingStatusIndicator::default();
+
+    let (result, shown) = await_with_status_indicator(
+        async {
+            sleep(Duration::from_millis(20)).await;
+            5usize
+        },
+        None,
+        Duration::from_millis(5),
+        &mut indicator,
+    )
+    .await
+    .expect("helper should succeed");
+
+    assert_eq!(result, 5);
+    assert!(shown);
+    assert_eq!(indicator.shown_frames.first().copied(), Some(0));
+    assert!(indicator.cleared);
+}
+
 #[test]
 fn decode_mount_parent_dirs_supports_literal_template_mount_paths() {
     let mounts = vec![MountSpec::Template(amber_template::MountTemplateSpec {
@@ -273,6 +494,7 @@ fn assign_direct_runtime_ports_preserves_repeated_slot_item_order() {
         outbound: vec![
             OutboundRoute {
                 route_id: "route-b".to_string(),
+                rewrite_route_id: None,
                 slot: "upstream".to_string(),
                 capability_kind: Some("http".to_string()),
                 capability_profile: None,
@@ -286,6 +508,7 @@ fn assign_direct_runtime_ports_preserves_repeated_slot_item_order() {
             },
             OutboundRoute {
                 route_id: "route-a".to_string(),
+                rewrite_route_id: None,
                 slot: "upstream".to_string(),
                 capability_kind: Some("http".to_string()),
                 capability_profile: None,
@@ -421,6 +644,28 @@ fn direct_storage_root_uses_explicit_override() {
         root.ends_with("custom-storage-root"),
         "override should be used verbatim: {}",
         root.display()
+    );
+}
+
+#[test]
+fn attached_run_storage_defaults_to_managed_storage_root() {
+    let storage = AttachedRunStorage::new(None).expect("attached storage should build");
+    let expected = mixed_run::mixed_run_storage_root(None).expect("managed storage root");
+    assert_eq!(storage.storage_root(), expected.as_path());
+    assert!(
+        storage.should_cleanup_run_root(),
+        "default attached storage should clean up the foreground run root"
+    );
+}
+
+#[test]
+fn attached_run_storage_uses_explicit_override() {
+    let storage = AttachedRunStorage::new(Some(Path::new("custom-storage-root")))
+        .expect("attached storage should build");
+    assert!(
+        storage.storage_root().ends_with("custom-storage-root"),
+        "override should be used verbatim: {}",
+        storage.storage_root().display()
     );
 }
 

@@ -18,10 +18,12 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env, fmt, fs,
-    io::Write as _,
+    future::Future,
+    io,
+    io::{IsTerminal as _, Write as _},
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
+    process::{Child, Stdio},
 };
 
 use amber_compiler::{
@@ -68,6 +70,12 @@ use amber_template::{ConfigTemplatePayload, MountSpec, RuntimeSlotObject, Runtim
 use amber_template::{ProgramArgTemplate, TemplateSpec};
 use base64::Engine as _;
 use clap::{ArgAction, Args, Parser, Subcommand};
+use crossterm::{
+    cursor::MoveToColumn,
+    execute, queue,
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    terminal::{Clear, ClearType},
+};
 use miette::{
     Context as _, Diagnostic, GraphicalReportHandler, IntoDiagnostic as _, Result, Severity,
 };
@@ -85,10 +93,10 @@ use self::command_support::*;
 pub(crate) use self::direct_runtime::*;
 use crate::{
     run_inputs::{
-        RunInterface, ambient_run_env, collect_run_interface, load_run_env,
-        missing_required_external_slots, missing_required_root_inputs, parse_env_sample,
-        project_env_path, prompt_for_missing_inputs, render_resolved_input_lines,
-        render_root_reuse_env, render_run_env_file, resolve_manifest_entry_path, run_interactive,
+        RunInterface, ambient_run_env, collect_run_interface, is_interactive_input_cancelled,
+        load_run_env, missing_required_external_slots, missing_required_root_inputs,
+        parse_env_sample, project_env_path, prompt_for_missing_inputs, promptable_external_slots,
+        render_run_env_file, resolve_manifest_entry_path, run_interactive,
         select_external_slot_env, select_root_env, slot_url_from_socket,
     },
     run_logs::{RunLogOptions, print_run_logs, print_run_ps, stream_run_logs_until},
@@ -103,13 +111,38 @@ Amber resolves a root manifest or bundle, validates the component graph, and wri
 
 Use `amber <command> --help` to drill into a specific workflow.";
 
+const ATTACHED_RUN_STARTUP_NOTICE_DELAY: Duration = Duration::from_millis(200);
+const ATTACHED_RUN_STATUS_SPINNER_TICK: Duration = Duration::from_millis(80);
+const ATTACHED_RUN_STATUS_SPINNER_FRAMES: &[&str] = &["-", "\\", "|", "/"];
+
 const CLI_AFTER_HELP: &str = "\
-Common workflows:
+Runtime:
+  amber run .
+      Compile the local scenario, start it, print exports, and tail traces.
+
+  amber run path/to/root.json5 --detach
+  amber attach <run-id>
+      Start a managed background run, then reattach a human-friendly export-and-traces session.
+
+  amber ps
+  amber logs <run-id>
+  amber stop <run-id>
+      Inspect or control active managed runs.
+
+  amber proxy <run-id> --export public=127.0.0.1:18080
+      Expose a running scenario export on localhost with an explicit binding.
+
+Authoring And Inspection:
   amber check path/to/root.json5
       Validate manifests and print diagnostics without writing outputs.
 
+  amber docs readme
+      Read the embedded project and CLI reference from the binary.
+
+Compile To Explicit Artifacts:
   amber compile path/to/root.json5 --run-plan /tmp/amber-run-plan.json
-      Generate the mixed-site run plan consumed by `amber run`.
+  amber run /tmp/amber-run-plan.json
+      Materialize a mixed-site plan first when you want an inspectable handoff artifact.
 
   amber compile path/to/root.json5 --docker-compose /tmp/amber-compose
       Generate runtime artifacts. `amber compile --help` lists every output format.
@@ -120,13 +153,7 @@ Common workflows:
 
   amber compile path/to/root.json5 --vm /tmp/amber-vm
   amber run /tmp/amber-vm
-      Build and start the VM runtime locally.
-
-  amber proxy /tmp/amber-compose --export public=127.0.0.1:18080
-      Expose scenario exports or wire external slots on localhost.
-
-  amber docs readme
-      Read the embedded project and CLI reference from the binary.";
+      Build and start the VM runtime locally.";
 
 const COMPILE_LONG_ABOUT: &str = "\
 Resolve a root manifest or bundle, run the Amber compiler, print diagnostics, and write one or \
@@ -225,13 +252,22 @@ Print the manifest schema README that ships inside the CLI.
 
 Use this for the detailed manifest format, field semantics, and authoring examples.";
 
-const RUN_LONG_ABOUT: &str = "\
+const RUN_LONG_ABOUT: &str =
+    "\
 Start a compiled Amber runtime artifact, a mixed-site run plan, or a manifest/bundle.
 
 This command understands direct/native artifacts from `amber compile --direct`, VM artifacts from \
-                              `amber compile --vm`, mixed-site run plans from `amber compile \
-                              --run-plan`, and manifest or bundle inputs that Amber can compile \
-                              into a run plan on the fly.";
+     `amber compile --vm`, mixed-site run plans from `amber compile --run-plan`, and manifest or \
+     bundle inputs that Amber can compile into a run plan on the fly.
+
+Foreground mixed-site runs use Amber's standard run storage while active, so `amber ps`, `amber \
+     logs`, and `amber attach` can find them. Mixed-site runs default to `--observability local`; \
+     pass `--observability off` to disable or a URL to export remotely. Unless you pass \
+     `--storage-root`, Amber removes the foreground run directory when the session exits.
+
+During interactive startup, non-secret root config prompts accept `@file` to load from a file and \
+     `@@` for a literal leading `@`, with path suggestions as you type and Tab completion. Secret \
+     root config uses the same `@file` / `@@` rules, but literal values stay hidden.";
 
 const RUN_AFTER_HELP: &str = "\
 Examples:
@@ -246,11 +282,27 @@ Examples:
   amber run /tmp/amber-direct
   amber run /tmp/amber-direct/direct-plan.json
   amber run /tmp/amber-vm
+  amber attach run-19d81cc0629-a374
   amber run /tmp/amber-direct --storage-root /srv/amber-state
 
 Runtime requirements:
   Linux: `bwrap` and `slirp4netns`
   macOS: `/usr/bin/sandbox-exec` or QEMU/HVF";
+
+const ATTACH_LONG_ABOUT: &str = "\
+Attach a human-friendly shell session to a running mixed-site Amber run.
+
+Amber allocates localhost listeners for the run's declared exports and tails the run's persisted \
+                                 trace log.
+
+Press Ctrl-C to detach this shell session. The run keeps running until you stop it with `amber \
+                                 stop <run-id>`.";
+
+const ATTACH_AFTER_HELP: &str = "\
+Examples:
+  amber attach <run-id>
+  amber attach <run-id> --storage-root /srv/amber-state
+  amber attach /path/to/.amber-runs/runs/<run-id>";
 
 const PROXY_LONG_ABOUT: &str = "\
 Attach a local proxy to compiled Amber output.
@@ -283,6 +335,8 @@ Examples:
 
 Notes:
   At least one `--slot NAME=ADDR:PORT` or `--export NAME=ADDR:PORT` is required.
+  For the human-friendly export-and-traces workflow on a running mixed-site scenario, prefer \
+                                `amber attach <run-id>`.
   Mixed-site run ids expose the whole running scenario by default; add `--site` only when you need \
                                 a specific internal site surface.
   Docker Compose outputs auto-detect router control and, for exports, the published router mesh \
@@ -292,21 +346,6 @@ Notes:
                                 `--project-name <name>` to `amber proxy`.
   Kubernetes output requires `--mesh-addr` when you use `--slot`, unless you are supplying an \
                                 equivalent override.";
-
-const DASHBOARD_LONG_ABOUT: &str = "\
-Start the dashboard container that Amber scenarios can send OpenTelemetry data to.
-
-This is mainly useful when debugging scenarios locally or following one of the observability \
-                                    tutorials.";
-
-const DASHBOARD_AFTER_HELP: &str = concat!(
-    "Examples:\n",
-    "  amber dashboard\n",
-    "  amber dashboard --detach\n\n",
-    "Requirements:\n",
-    "  Docker CLI plus a running Docker daemon.\n\n",
-    "Default UI address: http://127.0.0.1:18888"
-);
 
 const CLI_VERSION: &str = env!("AMBER_CLI_VERSION");
 
@@ -328,47 +367,56 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     #[command(
+        display_order = 8,
         about = "Compile a manifest into Scenario IR and runtime artifacts",
         long_about = COMPILE_LONG_ABOUT,
         after_help = COMPILE_AFTER_HELP
     )]
     Compile(CompileArgs),
     #[command(
+        display_order = 7,
         about = "Validate a manifest tree without writing outputs",
         long_about = CHECK_LONG_ABOUT,
         after_help = CHECK_AFTER_HELP
     )]
     Check(CheckArgs),
     #[command(
+        display_order = 9,
         about = "Read embedded Amber documentation",
         long_about = DOCS_LONG_ABOUT,
         after_help = DOCS_AFTER_HELP
     )]
     Docs(DocsArgs),
     #[command(
+        display_order = 1,
         about = "Run a manifest, run plan, or Amber runtime artifact",
         long_about = RUN_LONG_ABOUT,
         after_help = RUN_AFTER_HELP
     )]
     Run(RunArgs),
-    #[command(about = "Stop a mixed-site run by run id")]
-    Stop(StopArgs),
-    #[command(about = "List active mixed-site runs")]
-    Ps(PsArgs),
-    #[command(about = "Print persisted logs for a mixed-site run")]
-    Logs(LogsArgs),
     #[command(
+        display_order = 2,
+        about = "Attach export listeners and traces to a running mixed-site run",
+        long_about = ATTACH_LONG_ABOUT,
+        after_help = ATTACH_AFTER_HELP
+    )]
+    Attach(AttachArgs),
+    #[command(
+        display_order = 6,
         about = "Bridge scenario exports and external slots to the host",
         long_about = PROXY_LONG_ABOUT,
         after_help = PROXY_AFTER_HELP
     )]
     Proxy(ProxyArgs),
+    #[command(display_order = 3, about = "List active mixed-site runs")]
+    Ps(PsArgs),
     #[command(
-        about = "Run the Aspire dashboard for Amber telemetry",
-        long_about = DASHBOARD_LONG_ABOUT,
-        after_help = DASHBOARD_AFTER_HELP
+        display_order = 4,
+        about = "Print persisted interaction traces for a mixed-site run"
     )]
-    Dashboard(DashboardArgs),
+    Logs(LogsArgs),
+    #[command(display_order = 5, about = "Stop a mixed-site run by run id")]
+    Stop(StopArgs),
     #[command(hide = true, name = "run-direct-init")]
     RunDirectInit(RunDirectInitArgs),
     #[command(hide = true, name = "run-vm-init")]
@@ -504,7 +552,8 @@ struct RunArgs {
     #[arg(value_name = "TARGET")]
     output: String,
 
-    /// Override where Amber stores persistent runtime state.
+    /// Override where Amber stores runtime state. Foreground mixed-site runs use the default
+    /// storage root while running; pass this to keep their run directory after the session exits.
     #[arg(long = "storage-root", value_name = "DIR")]
     storage_root: Option<PathBuf>,
 
@@ -532,8 +581,9 @@ struct RunArgs {
     #[arg(long = "detach")]
     detach: bool,
 
-    /// Managed observability mode for mixed-site runs (`local` or an OTLP/HTTP endpoint URL).
-    #[arg(long = "observability", value_name = "local|URL")]
+    /// Managed observability mode for mixed-site runs. Defaults to `local`; pass `off` to
+    /// disable or an OTLP/HTTP endpoint URL to export remotely.
+    #[arg(long = "observability", value_name = "local|off|URL")]
     observability: Option<String>,
 
     /// Materialize the mixed-site launch bundle without starting workloads.
@@ -543,6 +593,17 @@ struct RunArgs {
     /// Write the materialized mixed-site launch bundle to this directory.
     #[arg(long = "emit-launch-bundle", value_name = "DIR")]
     emit_launch_bundle: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct AttachArgs {
+    /// Mixed-site run id, run root, or receipt path.
+    #[arg(value_name = "RUN")]
+    run: String,
+
+    /// Override where Amber stores persistent mixed-run state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -678,8 +739,9 @@ struct RunDetachedCoordinatorArgs {
     #[arg(long = "source-plan", value_name = "FILE")]
     source_plan: Option<PathBuf>,
 
-    /// Managed observability mode for mixed-site runs (`local` or an OTLP/HTTP endpoint URL).
-    #[arg(long = "observability", value_name = "local|URL")]
+    /// Managed observability mode for mixed-site runs. Defaults to `local`; pass `off` to
+    /// disable or an OTLP/HTTP endpoint URL to export remotely.
+    #[arg(long = "observability", value_name = "local|off|URL")]
     observability: Option<String>,
 }
 
@@ -688,13 +750,21 @@ struct PsArgs {
     /// Override where Amber stores persistent mixed-run state.
     #[arg(long = "storage-root", value_name = "DIR")]
     storage_root: Option<PathBuf>,
+
+    /// Force the human-readable summary format.
+    #[arg(long = "human", conflicts_with = "tsv")]
+    human: bool,
+
+    /// Print the older tab-separated machine-oriented format.
+    #[arg(long = "tsv", conflicts_with = "human")]
+    tsv: bool,
 }
 
 #[derive(Args)]
 struct LogsArgs {
-    /// Mixed-site run id.
-    #[arg(value_name = "RUN_ID")]
-    run_id: String,
+    /// Mixed-site run id, run root, or receipt path.
+    #[arg(value_name = "RUN")]
+    run: String,
 
     /// Override where Amber stores persistent mixed-run state.
     #[arg(long = "storage-root", value_name = "DIR")]
@@ -770,45 +840,6 @@ struct ProxyArgs {
     router_config: Option<PathBuf>,
 }
 
-#[derive(Args)]
-struct DashboardArgs {
-    /// Docker image to run for the dashboard.
-    #[arg(long = "image", value_name = "IMAGE")]
-    image: Option<String>,
-
-    /// Docker container name for the dashboard.
-    #[arg(long = "name", value_name = "NAME", default_value = "amber-dashboard")]
-    name: String,
-
-    /// Dashboard frontend listen address on the host.
-    #[arg(
-        long = "ui-addr",
-        value_name = "HOST:PORT",
-        default_value = "127.0.0.1:18888"
-    )]
-    ui_addr: SocketAddr,
-
-    /// Dashboard OTLP/gRPC listen address on the host.
-    #[arg(
-        long = "otlp-grpc-addr",
-        value_name = "HOST:PORT",
-        default_value = "127.0.0.1:18889"
-    )]
-    otlp_grpc_addr: SocketAddr,
-
-    /// Dashboard OTLP/HTTP (protobuf) listen address on the host.
-    #[arg(
-        long = "otlp-http-addr",
-        value_name = "HOST:PORT",
-        default_value = "127.0.0.1:18890"
-    )]
-    otlp_http_addr: SocketAddr,
-
-    /// Run the dashboard in the background.
-    #[arg(long = "detach")]
-    detach: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunTargetKind {
     Direct,
@@ -826,6 +857,7 @@ struct PreparedMixedRunInputs {
     interface: RunInterface,
     root_env: BTreeMap<String, String>,
     external_slot_env: BTreeMap<String, String>,
+    prompted_for_inputs: bool,
 }
 
 #[tokio::main]
@@ -845,10 +877,10 @@ async fn main() -> Result<()> {
                 Command::Check(args) => check(args).await,
                 Command::Docs(args) => docs(args),
                 Command::Run(args) => run(args).await,
+                Command::Attach(args) => attach(args).await,
                 Command::Stop(args) => stop(args).await,
                 Command::Ps(args) => ps(args),
                 Command::Logs(args) => logs(args).await,
-                Command::Dashboard(args) => dashboard(args).await,
                 Command::RunDirectInit(args) => run_direct_init(args).await,
                 Command::RunVmInit(args) => {
                     vm_runtime::run_vm_init(
@@ -883,57 +915,10 @@ async fn main() -> Result<()> {
     };
 
     tokio::task::block_in_place(shutdown_tracer_provider);
-    result
-}
-
-async fn dashboard(args: DashboardArgs) -> Result<()> {
-    let image = args
-        .image
-        .unwrap_or_else(|| "mcr.microsoft.com/dotnet/nightly/aspire-dashboard".to_string());
-
-    println!("dashboard ui: http://{}", args.ui_addr);
-    println!("dashboard otlp grpc: http://{}", args.otlp_grpc_addr);
-    println!("dashboard otlp http: http://{}", args.otlp_http_addr);
-    println!(
-        "from docker compose containers use: http://host.docker.internal:{}",
-        args.otlp_http_addr.port()
-    );
-
-    let mut cmd = ProcessCommand::new("docker");
-    cmd.arg("run");
-    if args.detach {
-        cmd.arg("-d");
-    } else {
-        cmd.arg("--rm");
+    match result {
+        Err(err) if is_interactive_input_cancelled(&err) => Ok(()),
+        other => other,
     }
-    cmd.args(["--name", &args.name]);
-    cmd.args([
-        "-p",
-        &format!("{}:18888", args.ui_addr),
-        "-p",
-        &format!("{}:18889", args.otlp_grpc_addr),
-        "-p",
-        &format!("{}:18890", args.otlp_http_addr),
-    ]);
-    cmd.args([
-        "-e",
-        "DOTNET_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true",
-        "-e",
-        "ASPNETCORE_URLS=http://0.0.0.0:18888",
-        "-e",
-        "DOTNET_DASHBOARD_OTLP_ENDPOINT_URL=http://0.0.0.0:18889",
-        "-e",
-        "DOTNET_DASHBOARD_OTLP_HTTP_ENDPOINT_URL=http://0.0.0.0:18890",
-    ]);
-    cmd.arg(image);
-
-    let status = cmd
-        .status()
-        .map_err(|err| miette::miette!("failed to run docker: {err}"))?;
-    if !status.success() {
-        return Err(miette::miette!("dashboard exited with status {status}"));
-    }
-    Ok(())
 }
 
 async fn run_vm_guestfwd_bridge(args: RunVmGuestfwdBridgeArgs) -> Result<()> {
@@ -1240,9 +1225,18 @@ fn docs(args: DocsArgs) -> Result<()> {
     docs::run(args)
 }
 
+fn managed_run_observability(requested: Option<&str>) -> Option<&str> {
+    match requested.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Some("local"),
+        Some("off" | "none") => None,
+        Some(value) => Some(value),
+    }
+}
+
 async fn run(args: RunArgs) -> Result<()> {
     let unstable_options = args.unstable.iter().any(|flag| flag == "unstable-options");
     let interactive = run_interactive();
+    let managed_observability = managed_run_observability(args.observability.as_deref());
     if (args.dry_run || args.emit_launch_bundle.is_some()) && !unstable_options {
         return Err(miette::miette!(
             "`amber run --dry-run` and `--emit-launch-bundle` are unstable; pass `-Z \
@@ -1276,8 +1270,14 @@ async fn run(args: RunArgs) -> Result<()> {
     let placement = load_placement_file(args.placement.as_deref())?;
     if let Some(output_path) = args.emit_env_file.as_deref() {
         if let Some(target) = try_load_run_target(&args.output)? {
-            let interface = interface_for_run_target(&target)?;
-            return write_env_file_output(output_path, &render_run_env_file(&interface));
+            let target_interface = interface_for_run_target(&target)?;
+            return write_env_file_output(
+                output_path,
+                &render_run_env_file(
+                    &target_interface.interface,
+                    target_interface.root_schema.as_ref(),
+                ),
+            );
         }
 
         let compiled = compile_for_run(&args.output).await?;
@@ -1285,7 +1285,10 @@ async fn run(args: RunArgs) -> Result<()> {
             .into_diagnostic()
             .wrap_err("failed to build mixed-site run plan")?;
         let interface = collect_run_interface(&run_plan)?;
-        return write_env_file_output(output_path, &render_run_env_file(&interface));
+        return write_env_file_output(
+            output_path,
+            &render_run_env_file(&interface, run_plan_root_schema(&run_plan)),
+        );
     }
 
     if let Some(target) = try_load_run_target(&args.output)? {
@@ -1297,7 +1300,7 @@ async fn run(args: RunArgs) -> Result<()> {
                          manifests and run plans"
                     ));
                 }
-                let interface = interface_for_run_target(&target)?;
+                let interface = interface_for_run_target(&target)?.interface;
                 let explicit_env =
                     load_run_env(None, &args.env_file, &args.config_file, &interface)?;
                 with_scoped_run_env(&explicit_env, || async {
@@ -1321,7 +1324,7 @@ async fn run(args: RunArgs) -> Result<()> {
                          manifests and run plans"
                     ));
                 }
-                let interface = interface_for_run_target(&target)?;
+                let interface = interface_for_run_target(&target)?.interface;
                 let explicit_env =
                     load_run_env(None, &args.env_file, &args.config_file, &interface)?;
                 with_scoped_run_env(&explicit_env, || async {
@@ -1357,7 +1360,7 @@ async fn run(args: RunArgs) -> Result<()> {
                         Some(&target.plan),
                         &run_plan,
                         bundle_root,
-                        args.observability.as_deref(),
+                        managed_observability,
                         &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
                     )
                     .map(|_| ());
@@ -1367,18 +1370,17 @@ async fn run(args: RunArgs) -> Result<()> {
                         &run_plan,
                         args.storage_root.as_deref(),
                         Some(&target.plan),
-                        args.observability.as_deref(),
+                        managed_observability,
                         &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
                     )
                     .await;
                 }
                 if interactive {
                     return run_attached_mixed_run(
-                        &args.output,
                         Some(&target.plan),
                         &run_plan,
                         args.storage_root.as_deref(),
-                        args.observability.as_deref(),
+                        managed_observability,
                         prepared,
                     )
                     .await;
@@ -1387,7 +1389,7 @@ async fn run(args: RunArgs) -> Result<()> {
                     Some(&target.plan),
                     &run_plan,
                     args.storage_root.as_deref(),
-                    args.observability.as_deref(),
+                    managed_observability,
                     &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
                 )
                 .await
@@ -1417,7 +1419,7 @@ async fn run(args: RunArgs) -> Result<()> {
             &run_plan,
             args.storage_root.as_deref(),
             None,
-            args.observability.as_deref(),
+            managed_observability,
             &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
         )
         .await;
@@ -1431,18 +1433,17 @@ async fn run(args: RunArgs) -> Result<()> {
             None,
             &run_plan,
             bundle_root,
-            args.observability.as_deref(),
+            managed_observability,
             &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
         )
         .map(|_| ());
     }
     if interactive {
         return run_attached_mixed_run(
-            &args.output,
             None,
             &run_plan,
             args.storage_root.as_deref(),
-            args.observability.as_deref(),
+            managed_observability,
             prepared,
         )
         .await;
@@ -1451,7 +1452,7 @@ async fn run(args: RunArgs) -> Result<()> {
         None,
         &run_plan,
         args.storage_root.as_deref(),
-        args.observability.as_deref(),
+        managed_observability,
         &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
     )
     .await
@@ -1461,11 +1462,19 @@ async fn run(args: RunArgs) -> Result<()> {
     })
 }
 
-fn interface_for_run_target(target: &RunTarget) -> Result<RunInterface> {
+struct RunTargetInterface {
+    interface: RunInterface,
+    root_schema: Option<Value>,
+}
+
+fn interface_for_run_target(target: &RunTarget) -> Result<RunTargetInterface> {
     match target.kind {
         RunTargetKind::MixedRunPlan => {
             let run_plan = load_run_plan(&target.plan)?;
-            collect_run_interface(&run_plan)
+            Ok(RunTargetInterface {
+                interface: collect_run_interface(&run_plan)?,
+                root_schema: run_plan_root_schema(&run_plan).cloned(),
+            })
         }
         RunTargetKind::Direct | RunTargetKind::Vm => {
             let artifact_dir = target.plan.parent().ok_or_else(|| {
@@ -1476,14 +1485,20 @@ fn interface_for_run_target(target: &RunTarget) -> Result<RunInterface> {
             })?;
             let env_example_path = artifact_dir.join("env.example");
             if !env_example_path.is_file() {
-                return Ok(RunInterface::default());
+                return Ok(RunTargetInterface {
+                    interface: RunInterface::default(),
+                    root_schema: None,
+                });
             }
             let contents = fs::read_to_string(&env_example_path)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("failed to read {}", env_example_path.display()))?;
-            Ok(RunInterface {
-                root_inputs: parse_env_sample(&contents)?,
-                ..RunInterface::default()
+            Ok(RunTargetInterface {
+                interface: RunInterface {
+                    root_inputs: parse_env_sample(&contents)?,
+                    ..RunInterface::default()
+                },
+                root_schema: None,
             })
         }
     }
@@ -1524,7 +1539,7 @@ async fn run_detached(
     let log_path = run_root.join("coordinator.log");
     let source_plan = source_plan_path.map(|path| canonicalize_user_path(path, "source run plan"));
     let source_plan = source_plan.transpose()?;
-    mixed_run::spawn_detached_child(&run_root, &log_path, |cmd| {
+    let mut coordinator = mixed_run::spawn_detached_child(&run_root, &log_path, |cmd| {
         cmd.arg("run-detached-coordinator")
             .arg("--plan")
             .arg(&plan_path)
@@ -1540,9 +1555,9 @@ async fn run_detached(
             cmd.arg("--observability").arg(observability);
         }
     })?;
-
-    println!("run_id={run_id}");
-    println!("run_root={}", run_root.display());
+    let interactive_stdout = io::stdout().is_terminal();
+    wait_for_detached_run_ready(&mut coordinator, &run_id, &run_root, &log_path).await?;
+    print_run_follow_up(&run_id, &run_root, interactive_stdout);
     Ok(())
 }
 
@@ -1589,14 +1604,24 @@ fn prepare_mixed_run_inputs(
 ) -> Result<PreparedMixedRunInputs> {
     let interface = collect_run_interface(run_plan)?;
     let root_schema = run_plan_root_schema(run_plan);
+    let prompt_optional_external_slots = env_files.is_empty() && config_file_overrides.is_empty();
     let mut env = load_run_env(
         project_env_root,
         env_files,
         config_file_overrides,
         &interface,
     )?;
+    let prompted_for_inputs = interactive
+        && (!missing_required_root_inputs(&env, &interface).is_empty()
+            || !promptable_external_slots(&env, &interface, prompt_optional_external_slots)
+                .is_empty());
     if interactive {
-        prompt_for_missing_inputs(&mut env, &interface, root_schema)?;
+        prompt_for_missing_inputs(
+            &mut env,
+            &interface,
+            root_schema,
+            prompt_optional_external_slots,
+        )?;
     }
 
     let root_env = select_root_env(&env, &interface);
@@ -1611,23 +1636,30 @@ fn prepare_mixed_run_inputs(
 
     let missing_slots = missing_required_external_slots(&env, &interface);
     if require_complete_inputs && (!missing_root.is_empty() || !missing_slots.is_empty()) {
+        let has_missing_root = !missing_root.is_empty();
         let mut message = String::from("missing required runtime inputs:");
-        for input in missing_root {
+        for input in &missing_root {
             message.push_str(&format!(
                 "\n  - {} for config.{}",
                 input.env_var, input.path
             ));
         }
-        for slot in missing_slots {
+        for slot in &missing_slots {
             message.push_str(&format!("\n  - {} for slot.{}", slot.env_var, slot.name));
         }
         if let Some(project_env_root) = project_env_root {
-            message.push_str(&format!(
-                "\n\nProvide them via ambient environment, `--env-file`, or {}",
-                project_env_path(project_env_root).display()
-            ));
+            message.push_str("\n\nProvide them via ambient environment");
+            if has_missing_root {
+                message.push_str(", `--config-file`");
+            }
+            message.push_str(", `--env-file`, or ");
+            message.push_str(&project_env_path(project_env_root).display().to_string());
         } else {
-            message.push_str("\n\nProvide them via ambient environment or `--env-file`.");
+            message.push_str("\n\nProvide them via ambient environment");
+            if has_missing_root {
+                message.push_str(", `--config-file`");
+            }
+            message.push_str(", or `--env-file`.");
         }
         return Err(miette::miette!(message));
     }
@@ -1636,6 +1668,7 @@ fn prepare_mixed_run_inputs(
         root_env,
         external_slot_env: select_external_slot_env(&env, &interface),
         interface,
+        prompted_for_inputs,
     })
 }
 
@@ -1680,6 +1713,180 @@ fn export_listener_url(protocol: &str, addr: SocketAddr) -> String {
     }
 }
 
+fn print_run_follow_up(run_id: &str, run_root: &Path, interactive_stdout: bool) {
+    println!("run_id={run_id}");
+    println!("run_root={}", run_root.display());
+    if interactive_stdout {
+        println!("attach=amber attach {run_id}");
+        println!("logs=amber logs -f {run_id}");
+        println!("stop=amber stop {run_id}");
+    }
+}
+
+async fn wait_for_detached_run_ready(
+    coordinator: &mut Child,
+    run_id: &str,
+    run_root: &Path,
+    log_path: &Path,
+) -> Result<()> {
+    let receipt_path = run_root.join("receipt.json");
+    loop {
+        if receipt_path.is_file() {
+            return Ok(());
+        }
+        if let Some(status) = coordinator.try_wait().into_diagnostic()? {
+            return Err(miette::miette!(
+                "detached run `{run_id}` exited before it became ready (status {status}); see {}",
+                log_path.display()
+            ));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn print_run_section_heading(writer: &mut impl io::Write, title: &str, color: Color) -> Result<()> {
+    execute!(
+        writer,
+        SetForegroundColor(color),
+        SetAttribute(Attribute::Bold),
+        Print(title),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        Print("\n")
+    )
+    .into_diagnostic()
+}
+
+fn print_run_badge(writer: &mut impl io::Write, label: &str, color: Color) -> Result<()> {
+    queue!(
+        writer,
+        Print(" "),
+        SetForegroundColor(color),
+        Print(format!("[{label}]")),
+        ResetColor
+    )
+    .into_diagnostic()
+}
+
+fn render_status_indicator(
+    writer: &mut impl io::Write,
+    frame_index: usize,
+    label: &str,
+    accent_color: Color,
+) -> Result<()> {
+    let frame = ATTACHED_RUN_STATUS_SPINNER_FRAMES
+        .get(frame_index % ATTACHED_RUN_STATUS_SPINNER_FRAMES.len())
+        .copied()
+        .unwrap_or("-");
+    execute!(
+        writer,
+        MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+        SetForegroundColor(accent_color),
+        SetAttribute(Attribute::Bold),
+        Print(frame),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        Print(" "),
+        SetForegroundColor(Color::DarkGrey),
+        Print(label),
+        ResetColor
+    )
+    .into_diagnostic()?;
+    writer.flush().into_diagnostic()
+}
+
+fn clear_status_indicator(writer: &mut impl io::Write) -> Result<()> {
+    execute!(writer, MoveToColumn(0), Clear(ClearType::CurrentLine)).into_diagnostic()?;
+    writer.flush().into_diagnostic()
+}
+
+fn print_export_bindings(
+    writer: &mut impl io::Write,
+    interface: &RunInterface,
+    export_bindings: &BTreeMap<String, SocketAddr>,
+) -> Result<()> {
+    if export_bindings.is_empty() {
+        return Ok(());
+    }
+
+    print_run_section_heading(writer, "Exports", Color::DarkMagenta)?;
+    for (name, addr) in export_bindings {
+        let protocol = interface
+            .exports
+            .iter()
+            .find(|export| export.name == *name)
+            .map(|export| export.protocol.as_str())
+            .unwrap_or("http");
+        queue!(
+            writer,
+            Print("  "),
+            SetForegroundColor(Color::Magenta),
+            SetAttribute(Attribute::Bold),
+            Print(name),
+            SetAttribute(Attribute::Reset),
+            ResetColor
+        )
+        .into_diagnostic()?;
+        print_run_badge(writer, protocol, Color::DarkGrey)?;
+        queue!(
+            writer,
+            Print(": "),
+            Print(export_listener_url(protocol, *addr)),
+            Print("\n")
+        )
+        .into_diagnostic()?;
+    }
+    writer.flush().into_diagnostic()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachedSessionMode {
+    ForegroundRun,
+    ExistingRun,
+}
+
+fn auto_export_bindings(interface: &RunInterface) -> Result<BTreeMap<String, SocketAddr>> {
+    interface
+        .exports
+        .iter()
+        .map(|export| {
+            Ok((
+                export.name.clone(),
+                SocketAddr::from(([127, 0, 0, 1], mixed_run::reserve_loopback_port()?)),
+            ))
+        })
+        .collect()
+}
+
+fn print_run_session_overview(
+    writer: &mut impl io::Write,
+    _mode: AttachedSessionMode,
+    run_id: &str,
+    run_root: &Path,
+    interface: &RunInterface,
+    export_bindings: &BTreeMap<String, SocketAddr>,
+) -> Result<()> {
+    print_run_section_heading(writer, "Run", Color::DarkMagenta)?;
+    queue!(
+        writer,
+        Print(format!("  id: {run_id}\n")),
+        Print(format!("  root: {}\n", run_root.display())),
+    )
+    .into_diagnostic()?;
+    writer.flush().into_diagnostic()?;
+    if export_bindings.is_empty() {
+        print_run_section_heading(writer, "Exports", Color::DarkMagenta)?;
+        queue!(writer, Print("  none declared\n")).into_diagnostic()?;
+        writer.flush().into_diagnostic()?;
+    } else {
+        print_export_bindings(writer, interface, export_bindings)?;
+    }
+    queue!(writer, Print("\n")).into_diagnostic()?;
+    print_run_section_heading(writer, "Interactions", Color::DarkGreen)?;
+    writer.flush().into_diagnostic()
+}
+
 async fn with_scoped_run_env<F, Fut, T>(vars: &BTreeMap<String, String>, run: F) -> T
 where
     F: FnOnce() -> Fut,
@@ -1689,130 +1896,315 @@ where
     run().await
 }
 
+trait StatusIndicator {
+    fn show(&mut self, frame_index: usize) -> Result<()>;
+    fn clear(&mut self) -> Result<()>;
+}
+
+struct SpinnerStatusIndicator<'a, W> {
+    writer: &'a mut W,
+    label: &'static str,
+    accent_color: Color,
+}
+
+impl<W: io::Write> SpinnerStatusIndicator<'_, W> {
+    fn new<'a>(
+        writer: &'a mut W,
+        label: &'static str,
+        accent_color: Color,
+    ) -> SpinnerStatusIndicator<'a, W> {
+        SpinnerStatusIndicator {
+            writer,
+            label,
+            accent_color,
+        }
+    }
+}
+
+impl<W: io::Write> StatusIndicator for SpinnerStatusIndicator<'_, W> {
+    fn show(&mut self, frame_index: usize) -> Result<()> {
+        render_status_indicator(self.writer, frame_index, self.label, self.accent_color)
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        clear_status_indicator(self.writer)
+    }
+}
+
+async fn await_with_status_indicator<T, F, S>(
+    future: F,
+    delay: Option<Duration>,
+    tick_interval: Duration,
+    indicator: &mut S,
+) -> Result<(T, bool)>
+where
+    F: Future<Output = T>,
+    S: StatusIndicator,
+{
+    tokio::pin!(future);
+    let mut shown = false;
+    let mut frame_index = 0usize;
+
+    if delay.is_none() {
+        indicator.show(frame_index)?;
+        shown = true;
+        frame_index = frame_index.wrapping_add(1);
+    }
+
+    let next_tick = sleep(delay.unwrap_or(tick_interval));
+    tokio::pin!(next_tick);
+
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                if shown {
+                    indicator.clear()?;
+                }
+                return Ok((result, shown));
+            }
+            _ = &mut next_tick => {
+                indicator.show(frame_index)?;
+                shown = true;
+                frame_index = frame_index.wrapping_add(1);
+                next_tick.as_mut().reset(Instant::now() + tick_interval);
+            }
+        }
+    }
+}
+
+async fn stop_run_with_cleanup_notice(
+    run_id: &str,
+    storage_root_override: Option<&Path>,
+) -> Result<()> {
+    if io::stdout().is_terminal() {
+        let mut stdout = io::stdout();
+        let mut indicator =
+            SpinnerStatusIndicator::new(&mut stdout, "Cleaning up run...", Color::DarkGrey);
+        let (result, _) = await_with_status_indicator(
+            mixed_run::stop_run(run_id, storage_root_override),
+            None,
+            ATTACHED_RUN_STATUS_SPINNER_TICK,
+            &mut indicator,
+        )
+        .await?;
+        result
+    } else {
+        mixed_run::stop_run(run_id, storage_root_override).await
+    }
+}
+
+fn cleanup_temporary_run_outside_proxy(
+    run_root: &Path,
+    proxy_child: &mut Option<Child>,
+) -> Result<()> {
+    if let Some(mut proxy_child) = proxy_child.take() {
+        let _ = proxy_child.kill();
+        let _ = proxy_child.wait();
+    }
+    mixed_run::clear_run_outside_proxy_state(run_root)
+}
+
+enum AttachedRunStorage {
+    Persistent(PathBuf),
+    Managed(PathBuf),
+}
+
+impl AttachedRunStorage {
+    fn new(storage_root_override: Option<&Path>) -> Result<Self> {
+        if let Some(root) = storage_root_override {
+            return Ok(Self::Persistent(mixed_run::mixed_run_storage_root(Some(
+                root,
+            ))?));
+        }
+        Ok(Self::Managed(mixed_run::mixed_run_storage_root(None)?))
+    }
+
+    fn storage_root(&self) -> &Path {
+        match self {
+            Self::Persistent(path) => path.as_path(),
+            Self::Managed(path) => path.as_path(),
+        }
+    }
+
+    fn should_cleanup_run_root(&self) -> bool {
+        matches!(self, Self::Managed(_))
+    }
+
+    fn cleanup_run_root(&self, run_root: &Path) -> Result<()> {
+        if !self.should_cleanup_run_root() || !run_root.exists() {
+            return Ok(());
+        }
+        fs::remove_dir_all(run_root)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to remove {}", run_root.display()))
+    }
+}
+
 async fn run_attached_mixed_run(
-    target: &str,
     source_plan_path: Option<&Path>,
     run_plan: &RunPlan,
     storage_root_override: Option<&Path>,
     observability: Option<&str>,
     prepared: PreparedMixedRunInputs,
 ) -> Result<()> {
-    let receipt = mixed_run::run_run_plan(
-        source_plan_path,
-        run_plan,
-        storage_root_override,
-        observability,
-        &prepared.root_env,
-    )
-    .await?;
-    let run_root = PathBuf::from(&receipt.run_root);
+    let attached_storage = AttachedRunStorage::new(storage_root_override)?;
+    let storage_root_override = Some(attached_storage.storage_root());
+    let startup = async {
+        let receipt = mixed_run::run_run_plan(
+            source_plan_path,
+            run_plan,
+            storage_root_override,
+            observability,
+            &prepared.root_env,
+        )
+        .await?;
+        let run_root = PathBuf::from(&receipt.run_root);
 
-    let export_bindings = prepared
-        .interface
-        .exports
-        .iter()
-        .map(|export| {
-            Ok((
-                export.name.clone(),
-                SocketAddr::from(([127, 0, 0, 1], mixed_run::reserve_loopback_port()?)),
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let slot_bindings = prepared
-        .interface
-        .external_slots
-        .iter()
-        .filter_map(|slot| {
-            prepared
-                .external_slot_env
-                .get(&slot.env_var)
-                .map(|value| (slot.name.clone(), value.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut proxy_child = if slot_bindings.is_empty() && export_bindings.is_empty() {
+        let export_bindings = auto_export_bindings(&prepared.interface)?;
+        let slot_bindings = prepared
+            .interface
+            .external_slots
+            .iter()
+            .filter_map(|slot| {
+                prepared
+                    .external_slot_env
+                    .get(&slot.env_var)
+                    .map(|value| (slot.name.clone(), value.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut proxy_child = if slot_bindings.is_empty() && export_bindings.is_empty() {
+            None
+        } else {
+            Some(mixed_run::spawn_run_outside_proxy(
+                &run_root,
+                &slot_bindings,
+                &export_bindings,
+            )?)
+        };
+        if proxy_child.is_some()
+            && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
+        {
+            cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child)?;
+            let _ = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
+            return Err(err);
+        }
+
+        Ok((receipt, run_root, export_bindings, proxy_child))
+    };
+
+    let ((receipt, run_root, export_bindings, mut proxy_child), startup_status_shown) =
+        if io::stdout().is_terminal() {
+            let mut stdout = io::stdout();
+            let mut indicator =
+                SpinnerStatusIndicator::new(&mut stdout, "Starting scenario...", Color::Magenta);
+            let (startup_result, shown) = await_with_status_indicator(
+                startup,
+                Some(ATTACHED_RUN_STARTUP_NOTICE_DELAY),
+                ATTACHED_RUN_STATUS_SPINNER_TICK,
+                &mut indicator,
+            )
+            .await?;
+            (startup_result?, shown)
+        } else {
+            (startup.await?, false)
+        };
+
+    let mut stdout = io::stdout();
+    if prepared.prompted_for_inputs || startup_status_shown {
+        queue!(stdout, Print("\n")).into_diagnostic()?;
+    }
+    print_run_session_overview(
+        &mut stdout,
+        AttachedSessionMode::ForegroundRun,
+        &receipt.run_id,
+        &run_root,
+        &prepared.interface,
+        &export_bindings,
+    )?;
+
+    let result = stream_run_logs_until(
+        &run_root,
+        RunLogOptions {
+            follow: true,
+            print_existing: true,
+        },
+    )
+    .await;
+    let proxy_cleanup_result = cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
+    let stop_result = stop_run_with_cleanup_notice(&receipt.run_id, storage_root_override).await;
+    result?;
+    proxy_cleanup_result?;
+    stop_result?;
+    attached_storage.cleanup_run_root(&run_root)
+}
+
+async fn attach(args: AttachArgs) -> Result<()> {
+    let run_root = mixed_run::maybe_resolve_run_root(&args.run, args.storage_root.as_deref())?
+        .ok_or_else(|| {
+            miette::miette!("`amber attach` expects a mixed-site run id, run root, or receipt path")
+        })?;
+    let receipt: mixed_run::RunReceipt =
+        mixed_run::read_json(&run_root.join("receipt.json"), "run receipt")?;
+    let run_plan: RunPlan = mixed_run::read_json(&run_root.join("run-plan.json"), "run plan")?;
+    let interface = collect_run_interface(&run_plan)?;
+    let export_bindings = auto_export_bindings(&interface)?;
+
+    let mut proxy_child = if export_bindings.is_empty() {
         None
     } else {
         Some(mixed_run::spawn_run_outside_proxy(
             &run_root,
-            &slot_bindings,
+            &BTreeMap::new(),
             &export_bindings,
         )?)
     };
     if proxy_child.is_some()
         && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
     {
-        if let Some(proxy_child) = proxy_child.as_mut() {
-            let _ = proxy_child.kill();
-            let _ = proxy_child.wait();
-        }
-        let _ = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
+        cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child)?;
         return Err(err);
     }
 
-    let reuse_path = if prepared.interface.root_inputs.is_empty() {
-        None
-    } else {
-        let path = run_root.join("root-config.env");
-        fs::write(
-            &path,
-            render_root_reuse_env(&prepared.root_env, &prepared.interface),
-        )
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to write {}", path.display()))?;
-        Some(path)
-    };
-
-    for line in render_resolved_input_lines(
-        &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
-        &prepared.interface,
-    ) {
-        println!("{line}");
-    }
-    if !prepared.interface.root_inputs.is_empty() || !prepared.interface.external_slots.is_empty() {
-        println!();
-    }
-    println!("Ready.");
-    for (name, addr) in &export_bindings {
-        let protocol = prepared
-            .interface
-            .exports
-            .iter()
-            .find(|export| export.name == *name)
-            .map(|export| export.protocol.as_str())
-            .unwrap_or("http");
-        println!("  {name}  {}", export_listener_url(protocol, *addr));
-    }
-    if let Some(path) = reuse_path.as_ref() {
-        println!();
-        println!("Reuse:");
-        println!("  amber run {target} --env-file {}", path.display());
-    }
+    let mut stdout = io::stdout();
+    print_run_session_overview(
+        &mut stdout,
+        AttachedSessionMode::ExistingRun,
+        &receipt.run_id,
+        &run_root,
+        &interface,
+        &export_bindings,
+    )?;
 
     let result = stream_run_logs_until(
         &run_root,
         RunLogOptions {
             follow: true,
-            print_existing: false,
+            print_existing: true,
         },
     )
     .await;
-    let stop_result = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
-    if let Some(proxy_child) = proxy_child.as_mut() {
-        let _ = proxy_child.kill();
-        let _ = proxy_child.wait();
-    }
+    let cleanup_result = cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
     result?;
-    stop_result
+    cleanup_result?;
+    Ok(())
 }
 
 fn ps(args: PsArgs) -> Result<()> {
     let storage_root = mixed_run::mixed_run_storage_root(args.storage_root.as_deref())?;
-    print_run_ps(&storage_root)
+    let human_output = if args.human {
+        true
+    } else if args.tsv {
+        false
+    } else {
+        io::stdout().is_terminal()
+    };
+    print_run_ps(&storage_root, human_output)
 }
 
 async fn logs(args: LogsArgs) -> Result<()> {
     let storage_root = mixed_run::mixed_run_storage_root(args.storage_root.as_deref())?;
-    let run_root = storage_root.join("runs").join(&args.run_id);
+    let run_root = mixed_run::maybe_resolve_run_root(&args.run, args.storage_root.as_deref())?
+        .unwrap_or_else(|| storage_root.join("runs").join(&args.run));
     if args.follow {
         stream_run_logs_until(
             &run_root,

@@ -15,7 +15,8 @@ use amber_compiler::{
 use amber_manifest::CapabilityTransport;
 use amber_mesh::{
     InboundRoute, InboundTarget, MeshConfig, MeshIdentity, MeshIdentityPublic, MeshPeer,
-    MeshProtocol, OutboundRoute, TransportConfig, component_route_id, router_export_route_id,
+    MeshProtocol, OutboundRoute, TransportConfig, component_route_id,
+    http_route_plugins_for_capability_kind, public_export_rewrite_route_id, router_export_route_id,
 };
 use amber_router::control::{PreboundListeners, run_with_listeners};
 use base64::Engine as _;
@@ -288,6 +289,10 @@ impl PreparedProxy {
         for binding in &self.export_bindings {
             let export_meta = &self.target.metadata.exports[&binding.export];
             let protocol = mesh_protocol_from_metadata(&export_meta.protocol)?;
+            let http_plugins = http_route_plugins_for_capability_kind(
+                export_meta.capability_kind.as_deref(),
+                protocol,
+            );
             let register_payload = ControlExportPayload::new(
                 &self.proxy_identity,
                 &export_meta.protocol,
@@ -323,13 +328,18 @@ impl PreparedProxy {
                 .unwrap_or_else(|| router_export_route_id(&binding.export, protocol));
             outbound.push(OutboundRoute {
                 route_id,
+                rewrite_route_id: Some(public_export_rewrite_route_id(
+                    &export_meta.component,
+                    &export_meta.provide,
+                    protocol,
+                )),
                 slot: binding.export.clone(),
-                capability_kind: None,
-                capability_profile: None,
+                capability_kind: export_meta.capability_kind.clone(),
+                capability_profile: export_meta.capability_profile.clone(),
                 listen_port: binding.listen.port(),
                 listen_addr: Some(binding.listen.ip().to_string()),
                 protocol,
-                http_plugins: Vec::new(),
+                http_plugins,
                 peer_addr: self
                     .router_addr
                     .expect("router address should exist when export bindings are present")

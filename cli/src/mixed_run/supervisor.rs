@@ -789,21 +789,18 @@ pub(super) async fn ensure_site_running(
             if !runtime.site_started {
                 runtime.last_start_attempt = Some(Instant::now());
                 runtime.ready_since = None;
-                let status = compose_command(
+                let output = compose_command(
                     plan.compose_project.as_deref(),
                     Path::new(&plan.artifact_dir),
                 )
                 .envs(plan.launch_env.clone())
                 .arg("up")
                 .arg("-d")
-                .status()
+                .output()
                 .into_diagnostic()
                 .wrap_err_with(|| format!("failed to start compose site `{}`", plan.site_id))?;
-                if !status.success() {
-                    return Err(miette::miette!(
-                        "compose site `{}` failed to start with status {status}",
-                        plan.site_id
-                    ));
+                if !output.status.success() {
+                    return Err(compose_start_failure(&plan.site_id, &output));
                 }
                 runtime.site_started = true;
             }
@@ -1309,6 +1306,54 @@ pub(super) fn compose_command(project_name: Option<&str>, artifact_dir: &Path) -
     }
     cmd.current_dir(artifact_dir);
     cmd
+}
+
+pub(super) fn compose_start_failure(
+    site_id: &str,
+    output: &std::process::Output,
+) -> miette::Report {
+    let detail = command_failure_detail(output);
+    if docker_daemon_unavailable(&detail) {
+        if detail.is_empty() {
+            miette::miette!(
+                "compose site `{site_id}` could not reach Docker. Start Docker Desktop or the \
+                 Docker daemon, then try again."
+            )
+        } else {
+            miette::miette!(
+                "compose site `{site_id}` could not reach Docker. Start Docker Desktop or the \
+                 Docker daemon, then try again.\n  detail: {detail}"
+            )
+        }
+    } else if detail.is_empty() {
+        miette::miette!(
+            "compose site `{site_id}` failed to start with status {}",
+            output.status
+        )
+    } else {
+        miette::miette!("compose site `{site_id}` failed to start: {detail}")
+    }
+}
+
+fn command_failure_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stderr
+        .lines()
+        .chain(stdout.lines())
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn docker_daemon_unavailable(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("cannot connect to the docker daemon")
+        || detail.contains("is the docker daemon running")
+        || detail.contains("docker desktop is not running")
+        || detail.contains("cannot connect to the docker desktop linux vm")
 }
 
 pub(super) fn read_compose_launch_env(

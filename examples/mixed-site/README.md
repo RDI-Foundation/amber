@@ -66,16 +66,9 @@ On a first interactive run, Amber may:
 Example:
 
 ```text
-config.tenant: acme-local
-config.catalog_token: ********
-slot.catalog_api: http://127.0.0.1:9100
-
-Ready.
-  app  http://127.0.0.1:18080
-  api  http://127.0.0.1:18081
-
-Reuse:
-  amber run . --env-file /path/to/generated.env
+Exports
+  app [http]: http://127.0.0.1:18080
+  api [http]: http://127.0.0.1:18081
 ```
 
 Your addresses may differ.
@@ -116,19 +109,15 @@ That response proves the whole path:
 - the direct `web` component called the Compose `api` component
 - the Compose `api` component called the outside `catalog_api` service you attached at run time
 
-## 4) Reuse the same config later
+## 4) Make the next run non-interactive
 
-After a successful interactive start, Amber prints an explicit replay command such as:
+If you want to avoid prompts on the next run, generate an env template and fill it in explicitly:
 
 ```sh
-amber run . --env-file .amber-runs/runs/<run-id>/root-config.env
+amber run . --emit-env-file .env.example
+$EDITOR .env.example
+amber run . --env-file .env.example
 ```
-
-That generated env file contains the root config values Amber collected for that run. It does not
-replace your own project `.env`; it is just the explicit reuse path Amber gives you immediately.
-
-External slot values are still runtime inputs. If you do not provide them in an existing `.env` or
-an explicit `--env-file`, Amber may prompt for them again on the next interactive run.
 
 ## 5) Stop the outside service and start it again
 

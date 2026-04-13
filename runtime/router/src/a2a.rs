@@ -40,10 +40,9 @@ pub(super) struct UrlRewriteTable {
     route_by_loopback_port: HashMap<u16, String>,
     #[cfg(test)]
     route_by_host_port: HashMap<(String, u16), String>,
-    #[cfg(test)]
-    local_target_by_route: HashMap<String, LocalRouteTarget>,
     upcast_plan: Option<Arc<StreamRewritePlan>>,
     downcast_plan: Option<Arc<StreamRewritePlan>>,
+    downcast_plan_by_route: HashMap<String, Arc<StreamRewritePlan>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,30 +64,41 @@ impl UrlRewriteTable {
         let mut route_by_loopback_port_raw: HashMap<u16, Option<String>> = HashMap::new();
         let mut route_by_host_port_raw: HashMap<(String, u16), Option<String>> = HashMap::new();
         let mut local_target_by_route: HashMap<String, LocalRouteTarget> = HashMap::new();
+        let mut downcast_map_by_route: HashMap<String, HashMap<Vec<u8>, Vec<u8>>> = HashMap::new();
 
         for route in outbound {
             if !a2a_http_route(route.protocol, &route.http_plugins) {
                 continue;
             }
+            let rewrite_route_id = route
+                .rewrite_route_id
+                .as_deref()
+                .unwrap_or(route.route_id.as_str());
             let Some(host) = normalize_host(route.listen_addr.as_deref().unwrap_or("127.0.0.1"))
             else {
                 continue;
             };
+            let target = LocalRouteTarget {
+                host,
+                port: route.listen_port,
+            };
             register_route_mapping(
-                route.route_id.as_str(),
-                host.clone(),
-                route.listen_port,
+                rewrite_route_id,
+                target.host.clone(),
+                target.port,
                 &mut route_by_loopback_port_raw,
                 &mut route_by_host_port_raw,
             );
             insert_route_target_if_absent(
                 &mut local_target_by_route,
-                route.route_id.as_str(),
-                LocalRouteTarget {
-                    host,
-                    port: route.listen_port,
-                },
+                rewrite_route_id,
+                target.clone(),
             );
+            let route_downcast_map = downcast_map_by_route
+                .entry(route.route_id.clone())
+                .or_default();
+            insert_downcast_mapping(route_downcast_map, rewrite_route_id, &target);
+            insert_downcast_mapping(route_downcast_map, route.route_id.as_str(), &target);
         }
 
         for route in inbound {
@@ -118,17 +128,25 @@ impl UrlRewriteTable {
         let route_by_loopback_port = retain_unique_mappings(route_by_loopback_port_raw);
         let route_by_host_port = retain_unique_mappings(route_by_host_port_raw);
         let upcast_plan = build_upcast_plan(&route_by_host_port, &route_by_loopback_port);
-        let downcast_plan = build_downcast_plan(&local_target_by_route);
+        let shared_downcast_map = build_downcast_map(&local_target_by_route);
+        let downcast_plan = build_stream_rewrite_plan(shared_downcast_map.clone());
+        let downcast_plan_by_route = downcast_map_by_route
+            .into_iter()
+            .filter_map(|(route_id, route_map)| {
+                let mut merged_map = shared_downcast_map.clone();
+                merged_map.extend(route_map);
+                build_stream_rewrite_plan(merged_map).map(|plan| (route_id, plan))
+            })
+            .collect();
 
         Self {
             #[cfg(test)]
             route_by_loopback_port,
             #[cfg(test)]
             route_by_host_port,
-            #[cfg(test)]
-            local_target_by_route,
             upcast_plan,
             downcast_plan,
+            downcast_plan_by_route,
         }
     }
 
@@ -164,26 +182,39 @@ impl UrlRewriteTable {
 
     #[cfg(test)]
     fn downcast(&self, original: &Url) -> Option<Url> {
-        let (route_id, path) = parse_abstract_route(original)?;
-        let target = self.local_target_by_route.get(route_id.as_str())?;
-        let host = format_url_host(target.host.as_str());
-        let mut rewritten = Url::parse(&format!("http://{host}:{}/", target.port)).ok()?;
-        rewritten.set_path(path.as_str());
-        rewritten.set_query(original.query());
-        rewritten.set_fragment(original.fragment());
-        Some(rewritten)
+        self.downcast_for_route(None, original)
     }
 
-    fn stream_rewriter(&self, mode: UrlRewriteMode) -> Option<UrlStreamRewriter> {
+    #[cfg(test)]
+    fn downcast_for_route(&self, route_id: Option<&str>, original: &Url) -> Option<Url> {
+        let mut raw = original.as_str().as_bytes().to_vec();
+        if !self.rewrite_bytes(&mut raw, UrlRewriteMode::Downcast, route_id) {
+            return None;
+        }
+        Url::parse(std::str::from_utf8(raw.as_slice()).ok()?).ok()
+    }
+
+    fn stream_rewriter(
+        &self,
+        mode: UrlRewriteMode,
+        route_id: Option<&str>,
+    ) -> Option<UrlStreamRewriter> {
         let plan = match mode {
             UrlRewriteMode::Upcast => self.upcast_plan.clone(),
-            UrlRewriteMode::Downcast => self.downcast_plan.clone(),
+            UrlRewriteMode::Downcast => route_id
+                .and_then(|route_id| self.downcast_plan_by_route.get(route_id).cloned())
+                .or_else(|| self.downcast_plan.clone()),
         }?;
         Some(UrlStreamRewriter::new(plan))
     }
 
-    fn rewrite_bytes(&self, raw: &mut Vec<u8>, mode: UrlRewriteMode) -> bool {
-        let Some(mut rewriter) = self.stream_rewriter(mode) else {
+    fn rewrite_bytes(
+        &self,
+        raw: &mut Vec<u8>,
+        mode: UrlRewriteMode,
+        route_id: Option<&str>,
+    ) -> bool {
+        let Some(mut rewriter) = self.stream_rewriter(mode, route_id) else {
             return false;
         };
         let rewritten = rewriter.rewrite_chunk(raw.as_slice(), true);
@@ -222,6 +253,23 @@ fn insert_route_target_if_absent(
     target: LocalRouteTarget,
 ) {
     map.entry(route_id.to_string()).or_insert(target);
+}
+
+fn insert_downcast_mapping(
+    map: &mut HashMap<Vec<u8>, Vec<u8>>,
+    route_id: &str,
+    target: &LocalRouteTarget,
+) {
+    let token = URL_SAFE_NO_PAD.encode(route_id.as_bytes());
+    map.insert(
+        format!("{ABSTRACT_ROUTE_SCHEME}://{ABSTRACT_ROUTE_HOST}/{token}").into_bytes(),
+        format!(
+            "http://{}:{}",
+            format_url_host(target.host.as_str()),
+            target.port
+        )
+        .into_bytes(),
+    );
 }
 
 fn insert_unique_or_invalidate<K, V>(map: &mut HashMap<K, Option<V>>, key: K, value: V)
@@ -284,25 +332,16 @@ fn build_upcast_plan(
     build_stream_rewrite_plan(map)
 }
 
-fn build_downcast_plan(
+fn build_downcast_map(
     local_target_by_route: &HashMap<String, LocalRouteTarget>,
-) -> Option<Arc<StreamRewritePlan>> {
+) -> HashMap<Vec<u8>, Vec<u8>> {
     let mut map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
 
     for (route_id, target) in local_target_by_route {
-        let token = URL_SAFE_NO_PAD.encode(route_id.as_bytes());
-        map.insert(
-            format!("{ABSTRACT_ROUTE_SCHEME}://{ABSTRACT_ROUTE_HOST}/{token}").into_bytes(),
-            format!(
-                "http://{}:{}",
-                format_url_host(target.host.as_str()),
-                target.port
-            )
-            .into_bytes(),
-        );
+        insert_downcast_mapping(&mut map, route_id, target);
     }
 
-    build_stream_rewrite_plan(map)
+    map
 }
 
 fn build_stream_rewrite_plan(map: HashMap<Vec<u8>, Vec<u8>>) -> Option<Arc<StreamRewritePlan>> {
@@ -379,7 +418,7 @@ impl HttpExchangePlugin for A2aUrlRewritePlugin {
             RewriteFlow::Outbound => UrlRewriteMode::Upcast,
         };
         self.table
-            .stream_rewriter(mode)
+            .stream_rewriter(mode, None)
             .map(|rewriter| Box::new(rewriter) as Box<dyn StreamBodyRewriter>)
     }
 
@@ -396,7 +435,7 @@ impl HttpExchangePlugin for A2aUrlRewritePlugin {
             RewriteFlow::Outbound => UrlRewriteMode::Downcast,
         };
         self.table
-            .stream_rewriter(mode)
+            .stream_rewriter(mode, Some(ctx.route_id.as_ref()))
             .map(|rewriter| Box::new(rewriter) as Box<dyn StreamBodyRewriter>)
     }
 
@@ -410,7 +449,7 @@ impl HttpExchangePlugin for A2aUrlRewritePlugin {
             RewriteFlow::Inbound => UrlRewriteMode::Downcast,
             RewriteFlow::Outbound => UrlRewriteMode::Upcast,
         };
-        self.table.rewrite_bytes(body, mode)
+        self.table.rewrite_bytes(body, mode, None)
     }
 
     fn rewrite_response(
@@ -426,7 +465,9 @@ impl HttpExchangePlugin for A2aUrlRewritePlugin {
             RewriteFlow::Inbound => UrlRewriteMode::Upcast,
             RewriteFlow::Outbound => UrlRewriteMode::Downcast,
         };
-        let mut rewritten = self.table.rewrite_bytes(body, mode);
+        let mut rewritten = self
+            .table
+            .rewrite_bytes(body, mode, Some(ctx.route_id.as_ref()));
         if ctx.request_is_agent_card && rewritten {
             rewritten |= strip_signatures(body);
         }
@@ -793,29 +834,6 @@ fn rewrite_loopback_url(original: &str, abstract_base: &str) -> Option<String> {
     Some(rewritten)
 }
 
-#[cfg(test)]
-fn parse_abstract_route(url: &Url) -> Option<(String, String)> {
-    if url.scheme() != ABSTRACT_ROUTE_SCHEME || url.host_str() != Some(ABSTRACT_ROUTE_HOST) {
-        return None;
-    }
-    let raw_path = url.path().strip_prefix('/')?;
-    if raw_path.is_empty() {
-        return None;
-    }
-    let (token, tail) = raw_path.split_once('/').unwrap_or((raw_path, ""));
-    if token.is_empty() {
-        return None;
-    }
-    let decoded = URL_SAFE_NO_PAD.decode(token.as_bytes()).ok()?;
-    let route_id = String::from_utf8(decoded).ok()?;
-    let path = if tail.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{tail}")
-    };
-    Some((route_id, path))
-}
-
 fn normalize_host(host: &str) -> Option<String> {
     let trimmed = host.trim();
     if trimmed.is_empty() {
@@ -899,6 +917,7 @@ mod tests {
     ) -> OutboundRoute {
         OutboundRoute {
             route_id: route_id.to_string(),
+            rewrite_route_id: None,
             slot: "slot".to_string(),
             capability_kind: Some("a2a".to_string()),
             capability_profile: None,
@@ -1040,6 +1059,73 @@ mod tests {
     }
 
     #[test]
+    fn public_exports_downcast_canonical_route_to_current_listener() {
+        let rewrite_route_id = "component:/runtime:a2a:http".to_string();
+        let codex = OutboundRoute {
+            route_id: "router:export:codex:http".to_string(),
+            rewrite_route_id: Some(rewrite_route_id.clone()),
+            slot: "codex".to_string(),
+            capability_kind: Some("a2a".to_string()),
+            capability_profile: None,
+            listen_port: 53122,
+            listen_addr: Some("127.0.0.1".to_string()),
+            protocol: MeshProtocol::Http,
+            http_plugins: vec![HttpRoutePlugin::A2a],
+            peer_addr: "127.0.0.1:31000".to_string(),
+            peer_id: "peer".to_string(),
+            capability: "codex".to_string(),
+        };
+        let assistant = OutboundRoute {
+            route_id: "router:export:assistant:http".to_string(),
+            rewrite_route_id: Some(rewrite_route_id.clone()),
+            slot: "assistant".to_string(),
+            capability_kind: Some("a2a".to_string()),
+            capability_profile: None,
+            listen_port: 53123,
+            listen_addr: Some("127.0.0.1".to_string()),
+            protocol: MeshProtocol::Http,
+            http_plugins: vec![HttpRoutePlugin::A2a],
+            peer_addr: "127.0.0.1:31000".to_string(),
+            peer_id: "peer".to_string(),
+            capability: "assistant".to_string(),
+        };
+        let table = UrlRewriteTable::from_outbound_routes(&[codex.clone(), assistant.clone()]);
+
+        let codex_public =
+            Url::parse("http://127.0.0.1:53122/invoke").expect("codex listener url parse");
+        let assistant_public =
+            Url::parse("http://127.0.0.1:53123/invoke").expect("assistant listener url parse");
+
+        let codex_abstract = table
+            .upcast(&codex_public)
+            .expect("upcast codex public listener url");
+        let assistant_abstract = table
+            .upcast(&assistant_public)
+            .expect("upcast assistant public listener url");
+
+        assert_eq!(codex_abstract, assistant_abstract);
+        assert_eq!(
+            codex_abstract.as_str(),
+            format!(
+                "amber://route/{}/invoke",
+                URL_SAFE_NO_PAD.encode(rewrite_route_id.as_bytes())
+            )
+        );
+        assert_eq!(
+            table
+                .downcast_for_route(Some(codex.route_id.as_str()), &codex_abstract)
+                .expect("downcast codex abstract route"),
+            codex_public
+        );
+        assert_eq!(
+            table
+                .downcast_for_route(Some(assistant.route_id.as_str()), &assistant_abstract)
+                .expect("downcast assistant abstract route"),
+            assistant_public
+        );
+    }
+
+    #[test]
     fn rewrite_bytes_rewrites_url_instances() {
         let table = UrlRewriteTable::from_outbound_routes(&[a2a_outbound_route(
             "component:a:agent:http",
@@ -1047,7 +1133,7 @@ mod tests {
             None,
         )]);
         let mut raw = br#"{"parts":[{"url":"http://127.0.0.1:20000/a2a"}]}"#.to_vec();
-        assert!(table.rewrite_bytes(&mut raw, UrlRewriteMode::Upcast));
+        assert!(table.rewrite_bytes(&mut raw, UrlRewriteMode::Upcast, None));
         let rewritten = String::from_utf8(raw).expect("utf8");
         assert!(rewritten.contains("amber://route/"));
         assert!(rewritten.contains("/a2a"));
@@ -1061,7 +1147,7 @@ mod tests {
             None,
         )]);
         let mut rewriter = table
-            .stream_rewriter(UrlRewriteMode::Upcast)
+            .stream_rewriter(UrlRewriteMode::Upcast, None)
             .expect("stream rewriter");
         let chunk_a = br#"{"url":"http://127.0.0.1:"#;
         let chunk_b = br#"20000/a2a"}"#;
@@ -1080,7 +1166,7 @@ mod tests {
             None,
         )]);
         let mut rewriter = table
-            .stream_rewriter(UrlRewriteMode::Upcast)
+            .stream_rewriter(UrlRewriteMode::Upcast, None)
             .expect("stream rewriter");
         let chunk_a = br#"{"url":"http://127.0.0.1:2000"#;
         let chunk_b = br#"1/cgi-bin/a2a"}"#;
@@ -1177,5 +1263,73 @@ mod tests {
 
         assert!(!rewrite_inbound_agent_card(&mut raw, route_id));
         assert_eq!(raw, original);
+    }
+
+    #[test]
+    fn outbound_agent_card_response_downcasts_canonical_route_to_public_listener() {
+        let rewrite_route_id = "component:/runtime:a2a:http".to_string();
+        let codex = OutboundRoute {
+            route_id: "router:export:codex:http".to_string(),
+            rewrite_route_id: Some(rewrite_route_id.clone()),
+            slot: "codex".to_string(),
+            capability_kind: Some("a2a".to_string()),
+            capability_profile: None,
+            listen_port: 53122,
+            listen_addr: Some("127.0.0.1".to_string()),
+            protocol: MeshProtocol::Http,
+            http_plugins: vec![HttpRoutePlugin::A2a],
+            peer_addr: "127.0.0.1:31000".to_string(),
+            peer_id: "peer".to_string(),
+            capability: "codex".to_string(),
+        };
+        let assistant = OutboundRoute {
+            route_id: "router:export:assistant:http".to_string(),
+            rewrite_route_id: Some(rewrite_route_id.clone()),
+            slot: "assistant".to_string(),
+            capability_kind: Some("a2a".to_string()),
+            capability_profile: None,
+            listen_port: 53123,
+            listen_addr: Some("127.0.0.1".to_string()),
+            protocol: MeshProtocol::Http,
+            http_plugins: vec![HttpRoutePlugin::A2a],
+            peer_addr: "127.0.0.1:31000".to_string(),
+            peer_id: "peer".to_string(),
+            capability: "assistant".to_string(),
+        };
+        let plugin = A2aUrlRewritePlugin::new(std::sync::Arc::new(
+            UrlRewriteTable::from_outbound_routes(&[codex.clone(), assistant.clone()]),
+        ));
+        let token = URL_SAFE_NO_PAD.encode(rewrite_route_id.as_bytes());
+        let body_template = format!(
+            r#"{{"supportedInterfaces":[{{"url":"amber://route/{token}/invoke"}}],"signatures":[{{"sig":"abc"}}]}}"#
+        );
+
+        for (route_id, expected_url) in [
+            ("router:export:codex:http", "http://127.0.0.1:53122/invoke"),
+            (
+                "router:export:assistant:http",
+                "http://127.0.0.1:53123/invoke",
+            ),
+        ] {
+            let ctx = RewriteContext {
+                flow: RewriteFlow::Outbound,
+                request_is_agent_card: true,
+                route_id: route_id.into(),
+            };
+            let (mut parts, _) = http::Response::new(()).into_parts();
+            let mut body = body_template.as_bytes().to_vec();
+            assert!(plugin.rewrite_response(&ctx, &mut parts, &mut body));
+            let value: Value = serde_json::from_slice(body.as_slice()).expect("value");
+            assert!(value.get("signatures").is_none());
+            let url = value
+                .get("supportedInterfaces")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_object)
+                .and_then(|entry| entry.get("url"))
+                .and_then(Value::as_str)
+                .expect("supportedInterfaces[0].url");
+            assert_eq!(url, expected_url);
+        }
     }
 }

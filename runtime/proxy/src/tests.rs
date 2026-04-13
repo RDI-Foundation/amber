@@ -225,6 +225,7 @@ async fn reserve_export_bindings_preserve_duplicate_export_listeners() {
     let routes = vec![
         OutboundRoute {
             route_id: "duplicate-route".to_string(),
+            rewrite_route_id: None,
             slot: "api".to_string(),
             capability_kind: None,
             capability_profile: None,
@@ -238,6 +239,7 @@ async fn reserve_export_bindings_preserve_duplicate_export_listeners() {
         },
         OutboundRoute {
             route_id: "duplicate-route".to_string(),
+            rewrite_route_id: None,
             slot: "api".to_string(),
             capability_kind: None,
             capability_profile: None,

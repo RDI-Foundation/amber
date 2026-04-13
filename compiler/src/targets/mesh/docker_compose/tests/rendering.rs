@@ -1168,8 +1168,8 @@ fn compose_emits_export_metadata_and_labels() {
         .exports
         .get("public")
         .expect("public export should exist");
-    assert_eq!(exports.component, "/server");
-    assert_eq!(exports.provide, "api");
+    assert_eq!(exports.capability_kind.as_deref(), Some("http"));
+    assert_eq!(exports.capability_profile, None);
     assert_eq!(exports.protocol, "http");
     assert_eq!(exports.router_mesh_port, 24000);
     let router_meta = compose

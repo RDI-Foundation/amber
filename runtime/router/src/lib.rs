@@ -400,6 +400,7 @@ impl RewriteFlow {
 #[derive(Clone)]
 struct HttpExchangeTelemetryContext {
     flow: RewriteFlow,
+    http_subject: Option<Arc<str>>,
     flow_name: &'static str,
     otel_kind: &'static str,
     local_role: &'static str,
@@ -420,7 +421,7 @@ struct HttpExchangeTelemetryContext {
 }
 
 impl HttpExchangeTelemetryContext {
-    fn new(flow: RewriteFlow, labels: &HttpExchangeLabels) -> Self {
+    fn new(flow: RewriteFlow, labels: &HttpExchangeLabels, http_subject: Option<String>) -> Self {
         let source_ref = Arc::<str>::from(source_ref_for(labels).into_boxed_str());
         let destination_ref = Arc::<str>::from(destination_ref_for(labels).into_boxed_str());
         let edge_ref = Arc::<str>::from(
@@ -428,6 +429,7 @@ impl HttpExchangeTelemetryContext {
         );
         Self {
             flow,
+            http_subject: http_subject.map(Arc::<str>::from),
             flow_name: flow.as_str(),
             otel_kind: flow.otel_kind(),
             local_role: flow.local_role(),
@@ -458,6 +460,10 @@ impl HttpExchangeTelemetryContext {
 
     fn capability_profile(&self) -> &str {
         self.capability_profile.as_deref().unwrap_or("")
+    }
+
+    fn http_subject(&self) -> Option<&str> {
+        self.http_subject.as_deref()
     }
 
     fn local_role(&self) -> &'static str {
@@ -759,7 +765,12 @@ async fn proxy_local_http_request(
     req: Request<Incoming>,
 ) -> Response<BoxBody> {
     let emit_telemetry = state.labels.emit_telemetry;
-    let telemetry = HttpExchangeTelemetryContext::new(RewriteFlow::Inbound, &state.labels);
+    let request_is_agent_card = a2a::is_agent_card_path(req.uri().path());
+    let telemetry = HttpExchangeTelemetryContext::new(
+        RewriteFlow::Inbound,
+        &state.labels,
+        http_subject_from_path(req.uri().path()),
+    );
     let span = if emit_telemetry {
         start_http_exchange_span(&telemetry, &req)
     } else {
@@ -770,7 +781,6 @@ async fn proxy_local_http_request(
     let status_telemetry = telemetry.clone();
 
     let response = async move {
-        let request_is_agent_card = a2a::is_agent_card_path(req.uri().path());
         let mut parts = req.into_parts();
         if emit_telemetry {
             emit_headers_event(
@@ -1280,14 +1290,18 @@ async fn proxy_http_request_to_noise(
     state: OutboundHttpProxyState,
     req: Request<Incoming>,
 ) -> Response<BoxBody> {
-    let telemetry = HttpExchangeTelemetryContext::new(flow, &state.labels);
+    let request_is_agent_card = a2a::is_agent_card_path(req.uri().path());
+    let telemetry = HttpExchangeTelemetryContext::new(
+        flow,
+        &state.labels,
+        http_subject_from_path(req.uri().path()),
+    );
     let span = start_http_exchange_span(&telemetry, &req);
     let instrument_span = span.clone();
     let status_span = span.clone();
     let status_telemetry = telemetry.clone();
 
     let response = async move {
-        let request_is_agent_card = a2a::is_agent_card_path(req.uri().path());
         let mut parts = req.into_parts();
         emit_headers_event(
             &span,
@@ -1666,7 +1680,11 @@ async fn proxy_http_request_to_noise(
 }
 
 async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Response<BoxBody> {
-    let telemetry = HttpExchangeTelemetryContext::new(RewriteFlow::Outbound, &state.labels);
+    let telemetry = HttpExchangeTelemetryContext::new(
+        RewriteFlow::Outbound,
+        &state.labels,
+        http_subject_from_path(req.uri().path()),
+    );
     let span = start_http_exchange_span(&telemetry, &req);
     let instrument_span = span.clone();
     let status_span = span.clone();

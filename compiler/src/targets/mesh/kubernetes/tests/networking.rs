@@ -917,6 +917,7 @@ fn kubernetes_smoke_export_routes_to_host() {
         inbound: Vec::new(),
         outbound: vec![OutboundRoute {
             route_id: router_export_route_id(export_name, MeshProtocol::Http),
+            rewrite_route_id: None,
             slot: export_name.to_string(),
             capability_kind: None,
             capability_profile: None,

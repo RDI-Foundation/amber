@@ -57,6 +57,8 @@ pub(crate) struct ExternalSlotDescriptor {
 pub(crate) struct ExportDescriptor {
     pub(crate) component: String,
     pub(crate) provide: String,
+    pub(crate) capability_kind: Option<String>,
+    pub(crate) capability_profile: Option<String>,
     pub(crate) protocol: NetworkProtocol,
 }
 
@@ -158,11 +160,18 @@ pub(crate) fn collect_exports(
 ) -> BTreeMap<String, ExportDescriptor> {
     let mut out = BTreeMap::new();
     for export in mesh_plan.exports() {
+        let provide_decl = scenario
+            .component(export.provider)
+            .provides
+            .get(&export.provide)
+            .expect("export provide should exist");
         out.insert(
             export.name.clone(),
             ExportDescriptor {
                 component: component_label(scenario, export.provider),
                 provide: export.provide.clone(),
+                capability_kind: Some(provide_decl.decl.kind.to_string()),
+                capability_profile: provide_decl.decl.profile.clone(),
                 protocol: export.endpoint.protocol,
             },
         );
@@ -323,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_exports_uses_component_labels() {
+    fn collect_exports_include_capability_metadata() {
         let root = component(0, "/");
         let mut child = component(1, "/server");
         child.parent = Some(ComponentId(0));
@@ -361,6 +370,8 @@ mod tests {
         let exports = collect_exports(&scenario, &mesh_plan);
         assert_eq!(exports["public"].component, "/server");
         assert_eq!(exports["public"].provide, "api");
+        assert_eq!(exports["public"].capability_kind.as_deref(), Some("http"));
+        assert_eq!(exports["public"].capability_profile, None);
         assert_eq!(exports["public"].protocol, NetworkProtocol::Http);
     }
 }

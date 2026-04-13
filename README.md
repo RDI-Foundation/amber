@@ -68,6 +68,10 @@ On a first interactive run, Amber may read an existing `.env`, prompt for missin
 prompt for the external catalog URL, start the local process and Compose service, and print the
 localhost URLs for the entrypoints the system exposes.
 
+For interactive root config prompts, type the value directly or start with `@` to load it from a
+file. Amber shows matching paths as you type, `Tab` completes them, and `@@` escapes a literal
+leading `@`. The same rule works for secret root config, but literal values stay hidden.
+
 If you want a non-interactive setup flow instead, ask Amber to write the input template first:
 
 ```sh
@@ -79,9 +83,9 @@ amber run . --env-file .env.example
 Example:
 
 ```text
-Ready.
-  app  http://127.0.0.1:18080
-  api  http://127.0.0.1:18081
+Exports
+  app [http]: http://127.0.0.1:18080
+  api [http]: http://127.0.0.1:18081
 ```
 
 Then call it:
@@ -106,8 +110,9 @@ using backend-specific control surfaces. The smallest example is
 available over HTTP at `$(slots.<name>.url)/v1/...` and over MCP at
 `$(slots.<name>.url)/mcp`.
 
-For background runs and persisted logs, `amber run --detach`, `amber ps`, `amber logs`, and
-`amber stop` give you a managed local workflow without requiring generated artifacts.
+For background runs and persisted traces, `amber run --detach`, `amber attach`, `amber ps`,
+`amber logs`, and `amber stop` give you a managed local workflow without requiring generated
+artifacts.
 
 ## Core ideas
 
@@ -233,6 +238,7 @@ Most people will spend most of their time in `amber run`:
 amber run .
 amber run path/to/root
 amber run path/to/root --detach
+amber attach <run-id>
 amber ps
 amber logs <run-id>
 amber stop <run-id>

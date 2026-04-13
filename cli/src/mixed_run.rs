@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     future::Future,
     io::{Read as _, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -23,10 +25,11 @@ use amber_compiler::{
 };
 use amber_manifest::{CapabilityKind, CapabilityTransport, NetworkProtocol};
 use amber_mesh::{
-    HttpRoutePlugin, InboundRoute, InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME,
-    MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer,
-    MeshProtocol, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTargetKind, OutboundRoute,
-    TransportConfig, component_route_id, router_dynamic_export_route_id, router_export_route_id,
+    InboundRoute, InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshConfig,
+    MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer, MeshProtocol,
+    MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTargetKind, OutboundRoute,
+    TransportConfig, component_route_id, http_route_plugins_for_capability_kind,
+    router_dynamic_export_route_id, router_export_route_id,
     telemetry::{SCENARIO_RUN_ID_ENV, SCENARIO_SCOPE_ENV},
 };
 use amber_proxy::{
@@ -42,6 +45,12 @@ use axum::{
 };
 use base64::Engine as _;
 use miette::{Context as _, IntoDiagnostic as _, Result};
+use opentelemetry_proto::tonic::{
+    collector::logs::v1::ExportLogsServiceRequest,
+    common::v1::{AnyValue as OtlpAnyValue, KeyValue as OtlpKeyValue, any_value},
+    logs::v1::LogRecord as OtlpLogRecord,
+};
+use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest as _, Sha256};
@@ -115,6 +124,8 @@ const OUTSIDE_PROXY_PLAN_SCHEMA: &str = "amber.run.outside_proxy";
 const OUTSIDE_PROXY_PLAN_VERSION: u32 = 1;
 const OUTSIDE_PROXY_STATE_SCHEMA: &str = "amber.run.outside_proxy_state";
 const OUTSIDE_PROXY_STATE_VERSION: u32 = 1;
+const PERSISTED_TRACE_EVENT_SCHEMA: &str = "amber.trace.event";
+const PERSISTED_TRACE_EVENT_VERSION: u32 = 1;
 
 const ROUTER_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -196,6 +207,8 @@ struct LaunchBundleObservability {
     state_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     requests_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    events_ndjson: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     launch_commands: Vec<LaunchCommandPreview>,
 }
@@ -271,6 +284,23 @@ pub(crate) struct ObservabilityReceipt {
     pub(crate) sink_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) requests_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) events_ndjson: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedTraceEvent {
+    pub(crate) schema: String,
+    pub(crate) version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observed_at_unix_nano: Option<u64>,
+    pub(crate) message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) severity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) attributes: BTreeMap<String, JsonValue>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -574,6 +604,7 @@ struct ObservabilitySinkPlan {
     listen_addr: String,
     advertise_endpoint: String,
     requests_log: String,
+    events_ndjson: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -607,6 +638,10 @@ struct RunOutsideProxyContext {
 #[derive(Clone, Debug)]
 struct RunOutsideExport {
     site_id: String,
+    component: String,
+    provide: String,
+    capability_kind: Option<String>,
+    capability_profile: Option<String>,
     protocol: String,
 }
 
@@ -1070,6 +1105,7 @@ pub(crate) async fn run_observability_sink(plan_path: PathBuf) -> Result<()> {
             endpoint: plan.advertise_endpoint.clone(),
             sink_pid: Some(std::process::id()),
             requests_log: Some(plan.requests_log.clone()),
+            events_ndjson: Some(plan.events_ndjson.clone()),
         },
     )?;
 
@@ -1079,9 +1115,11 @@ pub(crate) async fn run_observability_sink(plan_path: PathBuf) -> Result<()> {
         }
 
         match listener.accept() {
-            Ok((mut stream, _)) => {
-                handle_otlp_connection(&mut stream, Path::new(&plan.requests_log))?
-            }
+            Ok((mut stream, _)) => handle_otlp_connection(
+                &mut stream,
+                Path::new(&plan.requests_log),
+                Path::new(&plan.events_ndjson),
+            )?,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -1898,19 +1936,6 @@ fn dynamic_proxy_export_mesh_protocol(export: &DynamicProxyExportRecord) -> Resu
     mesh_protocol(protocol)
 }
 
-fn dynamic_proxy_export_http_plugins(
-    export: &DynamicProxyExportRecord,
-    protocol: MeshProtocol,
-) -> Vec<HttpRoutePlugin> {
-    matches!(
-        (export.capability_kind.as_str(), protocol),
-        ("a2a", MeshProtocol::Http)
-    )
-    .then_some(HttpRoutePlugin::A2a)
-    .into_iter()
-    .collect()
-}
-
 fn dynamic_proxy_export_route_id(
     export_name: &str,
     export: &DynamicProxyExportRecord,
@@ -1946,24 +1971,6 @@ fn dynamic_input_route_capability(input: &DynamicInputRouteRecord) -> String {
 
 fn is_compose_component_sidecar_service(service_name: &str) -> bool {
     service_name.ends_with("-net")
-}
-
-fn dynamic_input_route_http_plugins(
-    input: &DynamicInputRouteRecord,
-    protocol: MeshProtocol,
-) -> Vec<HttpRoutePlugin> {
-    dynamic_proxy_export_http_plugins(
-        &DynamicProxyExportRecord {
-            component_id: 0,
-            component: input.provider_component.clone(),
-            provide: dynamic_input_route_capability(input),
-            protocol: input.protocol.clone(),
-            capability_kind: input.capability_kind.clone(),
-            capability_profile: input.capability_profile.clone(),
-            target_port: 0,
-        },
-        protocol,
-    )
 }
 
 fn overlay_peer_addr_map_from_ports(ports: &BTreeMap<String, u16>) -> BTreeMap<String, String> {
@@ -2034,7 +2041,10 @@ fn routed_input_overlay_route(
         capability_kind: Some(input.capability_kind.clone()),
         capability_profile: input.capability_profile.clone(),
         protocol,
-        http_plugins: dynamic_input_route_http_plugins(input, protocol),
+        http_plugins: http_route_plugins_for_capability_kind(
+            Some(input.capability_kind.as_str()),
+            protocol,
+        ),
         target: InboundTarget::MeshForward {
             peer_addr: provider_peer_addr.to_string(),
             peer_id: input.provider_component.clone(),
@@ -2187,7 +2197,10 @@ fn rewrite_dynamic_routed_inputs(
             route.capability = capability.clone();
             route.capability_kind = Some(input.capability_kind.clone());
             route.capability_profile = input.capability_profile.clone();
-            route.http_plugins = dynamic_input_route_http_plugins(input, protocol);
+            route.http_plugins = http_route_plugins_for_capability_kind(
+                Some(input.capability_kind.as_str()),
+                protocol,
+            );
         }
         if !matched {
             return Err(miette::miette!(
@@ -2390,7 +2403,10 @@ fn ensure_dynamic_proxy_export_component_routes(
             capability_kind: Some(export.capability_kind.clone()),
             capability_profile: export.capability_profile.clone(),
             protocol,
-            http_plugins: dynamic_proxy_export_http_plugins(export, protocol),
+            http_plugins: http_route_plugins_for_capability_kind(
+                Some(export.capability_kind.as_str()),
+                protocol,
+            ),
             target: InboundTarget::Local {
                 port: export.target_port,
             },
@@ -2429,7 +2445,10 @@ fn add_dynamic_proxy_export_overlay_routes(
             capability_kind: Some(export.capability_kind.clone()),
             capability_profile: export.capability_profile.clone(),
             protocol,
-            http_plugins: dynamic_proxy_export_http_plugins(export, protocol),
+            http_plugins: http_route_plugins_for_capability_kind(
+                Some(export.capability_kind.as_str()),
+                protocol,
+            ),
             target: InboundTarget::MeshForward {
                 peer_addr: peer_addr_for_export(export)?,
                 peer_id: export.component.clone(),
@@ -7234,7 +7253,15 @@ fn emit_manager_event(event_name: &'static str, body: String, attributes: &[(&st
     let _ = send_manager_observability(&endpoint, "/v1/logs", &payload);
 }
 
-fn handle_otlp_connection(stream: &mut TcpStream, requests_log: &Path) -> Result<()> {
+fn handle_otlp_connection(
+    stream: &mut TcpStream,
+    requests_log: &Path,
+    events_ndjson: &Path,
+) -> Result<()> {
+    stream
+        .set_nonblocking(false)
+        .into_diagnostic()
+        .wrap_err("failed to configure observability stream blocking mode")?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .into_diagnostic()
@@ -7265,6 +7292,15 @@ fn handle_otlp_connection(stream: &mut TcpStream, requests_log: &Path) -> Result
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/")
         .to_string();
+    let content_type = header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-type")
+                .then_some(value.trim().to_ascii_lowercase())
+        })
+        .unwrap_or_default();
     let content_length = header
         .lines()
         .find_map(|line| {
@@ -7302,11 +7338,231 @@ fn handle_otlp_connection(stream: &mut TcpStream, requests_log: &Path) -> Result
     writeln!(log, "{}\t{}", path, body_len)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to append {}", requests_log.display()))?;
+    if path == "/v1/logs" {
+        let body = &buf[body_start..];
+        if content_type.contains("application/json") || body.starts_with(b"{") {
+            let _ = serde_json::from_slice::<serde_json::Value>(body);
+        } else {
+            match persist_otlp_log_records(body) {
+                Ok(events) => append_jsonl(events_ndjson, &events)?,
+                Err(err) => eprintln!("warning: failed to decode OTLP log payload: {err}"),
+            }
+        }
+    }
     stream
         .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         .into_diagnostic()
         .wrap_err("failed to write observability response")?;
     Ok(())
+}
+
+fn append_jsonl(path: &Path, events: &[PersistedTraceEvent]) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to open {}", path.display()))?;
+    for event in events {
+        serde_json::to_writer(&mut log, event)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to append {}", path.display()))?;
+        writeln!(log)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to append {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn persist_otlp_log_records(body: &[u8]) -> Result<Vec<PersistedTraceEvent>> {
+    let request = ExportLogsServiceRequest::decode(body)
+        .into_diagnostic()
+        .wrap_err("invalid OTLP log payload")?;
+    let mut events = Vec::new();
+    for resource_logs in &request.resource_logs {
+        let resource_attrs = resource_logs
+            .resource
+            .as_ref()
+            .map(|resource| resource.attributes.as_slice())
+            .unwrap_or(&[]);
+        for scope_logs in &resource_logs.scope_logs {
+            for record in &scope_logs.log_records {
+                if let Some(event) = persist_otlp_log_record(resource_attrs, record) {
+                    events.push(event);
+                }
+            }
+        }
+    }
+    Ok(events)
+}
+
+fn persist_otlp_log_record(
+    resource_attrs: &[OtlpKeyValue],
+    record: &OtlpLogRecord,
+) -> Option<PersistedTraceEvent> {
+    let entity_kind = otlp_attribute(resource_attrs, &record.attributes, "amber_entity_kind");
+    let edge_ref = otlp_attribute(resource_attrs, &record.attributes, "amber_edge_ref");
+    if entity_kind.as_deref() != Some("binding") {
+        return None;
+    }
+    if edge_ref
+        .as_deref()
+        .is_some_and(|edge_ref| edge_ref.starts_with("/site/"))
+    {
+        return None;
+    }
+
+    let body = record.body.as_ref().map(otlp_any_value_to_text)?;
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    Some(PersistedTraceEvent {
+        schema: PERSISTED_TRACE_EVENT_SCHEMA.to_string(),
+        version: PERSISTED_TRACE_EVENT_VERSION,
+        observed_at_unix_nano: nonzero_u64(record.time_unix_nano)
+            .or_else(|| nonzero_u64(record.observed_time_unix_nano)),
+        message: body.to_string(),
+        severity: nonempty(record.severity_text.trim()),
+        trace_id: otlp_trace_id(&record.trace_id),
+        attributes: merged_otlp_attributes(resource_attrs, &record.attributes),
+    })
+}
+
+fn merged_otlp_attributes(
+    resource_attrs: &[OtlpKeyValue],
+    record_attrs: &[OtlpKeyValue],
+) -> BTreeMap<String, JsonValue> {
+    let mut attributes = BTreeMap::new();
+    for attr in resource_attrs {
+        if let Some(value) = attr.value.as_ref() {
+            attributes.insert(attr.key.clone(), otlp_any_value_to_json(value));
+        }
+    }
+    for attr in record_attrs {
+        if let Some(value) = attr.value.as_ref() {
+            attributes.insert(attr.key.clone(), otlp_any_value_to_json(value));
+        }
+    }
+    attributes
+}
+
+fn nonzero_u64(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    (!value.is_empty()).then_some(value.to_string())
+}
+
+fn otlp_attribute(
+    resource_attrs: &[OtlpKeyValue],
+    record_attrs: &[OtlpKeyValue],
+    key: &str,
+) -> Option<String> {
+    if let Some(value) = otlp_attribute_from(record_attrs, key) {
+        return Some(value);
+    }
+    otlp_attribute_from(resource_attrs, key)
+}
+
+fn otlp_attribute_from(attrs: &[OtlpKeyValue], key: &str) -> Option<String> {
+    attrs.iter().find_map(|attr| {
+        (attr.key == key)
+            .then(|| attr.value.as_ref().map(otlp_any_value_to_text))
+            .flatten()
+    })
+}
+
+fn otlp_any_value_to_text(value: &OtlpAnyValue) -> String {
+    match value.value.as_ref() {
+        Some(any_value::Value::StringValue(value)) => value.clone(),
+        Some(any_value::Value::BoolValue(value)) => value.to_string(),
+        Some(any_value::Value::IntValue(value)) => value.to_string(),
+        Some(any_value::Value::DoubleValue(value)) => value.to_string(),
+        Some(any_value::Value::BytesValue(value)) => format!("0x{}", hex_bytes(value)),
+        Some(any_value::Value::ArrayValue(values)) => values
+            .values
+            .iter()
+            .map(otlp_any_value_to_text)
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(any_value::Value::KvlistValue(values)) => values
+            .values
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}={}",
+                    entry.key,
+                    entry
+                        .value
+                        .as_ref()
+                        .map(otlp_any_value_to_text)
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => String::new(),
+    }
+}
+
+fn otlp_any_value_to_json(value: &OtlpAnyValue) -> JsonValue {
+    match value.value.as_ref() {
+        Some(any_value::Value::StringValue(value)) => JsonValue::String(value.clone()),
+        Some(any_value::Value::BoolValue(value)) => JsonValue::Bool(*value),
+        Some(any_value::Value::IntValue(value)) => JsonValue::Number((*value).into()),
+        Some(any_value::Value::DoubleValue(value)) => serde_json::Number::from_f64(*value)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        Some(any_value::Value::BytesValue(value)) => {
+            JsonValue::String(format!("0x{}", hex_bytes(value)))
+        }
+        Some(any_value::Value::ArrayValue(values)) => JsonValue::Array(
+            values
+                .values
+                .iter()
+                .map(otlp_any_value_to_json)
+                .collect::<Vec<_>>(),
+        ),
+        Some(any_value::Value::KvlistValue(values)) => JsonValue::Object(
+            values
+                .values
+                .iter()
+                .filter_map(|entry| {
+                    Some((
+                        entry.key.clone(),
+                        otlp_any_value_to_json(entry.value.as_ref()?),
+                    ))
+                })
+                .collect::<JsonMap<_, _>>(),
+        ),
+        None => JsonValue::Null,
+    }
+}
+
+fn otlp_trace_id(trace_id: &[u8]) -> Option<String> {
+    if trace_id.len() != 16 || trace_id.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    Some(hex_bytes(trace_id))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut out, "{byte:02x}").expect("writing to an in-memory string should not fail");
+    }
+    out
 }
 
 #[cfg(unix)]
