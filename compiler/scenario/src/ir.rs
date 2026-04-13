@@ -9,13 +9,12 @@ use serde_json::Value;
 
 use crate::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
-    FrameworkRef, Governance, GovernanceScenario, GovernedScope, ManifestCatalogEntry, Moniker,
-    Program, ProgramMount, ProvideRef, ResourceDecl, ResourceRef, Scenario, ScenarioExport,
-    SlotRef, TemplateBinding, TemplateConfigField,
+    FrameworkRef, ManifestCatalogEntry, Moniker, Program, ProgramMount, ProvideRef, ResourceDecl,
+    ResourceRef, Scenario, ScenarioExport, SlotRef, TemplateBinding, TemplateConfigField,
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
-pub const SCENARIO_IR_VERSION: u32 = 7;
+pub const SCENARIO_IR_VERSION: u32 = 6;
 const MIN_SCENARIO_IR_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,9 +28,6 @@ pub struct ScenarioIr {
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub manifest_catalog: BTreeMap<String, ManifestCatalogEntryIr>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub governance: Option<GovernanceIr>,
 }
 
 impl From<&Scenario> for ScenarioIr {
@@ -55,7 +51,6 @@ impl From<&Scenario> for ScenarioIr {
                 .iter()
                 .map(|(key, entry)| (key.clone(), ManifestCatalogEntryIr::from(entry)))
                 .collect(),
-            governance: scenario.governance.as_ref().map(GovernanceIr::from),
         }
     }
 }
@@ -84,10 +79,6 @@ impl TryFrom<ScenarioIr> for Scenario {
             ir.exports,
             ir.manifest_catalog,
         )?;
-        scenario.governance = ir
-            .governance
-            .map(GovernanceIr::into_governance)
-            .transpose()?;
         validate_scenario(&scenario)?;
         scenario.normalize_order();
         Ok(scenario)
@@ -240,7 +231,6 @@ fn scenario_from_ir_parts(
             .into_iter()
             .map(|(key, entry)| (key, entry.into_entry()))
             .collect(),
-        governance: None,
     })
 }
 
@@ -507,126 +497,6 @@ impl ManifestCatalogEntryIr {
             digest: self.digest,
             manifest: self.manifest,
         }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GovernanceIr {
-    pub governance_scenario: GovernanceScenarioIr,
-    #[serde(default)]
-    pub scopes: Vec<GovernedScopeIr>,
-}
-
-impl From<&Governance> for GovernanceIr {
-    fn from(governance: &Governance) -> Self {
-        Self {
-            governance_scenario: GovernanceScenarioIr::from(&governance.governance_scenario),
-            scopes: governance
-                .scopes
-                .iter()
-                .map(GovernedScopeIr::from)
-                .collect(),
-        }
-    }
-}
-
-impl GovernanceIr {
-    fn into_governance(self) -> Result<Governance, ScenarioIrError> {
-        let governance_scenario = self.governance_scenario.into_governance_scenario()?;
-        let scopes = self
-            .scopes
-            .into_iter()
-            .map(GovernedScopeIr::into_governed_scope)
-            .collect::<Result<Vec<_>, _>>()?;
-        let governance = Governance {
-            governance_scenario,
-            scopes,
-        };
-        validate_governance(&governance)?;
-        Ok(governance)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GovernanceScenarioIr {
-    pub root: usize,
-    pub components: Vec<ComponentIr>,
-    pub bindings: Vec<BindingIr>,
-    pub exports: Vec<ExportIr>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub manifest_catalog: BTreeMap<String, ManifestCatalogEntryIr>,
-}
-
-impl From<&GovernanceScenario> for GovernanceScenarioIr {
-    fn from(scenario: &GovernanceScenario) -> Self {
-        let components = scenario
-            .components
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, component)| {
-                component
-                    .as_ref()
-                    .map(|component| ComponentIr::from_component(ComponentId(idx), component))
-            })
-            .collect();
-        Self {
-            root: scenario.root.0,
-            components,
-            bindings: scenario.bindings.iter().map(BindingIr::from).collect(),
-            exports: scenario.exports.iter().map(ExportIr::from).collect(),
-            manifest_catalog: scenario
-                .manifest_catalog
-                .iter()
-                .map(|(key, entry)| (key.clone(), ManifestCatalogEntryIr::from(entry)))
-                .collect(),
-        }
-    }
-}
-
-impl GovernanceScenarioIr {
-    fn into_governance_scenario(self) -> Result<GovernanceScenario, ScenarioIrError> {
-        let scenario = scenario_from_ir_parts(
-            self.root,
-            self.components,
-            self.bindings,
-            self.exports,
-            self.manifest_catalog,
-        )?;
-        Ok(GovernanceScenario::from_scenario(scenario))
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GovernedScopeIr {
-    pub root_moniker: String,
-    #[serde(default)]
-    pub policies: Vec<String>,
-}
-
-impl From<&GovernedScope> for GovernedScopeIr {
-    fn from(scope: &GovernedScope) -> Self {
-        Self {
-            root_moniker: scope.root_moniker.to_string(),
-            policies: scope.policies.iter().map(ToString::to_string).collect(),
-        }
-    }
-}
-
-impl GovernedScopeIr {
-    fn into_governed_scope(self) -> Result<GovernedScope, ScenarioIrError> {
-        Ok(GovernedScope {
-            root_moniker: Moniker::from(self.root_moniker),
-            policies: self
-                .policies
-                .into_iter()
-                .map(|policy| {
-                    policy.parse().map_err(|err| {
-                        invalid_scenario(format!("invalid governance export `{policy}`: {err}"))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        })
     }
 }
 
@@ -960,33 +830,6 @@ fn validate_scenario(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     validate_mounted_storage_slots(scenario)?;
     validate_exports(scenario)?;
     validate_child_templates(scenario)?;
-    if let Some(governance) = &scenario.governance {
-        validate_governance(governance)?;
-    }
-    Ok(())
-}
-
-fn validate_governance(governance: &Governance) -> Result<(), ScenarioIrError> {
-    let scenario = governance.governance_scenario.as_scenario();
-    validate_scenario(&scenario)?;
-
-    let exported_names = governance
-        .governance_scenario
-        .exports
-        .iter()
-        .map(|export| export.name.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    for scope in &governance.scopes {
-        for policy in &scope.policies {
-            if !exported_names.contains(policy.as_str()) {
-                return Err(invalid_scenario(format!(
-                    "governed scope `{}` references missing governance export `{policy}`",
-                    scope.root_moniker
-                )));
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -1625,7 +1468,6 @@ mod tests {
                 },
             }],
             manifest_catalog: BTreeMap::new(),
-            governance: None,
         };
         scenario.normalize_order();
 
@@ -1753,6 +1595,42 @@ mod tests {
     }
 
     #[test]
+    fn scenario_ir_rejects_governance_era_version() {
+        let ir = json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": 7,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [],
+                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {}
+                }
+            ],
+            "bindings": [],
+            "exports": []
+        });
+
+        let parsed: ScenarioIr =
+            serde_json::from_value(ir).expect("deserialize governance-era scenario IR");
+        let err =
+            Scenario::try_from(parsed).expect_err("governance-era scenario IR should be rejected");
+        assert!(matches!(
+            err,
+            ScenarioIrError::VersionMismatch {
+                expected: SCENARIO_IR_VERSION,
+                actual: 7
+            }
+        ));
+    }
+
+    #[test]
     fn scenario_ir_defaults_missing_program_and_caps() {
         let payload = json!({
             "schema": SCENARIO_IR_SCHEMA,
@@ -1815,7 +1693,6 @@ mod tests {
             }],
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
-            governance: None,
         };
         scenario.normalize_order();
 
@@ -1920,7 +1797,6 @@ mod tests {
                     manifest: catalog_manifest.clone(),
                 },
             )]),
-            governance: None,
         };
         scenario.normalize_order();
 
@@ -2051,7 +1927,6 @@ mod tests {
                     },
                 ),
             ]),
-            governance: None,
         })
         .expect("unresolved bounded child templates should deserialize");
     }

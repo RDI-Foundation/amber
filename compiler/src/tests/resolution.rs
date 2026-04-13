@@ -914,19 +914,16 @@ async fn compile_resolves_policy_exports_from_use_entries() {
         .await
         .unwrap();
 
-    let governance = output.scenario.governance.expect("governance should exist");
+    let governance = output.governance.expect("governance should exist");
     assert_eq!(governance.scopes.len(), 1);
     assert_eq!(governance.scopes[0].policies[0].as_str(), "policy_0_0");
-    assert_eq!(governance.governance_scenario.exports.len(), 1);
+    assert_eq!(governance.scenario.exports.len(), 1);
     assert_eq!(
-        governance.governance_scenario.exports[0].capability.kind,
+        governance.scenario.exports[0].capability.kind,
         amber_manifest::CapabilityKind::Http
     );
     assert_eq!(
-        governance.governance_scenario.exports[0]
-            .capability
-            .profile
-            .as_deref(),
+        governance.scenario.exports[0].capability.profile.as_deref(),
         Some("policy")
     );
 }
@@ -993,18 +990,15 @@ async fn compile_follows_child_exports_for_policies() {
         .await
         .unwrap();
 
-    let governance = output.scenario.governance.expect("governance should exist");
+    let governance = output.governance.expect("governance should exist");
     assert_eq!(governance.scopes[0].policies[0].as_str(), "policy_0_0");
-    assert_eq!(governance.governance_scenario.exports.len(), 1);
+    assert_eq!(governance.scenario.exports.len(), 1);
     assert_eq!(
-        governance.governance_scenario.exports[0].capability.kind,
+        governance.scenario.exports[0].capability.kind,
         amber_manifest::CapabilityKind::Http
     );
     assert_eq!(
-        governance.governance_scenario.exports[0]
-            .capability
-            .profile
-            .as_deref(),
+        governance.scenario.exports[0].capability.profile.as_deref(),
         Some("policy")
     );
 }
@@ -1169,8 +1163,8 @@ async fn policy_ref_rejects_slot_exports() {
 }
 
 #[tokio::test]
-async fn compile_attaches_governance_scenario_for_policy_uses() {
-    let dir = tmp_dir("scenario-governance-ir");
+async fn compile_attaches_governance_artifact_for_policy_uses() {
+    let dir = tmp_dir("compile-governance-artifact");
     let root_path = dir.path().join("root.json5");
     let child_path = dir.path().join("child.json5");
     let wrapper_path = dir.path().join("wrapper.json5");
@@ -1221,24 +1215,15 @@ async fn compile_attaches_governance_scenario_for_policy_uses() {
         .unwrap();
 
     let governance = output
-        .scenario
         .governance
         .as_ref()
-        .expect("governance should be attached");
+        .expect("governance artifact should be attached");
     assert_eq!(governance.scopes.len(), 1);
     assert_eq!(governance.scopes[0].root_moniker.as_str(), "/");
     assert_eq!(governance.scopes[0].policies.len(), 1);
     assert_eq!(governance.scopes[0].policies[0].as_str(), "policy_0_0");
-    assert_eq!(governance.governance_scenario.exports[0].name, "policy_0_0");
-    assert_eq!(
-        governance
-            .governance_scenario
-            .components
-            .iter()
-            .flatten()
-            .count(),
-        2
-    );
+    assert_eq!(governance.scenario.exports[0].name, "policy_0_0");
+    assert_eq!(governance.scenario.components.iter().flatten().count(), 2);
 }
 
 #[tokio::test]

@@ -104,7 +104,6 @@ mod tests {
             bindings: Vec::new(),
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
-            governance: None,
         };
 
         let rendered = render_metadata(&scenario).unwrap();

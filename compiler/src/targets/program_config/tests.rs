@@ -49,7 +49,6 @@ fn test_scenario() -> Scenario {
         bindings: Vec::<BindingEdge>::new(),
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
-        governance: None,
     }
 }
 
@@ -110,7 +109,6 @@ fn scenario_with_child(child: Component) -> Scenario {
         bindings: Vec::<BindingEdge>::new(),
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
-        governance: None,
     }
 }
 
@@ -482,7 +480,6 @@ fn build_endpoint_plan_expands_variadic_config_endpoints() {
     root.children.push(ComponentId(1));
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(child)],
         bindings: Vec::<BindingEdge>::new(),

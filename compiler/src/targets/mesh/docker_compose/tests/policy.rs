@@ -400,7 +400,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(allowed), Some(denied)],
         bindings: vec![BindingEdge {

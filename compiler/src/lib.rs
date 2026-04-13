@@ -8,13 +8,14 @@ mod tests;
 
 use amber_manifest::{ExperimentalFeature, Manifest, ManifestRef};
 use amber_resolver::Resolver;
-use amber_scenario::{BindingFrom, ComponentId, GovernanceScenario, Scenario};
+use amber_scenario::{BindingFrom, ComponentId, Scenario};
 use lint::{ManifestLint, lint_manifest};
 use miette::{Diagnostic, Report};
 use thiserror::Error;
 
 mod config;
 mod frontend;
+mod governance;
 mod linker;
 mod lint;
 pub mod mesh;
@@ -29,6 +30,7 @@ pub mod bundle;
 pub mod reporter;
 
 pub use frontend::{DigestStore, ResolveOptions, ResolvedNode, ResolvedTree, ResolverRegistry};
+pub use governance::{Governance, GovernedScope};
 pub use linker::{ComponentProvenance, Provenance};
 
 #[derive(Clone, Debug, Default)]
@@ -130,34 +132,39 @@ impl Compiler {
     ) -> Result<CompileOutput, Error> {
         let mut diagnostics =
             slots::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
-        let (scenario, provenance) = linker::link(tree, &self.store)?;
+        let (scenario, governance, provenance) = linker::link(tree, &self.store)?;
         diagnostics.extend(collect_manifest_diagnostics(
             &scenario,
             &provenance,
             &self.store,
         ));
 
-        let (mut scenario, provenance) = mir::optimize_linked_scenario(
+        let (scenario, provenance) = mir::optimize_linked_scenario(
             scenario,
             provenance,
             &self.store,
             mir::OptimizeOptions { dce: opts.dce },
         )?;
-        if let Some(mut governance) = scenario.governance.take() {
-            let (governance_scenario, _) = mir::optimize_linked_scenario(
-                governance.governance_scenario.into_scenario(),
-                Provenance::default(),
-                &self.store,
-                mir::OptimizeOptions { dce: opts.dce },
-            )?;
-            governance.governance_scenario = GovernanceScenario::from_scenario(governance_scenario);
-            scenario.governance = Some(governance);
-        }
+        let governance = governance
+            .map(|governance| -> Result<Governance, mir::Error> {
+                let (scenario, _) = mir::optimize_linked_scenario(
+                    governance.scenario,
+                    Provenance::default(),
+                    &self.store,
+                    mir::OptimizeOptions { dce: opts.dce },
+                )?;
+                Ok(Governance {
+                    scenario,
+                    scopes: governance.scopes,
+                })
+            })
+            .transpose()?;
         let config_analysis = config::analysis::ScenarioConfigAnalysis::from_scenario(&scenario)
             .expect("linked scenario should produce valid config analysis");
 
         Ok(CompileOutput {
             scenario,
+            governance,
             store: self.store.clone(),
             provenance,
             diagnostics,
@@ -173,7 +180,7 @@ impl Compiler {
         let tree_for_manifest_lints = tree.clone();
 
         match linker::link(tree, &self.store) {
-            Ok((scenario, provenance)) => diagnostics.extend(collect_manifest_diagnostics(
+            Ok((scenario, _, provenance)) => diagnostics.extend(collect_manifest_diagnostics(
                 &scenario,
                 &provenance,
                 &self.store,
@@ -224,6 +231,7 @@ impl Compiler {
 #[derive(Debug)]
 pub struct CompileOutput {
     pub scenario: Scenario,
+    pub governance: Option<Governance>,
     pub store: DigestStore,
     pub provenance: Provenance,
     pub diagnostics: Vec<Report>,

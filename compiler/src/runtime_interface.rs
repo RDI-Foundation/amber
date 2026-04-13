@@ -322,7 +322,6 @@ mod tests {
             bindings: Vec::new(),
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
-            governance: None,
         };
 
         let slots = collect_external_slots(&scenario, ["api", "api"]);
@@ -352,7 +351,6 @@ mod tests {
             bindings: Vec::new(),
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
-            governance: None,
         };
         let mesh_plan = MeshPlan::new(
             vec![ComponentId(1)],

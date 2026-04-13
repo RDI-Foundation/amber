@@ -22,10 +22,10 @@ use amber_manifest::{
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
-    FrameworkRef, Governance, GovernanceScenario, GovernedScope, ManifestCatalogEntry,
-    ProgramMount, ProvideRef, ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario,
-    ScenarioExport, SlotRef, StorageResourceParams as ScenarioStorageResourceParams,
-    TemplateBinding, TemplateConfigField, graph::component_path_for,
+    FrameworkRef, ManifestCatalogEntry, ProgramMount, ProvideRef,
+    ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
+    StorageResourceParams as ScenarioStorageResourceParams, TemplateBinding, TemplateConfigField,
+    graph::component_path_for,
 };
 use jsonschema::Validator;
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -46,6 +46,7 @@ use crate::{
     DigestStore,
     config::analysis::ScenarioConfigAnalysis,
     frontend::{ResolvedNode, ResolvedTree, store::display_url},
+    governance::{Governance, GovernedScope},
 };
 
 #[allow(unused_assignments)]
@@ -470,7 +471,10 @@ struct FlattenState<'a> {
     scope_builds: &'a mut Vec<ScopeBuild>,
 }
 
-pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Provenance), Error> {
+pub fn link(
+    tree: ResolvedTree,
+    store: &DigestStore,
+) -> Result<(Scenario, Option<Governance>, Provenance), Error> {
     let mut components = Vec::new();
     let mut link_index = Vec::new();
     let mut provenance = Provenance::default();
@@ -830,9 +834,8 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         bindings: binding_edges,
         exports,
         manifest_catalog,
-        governance: None,
     };
-    scenario.governance = build_governance(&scope_builds, store)?;
+    let governance = build_governance(&scope_builds, store)?;
     scenario.normalize_order();
 
     if !errors.is_empty() {
@@ -846,8 +849,11 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         return Err(err);
     }
     scenario.assert_invariants();
+    if let Some(governance) = &governance {
+        governance.scenario.assert_invariants();
+    }
 
-    Ok((scenario, provenance))
+    Ok((scenario, governance, provenance))
 }
 
 fn build_governance(
@@ -979,14 +985,15 @@ fn build_governance(
         },
     };
 
-    // Governance scenarios are linked like ordinary trees. This does not recurse because the
-    // frontend rejects `use` subtrees that declare nested `use` or `policies`, so this synthetic
-    // tree contains no governed scopes of its own.
-    let (scenario, _) = link(governance_tree, store)?;
-    Ok(Some(Governance {
-        governance_scenario: GovernanceScenario::from_scenario(scenario),
-        scopes,
-    }))
+    // The synthetic governance artifact is linked like an ordinary tree. This does not recurse
+    // because the frontend rejects `use` subtrees that declare nested `use` or `policies`, so
+    // this synthetic tree contains no governed scopes of its own.
+    let (scenario, nested_governance, _) = link(governance_tree, store)?;
+    debug_assert!(
+        nested_governance.is_none(),
+        "synthetic governance artifact should not contain nested governance"
+    );
+    Ok(Some(Governance { scenario, scopes }))
 }
 
 fn resolve_policy_export(

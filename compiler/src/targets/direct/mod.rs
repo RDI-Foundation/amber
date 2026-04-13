@@ -1116,7 +1116,6 @@ mod tests {
 
         Scenario {
             manifest_catalog: BTreeMap::new(),
-            governance: None,
             root: ComponentId(0),
             components: vec![Some(Component {
                 id: ComponentId(0),

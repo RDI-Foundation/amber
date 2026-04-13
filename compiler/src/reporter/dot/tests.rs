@@ -116,7 +116,6 @@ fn dot_renders_clusters_and_edges() {
         bindings,
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
-        governance: None,
     };
 
     let dot = render_dot(&scenario);
@@ -183,7 +182,6 @@ fn dot_omits_composite_wrapper_node_without_direct_edges() {
         bindings,
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
-        governance: None,
     };
 
     let dot = render_dot(&scenario);
@@ -227,7 +225,6 @@ fn dot_renders_root_program_node() {
         bindings: Vec::new(),
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
-        governance: None,
     };
 
     let dot = render_dot(&scenario);
@@ -265,7 +262,6 @@ fn dot_renders_framework_bindings() {
         bindings,
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
-        governance: None,
     };
 
     let dot = render_dot(&scenario);
@@ -371,7 +367,6 @@ fn dot_renders_root_exports_as_endpoints() {
             },
         }],
         manifest_catalog: BTreeMap::new(),
-        governance: None,
     };
 
     let dot = render_dot_with_exports(&scenario).expect("dot rendering");
@@ -436,7 +431,6 @@ fn dot_renders_root_exports_from_root_component() {
             },
         }],
         manifest_catalog: BTreeMap::new(),
-        governance: None,
     };
 
     let dot = render_dot_with_exports(&scenario).expect("dot rendering");

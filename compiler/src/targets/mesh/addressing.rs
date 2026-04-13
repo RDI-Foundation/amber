@@ -420,7 +420,6 @@ mod tests {
             bindings: Vec::<BindingEdge>::new(),
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
-            governance: None,
         };
 
         let mesh_plan = MeshPlan::new(
@@ -525,7 +524,6 @@ mod tests {
             bindings: Vec::<BindingEdge>::new(),
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
-            governance: None,
         };
 
         let mesh_plan = MeshPlan::new(
@@ -610,7 +608,6 @@ mod tests {
             bindings: Vec::<BindingEdge>::new(),
             exports: Vec::new(),
             manifest_catalog: BTreeMap::new(),
-            governance: None,
         };
 
         let mesh_plan = MeshPlan::new(

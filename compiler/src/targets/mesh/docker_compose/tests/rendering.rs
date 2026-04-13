@@ -28,7 +28,6 @@ fn compose_artifact_emits_env_sample_and_readme() {
     };
     let output = compile_output(Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
@@ -76,7 +75,6 @@ fn compose_emits_storage_volume_mounts() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
@@ -154,7 +152,6 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
     };
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
@@ -420,7 +417,6 @@ fn forced_router_without_exports_publishes_router_mesh_port_on_host() {
     };
     let output = compile_output(Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
@@ -472,7 +468,6 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
     };
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: vec![BindingEdge {
@@ -569,7 +564,6 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
     };
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
@@ -716,7 +710,6 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![BindingEdge {
@@ -934,7 +927,6 @@ fn compose_emits_minimal_peer_keys() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(server1), Some(server2), Some(client)],
         bindings: vec![BindingEdge {
@@ -1016,7 +1008,6 @@ fn compose_emits_named_volumes_for_storage_mounts() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
@@ -1077,7 +1068,6 @@ fn compose_escapes_entrypoint_dollars() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: vec![],
@@ -1154,7 +1144,6 @@ fn compose_emits_export_metadata_and_labels() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(server)],
         bindings: vec![],
@@ -1296,7 +1285,6 @@ fn compose_routes_external_slots_through_router() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(client)],
         bindings: vec![BindingEdge {

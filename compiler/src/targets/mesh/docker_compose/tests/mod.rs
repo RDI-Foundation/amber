@@ -157,6 +157,7 @@ fn compile_output_with_manifest_overrides(
         .expect("config analysis");
     crate::CompileOutput {
         scenario,
+        governance: None,
         store,
         provenance,
         diagnostics: Vec::new(),
@@ -470,7 +471,6 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
 
     Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),

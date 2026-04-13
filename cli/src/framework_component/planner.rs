@@ -2265,7 +2265,6 @@ pub(super) fn scenario_ir_with_fragments<'a>(
         bindings,
         exports: base_scenario.exports.clone(),
         manifest_catalog: base_scenario.manifest_catalog.clone(),
-        governance: base_scenario.governance.clone(),
     })
 }
 

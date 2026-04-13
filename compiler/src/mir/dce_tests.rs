@@ -162,7 +162,6 @@ fn externally_rooted_child_scenario(
 
     let mut scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(child)],
         bindings: vec![external_binding(0, slot_name, 1, slot_name, true)],
@@ -315,7 +314,6 @@ fn dce_prunes_unused_transitive_subtree() {
 
     let mut scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components,
         bindings,
@@ -466,7 +464,6 @@ fn dce_keeps_dependencies_for_program_slots() {
 
     let mut scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components,
         bindings,
@@ -576,7 +573,6 @@ fn dce_keeps_dependencies_for_repeated_slot_each() {
 
     let mut scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components,
         bindings,
@@ -690,7 +686,6 @@ fn dce_prunes_dependency_when_repeated_slot_each_is_dead() {
 
     let mut scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components,
         bindings,
@@ -786,7 +781,6 @@ fn dce_keeps_program_slots_from_env() {
 
     let mut scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components,
         bindings,
@@ -865,7 +859,6 @@ fn dce_keeps_storage_slots_used_by_program_mounts() {
 
     let mut scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
@@ -939,7 +932,6 @@ fn dce_keeps_resource_owner_between_export_and_storage_sink() {
 
     let mut scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
@@ -1045,7 +1037,6 @@ fn dce_keeps_ancestors_without_marking_ancestor_program_live() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components,
         bindings,
@@ -1096,7 +1087,6 @@ fn dce_keeps_framework_bound_slots() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components,
         bindings,
@@ -1144,7 +1134,6 @@ fn dce_keeps_child_template_owner_program_without_static_exports() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components,
         bindings: Vec::new(),
@@ -1200,7 +1189,6 @@ fn dce_keeps_static_child_subtree_visible_for_future_dynamic_bindings() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components,
         bindings: Vec::new(),
@@ -1247,7 +1235,6 @@ fn dce_keeps_self_external_root_slot_for_future_dynamic_use() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: vec![external_binding(0, "api", 0, "api", true)],
@@ -1311,7 +1298,6 @@ fn dce_keeps_live_external_root_slot_when_export_makes_consumer_live() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(green)],
         bindings: vec![external_binding(0, "white", 1, "white", true)],
@@ -1371,7 +1357,6 @@ fn dce_keeps_live_external_root_slot_used_in_when_condition() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(green)],
         bindings: vec![external_binding(0, "white", 1, "white", true)],
@@ -1434,7 +1419,6 @@ fn dce_keeps_live_external_root_slot_used_in_env_when_condition() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(green)],
         bindings: vec![external_binding(0, "white", 1, "white", true)],
@@ -1482,7 +1466,6 @@ fn dce_keeps_externally_rooted_child_program_without_exports() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(child)],
         bindings: vec![external_binding(0, "api", 1, "api", true)],
@@ -1531,7 +1514,6 @@ fn dce_keeps_externally_rooted_root_program_without_exports() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: vec![external_binding(0, "api", 0, "api", true)],
@@ -1583,7 +1565,6 @@ fn dce_prunes_unused_external_binding_without_exports() {
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(child)],
         bindings: vec![external_binding(0, "api", 1, "api", true)],
@@ -1648,7 +1629,6 @@ fn dce_keeps_internal_dependencies_of_externally_rooted_program_without_exports(
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(consumer), Some(provider)],
         bindings: vec![
@@ -1714,7 +1694,6 @@ fn dce_keeps_externally_rooted_program_when_slot_is_only_used_in_when_without_ex
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(child)],
         bindings: vec![external_binding(0, "api", 1, "api", true)],
@@ -1833,7 +1812,6 @@ fn dce_keeps_all_slot_dependencies_for_externally_rooted_program_without_exports
 
     let scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(consumer), Some(provider)],
         bindings: vec![
@@ -1913,7 +1891,6 @@ fn dce_prunes_dead_incoming_edges_of_live_externally_rooted_program() {
 
     let mut scenario = Scenario {
         manifest_catalog: BTreeMap::new(),
-        governance: None,
         root: ComponentId(0),
         components: vec![Some(root), Some(consumer), Some(provider)],
         bindings: vec![

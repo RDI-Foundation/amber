@@ -4,8 +4,8 @@ use std::{
 };
 
 use amber_manifest::{
-    CapabilityDecl, CapabilityKind, ExportName, FrameworkCapabilityName, Manifest, ManifestDigest,
-    ProvideDecl, RealmSelector, RuntimeBackend, SlotDecl,
+    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ProvideDecl,
+    RealmSelector, RuntimeBackend, SlotDecl,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,7 +79,6 @@ pub struct Scenario {
     pub bindings: Vec<BindingEdge>,
     pub exports: Vec<ScenarioExport>,
     pub manifest_catalog: BTreeMap<String, ManifestCatalogEntry>,
-    pub governance: Option<Governance>,
 }
 
 impl Scenario {
@@ -110,19 +109,32 @@ impl Scenario {
     }
 
     pub fn normalize_export_order_by_name(&mut self) {
-        normalize_export_order_by_name(&mut self.exports);
+        self.exports.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
     pub fn normalize_child_order_by_moniker(&mut self) {
-        normalize_child_order_by_moniker(&mut self.components);
+        let monikers: Vec<Option<Moniker>> = self
+            .components
+            .iter()
+            .map(|c| c.as_ref().map(|c| c.moniker.clone()))
+            .collect();
+
+        for component in self.components.iter_mut().flatten() {
+            component.children.sort_by(|a, b| {
+                let left = monikers[a.0]
+                    .as_ref()
+                    .expect("child component should exist");
+                let right = monikers[b.0]
+                    .as_ref()
+                    .expect("child component should exist");
+                left.cmp(right)
+            });
+        }
     }
 
     pub fn normalize_order(&mut self) {
         self.normalize_child_order_by_moniker();
         self.normalize_export_order_by_name();
-        if let Some(governance) = &mut self.governance {
-            governance.governance_scenario.normalize_order();
-        }
     }
 
     /// Debug-only validation for post-link invariants.
@@ -192,107 +204,7 @@ impl Scenario {
             );
             let _ = self.component(export.from.component);
         }
-
-        if let Some(governance) = &self.governance {
-            governance.governance_scenario.assert_invariants();
-        }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Governance {
-    pub governance_scenario: GovernanceScenario,
-    pub scopes: Vec<GovernedScope>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GovernanceScenario {
-    pub root: ComponentId,
-    pub components: Vec<Option<Component>>,
-    pub bindings: Vec<BindingEdge>,
-    pub exports: Vec<ScenarioExport>,
-    pub manifest_catalog: BTreeMap<String, ManifestCatalogEntry>,
-}
-
-impl GovernanceScenario {
-    pub fn normalize_order(&mut self) {
-        normalize_child_order_by_moniker(&mut self.components);
-        normalize_export_order_by_name(&mut self.exports);
-    }
-
-    pub fn assert_invariants(&self) {
-        self.as_scenario().assert_invariants();
-    }
-
-    pub fn from_scenario(scenario: Scenario) -> Self {
-        let Scenario {
-            root,
-            components,
-            bindings,
-            exports,
-            manifest_catalog,
-            governance: _,
-        } = scenario;
-        Self {
-            root,
-            components,
-            bindings,
-            exports,
-            manifest_catalog,
-        }
-    }
-
-    pub fn into_scenario(self) -> Scenario {
-        Scenario {
-            root: self.root,
-            components: self.components,
-            bindings: self.bindings,
-            exports: self.exports,
-            manifest_catalog: self.manifest_catalog,
-            governance: None,
-        }
-    }
-
-    pub fn as_scenario(&self) -> Scenario {
-        Scenario {
-            root: self.root,
-            components: self.components.clone(),
-            bindings: self.bindings.clone(),
-            exports: self.exports.clone(),
-            manifest_catalog: self.manifest_catalog.clone(),
-            governance: None,
-        }
-    }
-}
-
-fn normalize_export_order_by_name(exports: &mut Vec<ScenarioExport>) {
-    exports.sort_by(|a, b| a.name.cmp(&b.name));
-}
-
-fn normalize_child_order_by_moniker(components: &mut [Option<Component>]) {
-    let monikers: Vec<Option<Moniker>> = components
-        .iter()
-        .map(|c| c.as_ref().map(|c| c.moniker.clone()))
-        .collect();
-
-    for component in components.iter_mut().flatten() {
-        component.children.sort_by(|a, b| {
-            let left = monikers[a.0]
-                .as_ref()
-                .expect("child component should exist");
-            let right = monikers[b.0]
-                .as_ref()
-                .expect("child component should exist");
-            left.cmp(right)
-        });
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GovernedScope {
-    pub root_moniker: Moniker,
-    #[serde(default)]
-    pub policies: Vec<ExportName>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
