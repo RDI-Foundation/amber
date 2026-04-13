@@ -343,6 +343,7 @@ pub(super) fn build_launch_bundle_manifest(
                     .as_ref()
                     .map(|_| observability_state_path(bundle_root).display().to_string()),
                 requests_log: observability.receipt.requests_log.clone(),
+                events_ndjson: observability.receipt.events_ndjson.clone(),
                 launch_commands: observability_launch_commands(observability)?,
             })
         })
@@ -714,6 +715,7 @@ pub(super) fn materialize_observability(
         let listen_addr = SocketAddr::from(([0, 0, 0, 0], listen_port));
         let advertise_endpoint = format!("http://127.0.0.1:{listen_port}");
         let requests_log = run_root.join("observability").join("requests.log");
+        let events_ndjson = run_root.join("observability").join("events.ndjson");
         let plan = ObservabilitySinkPlan {
             schema: OTLP_SINK_PLAN_SCHEMA.to_string(),
             version: OTLP_SINK_PLAN_VERSION,
@@ -723,6 +725,7 @@ pub(super) fn materialize_observability(
             listen_addr: listen_addr.to_string(),
             advertise_endpoint: advertise_endpoint.clone(),
             requests_log: requests_log.display().to_string(),
+            events_ndjson: events_ndjson.display().to_string(),
         };
         let plan_path = observability_plan_path(run_root);
         write_json(&plan_path, &plan)?;
@@ -731,6 +734,7 @@ pub(super) fn materialize_observability(
                 endpoint: advertise_endpoint,
                 sink_pid: None,
                 requests_log: Some(requests_log.display().to_string()),
+                events_ndjson: Some(events_ndjson.display().to_string()),
             },
             plan_path: Some(plan_path),
         }));
@@ -741,6 +745,7 @@ pub(super) fn materialize_observability(
             endpoint: observability.to_string(),
             sink_pid: None,
             requests_log: None,
+            events_ndjson: None,
         },
         plan_path: None,
     }))

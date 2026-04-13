@@ -110,8 +110,9 @@ using backend-specific control surfaces. The smallest example is
 available over HTTP at `$(slots.<name>.url)/v1/...` and over MCP at
 `$(slots.<name>.url)/mcp`.
 
-For background runs and persisted logs, `amber run --detach`, `amber ps`, `amber logs`, and
-`amber stop` give you a managed local workflow without requiring generated artifacts.
+For background runs and persisted traces, `amber run --detach`, `amber attach`, `amber ps`,
+`amber logs`, and `amber stop` give you a managed local workflow without requiring generated
+artifacts.
 
 ## Core ideas
 
@@ -237,6 +238,7 @@ Most people will spend most of their time in `amber run`:
 amber run .
 amber run path/to/root
 amber run path/to/root --detach
+amber attach <run-id>
 amber ps
 amber logs <run-id>
 amber stop <run-id>

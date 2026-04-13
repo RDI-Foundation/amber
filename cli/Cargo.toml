@@ -25,6 +25,8 @@ fatfs = "0.3.6"
 jsonschema = { workspace = true, default-features = false }
 libc = "0.2.177"
 miette = { workspace = true, features = ["fancy"] }
+opentelemetry-proto = { version = "0.31.0", default-features = false, features = ["logs", "gen-tonic-messages"] }
+prost = "0.14.1"
 reqwest = { workspace = true }
 rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
 regex = "1.11.1"

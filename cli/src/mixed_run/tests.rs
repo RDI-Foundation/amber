@@ -1,6 +1,17 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::{Read as _, Write as _},
+    net::{TcpListener, TcpStream},
+};
 
 use base64::Engine as _;
+use opentelemetry_proto::tonic::{
+    collector::logs::v1::ExportLogsServiceRequest,
+    common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value},
+    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+    resource::v1::Resource,
+};
+use prost::Message as _;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -45,6 +56,12 @@ fn test_site_receipt(
         router_mesh_addr: router_mesh_addr.map(str::to_string),
         router_identity_id: None,
         router_public_key_b64: None,
+    }
+}
+
+fn otlp_string_value(value: &str) -> AnyValue {
+    AnyValue {
+        value: Some(any_value::Value::StringValue(value.to_string())),
     }
 }
 
@@ -3692,4 +3709,223 @@ async fn wait_for_kubernetes_site_router_ready_waits_for_live_discovery() {
         .expect("state update task should join");
     control_task.await.expect("control task should join");
     mesh_task.await.expect("mesh task should join");
+}
+
+#[test]
+fn handle_otlp_connection_persists_structured_trace_stream() {
+    let temp = tempdir().expect("tempdir should exist");
+    let requests_log = temp.path().join("observability").join("requests.log");
+    let events_ndjson = temp.path().join("observability").join("events.ndjson");
+    let body = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![
+                    KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(otlp_string_value("amber.run-test.bindings")),
+                    },
+                    KeyValue {
+                        key: "amber_entity_kind".to_string(),
+                        value: Some(otlp_string_value("binding")),
+                    },
+                    KeyValue {
+                        key: "amber_edge_ref".to_string(),
+                        value: Some(otlp_string_value("/public.a2a -> /server.a2a")),
+                    },
+                    KeyValue {
+                        key: "amber_http_subject".to_string(),
+                        value: Some(otlp_string_value("agent card")),
+                    },
+                ],
+                ..Default::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "amber.binding".to_string(),
+                    ..Default::default()
+                }),
+                log_records: vec![LogRecord {
+                    severity_text: "INFO".to_string(),
+                    body: Some(otlp_string_value(
+                        "request received from public by /server [headers]",
+                    )),
+                    trace_id: vec![0x1a; 16],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec();
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("listener should expose address");
+    let response_task = std::thread::spawn(move || {
+        let mut client = TcpStream::connect(addr).expect("client should connect");
+        write!(
+            client,
+            "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: \
+             close\r\n\r\n",
+            body.len()
+        )
+        .expect("request head should write");
+        client.write_all(&body).expect("request body should write");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("response should read");
+        response
+    });
+
+    let (mut stream, _) = listener.accept().expect("listener should accept");
+    handle_otlp_connection(&mut stream, &requests_log, &events_ndjson)
+        .expect("sink should handle otlp request");
+    drop(stream);
+
+    let response = response_task.join().expect("client thread should join");
+    assert!(
+        response.starts_with("HTTP/1.1 204 No Content"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        fs::read_to_string(&requests_log)
+            .expect("requests log should exist")
+            .contains("/v1/logs"),
+        "requests log should record the OTLP path"
+    );
+    let structured = fs::read_to_string(&events_ndjson).expect("structured events should exist");
+    assert!(
+        structured.contains("\"message\":\"request received from public by /server [headers]\""),
+        "structured log should contain the event body, got:\n{structured}"
+    );
+    assert!(
+        structured.contains("\"amber_http_subject\":\"agent card\""),
+        "structured log should preserve protocol attributes, got:\n{structured}"
+    );
+}
+
+#[test]
+fn handle_otlp_connection_ignores_internal_and_json_log_payloads() {
+    let temp = tempdir().expect("tempdir should exist");
+    let requests_log = temp.path().join("observability").join("requests.log");
+    let events_ndjson = temp.path().join("observability").join("events.ndjson");
+
+    let internal_body = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![
+                    KeyValue {
+                        key: "amber_entity_kind".to_string(),
+                        value: Some(otlp_string_value("binding")),
+                    },
+                    KeyValue {
+                        key: "amber_edge_ref".to_string(),
+                        value: Some(otlp_string_value(
+                            "/site/compose_local/router.a2a -> /runtime.a2a",
+                        )),
+                    },
+                ],
+                ..Default::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "amber.binding".to_string(),
+                    ..Default::default()
+                }),
+                log_records: vec![LogRecord {
+                    severity_text: "INFO".to_string(),
+                    body: Some(otlp_string_value(
+                        "request received by /runtime from /site/compose_local/router via \
+                         /site/compose_local/router.a2a -> /runtime.a2a [headers]",
+                    )),
+                    trace_id: vec![0x2b; 16],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec();
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("listener should expose address");
+    let internal_request = std::thread::spawn(move || {
+        let mut client = TcpStream::connect(addr).expect("client should connect");
+        write!(
+            client,
+            "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: \
+             close\r\n\r\n",
+            internal_body.len()
+        )
+        .expect("request head should write");
+        client
+            .write_all(&internal_body)
+            .expect("request body should write");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("response should read");
+        response
+    });
+    let (mut stream, _) = listener.accept().expect("listener should accept");
+    handle_otlp_connection(&mut stream, &requests_log, &events_ndjson)
+        .expect("sink should handle internal otlp request");
+    drop(stream);
+    let response = internal_request.join().expect("client thread should join");
+    assert!(
+        response.starts_with("HTTP/1.1 204 No Content"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        !events_ndjson.exists(),
+        "internal route chatter should not produce a structured trace stream"
+    );
+
+    let json_body = serde_json::to_vec(&serde_json::json!({
+        "event": "amber.run.starting",
+        "body": "starting mixed-site run run-test",
+        "attributes": {"amber.run_id": "run-test"}
+    }))
+    .expect("json payload should serialize");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("listener should expose address");
+    let json_request = std::thread::spawn(move || {
+        let mut client = TcpStream::connect(addr).expect("client should connect");
+        write!(
+            client,
+            "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: \
+             application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            json_body.len()
+        )
+        .expect("request head should write");
+        client
+            .write_all(&json_body)
+            .expect("request body should write");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("response should read");
+        response
+    });
+    let (mut stream, _) = listener.accept().expect("listener should accept");
+    handle_otlp_connection(&mut stream, &requests_log, &events_ndjson)
+        .expect("sink should handle manager json request");
+    drop(stream);
+    let response = json_request.join().expect("client thread should join");
+    assert!(
+        response.starts_with("HTTP/1.1 204 No Content"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        !events_ndjson.exists(),
+        "manager json events should not be mixed into the structured trace stream"
+    );
 }

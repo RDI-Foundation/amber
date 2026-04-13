@@ -380,7 +380,7 @@ pub(super) fn exchange_message(
             ),
         },
     };
-    match protocol_detail(summary, part) {
+    match protocol_detail(telemetry, summary, part) {
         Some(detail) => format!("{base}: {detail}"),
         None => base,
     }
@@ -430,59 +430,278 @@ pub(super) fn emit_binding_failure_event(
     );
 }
 
-fn protocol_detail(summary: &ProtocolSummary, part: HttpLifecyclePart) -> Option<String> {
-    let mut action = summary
+pub(super) fn protocol_detail(
+    telemetry: &HttpExchangeTelemetryContext,
+    summary: &ProtocolSummary,
+    part: HttpLifecyclePart,
+) -> Option<String> {
+    let mut narrative = protocol_narrative(telemetry, summary, part)?;
+    if part == HttpLifecyclePart::Request && summary.rpc_is_notification == Some(true) {
+        narrative.text.push_str(" notification");
+    }
+    if part == HttpLifecyclePart::Response && narrative.append_response_suffix {
+        if let Some(code) = summary.rpc_error_code {
+            narrative.text.push_str(&format!(" error {code}"));
+        } else if summary.has_application_error() {
+            narrative.text.push_str(" error");
+        } else if summary.rpc_kind == Some("result") {
+            narrative.text.push_str(" result");
+        } else {
+            narrative.text.push_str(" response");
+        }
+    }
+    if let Some(id) = summary.rpc_id.as_deref().filter(|id| !id.is_empty()) {
+        narrative
+            .text
+            .push_str(&format!(" (id={})", compact_display_value(id, 20)));
+    }
+    Some(narrative.text)
+}
+
+struct ProtocolNarrative {
+    text: String,
+    append_response_suffix: bool,
+}
+
+impl ProtocolNarrative {
+    fn new(text: String, append_response_suffix: bool) -> Self {
+        Self {
+            text,
+            append_response_suffix,
+        }
+    }
+}
+
+fn protocol_narrative(
+    telemetry: &HttpExchangeTelemetryContext,
+    summary: &ProtocolSummary,
+    part: HttpLifecyclePart,
+) -> Option<ProtocolNarrative> {
+    if let Some(detail) = a2a_task_update_detail(summary) {
+        return Some(ProtocolNarrative::new(detail, false));
+    }
+    if let Some(detail) = mcp_progress_detail(summary) {
+        return Some(ProtocolNarrative::new(detail, false));
+    }
+    if let Some(detail) = mcp_log_message_detail(summary) {
+        return Some(ProtocolNarrative::new(detail, false));
+    }
+    if let Some(detail) = protocol_operation_detail(summary) {
+        return Some(ProtocolNarrative::new(detail, true));
+    }
+    if part == HttpLifecyclePart::Response {
+        let remembered = telemetry.summary_snapshot();
+        if remembered != *summary
+            && let Some(detail) = protocol_narrative(telemetry, &remembered, part)
+        {
+            return Some(detail);
+        }
+    }
+    telemetry
+        .http_subject()
+        .map(|subject| ProtocolNarrative::new(subject.to_string(), false))
+}
+
+fn a2a_task_update_detail(summary: &ProtocolSummary) -> Option<String> {
+    let state = summary.a2a_task_state.as_deref()?;
+    let mut detail = format!("task {}", humanize_task_state(state));
+    if let Some(count) = summary.a2a_artifact_count.filter(|count| *count > 0) {
+        let noun = if count == 1 { "artifact" } else { "artifacts" };
+        detail.push_str(&format!(" ({count} {noun})"));
+    }
+    Some(detail)
+}
+
+fn mcp_progress_detail(summary: &ProtocolSummary) -> Option<String> {
+    let progress = summary.mcp_progress?;
+    let mut detail = if let Some(total) = summary.mcp_progress_total {
+        format!(
+            "progress {}/{}",
+            format_decimal(progress),
+            format_decimal(total)
+        )
+    } else {
+        format!("progress {}", format_decimal(progress))
+    };
+    if let Some(message) = summary
+        .mcp_progress_message
+        .as_deref()
+        .filter(|message| !message.is_empty())
+    {
+        detail.push_str(&format!(" ({})", compact_display_value(message, 28)));
+    }
+    Some(detail)
+}
+
+fn mcp_log_message_detail(summary: &ProtocolSummary) -> Option<String> {
+    if summary.rpc_method.as_deref() != Some("notifications/message") {
+        return None;
+    }
+    summary.mcp_log_level.as_deref().map(|level| {
+        let mut detail = format!("log {}", humanize_identifier(level));
+        if let Some(logger) = summary
+            .mcp_logger
+            .as_deref()
+            .filter(|logger| !logger.is_empty())
+        {
+            detail.push_str(&format!(" {}", compact_display_value(logger, 20)));
+        }
+        detail
+    })
+}
+
+fn protocol_operation_detail(summary: &ProtocolSummary) -> Option<String> {
+    let method = summary
         .rpc_method
         .as_deref()
-        .or(summary.rpc_method_raw.as_deref())
-        .map(ToString::to_string)
-        .or_else(|| {
-            summary
-                .mcp_tool_name
-                .as_ref()
-                .map(|tool_name| format!("tool {tool_name}"))
-        })
-        .or_else(|| {
-            summary
-                .a2a_task_state
-                .as_ref()
-                .map(|task_state| format!("A2A {task_state}"))
-        })
-        .or_else(|| summary.mcp_progress.map(|_| "MCP progress".to_string()));
+        .or(summary.rpc_method_raw.as_deref())?;
+    let mut detail = humanize_method_detail(method);
 
-    if action.as_deref() == Some("tools/call")
-        && let Some(tool_name) = summary.mcp_tool_name.as_deref()
+    if let Some(tool_name) = summary
+        .mcp_tool_name
+        .as_deref()
+        .filter(|_| method == "tools/call")
     {
-        action = Some(format!("tools/call {tool_name}"));
-    }
-
-    let mut detail = match (part, action) {
-        (HttpLifecyclePart::Request, Some(action)) => {
-            if summary.rpc_is_notification == Some(true) {
-                format!("{action} notification")
-            } else {
-                action
-            }
-        }
-        (HttpLifecyclePart::Response, Some(action)) => {
-            if let Some(code) = summary.rpc_error_code {
-                format!("{action} error {code}")
-            } else if summary.has_application_error() {
-                format!("{action} error")
-            } else if summary.rpc_kind == Some("result") {
-                format!("{action} result")
-            } else {
-                format!("{action} response")
-            }
-        }
-        (_, None) => return None,
-    };
-
-    if let Some(id) = summary.rpc_id.as_deref().filter(|id| !id.is_empty()) {
-        detail.push_str(&format!(" (id={id})"));
+        detail.push_str(&format!(" {}", compact_display_value(tool_name, 24)));
+    } else if let Some(resource_uri) = summary
+        .mcp_resource_uri
+        .as_deref()
+        .filter(|_| method.starts_with("resources/"))
+    {
+        detail.push_str(&format!(" {}", compact_display_value(resource_uri, 32)));
     }
 
     Some(detail)
+}
+
+fn humanize_method_detail(method: &str) -> String {
+    if let Some((family, action)) = method.split_once('/') {
+        return humanize_slash_method(family, action);
+    }
+    humanize_identifier(method)
+}
+
+fn humanize_slash_method(family: &str, action: &str) -> String {
+    let action = humanize_identifier(action);
+    let family_plural = humanize_identifier(family);
+    let family_singular = singularize_phrase(&family_plural);
+
+    if family == "notifications" {
+        return match action.as_str() {
+            "progress" => "progress update".to_string(),
+            "message" => "log message".to_string(),
+            _ => format!("{action} notification"),
+        };
+    }
+
+    if action == "list" {
+        return format!("list {family_plural}");
+    }
+
+    format!("{action} {family_singular}")
+}
+
+fn singularize_phrase(phrase: &str) -> String {
+    let Some((prefix, last)) = phrase.rsplit_once(' ') else {
+        return singularize_word(phrase).to_string();
+    };
+    format!("{prefix} {}", singularize_word(last))
+}
+
+fn singularize_word(word: &str) -> &str {
+    if word.len() > 1 && word.ends_with('s') {
+        &word[..word.len() - 1]
+    } else {
+        word
+    }
+}
+
+fn humanize_task_state(state: &str) -> String {
+    humanize_identifier(state.trim_start_matches("TASK_STATE_"))
+}
+
+fn format_decimal(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+fn compact_display_value(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 6 {
+        return value.chars().take(max_chars).collect();
+    }
+    let left = (max_chars - 3) / 2;
+    let right = max_chars - 3 - left;
+    let prefix = value.chars().take(left).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}...{suffix}")
+}
+
+fn humanize_identifier(input: &str) -> String {
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut previous_was_lower_or_digit = false;
+    let mut previous_was_upper = false;
+
+    for (index, ch) in chars.iter().enumerate() {
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            previous_was_lower_or_digit = false;
+            previous_was_upper = false;
+            continue;
+        }
+
+        let next_is_lower = chars
+            .get(index + 1)
+            .is_some_and(|next| next.is_ascii_lowercase());
+        let starts_new_word = !current.is_empty()
+            && ((previous_was_lower_or_digit && ch.is_ascii_uppercase())
+                || (previous_was_upper && ch.is_ascii_uppercase() && next_is_lower));
+        if starts_new_word {
+            words.push(std::mem::take(&mut current));
+        }
+
+        current.push(ch.to_ascii_lowercase());
+        previous_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        previous_was_upper = ch.is_ascii_uppercase();
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    words.join(" ")
+}
+
+pub(super) fn http_subject_from_path(path: &str) -> Option<String> {
+    let segment = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())?;
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or(segment)
+        .trim_matches('.');
+    let subject = humanize_identifier(stem);
+    (!subject.is_empty() && subject.chars().any(|ch| ch.is_ascii_alphabetic())).then_some(subject)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -514,6 +733,108 @@ fn protocol_fields(summary: &ProtocolSummary) -> EventProtocolFields<'_> {
         rpc_id: summary.rpc_id.as_deref().unwrap_or(""),
         rpc_method: summary.rpc_method.as_deref().unwrap_or(""),
         application_error: summary.has_application_error(),
+    }
+}
+
+fn push_protocol_summary_log_attrs(
+    attributes: &mut OtlpLogAttributes,
+    telemetry: &HttpExchangeTelemetryContext,
+    summary: &ProtocolSummary,
+) {
+    push_nonempty_log_attr(
+        attributes,
+        "amber_http_subject",
+        telemetry.http_subject().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_parent_request_key",
+        summary.parent_request_key.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_mcp_tool_name",
+        summary.mcp_tool_name.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_mcp_task_id",
+        summary.mcp_task_id.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_mcp_progress_token",
+        summary.mcp_progress_token.as_deref().unwrap_or(""),
+    );
+    if let Some(progress) = summary.mcp_progress {
+        push_log_attr(attributes, "amber_mcp_progress", progress);
+    }
+    if let Some(total) = summary.mcp_progress_total {
+        push_log_attr(attributes, "amber_mcp_progress_total", total);
+    }
+    push_nonempty_log_attr(
+        attributes,
+        "amber_mcp_progress_message",
+        summary.mcp_progress_message.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_mcp_resource_uri",
+        summary.mcp_resource_uri.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_mcp_cursor",
+        summary.mcp_cursor.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_mcp_next_cursor",
+        summary.mcp_next_cursor.as_deref().unwrap_or(""),
+    );
+    if let Some(list_changed) = summary.mcp_list_changed {
+        push_log_attr(attributes, "amber_mcp_list_changed", list_changed);
+    }
+    if let Some(tool_is_error) = summary.mcp_tool_is_error {
+        push_log_attr(attributes, "amber_mcp_tool_is_error", tool_is_error);
+    }
+    push_nonempty_log_attr(
+        attributes,
+        "amber_mcp_log_level",
+        summary.mcp_log_level.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_mcp_logger",
+        summary.mcp_logger.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_a2a_message_id",
+        summary.a2a_message_id.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_a2a_task_id",
+        summary.a2a_task_id.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_a2a_context_id",
+        summary.a2a_context_id.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_a2a_reference_task_id",
+        summary.a2a_reference_task_id.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        attributes,
+        "amber_a2a_task_state",
+        summary.a2a_task_state.as_deref().unwrap_or(""),
+    );
+    if let Some(artifact_count) = summary.a2a_artifact_count {
+        push_log_attr(attributes, "amber_a2a_artifact_count", artifact_count);
     }
 }
 
@@ -654,6 +975,7 @@ fn binding_log_attributes(
     push_nonempty_log_attr(&mut attributes, "amber_request_key", fields.request_key);
     push_nonempty_log_attr(&mut attributes, "amber_rpc_id", fields.rpc_id);
     push_nonempty_log_attr(&mut attributes, "amber_rpc_method", fields.rpc_method);
+    push_protocol_summary_log_attrs(&mut attributes, telemetry, summary);
     push_true_log_attr(
         &mut attributes,
         "amber_application_error",
@@ -1082,7 +1404,7 @@ fn extract_a2a_fields(value: &serde_json::Value) -> ProtocolSummary {
     }
 }
 
-fn extract_protocol_summary(
+pub(super) fn extract_protocol_summary(
     telemetry: &HttpExchangeTelemetryContext,
     body_text: &str,
 ) -> ProtocolSummary {

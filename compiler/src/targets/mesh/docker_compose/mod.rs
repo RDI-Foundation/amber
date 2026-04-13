@@ -582,8 +582,7 @@ fn render_docker_compose_inner(
     // Per-scenario OpenTelemetry collector agent.
     //
     // Amber runtimes export OTLP traces and logs directly to the collector, which then forwards
-    // them to the configured upstream endpoint (defaulting to the local `amber dashboard` Aspire
-    // OTLP/HTTP port).
+    // them to the configured upstream endpoint.
     let otelcol_config = otelcol_config_content();
     compose.configs.insert(
         OTELCOL_CONFIG_NAME.to_string(),

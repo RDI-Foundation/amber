@@ -1541,7 +1541,7 @@ fn export_messages_use_user_facing_component_story() {
         &route,
         &open,
     );
-    let telemetry = HttpExchangeTelemetryContext::new(RewriteFlow::Inbound, &labels);
+    let telemetry = HttpExchangeTelemetryContext::new(RewriteFlow::Inbound, &labels, None);
 
     assert_eq!(
         exchange_message(
@@ -1550,6 +1550,84 @@ fn export_messages_use_user_facing_component_story() {
             &ProtocolSummary::default(),
         ),
         "request received from public by /server"
+    );
+}
+
+#[test]
+fn http_subject_from_path_humanizes_last_segment() {
+    assert_eq!(
+        http_subject_from_path("/.well-known/agent-card.json"),
+        Some("agent card".to_string())
+    );
+    assert_eq!(http_subject_from_path("/"), None);
+}
+
+#[test]
+fn protocol_detail_uses_http_subject_fallback_for_header_only_exchanges() {
+    let labels = test_http_exchange_labels();
+    let telemetry = HttpExchangeTelemetryContext::new(
+        RewriteFlow::Outbound,
+        &labels,
+        http_subject_from_path("/.well-known/agent-card.json"),
+    );
+
+    assert_eq!(
+        protocol_detail(
+            &telemetry,
+            &ProtocolSummary::default(),
+            HttpLifecyclePart::Request,
+        ),
+        Some("agent card".to_string())
+    );
+}
+
+#[test]
+fn protocol_detail_humanizes_mcp_method_families_and_reuses_request_context() {
+    let labels = test_http_exchange_labels();
+    let telemetry = HttpExchangeTelemetryContext::new(RewriteFlow::Outbound, &labels, None);
+    let request_summary = extract_protocol_summary(
+        &telemetry,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"weather.lookup"}}"#,
+    );
+    telemetry.remember_summary(&request_summary);
+    let response_summary =
+        extract_protocol_summary(&telemetry, r#"{"jsonrpc":"2.0","id":7,"result":{}}"#);
+
+    assert_eq!(
+        protocol_detail(&telemetry, &request_summary, HttpLifecyclePart::Request),
+        Some("call tool weather.lookup (id=7)".to_string())
+    );
+    assert_eq!(
+        protocol_detail(&telemetry, &response_summary, HttpLifecyclePart::Response),
+        Some("call tool weather.lookup result (id=7)".to_string())
+    );
+}
+
+#[test]
+fn protocol_detail_prefers_task_updates_over_generic_a2a_method_names() {
+    let labels = HttpExchangeLabels {
+        capability_kind: Some(Arc::<str>::from("a2a")),
+        capability_profile: Some(Arc::<str>::from("a2a")),
+        ..test_http_exchange_labels()
+    };
+    let telemetry = HttpExchangeTelemetryContext::new(RewriteFlow::Outbound, &labels, None);
+    let request_summary = extract_protocol_summary(
+        &telemetry,
+        r#"{"jsonrpc":"2.0","id":"abc123","method":"message/stream","params":{"message":{"messageId":"msg-1"}}}"#,
+    );
+    telemetry.remember_summary(&request_summary);
+    let response_summary = extract_protocol_summary(
+        &telemetry,
+        r#"{"jsonrpc":"2.0","id":"abc123","result":{"task":{"id":"task-1","status":{"state":"TASK_STATE_SUBMITTED"}}}}"#,
+    );
+
+    assert_eq!(
+        protocol_detail(&telemetry, &request_summary, HttpLifecyclePart::Request),
+        Some("send streaming message (id=abc123)".to_string())
+    );
+    assert_eq!(
+        protocol_detail(&telemetry, &response_summary, HttpLifecyclePart::Response),
+        Some("task submitted (id=abc123)".to_string())
     );
 }
 

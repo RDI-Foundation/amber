@@ -120,6 +120,8 @@ dependencies = [
  "jsonschema",
  "libc",
  "miette",
+ "opentelemetry-proto",
+ "prost",
  "regex",
  "reqwest 0.13.2",
  "rmcp",

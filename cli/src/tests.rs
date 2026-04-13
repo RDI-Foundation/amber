@@ -1,3 +1,5 @@
+use std::{collections::BTreeMap, path::Path};
+
 use clap::CommandFactory as _;
 
 use super::*;
@@ -50,9 +52,75 @@ fn verbosity_levels_follow_v_flag_ladder() {
 }
 
 #[test]
+fn managed_run_observability_defaults_to_local() {
+    assert_eq!(managed_run_observability(None), Some("local"));
+    assert_eq!(managed_run_observability(Some("")), Some("local"));
+    assert_eq!(managed_run_observability(Some("  ")), Some("local"));
+}
+
+#[test]
+fn managed_run_observability_accepts_explicit_modes() {
+    assert_eq!(managed_run_observability(Some("local")), Some("local"));
+    assert_eq!(managed_run_observability(Some("off")), None);
+    assert_eq!(managed_run_observability(Some("none")), None);
+    assert_eq!(
+        managed_run_observability(Some("http://127.0.0.1:4318")),
+        Some("http://127.0.0.1:4318")
+    );
+}
+
+#[test]
 fn cli_version_comes_from_build_metadata() {
     let cli = Cli::command();
     assert_eq!(cli.get_version(), Some(CLI_VERSION));
+}
+
+#[test]
+fn top_level_help_groups_authoring_and_runtime_workflows() {
+    let mut cli = Cli::command();
+    let mut help = Vec::new();
+    cli.write_long_help(&mut help)
+        .expect("top-level help should render");
+    let help = String::from_utf8(help).expect("help should be utf-8");
+
+    assert!(help.contains("Authoring And Inspection:"), "{help}");
+    assert!(help.contains("Runtime:"), "{help}");
+    assert!(help.contains("Compile To Explicit Artifacts:"), "{help}");
+    assert!(
+        help.contains("run      Run a manifest, run plan, or Amber runtime artifact"),
+        "{help}"
+    );
+    assert!(
+        help.contains("proxy    Bridge scenario exports and external slots to the host"),
+        "{help}"
+    );
+    assert!(
+        help.find("run      Run a manifest, run plan, or Amber runtime artifact")
+            < help.find("compile  Compile a manifest into Scenario IR and runtime artifacts"),
+        "{help}"
+    );
+}
+
+#[test]
+fn attached_run_overview_stays_focused_on_identity_and_exports() {
+    let mut output = Vec::new();
+    print_run_session_overview(
+        &mut output,
+        AttachedSessionMode::ForegroundRun,
+        "run-123",
+        Path::new("/tmp/run-123"),
+        &RunInterface::default(),
+        &BTreeMap::new(),
+    )
+    .expect("overview should render");
+    let rendered = String::from_utf8(output).expect("overview should be utf-8");
+
+    assert!(rendered.contains("run-123"), "{rendered}");
+    assert!(rendered.contains("/tmp/run-123"), "{rendered}");
+    assert!(rendered.contains("none declared\n\n"), "{rendered}");
+    assert!(!rendered.contains("amber logs -f"), "{rendered}");
+    assert!(!rendered.contains("amber stop"), "{rendered}");
+    assert!(!rendered.contains("Ctrl-C"), "{rendered}");
 }
 
 #[test]
@@ -508,16 +576,13 @@ fn direct_storage_root_uses_explicit_override() {
 }
 
 #[test]
-fn attached_run_storage_defaults_to_temporary_root() {
+fn attached_run_storage_defaults_to_managed_storage_root() {
     let storage = AttachedRunStorage::new(None).expect("attached storage should build");
-    let path = storage.storage_root();
-    assert!(path.exists(), "temporary storage root should exist");
+    let expected = mixed_run::mixed_run_storage_root(None).expect("managed storage root");
+    assert_eq!(storage.storage_root(), expected.as_path());
     assert!(
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("amber-run-")),
-        "unexpected temporary storage root: {}",
-        path.display()
+        storage.should_cleanup_run_root(),
+        "default attached storage should clean up the foreground run root"
     );
 }
 
