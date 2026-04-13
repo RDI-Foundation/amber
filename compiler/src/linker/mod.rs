@@ -94,8 +94,22 @@ fn component_local_name(component: &Component) -> &str {
 #[derive(Clone, Debug)]
 struct ScopeBuild {
     root_moniker: amber_scenario::Moniker,
+    manifest_url: Url,
     uses: BTreeMap<String, ResolvedNode>,
     policies: Vec<PolicyRef>,
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedPolicyEndpoint {
+    Provide {
+        name: String,
+        decl: CapabilityDecl,
+        resolved_url: Url,
+    },
+    Slot {
+        name: String,
+        resolved_url: Url,
+    },
 }
 
 #[allow(unused_assignments)]
@@ -115,6 +129,40 @@ pub enum Error {
     MissingManifest {
         component_path: String,
         digest: ManifestDigest,
+    },
+
+    #[error("policy `{policy}` could not resolve export `{export}` from use `#{use_name}`")]
+    #[diagnostic(
+        code(compiler::policy_export_unresolved),
+        help(
+            "Ensure the used manifest exports this capability and that any child export chain \
+             resolves to a real export."
+        )
+    )]
+    PolicyExportUnresolved {
+        policy: Box<str>,
+        use_name: Box<str>,
+        export: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "policy referenced here")]
+        span: Option<SourceSpan>,
+    },
+
+    #[error("policy `{policy}` {message}")]
+    #[diagnostic(
+        code(compiler::invalid_policy_export),
+        help("Policy refs must resolve to an exported `http` provide with profile `policy`.")
+    )]
+    InvalidPolicyExport {
+        policy: Box<str>,
+        message: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "policy referenced here")]
+        span: Option<SourceSpan>,
+        #[related]
+        related: Vec<RelatedSpan>,
     },
 
     #[error("unknown slot `{slot}` on {to_component_path}")]
@@ -841,6 +889,53 @@ fn build_governance(
 
         let mut policies = Vec::with_capacity(scope.policies.len());
         for (policy_index, policy) in scope.policies.iter().enumerate() {
+            let use_node = scope
+                .uses
+                .get(policy.alias.as_str())
+                .expect("policy aliases are validated before resolution");
+            let endpoint =
+                resolve_policy_export(store, use_node, policy.export.as_str()).map_err(|()| {
+                    let (src, span) =
+                        policy_ref_decl_site(store, &scope.manifest_url, policy_index);
+                    Error::PolicyExportUnresolved {
+                        policy: policy.to_string().into(),
+                        use_name: policy.alias.clone().into(),
+                        export: policy.export.clone().into(),
+                        src,
+                        span,
+                    }
+                })?;
+            match &endpoint {
+                ResolvedPolicyEndpoint::Provide { decl, .. }
+                    if decl.kind == CapabilityKind::Http
+                        && decl.profile.as_deref() == Some("policy") => {}
+                ResolvedPolicyEndpoint::Provide { decl, .. } => {
+                    let (src, span) =
+                        policy_ref_decl_site(store, &scope.manifest_url, policy_index);
+                    return Err(Error::InvalidPolicyExport {
+                        policy: policy.to_string().into(),
+                        message: format!(
+                            "must resolve to an `http` provide with profile `policy`, got `{decl}`"
+                        )
+                        .into(),
+                        src,
+                        span,
+                        related: policy_endpoint_related_spans(store, policy, &endpoint),
+                    });
+                }
+                ResolvedPolicyEndpoint::Slot { .. } => {
+                    let (src, span) =
+                        policy_ref_decl_site(store, &scope.manifest_url, policy_index);
+                    return Err(Error::InvalidPolicyExport {
+                        policy: policy.to_string().into(),
+                        message: "must resolve to a provide, not a slot".into(),
+                        src,
+                        span,
+                        related: policy_endpoint_related_spans(store, policy, &endpoint),
+                    });
+                }
+            }
+
             let child_name = use_child_names
                 .get(policy.alias.as_str())
                 .expect("resolved policy alias should match a resolved use");
@@ -880,7 +975,6 @@ fn build_governance(
             config: None,
             children: governance_children,
             uses: BTreeMap::new(),
-            policies: Vec::new(),
             child_templates: BTreeMap::new(),
         },
     };
@@ -893,6 +987,105 @@ fn build_governance(
         governance_scenario: GovernanceScenario::from_scenario(scenario),
         scopes,
     }))
+}
+
+fn resolve_policy_export(
+    store: &DigestStore,
+    node: &ResolvedNode,
+    export_name: &str,
+) -> Result<ResolvedPolicyEndpoint, ()> {
+    let manifest = store
+        .get(&node.digest)
+        .expect("resolved policy manifest should be in the digest store");
+    let Some(target) = manifest.exports().get(export_name) else {
+        return Err(());
+    };
+
+    match target {
+        ExportTarget::SelfProvide(provide_name) => {
+            let provide_decl = manifest
+                .provides()
+                .get(provide_name)
+                .expect("manifest invariant: exported provide exists");
+            Ok(ResolvedPolicyEndpoint::Provide {
+                name: provide_name.to_string(),
+                decl: provide_decl.decl.clone(),
+                resolved_url: node.resolved_url.clone(),
+            })
+        }
+        ExportTarget::SelfSlot(slot_name) => {
+            manifest
+                .slots()
+                .get(slot_name)
+                .expect("manifest invariant: exported slot exists");
+            Ok(ResolvedPolicyEndpoint::Slot {
+                name: slot_name.to_string(),
+                resolved_url: node.resolved_url.clone(),
+            })
+        }
+        ExportTarget::ChildExport { child, export } => {
+            let child_node = node
+                .children
+                .get(child.as_str())
+                .expect("manifest invariant: exported child exists");
+            resolve_policy_export(store, child_node, export.as_str())
+        }
+        _ => Err(()),
+    }
+}
+
+fn policy_ref_decl_site(
+    store: &DigestStore,
+    manifest_url: &Url,
+    policy_index: usize,
+) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
+    store
+        .diagnostic_source(manifest_url)
+        .map_or((None, None), |(src, spans)| {
+            let span = spans
+                .policies
+                .get(policy_index)
+                .map(|candidate| candidate.whole)
+                .unwrap_or((0usize, 0usize).into());
+            (Some(src), Some(span))
+        })
+}
+
+fn policy_endpoint_related_spans(
+    store: &DigestStore,
+    policy: &PolicyRef,
+    endpoint: &ResolvedPolicyEndpoint,
+) -> Vec<RelatedSpan> {
+    let (resolved_url, name, label) = match endpoint {
+        ResolvedPolicyEndpoint::Provide {
+            resolved_url, name, ..
+        } => (resolved_url, name, "resolved provide declared here"),
+        ResolvedPolicyEndpoint::Slot {
+            resolved_url, name, ..
+        } => (resolved_url, name, "resolved slot declared here"),
+    };
+
+    let Some(stored) = store.get_source(resolved_url) else {
+        return Vec::new();
+    };
+    let span = match endpoint {
+        ResolvedPolicyEndpoint::Provide { .. } => stored
+            .spans
+            .provides
+            .get(name.as_str())
+            .map(|provide| provide.capability.name),
+        ResolvedPolicyEndpoint::Slot { .. } => {
+            stored.spans.slots.get(name.as_str()).map(|slot| slot.name)
+        }
+    }
+    .unwrap_or((0usize, 0usize).into());
+
+    vec![RelatedSpan {
+        message: format!("policy `{policy}` resolves here"),
+        src: NamedSource::new(display_url(resolved_url), stored.source).with_language("json5"),
+        span,
+        label: label.to_string(),
+    }]
 }
 
 fn flatten(
@@ -913,15 +1106,16 @@ fn flatten(
 
     let moniker: amber_scenario::Moniker = Arc::clone(&authored_moniker).into();
     let child_templates = lower_child_templates(node, state.store, state.manifest_catalog);
-    if !node.policies.is_empty() {
+    let manifest = state
+        .store
+        .get(&node.digest)
+        .expect("resolved manifest should exist in digest store");
+    if !manifest.policies().is_empty() {
         state.scope_builds.push(ScopeBuild {
             root_moniker: moniker.clone(),
+            manifest_url: node.resolved_url.clone(),
             uses: node.uses.clone(),
-            policies: node
-                .policies
-                .iter()
-                .map(|policy| policy.reference.clone())
-                .collect(),
+            policies: manifest.policies().to_vec(),
         });
     }
 

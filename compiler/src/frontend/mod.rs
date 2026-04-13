@@ -14,8 +14,8 @@ use std::{
 };
 
 use amber_manifest::{
-    CapabilityDecl, CapabilityKind, ChildTemplateDecl, ChildTemplateManifestDecl, ComponentDecl,
-    ExperimentalFeature, Manifest, ManifestDigest, ManifestRef, PolicyRef,
+    ChildTemplateDecl, ChildTemplateManifestDecl, ComponentDecl, ExperimentalFeature, Manifest,
+    ManifestDigest, ManifestRef,
 };
 use amber_resolver::{self as resolver, RemoteResolver, Resolver};
 use futures::stream::StreamExt;
@@ -148,40 +148,6 @@ pub enum Error {
         related: Vec<RelatedManifestSpan>,
     },
 
-    #[error("policy `{policy}` could not resolve export `{export}` from use `#{use_name}`")]
-    #[diagnostic(
-        code(compiler::policy_export_unresolved),
-        help(
-            "Ensure the used manifest exports this capability and that any child export chain \
-             resolves to a real export."
-        )
-    )]
-    PolicyExportUnresolved {
-        policy: Box<str>,
-        use_name: Box<str>,
-        export: Box<str>,
-        #[source_code]
-        src: Option<NamedSource<Arc<str>>>,
-        #[label(primary, "policy referenced here")]
-        span: Option<SourceSpan>,
-    },
-
-    #[error("policy `{policy}` {message}")]
-    #[diagnostic(
-        code(compiler::invalid_policy_export),
-        help("Policy refs must resolve to an exported `http` provide with profile `policy`.")
-    )]
-    InvalidPolicyExport {
-        policy: Box<str>,
-        message: Box<str>,
-        #[source_code]
-        src: Option<NamedSource<Arc<str>>>,
-        #[label(primary, "policy referenced here")]
-        span: Option<SourceSpan>,
-        #[related]
-        related: Vec<RelatedManifestSpan>,
-    },
-
     #[error("use `#{name}` requires root slot(s) that the main scenario cannot bind: {slots}")]
     #[diagnostic(
         code(compiler::use_requires_root_slots),
@@ -230,27 +196,7 @@ pub struct ResolvedNode {
     pub config: Option<serde_json::Value>,
     pub children: BTreeMap<String, ResolvedNode>,
     pub uses: BTreeMap<String, ResolvedNode>,
-    pub policies: Vec<ResolvedPolicy>,
     pub child_templates: BTreeMap<String, ResolvedChildTemplate>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ResolvedPolicy {
-    pub reference: PolicyRef,
-    pub capability: CapabilityDecl,
-}
-
-#[derive(Clone, Debug)]
-enum ResolvedPolicyEndpoint {
-    Provide {
-        name: String,
-        decl: CapabilityDecl,
-        resolved_url: Url,
-    },
-    Slot {
-        name: String,
-        resolved_url: Url,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -556,8 +502,6 @@ async fn resolve_component(
         uses.insert(use_name, use_node);
     }
 
-    let policies = resolve_policies(&svc, &manifest, &manifest_url, &uses)?;
-
     let child_templates = resolve_child_templates(
         &svc,
         &env,
@@ -578,7 +522,6 @@ async fn resolve_component(
         config,
         children,
         uses,
-        policies,
         child_templates,
     })
 }
@@ -588,114 +531,6 @@ fn component_decl_environment(decl: &ComponentDecl) -> Option<String> {
         ComponentDecl::Object(o) => o.environment.clone(),
         ComponentDecl::Reference(_) => None,
         _ => None,
-    }
-}
-
-fn resolve_policies(
-    svc: &ResolveService,
-    manifest: &Manifest,
-    manifest_url: &Url,
-    uses: &BTreeMap<String, ResolvedNode>,
-) -> Result<Vec<ResolvedPolicy>, Error> {
-    let mut resolved = Vec::with_capacity(manifest.policies().len());
-    for (policy_index, policy) in manifest.policies().iter().enumerate() {
-        let use_node = uses
-            .get(policy.alias.as_str())
-            .expect("policy aliases are validated before resolution");
-        let endpoint =
-            resolve_policy_export(svc, use_node, policy.export.as_str()).map_err(|()| {
-                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy_index);
-                Error::PolicyExportUnresolved {
-                    policy: policy.to_string().into(),
-                    use_name: policy.alias.clone().into(),
-                    export: policy.export.clone().into(),
-                    src,
-                    span,
-                }
-            })?;
-
-        match &endpoint {
-            ResolvedPolicyEndpoint::Provide { decl, .. }
-                if decl.kind == CapabilityKind::Http
-                    && decl.profile.as_deref() == Some("policy") =>
-            {
-                resolved.push(ResolvedPolicy {
-                    reference: policy.clone(),
-                    capability: decl.clone(),
-                });
-            }
-            ResolvedPolicyEndpoint::Provide { decl, .. } => {
-                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy_index);
-                return Err(Error::InvalidPolicyExport {
-                    policy: policy.to_string().into(),
-                    message: format!(
-                        "must resolve to an `http` provide with profile `policy`, got `{decl}`"
-                    )
-                    .into(),
-                    src,
-                    span,
-                    related: policy_endpoint_related_spans(svc, policy, &endpoint),
-                });
-            }
-            ResolvedPolicyEndpoint::Slot { .. } => {
-                let (src, span) = policy_ref_decl_site(svc, manifest_url, policy_index);
-                return Err(Error::InvalidPolicyExport {
-                    policy: policy.to_string().into(),
-                    message: "must resolve to a provide, not a slot".into(),
-                    src,
-                    span,
-                    related: policy_endpoint_related_spans(svc, policy, &endpoint),
-                });
-            }
-        }
-    }
-
-    Ok(resolved)
-}
-
-fn resolve_policy_export(
-    svc: &ResolveService,
-    node: &ResolvedNode,
-    export_name: &str,
-) -> Result<ResolvedPolicyEndpoint, ()> {
-    let manifest = svc
-        .store
-        .get(&node.digest)
-        .expect("resolved policy manifest should be in the digest store");
-    let Some(target) = manifest.exports().get(export_name) else {
-        return Err(());
-    };
-
-    match target {
-        amber_manifest::ExportTarget::SelfProvide(provide_name) => {
-            let provide_decl = manifest
-                .provides()
-                .get(provide_name)
-                .expect("manifest invariant: exported provide exists");
-            Ok(ResolvedPolicyEndpoint::Provide {
-                name: provide_name.to_string(),
-                decl: provide_decl.decl.clone(),
-                resolved_url: node.resolved_url.clone(),
-            })
-        }
-        amber_manifest::ExportTarget::SelfSlot(slot_name) => {
-            manifest
-                .slots()
-                .get(slot_name)
-                .expect("manifest invariant: exported slot exists");
-            Ok(ResolvedPolicyEndpoint::Slot {
-                name: slot_name.to_string(),
-                resolved_url: node.resolved_url.clone(),
-            })
-        }
-        amber_manifest::ExportTarget::ChildExport { child, export } => {
-            let child_node = node
-                .children
-                .get(child.as_str())
-                .expect("manifest invariant: exported child exists");
-            resolve_policy_export(svc, child_node, export.as_str())
-        }
-        _ => Err(()),
     }
 }
 
@@ -732,60 +567,6 @@ fn use_manifest_decl_site(
                 .unwrap_or((0usize, 0usize).into());
             (Some(src), Some(span))
         })
-}
-
-fn policy_ref_decl_site(
-    svc: &ResolveService,
-    manifest_url: &Url,
-    policy_index: usize,
-) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
-    svc.store
-        .diagnostic_source(manifest_url)
-        .map_or((None, None), |(src, spans)| {
-            let span = spans
-                .policies
-                .get(policy_index)
-                .map(|candidate| candidate.whole)
-                .unwrap_or((0usize, 0usize).into());
-            (Some(src), Some(span))
-        })
-}
-
-fn policy_endpoint_related_spans(
-    svc: &ResolveService,
-    policy: &PolicyRef,
-    endpoint: &ResolvedPolicyEndpoint,
-) -> Vec<RelatedManifestSpan> {
-    let (resolved_url, name, label) = match endpoint {
-        ResolvedPolicyEndpoint::Provide {
-            resolved_url, name, ..
-        } => (resolved_url, name, "resolved provide declared here"),
-        ResolvedPolicyEndpoint::Slot {
-            resolved_url, name, ..
-        } => (resolved_url, name, "resolved slot declared here"),
-    };
-
-    let Some(stored) = svc.store.get_source(resolved_url) else {
-        return Vec::new();
-    };
-    let span = match endpoint {
-        ResolvedPolicyEndpoint::Provide { .. } => stored
-            .spans
-            .provides
-            .get(name.as_str())
-            .map(|provide| provide.capability.name),
-        ResolvedPolicyEndpoint::Slot { .. } => {
-            stored.spans.slots.get(name.as_str()).map(|slot| slot.name)
-        }
-    }
-    .unwrap_or((0usize, 0usize).into());
-
-    vec![RelatedManifestSpan {
-        message: format!("policy `{policy}` resolves here"),
-        src: NamedSource::new(display_url(resolved_url), stored.source).with_language("json5"),
-        span,
-        label: label.to_string(),
-    }]
 }
 
 fn wrap_child_manifest_resolution_error(

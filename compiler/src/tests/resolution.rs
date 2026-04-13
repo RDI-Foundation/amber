@@ -869,7 +869,7 @@ async fn used_manifest_must_not_require_root_slots() {
 }
 
 #[tokio::test]
-async fn resolve_tree_resolves_policy_exports_from_use_entries() {
+async fn compile_resolves_policy_exports_from_use_entries() {
     let dir = tmp_dir("scenario-policy-resolve");
     let root_path = dir.path().join("root.json5");
     let wrapper_path = dir.path().join("wrapper.json5");
@@ -906,29 +906,33 @@ async fn resolve_tree_resolves_policy_exports_from_use_entries() {
         ),
     );
 
-    let tree = default_compiler()
-        .resolve_tree(
+    let output = default_compiler()
+        .compile(
             manifest_ref_for_path(&root_path),
-            standard_compile_options().resolve,
+            standard_compile_options(),
         )
         .await
         .unwrap();
 
-    assert_eq!(tree.root.policies.len(), 1);
-    assert_eq!(tree.root.policies[0].reference.alias, "wrapper");
-    assert_eq!(tree.root.policies[0].reference.export, "rewrite");
+    let governance = output.scenario.governance.expect("governance should exist");
+    assert_eq!(governance.scopes.len(), 1);
+    assert_eq!(governance.scopes[0].policies[0].as_str(), "policy_0_0");
+    assert_eq!(governance.governance_scenario.exports.len(), 1);
     assert_eq!(
-        tree.root.policies[0].capability.kind,
+        governance.governance_scenario.exports[0].capability.kind,
         amber_manifest::CapabilityKind::Http
     );
     assert_eq!(
-        tree.root.policies[0].capability.profile.as_deref(),
+        governance.governance_scenario.exports[0]
+            .capability
+            .profile
+            .as_deref(),
         Some("policy")
     );
 }
 
 #[tokio::test]
-async fn resolve_tree_follows_child_exports_for_policies() {
+async fn compile_follows_child_exports_for_policies() {
     let dir = tmp_dir("scenario-policy-child-export");
     let root_path = dir.path().join("root.json5");
     let wrapper_path = dir.path().join("wrapper.json5");
@@ -981,21 +985,26 @@ async fn resolve_tree_follows_child_exports_for_policies() {
         ),
     );
 
-    let tree = default_compiler()
-        .resolve_tree(
+    let output = default_compiler()
+        .compile(
             manifest_ref_for_path(&root_path),
-            standard_compile_options().resolve,
+            standard_compile_options(),
         )
         .await
         .unwrap();
 
-    assert_eq!(tree.root.policies.len(), 1);
+    let governance = output.scenario.governance.expect("governance should exist");
+    assert_eq!(governance.scopes[0].policies[0].as_str(), "policy_0_0");
+    assert_eq!(governance.governance_scenario.exports.len(), 1);
     assert_eq!(
-        tree.root.policies[0].capability.kind,
+        governance.governance_scenario.exports[0].capability.kind,
         amber_manifest::CapabilityKind::Http
     );
     assert_eq!(
-        tree.root.policies[0].capability.profile.as_deref(),
+        governance.governance_scenario.exports[0]
+            .capability
+            .profile
+            .as_deref(),
         Some("policy")
     );
 }
@@ -1025,15 +1034,15 @@ async fn policy_ref_requires_resolvable_export() {
     );
 
     let err = default_compiler()
-        .resolve_tree(
+        .compile(
             manifest_ref_for_path(&root_path),
-            standard_compile_options().resolve,
+            standard_compile_options(),
         )
         .await
         .unwrap_err();
 
     match err {
-        crate::Error::Frontend(crate::frontend::Error::PolicyExportUnresolved {
+        crate::Error::Linker(crate::linker::Error::PolicyExportUnresolved {
             policy,
             use_name,
             export,
@@ -1086,18 +1095,16 @@ async fn policy_ref_requires_http_policy_provide() {
     );
 
     let err = default_compiler()
-        .resolve_tree(
+        .compile(
             manifest_ref_for_path(&root_path),
-            standard_compile_options().resolve,
+            standard_compile_options(),
         )
         .await
         .unwrap_err();
 
     match err {
-        crate::Error::Frontend(crate::frontend::Error::InvalidPolicyExport {
-            policy,
-            message,
-            ..
+        crate::Error::Linker(crate::linker::Error::InvalidPolicyExport {
+            policy, message, ..
         }) => {
             assert_eq!(policy.as_ref(), "#wrapper.rewrite");
             assert_eq!(
@@ -1143,18 +1150,16 @@ async fn policy_ref_rejects_slot_exports() {
     );
 
     let err = default_compiler()
-        .resolve_tree(
+        .compile(
             manifest_ref_for_path(&root_path),
-            standard_compile_options().resolve,
+            standard_compile_options(),
         )
         .await
         .unwrap_err();
 
     match err {
-        crate::Error::Frontend(crate::frontend::Error::InvalidPolicyExport {
-            policy,
-            message,
-            ..
+        crate::Error::Linker(crate::linker::Error::InvalidPolicyExport {
+            policy, message, ..
         }) => {
             assert_eq!(policy.as_ref(), "#wrapper.rewrite");
             assert_eq!(message.as_ref(), "must resolve to a provide, not a slot");
