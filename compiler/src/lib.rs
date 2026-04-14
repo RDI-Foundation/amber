@@ -21,6 +21,7 @@ mod lint;
 pub mod mesh;
 mod mir;
 pub mod policy;
+mod policy_pass;
 pub mod run_plan;
 mod runtime_interface;
 mod slots;
@@ -74,6 +75,10 @@ pub enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Mir(#[from] mir::Error),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    PolicyPass(#[from] policy_pass::Error),
 }
 
 #[derive(Clone)]
@@ -139,26 +144,8 @@ impl Compiler {
             &self.store,
         ));
 
-        let (scenario, provenance) = mir::optimize_linked_scenario(
-            scenario,
-            provenance,
-            &self.store,
-            mir::OptimizeOptions { dce: opts.dce },
-        )?;
-        let governance = governance
-            .map(|governance| -> Result<Governance, mir::Error> {
-                let (scenario, _) = mir::optimize_linked_scenario(
-                    governance.scenario,
-                    Provenance::default(),
-                    &self.store,
-                    mir::OptimizeOptions { dce: opts.dce },
-                )?;
-                Ok(Governance {
-                    scenario,
-                    scopes: governance.scopes,
-                })
-            })
-            .transpose()?;
+        let (scenario, governance, provenance) =
+            self.finalize_linked_scenario(scenario, governance, provenance, opts)?;
         let config_analysis = config::analysis::ScenarioConfigAnalysis::from_scenario(&scenario)
             .expect("linked scenario should produce valid config analysis");
 
@@ -180,11 +167,22 @@ impl Compiler {
         let tree_for_manifest_lints = tree.clone();
 
         match linker::link(tree, &self.store) {
-            Ok((scenario, _, provenance)) => diagnostics.extend(collect_manifest_diagnostics(
-                &scenario,
-                &provenance,
-                &self.store,
-            )),
+            Ok((scenario, governance, provenance)) => {
+                diagnostics.extend(collect_manifest_diagnostics(
+                    &scenario,
+                    &provenance,
+                    &self.store,
+                ));
+                if let Err(err) = self.finalize_linked_scenario(
+                    scenario,
+                    governance,
+                    provenance,
+                    OptimizeOptions::default(),
+                ) {
+                    has_errors = true;
+                    diagnostics.push(Report::new(err));
+                }
+            }
             Err(err) => {
                 has_errors = true;
                 diagnostics.extend(collect_manifest_diagnostics_from_tree(
@@ -217,7 +215,8 @@ impl Compiler {
         self.compile_from_tree(tree, opts.optimize)
     }
 
-    /// Resolve and lint manifests, then attempt to link and report as many errors as possible.
+    /// Resolve manifests, run the compiler passes without emitting artifacts, and report
+    /// diagnostics.
     pub async fn check(
         &self,
         root: ManifestRef,
@@ -225,6 +224,38 @@ impl Compiler {
     ) -> Result<CheckOutput, Error> {
         let tree = self.resolve_tree(root, opts.resolve).await?;
         self.check_from_tree(tree)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn finalize_linked_scenario(
+        &self,
+        scenario: Scenario,
+        governance: Option<Governance>,
+        provenance: Provenance,
+        opts: OptimizeOptions,
+    ) -> Result<(Scenario, Option<Governance>, Provenance), Error> {
+        let (scenario, provenance) = mir::optimize_linked_scenario(
+            scenario,
+            provenance,
+            &self.store,
+            mir::OptimizeOptions { dce: opts.dce },
+        )?;
+        let governance = governance
+            .map(|governance| -> Result<Governance, mir::Error> {
+                let (scenario, _) = mir::optimize_linked_scenario(
+                    governance.scenario,
+                    Provenance::default(),
+                    &self.store,
+                    mir::OptimizeOptions { dce: opts.dce },
+                )?;
+                Ok(Governance {
+                    scenario,
+                    scopes: governance.scopes,
+                })
+            })
+            .transpose()?;
+        let scenario = policy_pass::apply_policies(scenario, governance.as_ref())?;
+        Ok((scenario, governance, provenance))
     }
 }
 
