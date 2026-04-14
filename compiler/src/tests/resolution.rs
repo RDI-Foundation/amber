@@ -146,7 +146,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
         ),
     );
 
-    let compiler = default_compiler();
+    let compiler = compiler_with_noop_governance();
     let root_ref = manifest_ref_for_path(&root_path);
 
     let compilation = compiler
@@ -226,7 +226,7 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
     let root_digest = root_contents.parse::<Manifest>().unwrap().digest();
     let root_ref = ManifestRef::new(file_url(&root_path), Some(root_digest));
 
-    let compiler = default_compiler();
+    let compiler = compiler_with_noop_governance();
 
     let compilation = compiler
         .compile(root_ref.clone(), standard_compile_options())
@@ -256,7 +256,7 @@ async fn provenance_records_redirect_when_fetched() {
     let digest = contents.parse::<Manifest>().unwrap().digest();
     let (url, server) = spawn_redirecting_manifest_server(contents);
 
-    let compiler = default_compiler();
+    let compiler = compiler_with_noop_governance();
     let root_ref = ManifestRef::new(url.clone(), Some(digest));
 
     let compilation = compiler
@@ -790,7 +790,7 @@ async fn resolve_tree_keeps_use_entries_out_of_component_tree() {
         ),
     );
 
-    let compiler = default_compiler();
+    let compiler = compiler_with_noop_governance();
     let tree = compiler
         .resolve_tree(
             manifest_ref_for_path(&root_path),
@@ -804,6 +804,7 @@ async fn resolve_tree_keeps_use_entries_out_of_component_tree() {
 
     let output = compiler
         .compile_from_tree(tree, standard_compile_options().optimize)
+        .await
         .unwrap();
     assert_eq!(output.scenario.components.len(), 2);
 }
@@ -906,7 +907,7 @@ async fn compile_resolves_policy_exports_from_use_entries() {
         ),
     );
 
-    let output = default_compiler()
+    let output = compiler_with_noop_governance()
         .compile(
             manifest_ref_for_path(&root_path),
             standard_compile_options(),
@@ -982,7 +983,7 @@ async fn compile_follows_child_exports_for_policies() {
         ),
     );
 
-    let output = default_compiler()
+    let output = compiler_with_noop_governance()
         .compile(
             manifest_ref_for_path(&root_path),
             standard_compile_options(),
@@ -1206,7 +1207,7 @@ async fn compile_attaches_governance_artifact_for_policy_uses() {
         ),
     );
 
-    let output = default_compiler()
+    let output = compiler_with_noop_governance()
         .compile(
             manifest_ref_for_path(&root_path),
             standard_compile_options(),

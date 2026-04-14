@@ -416,6 +416,7 @@ async fn compile_source_materialization(
         }
         compiler
             .compile_from_tree(tree, CompileOptions::default().optimize)
+            .await
             .map_err(|err| CompileError::Compile(err.to_string()))?
     } else {
         compiler

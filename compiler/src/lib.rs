@@ -16,6 +16,7 @@ use thiserror::Error;
 mod config;
 mod frontend;
 mod governance;
+mod governance_runtime;
 mod linker;
 mod lint;
 pub mod mesh;
@@ -32,6 +33,9 @@ pub mod reporter;
 
 pub use frontend::{DigestStore, ResolveOptions, ResolvedNode, ResolvedTree, ResolverRegistry};
 pub use governance::{Governance, GovernedScope};
+pub use governance_runtime::{
+    GovernanceFuture, GovernanceRuntime, GovernanceRuntimeError, GovernanceSession,
+};
 pub use linker::{ComponentProvenance, Provenance};
 
 #[derive(Clone, Debug, Default)]
@@ -86,6 +90,7 @@ pub struct Compiler {
     resolver: Resolver,
     store: DigestStore,
     registry: ResolverRegistry,
+    governance_runtime: Option<Arc<dyn GovernanceRuntime>>,
 }
 
 impl Compiler {
@@ -94,6 +99,7 @@ impl Compiler {
             resolver,
             store,
             registry: ResolverRegistry::default(),
+            governance_runtime: None,
         }
     }
 
@@ -114,6 +120,14 @@ impl Compiler {
         self
     }
 
+    pub fn with_governance_runtime(
+        mut self,
+        governance_runtime: Arc<dyn GovernanceRuntime>,
+    ) -> Self {
+        self.governance_runtime = Some(governance_runtime);
+        self
+    }
+
     pub async fn resolve_tree(
         &self,
         root: ManifestRef,
@@ -130,7 +144,7 @@ impl Compiler {
     }
 
     #[allow(clippy::result_large_err)]
-    pub fn compile_from_tree(
+    pub async fn compile_from_tree(
         &self,
         tree: ResolvedTree,
         opts: OptimizeOptions,
@@ -144,8 +158,9 @@ impl Compiler {
             &self.store,
         ));
 
-        let (scenario, governance, provenance) =
-            self.finalize_linked_scenario(scenario, governance, provenance, opts)?;
+        let (scenario, governance, provenance) = self
+            .finalize_linked_scenario(scenario, governance, provenance, opts)
+            .await?;
         let config_analysis = config::analysis::ScenarioConfigAnalysis::from_scenario(&scenario)
             .expect("linked scenario should produce valid config analysis");
 
@@ -160,7 +175,7 @@ impl Compiler {
     }
 
     #[allow(clippy::result_large_err)]
-    pub fn check_from_tree(&self, tree: ResolvedTree) -> Result<CheckOutput, Error> {
+    pub async fn check_from_tree(&self, tree: ResolvedTree) -> Result<CheckOutput, Error> {
         let mut diagnostics =
             slots::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
         let mut has_errors = false;
@@ -173,12 +188,15 @@ impl Compiler {
                     &provenance,
                     &self.store,
                 ));
-                if let Err(err) = self.finalize_linked_scenario(
-                    scenario,
-                    governance,
-                    provenance,
-                    OptimizeOptions::default(),
-                ) {
+                if let Err(err) = self
+                    .finalize_linked_scenario(
+                        scenario,
+                        governance,
+                        provenance,
+                        OptimizeOptions::default(),
+                    )
+                    .await
+                {
                     has_errors = true;
                     diagnostics.push(Report::new(err));
                 }
@@ -212,7 +230,7 @@ impl Compiler {
         opts: CompileOptions,
     ) -> Result<CompileOutput, Error> {
         let tree = self.resolve_tree(root, opts.resolve).await?;
-        self.compile_from_tree(tree, opts.optimize)
+        self.compile_from_tree(tree, opts.optimize).await
     }
 
     /// Resolve manifests, run the compiler passes without emitting artifacts, and report
@@ -223,11 +241,11 @@ impl Compiler {
         opts: CompileOptions,
     ) -> Result<CheckOutput, Error> {
         let tree = self.resolve_tree(root, opts.resolve).await?;
-        self.check_from_tree(tree)
+        self.check_from_tree(tree).await
     }
 
     #[allow(clippy::result_large_err)]
-    fn finalize_linked_scenario(
+    async fn finalize_linked_scenario(
         &self,
         scenario: Scenario,
         governance: Option<Governance>,
@@ -254,7 +272,12 @@ impl Compiler {
                 })
             })
             .transpose()?;
-        let scenario = policy_pass::apply_policies(scenario, governance.as_ref())?;
+        let scenario = policy_pass::apply_policies(
+            scenario,
+            governance.as_ref(),
+            self.governance_runtime.as_deref(),
+        )
+        .await?;
         Ok((scenario, governance, provenance))
     }
 }

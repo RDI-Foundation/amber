@@ -22,11 +22,13 @@ use tempfile::TempDir;
 use url::Url;
 
 use crate::{
-    CompileOptions, Compiler, DigestStore, ResolvedNode, ResolvedTree, ResolverRegistry,
+    CompileOptions, Compiler, DigestStore, GovernanceFuture, GovernanceRuntime,
+    GovernanceRuntimeError, GovernanceSession, ResolvedNode, ResolvedTree, ResolverRegistry,
     bundle::{
         BUNDLE_INDEX_NAME, BUNDLE_SCHEMA, BUNDLE_VERSION, BundleBuilder, BundleIndex, BundleLoader,
         BundleRequest,
     },
+    policy::{PolicyInput, PolicyOutput},
     reporter::{Reporter as _, scenario_ir::ScenarioIrReporter},
 };
 
@@ -54,6 +56,11 @@ fn file_url(path: &Path) -> Url {
 
 fn default_compiler() -> Compiler {
     Compiler::new(Resolver::new(), DigestStore::default())
+}
+
+fn compiler_with_noop_governance() -> Compiler {
+    Compiler::new(Resolver::new(), DigestStore::default())
+        .with_governance_runtime(Arc::new(TestGovernanceRuntime))
 }
 
 fn manifest_ref_for_path(path: &Path) -> ManifestRef {
@@ -118,6 +125,33 @@ fn has_diagnostic_code(diagnostics: &[miette::Report], code: &str) -> bool {
         let diag: &dyn Diagnostic = &**report;
         diag.code().is_some_and(|c| c.to_string() == code)
     })
+}
+
+struct TestGovernanceRuntime;
+
+impl GovernanceRuntime for TestGovernanceRuntime {
+    fn start<'a>(
+        &'a self,
+        _governance: &'a crate::Governance,
+    ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>> {
+        Box::pin(async { Ok(Box::new(TestGovernanceSession) as Box<dyn GovernanceSession>) })
+    }
+}
+
+struct TestGovernanceSession;
+
+impl GovernanceSession for TestGovernanceSession {
+    fn invoke_policy<'a>(
+        &'a self,
+        _policy_export: &'a amber_manifest::ExportName,
+        _input: &'a PolicyInput,
+    ) -> GovernanceFuture<'a, Result<PolicyOutput, GovernanceRuntimeError>> {
+        Box::pin(async { Ok(PolicyOutput::default()) })
+    }
+
+    fn finish(self: Box<Self>) -> GovernanceFuture<'static, Result<(), GovernanceRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 fn accept_with_deadline(listener: &TcpListener, deadline: Instant) -> std::net::TcpStream {

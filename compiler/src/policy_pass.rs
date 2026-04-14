@@ -12,25 +12,12 @@ use thiserror::Error;
 
 use crate::{
     Governance, GovernedScope,
+    governance_runtime::{GovernanceRuntime, GovernanceRuntimeError},
     policy::{
         AttachmentId, PolicyInput, PolicyOutput, ScenarioScope, ScopeBinding, ScopeBindingFrom,
         ScopeExport, ScopeImport, ValidationError, validate_policy_output,
     },
 };
-
-pub(crate) trait GovernanceRunner {
-    type Session: GovernanceSession;
-
-    fn start(&self, governance: &Governance) -> Result<Self::Session, String>;
-}
-
-pub(crate) trait GovernanceSession {
-    fn invoke_policy(
-        &self,
-        policy_export: &ExportName,
-        input: &PolicyInput,
-    ) -> Result<PolicyOutput, String>;
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PolicyApplication {
@@ -41,10 +28,6 @@ pub(crate) struct PolicyApplication {
     targets: BTreeMap<AttachmentId, TargetDescriptor>,
     pub output: PolicyOutput,
 }
-
-struct InternalGovernanceRunner;
-
-struct InternalGovernanceSession;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum TargetKey {
@@ -96,16 +79,34 @@ pub enum Error {
         slot: String,
     },
 
-    #[error("failed to start governance artifact: {message}")]
-    #[diagnostic(code(compiler::policy_pass_start_governance))]
-    StartGovernance { message: String },
+    #[error(
+        "governance policies require a runtime, but none was configured while compiling scope \
+         `{scope_root}`"
+    )]
+    #[diagnostic(code(compiler::policy_pass_missing_governance_runtime))]
+    MissingGovernanceRuntime { scope_root: Moniker },
 
-    #[error("policy `{policy}` in scope `{scope_root}` failed: {message}")]
+    #[error("failed to start governance artifact: {source}")]
+    #[diagnostic(code(compiler::policy_pass_start_governance))]
+    StartGovernance {
+        #[source]
+        source: GovernanceRuntimeError,
+    },
+
+    #[error("failed to stop governance artifact: {source}")]
+    #[diagnostic(code(compiler::policy_pass_stop_governance))]
+    StopGovernance {
+        #[source]
+        source: GovernanceRuntimeError,
+    },
+
+    #[error("policy `{policy}` in scope `{scope_root}` failed: {source}")]
     #[diagnostic(code(compiler::policy_pass_invoke_policy))]
     InvokePolicy {
         scope_root: Moniker,
         policy: ExportName,
-        message: String,
+        #[source]
+        source: GovernanceRuntimeError,
     },
 
     #[error("policy `{policy}` in scope `{scope_root}` returned invalid output: {source}")]
@@ -129,85 +130,80 @@ pub enum Error {
     InvalidRewrittenScenario(#[from] ScenarioIrError),
 }
 
-impl GovernanceRunner for InternalGovernanceRunner {
-    type Session = InternalGovernanceSession;
-
-    fn start(&self, _governance: &Governance) -> Result<Self::Session, String> {
-        Ok(InternalGovernanceSession)
-    }
-}
-
-impl GovernanceSession for InternalGovernanceSession {
-    fn invoke_policy(
-        &self,
-        _policy_export: &ExportName,
-        _input: &PolicyInput,
-    ) -> Result<PolicyOutput, String> {
-        Ok(PolicyOutput::default())
-    }
-}
-
-pub(crate) fn apply_policies(
+pub(crate) async fn apply_policies(
     scenario: Scenario,
     governance: Option<&Governance>,
-) -> Result<Scenario, Error> {
-    apply_policies_with_runner(scenario, governance, &InternalGovernanceRunner)
-}
-
-pub(crate) fn apply_policies_with_runner<R: GovernanceRunner>(
-    scenario: Scenario,
-    governance: Option<&Governance>,
-    runner: &R,
+    runtime: Option<&dyn GovernanceRuntime>,
 ) -> Result<Scenario, Error> {
     let Some(governance) = governance else {
         return Ok(scenario);
     };
+    if governance.scopes.is_empty() {
+        return Ok(scenario);
+    }
+    let Some(runtime) = runtime else {
+        return Err(Error::MissingGovernanceRuntime {
+            scope_root: governance.scopes[0].root_moniker.clone(),
+        });
+    };
 
-    let collected = collect_policy_outputs(&scenario, governance, runner)?;
+    let collected = collect_policy_outputs(&scenario, governance, runtime).await?;
     rewrite_scenario(scenario, &collected)
 }
 
-pub(crate) fn collect_policy_outputs<R: GovernanceRunner>(
+pub(crate) async fn collect_policy_outputs(
     scenario: &Scenario,
     governance: &Governance,
-    runner: &R,
+    runtime: &dyn GovernanceRuntime,
 ) -> Result<Vec<PolicyApplication>, Error> {
-    let session = runner
+    let session = runtime
         .start(governance)
-        .map_err(|message| Error::StartGovernance { message })?;
-    let mut collected = Vec::new();
+        .await
+        .map_err(|source| Error::StartGovernance { source })?;
+    let collected = async {
+        let mut collected = Vec::new();
 
-    for scope in &governance.scopes {
-        let ScopeArtifacts { input, targets } = build_scope_artifacts(scenario, scope)?;
-        let scope_depth = scope_depth(&scope.root_moniker);
+        for scope in &governance.scopes {
+            let ScopeArtifacts { input, targets } = build_scope_artifacts(scenario, scope)?;
+            let scope_depth = scope_depth(&scope.root_moniker);
 
-        for (policy_index, policy_export) in scope.policies.iter().enumerate() {
-            let output = session
-                .invoke_policy(policy_export, &input)
-                .map_err(|message| Error::InvokePolicy {
+            for (policy_index, policy_export) in scope.policies.iter().enumerate() {
+                let output =
+                    session
+                        .invoke_policy(policy_export, &input)
+                        .await
+                        .map_err(|source| Error::InvokePolicy {
+                            scope_root: scope.root_moniker.clone(),
+                            policy: policy_export.clone(),
+                            source,
+                        })?;
+                // Generated interposers may not rely on experimental features.
+                validate_policy_output(&output, &input, &BTreeSet::<ExperimentalFeature>::new())
+                    .map_err(|source| Error::InvalidPolicyOutput {
+                        scope_root: scope.root_moniker.clone(),
+                        policy: policy_export.clone(),
+                        source: Box::new(source),
+                    })?;
+                collected.push(PolicyApplication {
                     scope_root: scope.root_moniker.clone(),
-                    policy: policy_export.clone(),
-                    message,
-                })?;
-            // Generated interposers may not rely on experimental features.
-            validate_policy_output(&output, &input, &BTreeSet::<ExperimentalFeature>::new())
-                .map_err(|source| Error::InvalidPolicyOutput {
-                    scope_root: scope.root_moniker.clone(),
-                    policy: policy_export.clone(),
-                    source: Box::new(source),
-                })?;
-            collected.push(PolicyApplication {
-                scope_root: scope.root_moniker.clone(),
-                scope_depth,
-                policy_index,
-                input: input.clone(),
-                targets: targets.clone(),
-                output,
-            });
+                    scope_depth,
+                    policy_index,
+                    input: input.clone(),
+                    targets: targets.clone(),
+                    output,
+                });
+            }
         }
+        Ok(collected)
     }
+    .await;
 
-    Ok(collected)
+    let finish_result = session.finish().await;
+    match (collected, finish_result) {
+        (Ok(collected), Ok(())) => Ok(collected),
+        (Ok(_), Err(source)) => Err(Error::StopGovernance { source }),
+        (Err(err), _) => Err(err),
+    }
 }
 
 pub(crate) fn build_policy_input(
@@ -726,19 +722,28 @@ mod tests {
     };
 
     use super::*;
-    use crate::policy::{Attachment, InterposerComponent, Interposition};
+    use crate::{
+        governance_runtime::{
+            GovernanceFuture, GovernanceRuntime, GovernanceRuntimeError, GovernanceSession,
+        },
+        policy::{Attachment, InterposerComponent, Interposition},
+    };
 
     #[derive(Default)]
     struct MockRunner {
         outputs: BTreeMap<String, PolicyOutput>,
     }
 
-    impl GovernanceRunner for MockRunner {
-        type Session = MockSession;
-
-        fn start(&self, _governance: &Governance) -> Result<Self::Session, String> {
-            Ok(MockSession {
-                outputs: self.outputs.clone(),
+    impl GovernanceRuntime for MockRunner {
+        fn start<'a>(
+            &'a self,
+            _governance: &'a Governance,
+        ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>>
+        {
+            Box::pin(async move {
+                Ok(Box::new(MockSession {
+                    outputs: self.outputs.clone(),
+                }) as Box<dyn GovernanceSession>)
             })
         }
     }
@@ -748,21 +753,29 @@ mod tests {
     }
 
     impl GovernanceSession for MockSession {
-        fn invoke_policy(
-            &self,
-            policy_export: &ExportName,
-            _input: &PolicyInput,
-        ) -> Result<PolicyOutput, String> {
-            Ok(self
-                .outputs
-                .get(policy_export.as_str())
-                .cloned()
-                .unwrap_or_default())
+        fn invoke_policy<'a>(
+            &'a self,
+            policy_export: &'a ExportName,
+            _input: &'a PolicyInput,
+        ) -> GovernanceFuture<'a, Result<PolicyOutput, GovernanceRuntimeError>> {
+            Box::pin(async move {
+                Ok(self
+                    .outputs
+                    .get(policy_export.as_str())
+                    .cloned()
+                    .unwrap_or_default())
+            })
+        }
+
+        fn finish(
+            self: Box<Self>,
+        ) -> GovernanceFuture<'static, Result<(), GovernanceRuntimeError>> {
+            Box::pin(async { Ok(()) })
         }
     }
 
-    #[test]
-    fn build_policy_input_classifies_bindings_imports_and_exports() {
+    #[tokio::test]
+    async fn build_policy_input_classifies_bindings_imports_and_exports() {
         let scenario = fixture_scenario();
         let scope = GovernedScope {
             root_moniker: moniker("/left"),
@@ -805,19 +818,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn apply_policies_returns_original_scenario_for_empty_outputs() {
+    #[tokio::test]
+    async fn apply_policies_returns_original_scenario_for_empty_outputs() {
         let scenario = fixture_scenario();
         let governance = fixture_governance();
-        let rewritten =
-            apply_policies_with_runner(scenario.clone(), Some(&governance), &MockRunner::default())
-                .expect("empty outputs should keep scenario unchanged");
+        let rewritten = apply_policies(
+            scenario.clone(),
+            Some(&governance),
+            Some(&MockRunner::default()),
+        )
+        .await
+        .expect("empty outputs should keep scenario unchanged");
 
         assert_eq!(rewritten, scenario);
     }
 
-    #[test]
-    fn apply_policies_rewrites_import_binding_chain_for_non_empty_outputs() {
+    #[tokio::test]
+    async fn apply_policies_rewrites_import_binding_chain_for_non_empty_outputs() {
         let scenario = fixture_scenario();
         let governance = fixture_governance();
 
@@ -826,7 +843,8 @@ mod tests {
             outputs: BTreeMap::from([("policy_0_0".to_string(), valid_output(AttachmentId(0)))]),
         };
 
-        let rewritten = apply_policies_with_runner(scenario, Some(&governance), &runner)
+        let rewritten = apply_policies(scenario, Some(&governance), Some(&runner))
+            .await
             .expect("non-empty outputs should rewrite the binding");
 
         assert_eq!(rewritten.bindings.len(), 4);
@@ -853,8 +871,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_policies_rewrites_scenario_exports() {
+    #[tokio::test]
+    async fn apply_policies_rewrites_scenario_exports() {
         let scenario = fixture_scenario();
         let governance = fixture_governance();
 
@@ -862,7 +880,8 @@ mod tests {
             outputs: BTreeMap::from([("policy_0_0".to_string(), valid_output(AttachmentId(3)))]),
         };
 
-        let rewritten = apply_policies_with_runner(scenario, Some(&governance), &runner)
+        let rewritten = apply_policies(scenario, Some(&governance), Some(&runner))
+            .await
             .expect("export target should be rewritten");
 
         assert!(rewritten.bindings.iter().any(|binding| matches!(
@@ -878,8 +897,8 @@ mod tests {
         assert_eq!(rewritten.exports[0].from.name, "out");
     }
 
-    #[test]
-    fn apply_policies_orders_cross_scope_interposers_by_side_and_depth() {
+    #[tokio::test]
+    async fn apply_policies_orders_cross_scope_interposers_by_side_and_depth() {
         let scenario = cross_scope_fixture_scenario();
         let governance = Governance {
             scenario: governance_fixture_scenario(),
@@ -909,7 +928,8 @@ mod tests {
             ]),
         };
 
-        let rewritten = apply_policies_with_runner(scenario, Some(&governance), &runner)
+        let rewritten = apply_policies(scenario, Some(&governance), Some(&runner))
+            .await
             .expect("cross-scope outputs should rewrite the binding");
 
         assert_eq!(rewritten.bindings.len(), 4);
@@ -931,8 +951,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_policies_orders_same_scope_policies_by_declaration_order() {
+    #[tokio::test]
+    async fn apply_policies_orders_same_scope_policies_by_declaration_order() {
         let scenario = fixture_scenario();
         let governance = Governance {
             scenario: governance_fixture_scenario(),
@@ -952,7 +972,8 @@ mod tests {
             ]),
         };
 
-        let rewritten = apply_policies_with_runner(scenario, Some(&governance), &runner)
+        let rewritten = apply_policies(scenario, Some(&governance), Some(&runner))
+            .await
             .expect("same-scope outputs should rewrite in declaration order");
 
         assert_eq!(rewritten.bindings.len(), 5);

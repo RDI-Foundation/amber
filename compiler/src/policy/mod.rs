@@ -8,6 +8,7 @@ use amber_manifest::{
     SlotDecl, SlotName,
 };
 use amber_scenario::{Component, FrameworkRef, Program, ProvideRef, ResourceRef, SlotRef};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -15,7 +16,7 @@ use crate::linker::program_lowering::validate_lowered_program_mounts;
 
 pub type PolicyInput = ScenarioScope;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AttachmentId(pub u64);
 
 impl fmt::Display for AttachmentId {
@@ -24,7 +25,7 @@ impl fmt::Display for AttachmentId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioScope {
     /// Components contained within the governed subtree.
     pub components: Vec<Component>,
@@ -36,7 +37,7 @@ pub struct ScenarioScope {
     pub exports: Vec<ScopeExport>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeBinding {
     pub id: AttachmentId,
     pub from: ScopeBindingFrom,
@@ -44,46 +45,46 @@ pub struct ScopeBinding {
     pub capability: CapabilityDecl,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeImport {
     pub id: AttachmentId,
     pub to: SlotRef,
     pub capability: CapabilityDecl,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeExport {
     pub id: AttachmentId,
     pub from: ScopeBindingFrom,
     pub capability: CapabilityDecl,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScopeBindingFrom {
     Component(ProvideRef),
     Resource(ResourceRef),
     Framework(FrameworkRef),
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyOutput {
     pub interpositions: Vec<Interposition>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interposition {
     pub interposer: InterposerComponent,
     pub attachments: Vec<Attachment>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub target: AttachmentId,
     pub interposer_slot: SlotName,
     pub interposer_provide: ProvideName,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterposerComponent {
     pub program: Option<Program>,
     pub slots: BTreeMap<SlotName, SlotDecl>,

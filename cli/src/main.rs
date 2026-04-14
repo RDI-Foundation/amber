@@ -2,6 +2,7 @@ mod command_support;
 mod direct_runtime;
 mod docs;
 mod framework_component;
+mod governance_runtime;
 mod mixed_run;
 mod run_inputs;
 mod run_logs;
@@ -24,6 +25,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Stdio},
+    sync::Arc,
 };
 
 use amber_compiler::{
@@ -1072,7 +1074,10 @@ async fn compile(args: CompileArgs) -> Result<()> {
     let compiled = match resolve_compile_input(&args.manifest).await? {
         CompileInput::Manifest(resolved) => {
             let compiler = Compiler::new(resolved.resolver, Default::default())
-                .with_registry(resolved.registry);
+                .with_registry(resolved.registry)
+                .with_governance_runtime(Arc::new(
+                    governance_runtime::CliGovernanceRuntime::default(),
+                ));
             let mut opts = CompileOptions::default();
             if args.no_opt {
                 opts.optimize.dce = false;
@@ -1089,6 +1094,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
 
             let output = compiler
                 .compile_from_tree(tree, opts.optimize)
+                .await
                 .wrap_err("compile failed")?;
 
             let deny = DenySet::new(&args.deny);
@@ -1204,8 +1210,9 @@ async fn compile(args: CompileArgs) -> Result<()> {
 
 async fn check(args: CheckArgs) -> Result<()> {
     let resolved = resolve_input(&args.manifest).await?;
-    let compiler =
-        Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
+    let compiler = Compiler::new(resolved.resolver, Default::default())
+        .with_registry(resolved.registry)
+        .with_governance_runtime(Arc::new(governance_runtime::CliGovernanceRuntime::default()));
 
     let output = compiler
         .check(resolved.manifest, CompileOptions::default())
@@ -2318,7 +2325,10 @@ async fn compile_for_run(input: &str) -> Result<CompiledScenario> {
         CompileInput::ScenarioIr(compiled) => Ok(compiled),
         CompileInput::Manifest(resolved) => {
             let compiler = Compiler::new(resolved.resolver, Default::default())
-                .with_registry(resolved.registry);
+                .with_registry(resolved.registry)
+                .with_governance_runtime(Arc::new(
+                    governance_runtime::CliGovernanceRuntime::default(),
+                ));
             let output = compiler
                 .compile_from_tree(
                     compiler
@@ -2327,6 +2337,7 @@ async fn compile_for_run(input: &str) -> Result<CompiledScenario> {
                         .wrap_err("compile failed")?,
                     CompileOptions::default().optimize,
                 )
+                .await
                 .wrap_err("compile failed")?;
             let has_error = print_diagnostics(&output.diagnostics, &DenySet::default())?;
             if has_error {
