@@ -17,6 +17,7 @@ use crate::{
         AttachmentId, PolicyInput, PolicyOutput, ScenarioScope, ScopeBinding, ScopeBindingFrom,
         ScopeExport, ScopeImport, ValidationError, validate_policy_output,
     },
+    reporter::{CompiledScenario, CompiledScenarioError},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,21 +87,28 @@ pub enum Error {
     #[diagnostic(code(compiler::policy_pass_missing_governance_runtime))]
     MissingGovernanceRuntime { scope_root: Moniker },
 
-    #[error("failed to start governance artifact: {source}")]
+    #[error("failed to start governance artifact")]
     #[diagnostic(code(compiler::policy_pass_start_governance))]
     StartGovernance {
         #[source]
         source: GovernanceRuntimeError,
     },
 
-    #[error("failed to stop governance artifact: {source}")]
+    #[error("failed to compile governance artifact")]
+    #[diagnostic(code(compiler::policy_pass_compile_governance))]
+    CompileGovernance {
+        #[source]
+        source: CompiledScenarioError,
+    },
+
+    #[error("failed to stop governance artifact")]
     #[diagnostic(code(compiler::policy_pass_stop_governance))]
     StopGovernance {
         #[source]
         source: GovernanceRuntimeError,
     },
 
-    #[error("policy `{policy}` in scope `{scope_root}` failed: {source}")]
+    #[error("policy `{policy}` in scope `{scope_root}` failed")]
     #[diagnostic(code(compiler::policy_pass_invoke_policy))]
     InvokePolicy {
         scope_root: Moniker,
@@ -109,7 +117,7 @@ pub enum Error {
         source: GovernanceRuntimeError,
     },
 
-    #[error("policy `{policy}` in scope `{scope_root}` returned invalid output: {source}")]
+    #[error("policy `{policy}` in scope `{scope_root}` returned invalid output")]
     #[diagnostic(code(compiler::policy_pass_invalid_output))]
     InvalidPolicyOutput {
         scope_root: Moniker,
@@ -156,8 +164,13 @@ pub(crate) async fn collect_policy_outputs(
     governance: &Governance,
     runtime: &dyn GovernanceRuntime,
 ) -> Result<Vec<PolicyApplication>, Error> {
+    let compiled = CompiledScenario::from_scenario_with_provenance(
+        &governance.scenario,
+        &governance.provenance,
+    )
+    .map_err(|source| Error::CompileGovernance { source })?;
     let session = runtime
-        .start(governance)
+        .start(&compiled)
         .await
         .map_err(|source| Error::StartGovernance { source })?;
     let collected = async {
@@ -737,7 +750,7 @@ mod tests {
     impl GovernanceRuntime for MockRunner {
         fn start<'a>(
             &'a self,
-            _governance: &'a Governance,
+            _compiled: &'a CompiledScenario,
         ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>>
         {
             Box::pin(async move {
@@ -902,6 +915,7 @@ mod tests {
         let scenario = cross_scope_fixture_scenario();
         let governance = Governance {
             scenario: governance_fixture_scenario(),
+            provenance: Default::default(),
             scopes: vec![
                 GovernedScope {
                     root_moniker: moniker("/"),
@@ -956,6 +970,7 @@ mod tests {
         let scenario = fixture_scenario();
         let governance = Governance {
             scenario: governance_fixture_scenario(),
+            provenance: Default::default(),
             scopes: vec![GovernedScope {
                 root_moniker: moniker("/left"),
                 policies: vec![
@@ -994,6 +1009,7 @@ mod tests {
     fn fixture_governance() -> Governance {
         Governance {
             scenario: governance_fixture_scenario(),
+            provenance: Default::default(),
             scopes: vec![GovernedScope {
                 root_moniker: moniker("/left"),
                 policies: vec![ExportName::try_from("policy_0_0").expect("valid export name")],

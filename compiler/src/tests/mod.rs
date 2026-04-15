@@ -132,7 +132,7 @@ struct TestGovernanceRuntime;
 impl GovernanceRuntime for TestGovernanceRuntime {
     fn start<'a>(
         &'a self,
-        _governance: &'a crate::Governance,
+        _compiled: &'a crate::reporter::CompiledScenario,
     ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>> {
         Box::pin(async { Ok(Box::new(TestGovernanceSession) as Box<dyn GovernanceSession>) })
     }

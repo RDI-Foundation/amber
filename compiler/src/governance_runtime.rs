@@ -4,8 +4,8 @@ use amber_manifest::ExportName;
 use thiserror::Error;
 
 use crate::{
-    Governance,
     policy::{PolicyInput, PolicyOutput},
+    reporter::CompiledScenario,
 };
 
 pub type GovernanceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -27,7 +27,7 @@ impl GovernanceRuntimeError {
 pub trait GovernanceRuntime: Send + Sync {
     fn start<'a>(
         &'a self,
-        governance: &'a Governance,
+        compiled: &'a CompiledScenario,
     ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>>;
 }
 

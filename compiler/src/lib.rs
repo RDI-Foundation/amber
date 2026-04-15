@@ -260,14 +260,15 @@ impl Compiler {
         )?;
         let governance = governance
             .map(|governance| -> Result<Governance, mir::Error> {
-                let (scenario, _) = mir::optimize_linked_scenario(
+                let (scenario, provenance) = mir::optimize_linked_scenario(
                     governance.scenario,
-                    Provenance::default(),
+                    governance.provenance,
                     &self.store,
                     mir::OptimizeOptions { dce: opts.dce },
                 )?;
                 Ok(Governance {
                     scenario,
+                    provenance,
                     scopes: governance.scopes,
                 })
             })

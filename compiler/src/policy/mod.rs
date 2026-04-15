@@ -68,12 +68,14 @@ pub enum ScopeBindingFrom {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyOutput {
+    #[serde(default)]
     pub interpositions: Vec<Interposition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interposition {
     pub interposer: InterposerComponent,
+    #[serde(default)]
     pub attachments: Vec<Attachment>,
 }
 
@@ -87,8 +89,11 @@ pub struct Attachment {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterposerComponent {
     pub program: Option<Program>,
+    #[serde(default)]
     pub slots: BTreeMap<SlotName, SlotDecl>,
+    #[serde(default)]
     pub provides: BTreeMap<ProvideName, ProvideDecl>,
+    #[serde(default)]
     pub resources: BTreeMap<ResourceName, ResourceDecl>,
     pub metadata: Option<Value>,
 }
@@ -283,6 +288,7 @@ fn target_capability(input: &PolicyInput, target: AttachmentId) -> Option<&Capab
 mod tests {
     use amber_manifest::CapabilityKind;
     use amber_scenario::{ProgramCommon, ProgramMount, ProgramPath};
+    use serde_json::json;
 
     use super::*;
 
@@ -503,5 +509,33 @@ mod tests {
         )
         .expect_err("missing interposer program must be rejected");
         assert_eq!(err, ValidationError::MissingInterposerProgram);
+    }
+
+    #[test]
+    fn policy_output_deserialize_defaults_omitted_collections() {
+        let output: PolicyOutput = serde_json::from_value(json!({
+            "interpositions": [{
+                "interposer": {
+                    "program": {
+                        "path": "/usr/bin/env",
+                        "args": ["python3"],
+                    },
+                    "slots": {
+                        "in": { "kind": "http" }
+                    },
+                    "provides": {
+                        "out": { "kind": "http" }
+                    }
+                },
+                "attachments": [{
+                    "target": 1,
+                    "interposer_slot": "in",
+                    "interposer_provide": "out"
+                }]
+            }]
+        }))
+        .expect("policy output should deserialize");
+
+        assert!(output.interpositions[0].interposer.resources.is_empty());
     }
 }

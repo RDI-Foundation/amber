@@ -1,9 +1,12 @@
 use amber_manifest::ExportName;
 use amber_scenario::{Moniker, Scenario};
 
+use crate::Provenance;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Governance {
     pub scenario: Scenario,
+    pub provenance: Provenance,
     pub scopes: Vec<GovernedScope>,
 }
 

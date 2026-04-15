@@ -988,12 +988,16 @@ fn build_governance(
     // The synthetic governance artifact is linked like an ordinary tree. This does not recurse
     // because the frontend rejects `use` subtrees that declare nested `use` or `policies`, so
     // this synthetic tree contains no governed scopes of its own.
-    let (scenario, nested_governance, _) = link(governance_tree, store)?;
+    let (scenario, nested_governance, provenance) = link(governance_tree, store)?;
     debug_assert!(
         nested_governance.is_none(),
         "synthetic governance artifact should not contain nested governance"
     );
-    Ok(Some(Governance { scenario, scopes }))
+    Ok(Some(Governance {
+        scenario,
+        provenance,
+        scopes,
+    }))
 }
 
 fn resolve_policy_export(

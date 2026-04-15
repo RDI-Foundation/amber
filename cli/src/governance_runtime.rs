@@ -1,16 +1,25 @@
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::Duration,
+};
 
 use amber_compiler::{
-    Governance, GovernanceFuture, GovernanceRuntime, GovernanceRuntimeError, GovernanceSession,
+    GovernanceFuture, GovernanceRuntime, GovernanceRuntimeError, GovernanceSession,
     policy::{PolicyInput, PolicyOutput},
     reporter::CompiledScenario,
-    run_plan::{SiteKind, build_homogeneous_export_run_plan},
+    run_plan::build_run_plan,
 };
 use amber_manifest::ExportName;
-use amber_scenario::ScenarioIr;
 use reqwest::Client;
 use tempfile::TempDir;
-use tokio::task::JoinHandle;
+use tokio::{
+    task::JoinHandle,
+    time::{Instant, sleep},
+};
 use url::Url;
 
 use crate::{mixed_run, run_inputs::collect_run_interface};
@@ -46,7 +55,7 @@ struct GovernanceCleanup {
 impl GovernanceRuntime for CliGovernanceRuntime {
     fn start<'a>(
         &'a self,
-        governance: &'a Governance,
+        compiled: &'a CompiledScenario,
     ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>> {
         Box::pin(async move {
             let storage_root = TempDir::new().map_err(|err| {
@@ -54,18 +63,11 @@ impl GovernanceRuntime for CliGovernanceRuntime {
                     "failed to create governance storage root: {err}"
                 ))
             })?;
-            let compiled = CompiledScenario::from_ir(ScenarioIr::from(&governance.scenario))
-                .map_err(|err| {
-                    GovernanceRuntimeError::message(format!(
-                        "failed to compile governance scenario: {err}"
-                    ))
-                })?;
-            let run_plan =
-                build_homogeneous_export_run_plan(&compiled, SiteKind::Direct).map_err(|err| {
-                    GovernanceRuntimeError::message(format!(
-                        "failed to build governance run plan: {err}"
-                    ))
-                })?;
+            let run_plan = build_run_plan(compiled, None).map_err(|err| {
+                GovernanceRuntimeError::message(format!(
+                    "failed to build governance run plan: {err}"
+                ))
+            })?;
             let interface = collect_run_interface(&run_plan).map_err(|err| {
                 GovernanceRuntimeError::message(format!(
                     "failed to inspect governance exports: {err}"
@@ -79,11 +81,7 @@ impl GovernanceRuntime for CliGovernanceRuntime {
                 &BTreeMap::new(),
             )
             .await
-            .map_err(|err| {
-                GovernanceRuntimeError::message(format!(
-                    "failed to start governance artifact: {err}"
-                ))
-            })?;
+            .map_err(|err| GovernanceRuntimeError::message(err.to_string()))?;
             let run_root = PathBuf::from(&receipt.run_root);
 
             let export_bindings = match reserve_export_bindings(&interface.exports) {
@@ -123,6 +121,14 @@ impl GovernanceRuntime for CliGovernanceRuntime {
                 return Err(GovernanceRuntimeError::message(format!(
                     "failed to expose governance exports: {err}"
                 )));
+            }
+            if let Err(err) =
+                wait_for_governance_exports_ready(&self.client, &export_urls, &run_root).await
+            {
+                proxy_task.abort();
+                let _ = proxy_task.await;
+                let _ = mixed_run::stop_run(&receipt.run_id, Some(storage_root.path())).await;
+                return Err(err);
             }
 
             Ok(Box::new(CliGovernanceSession {
@@ -168,18 +174,23 @@ impl GovernanceSession for CliGovernanceSession {
             if !status.is_success() {
                 let body = response.text().await.map_err(|err| {
                     GovernanceRuntimeError::message(format!(
-                        "policy `{policy_export}` returned {status} and its error body could not \
-                         be read: {err}"
+                        "{status} response body could not be read: {err}"
                     ))
                 })?;
                 return Err(GovernanceRuntimeError::message(format!(
-                    "policy `{policy_export}` returned {status}: {}",
+                    "{status}: {}",
                     body.trim()
                 )));
             }
-            response.json::<PolicyOutput>().await.map_err(|err| {
+            let body = response.text().await.map_err(|err| {
                 GovernanceRuntimeError::message(format!(
-                    "policy `{policy_export}` returned invalid JSON: {err}"
+                    "successful response body could not be read: {err}"
+                ))
+            })?;
+            serde_json::from_str::<PolicyOutput>(&body).map_err(|err| {
+                GovernanceRuntimeError::message(format!(
+                    "response body was not valid policy output JSON: {err}\n\nbody:\n{}",
+                    body.trim()
                 ))
             })
         })
@@ -218,11 +229,7 @@ impl GovernanceSession for CliGovernanceSession {
             }
             mixed_run::stop_run(&run_id, Some(storage_root.path()))
                 .await
-                .map_err(|err| {
-                    GovernanceRuntimeError::message(format!(
-                        "failed to stop governance artifact: {err}"
-                    ))
-                })
+                .map_err(|err| GovernanceRuntimeError::message(err.to_string()))
         })
     }
 }
@@ -271,4 +278,83 @@ fn build_export_urls(
             Ok((export.name.clone(), url))
         })
         .collect()
+}
+
+async fn wait_for_governance_exports_ready(
+    client: &Client,
+    export_urls: &BTreeMap<String, Url>,
+    run_root: &Path,
+) -> Result<(), GovernanceRuntimeError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut pending = Vec::new();
+
+        for (name, url) in export_urls {
+            let ready = match client.get(url.clone()).send().await {
+                Ok(response) => response.status() != reqwest::StatusCode::BAD_GATEWAY,
+                Err(_) => false,
+            };
+            if !ready {
+                pending.push(name.as_str());
+            }
+        }
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let logs = governance_log_excerpt(run_root);
+            return Err(GovernanceRuntimeError::message(format!(
+                "governance exports did not become ready in time: {}{}",
+                pending.join(", "),
+                logs
+            )));
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn governance_log_excerpt(run_root: &Path) -> String {
+    let mut excerpts = Vec::new();
+    let mut candidates = vec![run_root.join("outside-proxy.log")];
+    let state_root = run_root.join("state");
+    if let Ok(entries) = fs::read_dir(&state_root) {
+        for entry in entries.flatten() {
+            let site_root = entry.path();
+            if !site_root.is_dir() {
+                continue;
+            }
+            candidates.push(site_root.join("site.log"));
+            candidates.push(site_root.join("supervisor.log"));
+        }
+    }
+
+    for path in candidates {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let all_lines = raw.lines().collect::<Vec<_>>();
+        if all_lines.is_empty() {
+            continue;
+        }
+        let mut excerpt = Vec::new();
+        excerpt.extend(all_lines.iter().take(20).copied());
+
+        let tail_start = all_lines.len().saturating_sub(20);
+        if tail_start > 20 {
+            excerpt.push("...");
+        }
+        excerpt.extend(all_lines.iter().skip(tail_start).copied());
+
+        excerpts.push(format!(
+            "\n\n{}:\n{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("log"),
+            excerpt.join("\n")
+        ));
+    }
+
+    excerpts.concat()
 }
