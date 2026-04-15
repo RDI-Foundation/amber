@@ -227,39 +227,48 @@ pub(crate) async fn resolve_dynamic_capability_origin_internal(
             ))
         })?;
     let _origin_runtime = local_component_runtime(app, &state, &root.holder_component_id)?;
-    let origin_manager_state = load_site_manager_state(app, &app.controller_plan.site_id)?;
     let origin_peer = local_router_identity_for_overlay(app).await?;
-    let origin_peer_addr = origin_manager_state
-        .router_mesh_addr
-        .as_deref()
-        .ok_or_else(|| {
-            ProtocolApiError::from(protocol_error(
-                ProtocolErrorCode::OriginUnavailable,
-                &format!(
-                    "site `{}` does not expose a live router mesh address for dynamic capability \
-                     publication",
-                    app.controller_plan.site_id
-                ),
-            ))
-        })
-        .and_then(|router_mesh_addr| {
-            app.runtime
-                .router_mesh_addr_for_consumer(
-                    app.controller_plan.kind,
-                    request.holder_site_kind,
-                    router_mesh_addr,
-                )
-                .map_err(|err| {
-                    ProtocolApiError::from(protocol_error(
-                        ProtocolErrorCode::OriginUnavailable,
-                        &format!(
-                            "site `{}` exposes an invalid live router mesh address for dynamic \
-                             capability publication: {err}",
-                            app.controller_plan.site_id
-                        ),
-                    ))
-                })
-        })?;
+    let origin_state = load_site_manager_state(app, &app.controller_plan.site_id)?;
+    let origin_receipt = super::orchestration::site_receipt_from_manager_state(&origin_state);
+    let origin_peer_addr = if let Some(router_mesh_addr) =
+        crate::runtime_api::published_router_mesh_addr_for_consumer_kind(
+            &origin_receipt,
+            request.holder_site_kind,
+        ) {
+        Ok(router_mesh_addr.to_string())
+    } else {
+        origin_state
+            .router_mesh_addr
+            .as_deref()
+            .ok_or_else(|| {
+                ProtocolApiError::from(protocol_error(
+                    ProtocolErrorCode::OriginUnavailable,
+                    &format!(
+                        "site `{}` does not expose a live router mesh address for dynamic \
+                         capability publication",
+                        app.controller_plan.site_id
+                    ),
+                ))
+            })
+            .and_then(|router_mesh_addr| {
+                app.runtime
+                    .router_mesh_addr_for_component_consumer(
+                        app.controller_plan.kind,
+                        request.holder_site_kind,
+                        router_mesh_addr,
+                    )
+                    .map_err(|err| {
+                        ProtocolApiError::from(protocol_error(
+                            ProtocolErrorCode::OriginUnavailable,
+                            &format!(
+                                "site `{}` exposes an invalid live router mesh address for \
+                                 dynamic capability publication: {err}",
+                                app.controller_plan.site_id
+                            ),
+                        ))
+                    })
+            })
+    }?;
     let overlay_id = dynamic_caps::origin_overlay_id(
         &request.holder_component_id,
         &resolved_source.root_authority_selector,
@@ -307,18 +316,18 @@ async fn resolve_dynamic_capability_origin(
     app: &ControlStateApp,
     request: dynamic_caps::ControlDynamicResolveOriginRequest,
 ) -> std::result::Result<dynamic_caps::ControlDynamicResolveOriginResponse, ProtocolApiError> {
-    let holder_runtime = {
-        let state = app.control_state.lock().await.clone();
-        local_component_runtime(app, &state, &request.holder_component_id)?
-    };
+    let state = app.control_state.lock().await.clone();
+    let holder_peer = local_component_runtime(app, &state, &request.holder_component_id)?
+        .mesh_config
+        .identity;
     resolve_dynamic_capability_origin_internal(
         app,
         dynamic_caps::InternalDynamicResolveOriginRequest {
             holder_component_id: request.holder_component_id,
             source: request.source,
-            holder_peer_id: holder_runtime.mesh_config.identity.id.clone(),
+            holder_peer_id: holder_peer.id,
             holder_peer_key_b64: base64::engine::general_purpose::STANDARD
-                .encode(holder_runtime.mesh_config.identity.public_key),
+                .encode(holder_peer.public_key),
             holder_site_kind: app.controller_plan.kind,
         },
     )

@@ -83,6 +83,15 @@ pub(crate) trait SiteControllerRuntime: Send + Sync {
         router_mesh_addr: &str,
     ) -> Result<String>;
 
+    fn router_mesh_addr_for_component_consumer(
+        &self,
+        provider_kind: SiteKind,
+        consumer_kind: SiteKind,
+        router_mesh_addr: &str,
+    ) -> Result<String> {
+        self.router_mesh_addr_for_consumer(provider_kind, consumer_kind, router_mesh_addr)
+    }
+
     fn update_desired_overlay_for_consumer(
         &self,
         site_state_root: &Path,
@@ -132,6 +141,10 @@ pub struct SiteReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_mesh_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_consumer_router_mesh_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubernetes_consumer_router_mesh_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_identity_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_public_key_b64: Option<String>,
@@ -177,7 +190,8 @@ pub struct SiteControllerRuntimePlan {
 #[derive(Clone, Debug)]
 pub struct LiveComponentRuntimeMetadata {
     pub moniker: String,
-    pub host_mesh_addr: String,
+    pub router_reachable_mesh_addr: String,
+    pub component_reachable_mesh_addr: String,
     pub control_endpoint: Option<ControlEndpoint>,
     pub mesh_config: MeshConfigPublic,
 }
@@ -467,4 +481,15 @@ pub fn launched_site_from_receipt(
         router_identity,
         router_addr,
     })
+}
+
+pub fn published_router_mesh_addr_for_consumer_kind(
+    site_receipt: &SiteReceipt,
+    consumer_kind: SiteKind,
+) -> Option<&str> {
+    match consumer_kind {
+        SiteKind::Compose => site_receipt.compose_consumer_router_mesh_addr.as_deref(),
+        SiteKind::Kubernetes => site_receipt.kubernetes_consumer_router_mesh_addr.as_deref(),
+        SiteKind::Direct | SiteKind::Vm => None,
+    }
 }

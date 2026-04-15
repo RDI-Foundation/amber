@@ -2,6 +2,8 @@
 
 #[path = "test_support/cloud_image.rs"]
 mod cloud_image_support;
+#[path = "test_support/port_allocator.rs"]
+mod port_allocator_support;
 #[path = "test_support/target_dir.rs"]
 mod target_dir_support;
 #[path = "test_support/workspace_root.rs"]
@@ -10,7 +12,7 @@ mod workspace_root_support;
 use std::{
     env, fs,
     io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -18,6 +20,7 @@ use std::{
 };
 
 use cloud_image_support::default_host_arch_cloud_image_filename;
+use port_allocator_support::reserve_test_loopback_port;
 use target_dir_support::cargo_target_dir;
 use workspace_root_support::workspace_root;
 
@@ -86,8 +89,7 @@ fn emit_wait_heartbeat(
 }
 
 fn pick_free_port() -> u16 {
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-    listener.local_addr().unwrap().port()
+    reserve_test_loopback_port()
 }
 
 fn ensure_runtime_binaries_built(workspace_root: &Path) -> PathBuf {

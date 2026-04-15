@@ -774,66 +774,6 @@ pub(crate) fn spawn_detached_child(
     })
 }
 
-pub(super) async fn stop_child(child: &mut Child) -> Result<()> {
-    #[cfg(unix)]
-    {
-        terminate_recorded_processes(&[child.id()]).await?;
-        let _ = child.wait();
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    {
-        send_sigterm(child.id());
-        let _ = wait_for_child_exit(child, PROCESS_SHUTDOWN_GRACE_PERIOD).await;
-        Ok(())
-    }
-}
-
-#[cfg(not(unix))]
-pub(super) async fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait().into_diagnostic()?.is_some() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
-pub(super) async fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if !pid_is_alive(pid) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
-pub(super) async fn router_mesh_listener_ready(addr: SocketAddr) -> bool {
-    tokio::net::TcpStream::connect(addr).await.is_ok()
-}
-
-pub(super) async fn wait_for_socket_listener(addr: SocketAddr) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if router_mesh_listener_ready(addr).await {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    Err(miette::miette!("timed out waiting for listener {}", addr))
-}
-
 pub(super) fn endpoint_returns_http_response_blocking(
     addr: SocketAddr,
     timeout: Duration,
@@ -870,12 +810,6 @@ pub(super) fn endpoint_accepts_stable_connection_blocking(
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(false)
-}
-
-pub(super) fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4)
 }
 
 pub(super) fn pid_is_alive(pid: u32) -> bool {
@@ -920,13 +854,6 @@ fn parse_process_status_code(raw: &str) -> Option<char> {
         .map(|state| state.to_ascii_uppercase())
 }
 
-#[cfg(unix)]
-pub(super) fn send_sigterm(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-}
-
 #[cfg(not(unix))]
 pub(super) fn send_sigterm(_pid: u32) {}
 
@@ -952,21 +879,78 @@ pub(super) fn send_signal_to_process_group(root_pid: u32, signal: i32) {
 #[cfg(not(unix))]
 pub(super) fn send_signal_to_process_group(_root_pid: u32, _signal: i32) {}
 
-pub(super) fn process_tree_postorder(root_pid: u32) -> Result<Vec<u32>> {
-    Ok(vec![root_pid])
+#[cfg(unix)]
+fn parse_process_tree_line(raw: &str) -> Option<(u32, u32)> {
+    let mut fields = raw.split_ascii_whitespace();
+    let pid = fields.next()?.parse::<u32>().ok()?;
+    let ppid = fields.next()?.parse::<u32>().ok()?;
+    Some((pid, ppid))
 }
 
-pub(super) async fn terminate_recorded_processes(root_pids: &[u32]) -> Result<()> {
-    for pid in root_pids {
-        send_sigterm(*pid);
-        if !wait_for_pid_exit(*pid, PROCESS_SHUTDOWN_GRACE_PERIOD).await {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(*pid as i32, libc::SIGKILL);
+#[cfg(unix)]
+fn process_tree_postorder_from_ps(raw: &str, root_pid: u32) -> Vec<u32> {
+    fn visit(
+        pid: u32,
+        children_by_parent: &std::collections::BTreeMap<u32, Vec<u32>>,
+        seen: &mut std::collections::BTreeSet<u32>,
+        out: &mut Vec<u32>,
+    ) {
+        if !seen.insert(pid) {
+            return;
+        }
+        if let Some(children) = children_by_parent.get(&pid) {
+            for child in children {
+                visit(*child, children_by_parent, seen, out);
             }
         }
+        out.push(pid);
     }
-    Ok(())
+
+    let mut children_by_parent = std::collections::BTreeMap::<u32, Vec<u32>>::new();
+    for line in raw.lines() {
+        let Some((pid, ppid)) = parse_process_tree_line(line) else {
+            continue;
+        };
+        children_by_parent.entry(ppid).or_default().push(pid);
+    }
+    for children in children_by_parent.values_mut() {
+        children.sort_unstable();
+    }
+
+    let mut out = Vec::new();
+    visit(
+        root_pid,
+        &children_by_parent,
+        &mut std::collections::BTreeSet::new(),
+        &mut out,
+    );
+    out
+}
+
+pub(super) fn process_tree_postorder(root_pid: u32) -> Result<Vec<u32>> {
+    #[cfg(unix)]
+    {
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,ppid="])
+            .output()
+            .into_diagnostic()
+            .wrap_err("failed to query process tree via `ps`")?;
+        if !output.status.success() {
+            return Err(miette::miette!(
+                "`ps -axo pid=,ppid=` failed with status {}",
+                output.status
+            ));
+        }
+        Ok(process_tree_postorder_from_ps(
+            &String::from_utf8_lossy(&output.stdout),
+            root_pid,
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(vec![root_pid])
+    }
 }
 
 pub(crate) async fn resolve_link_external_url_for_output(
@@ -974,119 +958,9 @@ pub(crate) async fn resolve_link_external_url_for_output(
     provider_output_dir: &Path,
     link: &RunLink,
     consumer_kind: SiteKind,
-    run_root: &Path,
-    bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
+    _run_root: &Path,
 ) -> Result<String> {
-    if !link_needs_bridge_proxy(provider.receipt.kind, consumer_kind) {
-        return external_slot_url(provider, provider_output_dir, link, consumer_kind);
-    }
-
-    let port = ensure_bridge_proxy(
-        run_root,
-        provider,
-        provider_output_dir,
-        &link.export_name,
-        consumer_kind,
-        bridge_proxies,
-    )
-    .await?;
-    bridge_proxy_external_url(port, link.protocol, consumer_kind)
-}
-
-pub(super) fn link_needs_bridge_proxy(provider_kind: SiteKind, consumer_kind: SiteKind) -> bool {
-    matches!(consumer_kind, SiteKind::Compose | SiteKind::Kubernetes)
-        && provider_kind != SiteKind::Kubernetes
-}
-
-pub(super) async fn ensure_bridge_proxy(
-    run_root: &Path,
-    provider: &LaunchedSite,
-    provider_output_dir: &Path,
-    export_name: &str,
-    consumer_kind: SiteKind,
-    bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
-) -> Result<u16> {
-    let key = BridgeProxyKey {
-        provider_output_dir: provider_output_dir.display().to_string(),
-        export_name: export_name.to_string(),
-        consumer_kind,
-    };
-    if let Some(proxy) = bridge_proxies.get_mut(&key)
-        && proxy.child.try_wait().into_diagnostic()?.is_none()
-    {
-        return Ok(proxy.listen.port());
-    }
-
-    let listen = bridge_proxy_bind_addr(consumer_kind, reserve_loopback_port()?);
-    let child = spawn_bridge_proxy(run_root, provider, provider_output_dir, export_name, listen)?;
-    wait_for_socket_listener(bridge_proxy_probe_addr(listen)).await?;
-    bridge_proxies.insert(key, BridgeProxyHandle { child, listen });
-    Ok(listen.port())
-}
-
-pub(super) fn spawn_bridge_proxy(
-    run_root: &Path,
-    provider: &LaunchedSite,
-    provider_output_dir: &Path,
-    export_name: &str,
-    listen: SocketAddr,
-) -> Result<Child> {
-    let logs_root = run_root.join("bridge-proxies");
-    fs::create_dir_all(&logs_root)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to create {}", logs_root.display()))?;
-    let log_path = logs_root.join(format!("{export_name}.log"));
-    spawn_detached_child(run_root, &log_path, |cmd| {
-        cmd.arg("proxy")
-            .arg(provider_output_dir)
-            .arg("--export")
-            .arg(bridge_proxy_export_binding(export_name, listen));
-        if provider.receipt.kind == SiteKind::Kubernetes {
-            let control = provider.router_control.to_string();
-            cmd.arg("--router-addr")
-                .arg(provider.router_addr.to_string())
-                .arg("--router-control-addr")
-                .arg(control);
-        }
-    })
-}
-
-pub(super) fn bridge_proxy_export_binding(export_name: &str, listen: SocketAddr) -> String {
-    format!("{export_name}={}:{}", listen.ip(), listen.port())
-}
-
-pub(super) fn bridge_proxy_bind_addr(consumer_kind: SiteKind, port: u16) -> SocketAddr {
-    host_service_bind_addr_for_consumer(consumer_kind, port)
-}
-
-pub(super) fn bridge_proxy_probe_addr(listen: SocketAddr) -> SocketAddr {
-    listener_probe_addr(listen)
-}
-
-pub(super) fn bridge_proxy_external_url(
-    port: u16,
-    protocol: NetworkProtocol,
-    consumer_kind: SiteKind,
-) -> Result<String> {
-    let host = host_service_host_for_consumer(consumer_kind);
-    Ok(match protocol {
-        NetworkProtocol::Http | NetworkProtocol::Https => format!("http://{host}:{port}"),
-        NetworkProtocol::Tcp => format!("tcp://{host}:{port}"),
-        _ => {
-            return Err(miette::miette!(
-                "mixed-site bridge proxy does not support protocol `{protocol}`"
-            ));
-        }
-    })
-}
-
-pub(crate) fn host_service_host_for_consumer(consumer_kind: SiteKind) -> String {
-    match consumer_kind {
-        SiteKind::Compose => CONTAINER_HOST_ALIAS.to_string(),
-        SiteKind::Direct | SiteKind::Vm | SiteKind::Kubernetes => {
-            container_host_for_consumer(SiteKind::Direct, consumer_kind)
-        }
-    }
+    external_slot_url(provider, provider_output_dir, link, consumer_kind)
 }
 
 pub fn site_controller_peer_router_url(controller_site_kind: SiteKind, route_port: u16) -> String {
@@ -1098,7 +972,10 @@ pub fn site_controller_peer_router_url(controller_site_kind: SiteKind, route_por
 }
 
 pub(super) fn consumer_needs_host_wide_listener(consumer_kind: SiteKind) -> bool {
-    matches!(consumer_kind, SiteKind::Compose | SiteKind::Kubernetes)
+    matches!(
+        consumer_kind,
+        SiteKind::Compose | SiteKind::Kubernetes | SiteKind::Vm
+    ) || (cfg!(target_os = "linux") && matches!(consumer_kind, SiteKind::Direct))
 }
 
 pub fn host_service_bind_addr_for_consumer(consumer_kind: SiteKind, port: u16) -> SocketAddr {
@@ -1106,6 +983,27 @@ pub fn host_service_bind_addr_for_consumer(consumer_kind: SiteKind, port: u16) -
 }
 
 pub fn router_mesh_addr_for_consumer(
+    provider_kind: SiteKind,
+    consumer_kind: SiteKind,
+    router_mesh_addr: &str,
+) -> Result<String> {
+    match consumer_kind {
+        SiteKind::Compose | SiteKind::Kubernetes => {
+            let addr = router_mesh_addr
+                .parse::<SocketAddr>()
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("invalid live router mesh address `{router_mesh_addr}`")
+                })?;
+            let host = container_host_for_consumer(provider_kind, consumer_kind);
+            Ok(format!("{host}:{}", addr.port()))
+        }
+        SiteKind::Direct => Ok(router_mesh_addr.to_string()),
+        SiteKind::Vm => Ok(router_mesh_addr.to_string()),
+    }
+}
+
+pub fn router_mesh_addr_for_component_consumer(
     provider_kind: SiteKind,
     consumer_kind: SiteKind,
     router_mesh_addr: &str,
@@ -1142,23 +1040,31 @@ pub(super) fn host_proxy_bind_addr(needs_host_wide_listener: bool, port: u16) ->
     }
 }
 
-pub(super) fn listener_probe_addr(listen: SocketAddr) -> SocketAddr {
-    if listen.ip().is_unspecified() {
-        SocketAddr::from(([127, 0, 0, 1], listen.port()))
-    } else {
-        listen
-    }
-}
-
 pub(super) fn external_slot_url(
     provider: &LaunchedSite,
     provider_output_dir: &Path,
     link: &RunLink,
     consumer_kind: SiteKind,
 ) -> Result<String> {
-    let host = container_host_for_consumer(provider.receipt.kind, consumer_kind);
+    let router_mesh_addr = if let Some(router_mesh_addr) =
+        crate::runtime_api::published_router_mesh_addr_for_consumer_kind(
+            &provider.receipt,
+            consumer_kind,
+        ) {
+        router_mesh_addr.to_string()
+    } else {
+        router_mesh_addr_for_consumer(
+            provider.receipt.kind,
+            consumer_kind,
+            provider
+                .receipt
+                .router_mesh_addr
+                .as_deref()
+                .ok_or_else(|| miette::miette!("provider site is missing router mesh addr"))?,
+        )?
+    };
     let route_id = provider_export_route_id(provider_output_dir, link)?;
-    let mut mesh_url = Url::parse(&format!("mesh://{}:{}", host, provider.router_addr.port()))
+    let mut mesh_url = Url::parse(&format!("mesh://{router_mesh_addr}"))
         .into_diagnostic()
         .wrap_err("failed to build mesh link url")?;
     let peer_key =
@@ -1198,21 +1104,13 @@ pub(super) fn container_host_for_consumer(
 }
 
 pub(super) fn container_host_from_resolved_ip(
-    provider_kind: SiteKind,
+    _provider_kind: SiteKind,
     consumer_kind: SiteKind,
     container_host_ip: Option<&str>,
 ) -> String {
     match consumer_kind {
         SiteKind::Direct | SiteKind::Vm => "127.0.0.1".to_string(),
-        SiteKind::Compose => {
-            if provider_kind == SiteKind::Kubernetes {
-                container_host_ip
-                    .unwrap_or(CONTAINER_HOST_ALIAS)
-                    .to_string()
-            } else {
-                CONTAINER_HOST_ALIAS.to_string()
-            }
-        }
+        SiteKind::Compose => CONTAINER_HOST_ALIAS.to_string(),
         SiteKind::Kubernetes => container_host_ip
             .unwrap_or(CONTAINER_HOST_ALIAS)
             .to_string(),
@@ -1274,16 +1172,25 @@ pub(super) fn resolve_desktop_container_host_ip() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, fs, net::SocketAddr};
 
-    use amber_compiler::run_plan::SiteKind;
+    use amber_compiler::{
+        mesh::{PROXY_METADATA_FILENAME, PROXY_METADATA_VERSION},
+        run_plan::SiteKind,
+    };
+    use amber_manifest::NetworkProtocol;
+    use amber_mesh::{MeshIdentity, MeshIdentityPublic, router_export_route_id};
+    use amber_proxy::ControlEndpoint;
+    use base64::Engine as _;
+    use tempfile::tempdir;
 
-    #[cfg(unix)]
-    use super::parse_process_status_code;
     use super::{
-        SITE_PLAN_SCHEMA, SITE_PLAN_VERSION, SiteSupervisorPlan,
+        LaunchedSite, SITE_PLAN_SCHEMA, SITE_PLAN_VERSION, SiteReceipt, SiteSupervisorPlan,
+        external_slot_url, resolve_link_external_url_for_output, router_mesh_addr_for_consumer,
         should_prepare_kubernetes_namespace,
     };
+    #[cfg(unix)]
+    use super::{parse_process_status_code, process_tree_postorder_from_ps};
 
     fn kubernetes_supervisor_plan(context: Option<&str>) -> SiteSupervisorPlan {
         SiteSupervisorPlan {
@@ -1320,6 +1227,24 @@ mod tests {
         assert_eq!(parse_process_status_code(""), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn process_tree_postorder_from_ps_includes_descendants_before_root() {
+        let tree = process_tree_postorder_from_ps(
+            "\
+1 0
+42 1
+7 42
+8 42
+9 8
+100 1
+",
+            42,
+        );
+
+        assert_eq!(tree, vec![7, 9, 8, 42]);
+    }
+
     #[test]
     fn in_cluster_kubernetes_controller_skips_namespace_bootstrap() {
         let plan = kubernetes_supervisor_plan(None);
@@ -1336,6 +1261,289 @@ mod tests {
             should_prepare_kubernetes_namespace(&plan, true),
             "external site supervisors still need to prepare the namespace before applying \
              artifacts"
+        );
+    }
+
+    #[test]
+    fn direct_consumers_keep_router_mesh_addr_verbatim() {
+        let peer_addr =
+            router_mesh_addr_for_consumer(SiteKind::Direct, SiteKind::Direct, "127.0.0.1:24077")
+                .expect("direct consumers should keep direct peer mesh addresses");
+        assert_eq!(peer_addr, "127.0.0.1:24077");
+    }
+
+    #[test]
+    fn vm_site_consumers_keep_router_mesh_addr_verbatim() {
+        let peer_addr =
+            router_mesh_addr_for_consumer(SiteKind::Direct, SiteKind::Vm, "127.0.0.1:24077")
+                .expect("vm site consumers should keep peer router mesh addresses");
+        assert_eq!(peer_addr, "127.0.0.1:24077");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_component_consumers_rewrite_loopback_router_mesh_addr_to_slirp_gateway() {
+        let peer_addr = super::router_mesh_addr_for_component_consumer(
+            SiteKind::Direct,
+            SiteKind::Direct,
+            "127.0.0.1:24077",
+        )
+        .expect("direct component consumers should rewrite loopback peer mesh addresses");
+        assert_eq!(peer_addr, "10.0.2.2:24077");
+    }
+
+    #[test]
+    fn host_service_bind_addr_matches_component_reachability() {
+        assert_eq!(
+            super::host_service_bind_addr_for_consumer(SiteKind::Compose, 24077),
+            SocketAddr::from(([0, 0, 0, 0], 24077))
+        );
+        assert_eq!(
+            super::host_service_bind_addr_for_consumer(SiteKind::Kubernetes, 24078),
+            SocketAddr::from(([0, 0, 0, 0], 24078))
+        );
+        assert_eq!(
+            super::host_service_bind_addr_for_consumer(SiteKind::Vm, 24079),
+            SocketAddr::from(([0, 0, 0, 0], 24079))
+        );
+
+        let direct = super::host_service_bind_addr_for_consumer(SiteKind::Direct, 24080);
+        if cfg!(target_os = "linux") {
+            assert_eq!(direct, SocketAddr::from(([0, 0, 0, 0], 24080)));
+        } else {
+            assert_eq!(direct, SocketAddr::from(([127, 0, 0, 1], 24080)));
+        }
+    }
+
+    #[test]
+    fn compose_consumers_reach_kubernetes_peers_via_host_alias() {
+        let peer_addr = super::router_mesh_addr_for_consumer(
+            SiteKind::Kubernetes,
+            SiteKind::Compose,
+            "127.0.0.1:24077",
+        )
+        .expect("compose consumers should rewrite kubernetes peers to a host-reachable address");
+        assert_eq!(peer_addr, "host.docker.internal:24077");
+    }
+
+    #[test]
+    fn kubernetes_consumers_resolve_cross_site_links_as_mesh_router_urls() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        fs::write(
+            temp.path().join(PROXY_METADATA_FILENAME),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": PROXY_METADATA_VERSION,
+                "exports": {
+                    "compose_http": {
+                        "component": "/job-kind/compose_helper",
+                        "provide": "http",
+                        "capability_kind": "http",
+                        "protocol": "http",
+                        "router_mesh_port": 24000,
+                        "route_id": router_export_route_id("compose_http", amber_mesh::MeshProtocol::Http),
+                    }
+                }
+            }))
+            .expect("proxy metadata should serialize"),
+        )
+        .expect("proxy metadata should write");
+
+        let router_identity = MeshIdentity::generate("/site/compose_local/router", None);
+        let provider = LaunchedSite {
+            receipt: SiteReceipt {
+                kind: SiteKind::Compose,
+                artifact_dir: temp.path().display().to_string(),
+                supervisor_pid: 0,
+                process_pid: None,
+                compose_project: Some("compose-test".to_string()),
+                kubernetes_namespace: None,
+                port_forward_pid: None,
+                context: None,
+                router_control: None,
+                router_mesh_addr: Some("127.0.0.1:24000".to_string()),
+                compose_consumer_router_mesh_addr: None,
+                kubernetes_consumer_router_mesh_addr: None,
+                router_identity_id: Some(router_identity.id.clone()),
+                router_public_key_b64: None,
+                site_controller_pid: None,
+                site_controller_url: None,
+            },
+            router_control: ControlEndpoint::Tcp("127.0.0.1:24100".to_string()),
+            router_identity: MeshIdentityPublic::from_identity(&router_identity),
+            router_addr: SocketAddr::from(([127, 0, 0, 1], 24000)),
+        };
+        let link = amber_compiler::run_plan::RunLink {
+            provider_site: "compose_local".to_string(),
+            consumer_site: "kind_local".to_string(),
+            provider_component: "/job-kind/compose_helper".to_string(),
+            provide: "http".to_string(),
+            consumer_component: "/job-kind/root".to_string(),
+            slot: "compose".to_string(),
+            weak: false,
+            protocol: NetworkProtocol::Http,
+            export_name: "compose_http".to_string(),
+            external_slot_name: "amber_link_compose_http".to_string(),
+        };
+
+        let resolved = tokio::runtime::Runtime::new()
+            .expect("tokio runtime should create")
+            .block_on(resolve_link_external_url_for_output(
+                &provider,
+                temp.path(),
+                &link,
+                SiteKind::Kubernetes,
+                temp.path(),
+            ))
+            .expect("kubernetes consumer link should resolve");
+
+        assert!(
+            resolved.starts_with("mesh://"),
+            "cross-site kubernetes consumers should route through mesh, got {resolved}"
+        );
+        assert!(
+            !resolved.starts_with("http://"),
+            "cross-site kubernetes consumers should not bounce through an HTTP bridge proxy: \
+             {resolved}"
+        );
+        assert!(resolved.contains("peer_id=%2Fsite%2Fcompose_local%2Frouter"));
+    }
+
+    #[test]
+    fn external_slot_url_prefers_host_published_mesh_addr_for_kubernetes_consumers() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        fs::write(
+            temp.path().join(PROXY_METADATA_FILENAME),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": PROXY_METADATA_VERSION,
+                "exports": {
+                    "compose_http": {
+                        "component": "/job-kind/compose_helper",
+                        "provide": "http",
+                        "capability_kind": "http",
+                        "protocol": "http",
+                        "router_mesh_port": 24000,
+                        "route_id": router_export_route_id("compose_http", amber_mesh::MeshProtocol::Http),
+                    }
+                }
+            }))
+            .expect("proxy metadata should serialize"),
+        )
+        .expect("proxy metadata should write");
+        let router_identity = MeshIdentity::generate("/site/compose_local/router", None);
+        let provider = LaunchedSite {
+            receipt: SiteReceipt {
+                kind: SiteKind::Compose,
+                artifact_dir: temp.path().display().to_string(),
+                supervisor_pid: 0,
+                process_pid: None,
+                compose_project: Some("compose-test".to_string()),
+                kubernetes_namespace: None,
+                port_forward_pid: None,
+                context: None,
+                router_control: Some("unix:///tmp/router.sock".to_string()),
+                router_mesh_addr: Some("127.0.0.1:24000".to_string()),
+                compose_consumer_router_mesh_addr: Some("host.docker.internal:24000".to_string()),
+                kubernetes_consumer_router_mesh_addr: Some("192.168.65.254:24000".to_string()),
+                router_identity_id: Some(router_identity.id.clone()),
+                router_public_key_b64: Some(
+                    base64::engine::general_purpose::STANDARD.encode(router_identity.public_key),
+                ),
+                site_controller_pid: None,
+                site_controller_url: None,
+            },
+            router_control: ControlEndpoint::Tcp("127.0.0.1:24100".to_string()),
+            router_identity: MeshIdentityPublic::from_identity(&router_identity),
+            router_addr: SocketAddr::from(([127, 0, 0, 1], 24000)),
+        };
+        let link = amber_compiler::run_plan::RunLink {
+            provider_site: "compose_local".to_string(),
+            consumer_site: "kind_local".to_string(),
+            provider_component: "/job-kind/compose_helper".to_string(),
+            provide: "http".to_string(),
+            consumer_component: "/job-kind/root".to_string(),
+            slot: "compose".to_string(),
+            weak: false,
+            protocol: NetworkProtocol::Http,
+            export_name: "compose_http".to_string(),
+            external_slot_name: "amber_link_compose_http".to_string(),
+        };
+
+        let resolved = external_slot_url(&provider, temp.path(), &link, SiteKind::Kubernetes)
+            .expect("external slot url should resolve");
+
+        assert!(
+            resolved.starts_with("mesh://192.168.65.254:24000"),
+            "container consumers should use the host-published mesh address, got {resolved}"
+        );
+    }
+
+    #[test]
+    fn external_slot_url_keeps_vm_router_mesh_addr_loopback() {
+        let temp = tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join(PROXY_METADATA_FILENAME),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": PROXY_METADATA_VERSION,
+                "exports": {
+                    "compose_http": {
+                        "component": "/job-vm/compose_helper",
+                        "provide": "http",
+                        "capability_kind": "http",
+                        "protocol": "http",
+                        "router_mesh_port": 24000,
+                        "route_id": router_export_route_id("compose_http", amber_mesh::MeshProtocol::Http),
+                    }
+                }
+            }))
+            .expect("proxy metadata should serialize"),
+        )
+        .expect("proxy metadata should write");
+        let router_identity = MeshIdentity::generate("/site/compose_local/router", None);
+        let provider = LaunchedSite {
+            receipt: SiteReceipt {
+                kind: SiteKind::Compose,
+                artifact_dir: temp.path().display().to_string(),
+                supervisor_pid: 1,
+                process_pid: None,
+                compose_project: None,
+                kubernetes_namespace: None,
+                port_forward_pid: None,
+                context: None,
+                router_control: Some("unix:///tmp/router.sock".to_string()),
+                router_mesh_addr: Some("127.0.0.1:24000".to_string()),
+                compose_consumer_router_mesh_addr: Some("host.docker.internal:24000".to_string()),
+                kubernetes_consumer_router_mesh_addr: Some("192.168.65.254:24000".to_string()),
+                router_identity_id: Some(router_identity.id.clone()),
+                router_public_key_b64: Some(
+                    base64::engine::general_purpose::STANDARD.encode(router_identity.public_key),
+                ),
+                site_controller_pid: None,
+                site_controller_url: None,
+            },
+            router_control: ControlEndpoint::Tcp("127.0.0.1:24100".to_string()),
+            router_identity: MeshIdentityPublic::from_identity(&router_identity),
+            router_addr: SocketAddr::from(([127, 0, 0, 1], 24000)),
+        };
+        let link = amber_compiler::run_plan::RunLink {
+            provider_site: "compose_local".to_string(),
+            consumer_site: "vm_local".to_string(),
+            provider_component: "/job-vm/compose_helper".to_string(),
+            provide: "http".to_string(),
+            consumer_component: "/job-vm/root".to_string(),
+            slot: "compose".to_string(),
+            weak: false,
+            protocol: NetworkProtocol::Http,
+            export_name: "compose_http".to_string(),
+            external_slot_name: "amber_link_compose_http".to_string(),
+        };
+
+        let resolved = external_slot_url(&provider, temp.path(), &link, SiteKind::Vm).expect(
+            "external slot url should resolve for vm site consumers without slirp rewriting",
+        );
+
+        assert!(
+            resolved.starts_with("mesh://127.0.0.1:24000"),
+            "vm site consumers should use the live router mesh address, got {resolved}"
         );
     }
 }

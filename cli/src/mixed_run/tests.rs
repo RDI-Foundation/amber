@@ -53,6 +53,30 @@ fn site_controller_image_override_uses_dev_tag() {
 }
 
 #[test]
+fn recorded_process_roots_include_site_supervisor() {
+    let site = SiteReceipt {
+        kind: SiteKind::Direct,
+        artifact_dir: "/tmp/artifact".to_string(),
+        supervisor_pid: 7,
+        process_pid: Some(11),
+        compose_project: None,
+        kubernetes_namespace: None,
+        port_forward_pid: Some(13),
+        context: None,
+        router_control: None,
+        router_mesh_addr: None,
+        compose_consumer_router_mesh_addr: None,
+        kubernetes_consumer_router_mesh_addr: None,
+        router_identity_id: None,
+        router_public_key_b64: None,
+        site_controller_pid: None,
+        site_controller_url: None,
+    };
+
+    assert_eq!(recorded_process_roots(&site), vec![7, 11, 13]);
+}
+
+#[test]
 fn site_controller_local_router_control_uses_backend_local_control_targets() {
     let artifact_dir = Path::new("/tmp/site-artifact");
 
@@ -93,6 +117,27 @@ fn site_controller_peer_router_urls_are_local_to_the_controller_site() {
     assert_eq!(
         amber_site_controller::site_controller_peer_router_url(SiteKind::Kubernetes, 37046),
         "http://amber-router:37046"
+    );
+}
+
+#[test]
+fn compose_consumers_use_host_alias_for_kubernetes_router_mesh() {
+    assert_eq!(
+        supervisor::container_host_from_resolved_ip(
+            SiteKind::Kubernetes,
+            SiteKind::Compose,
+            Some("192.168.65.254"),
+        ),
+        "host.docker.internal"
+    );
+    assert_eq!(
+        amber_site_controller::router_mesh_addr_for_consumer(
+            SiteKind::Kubernetes,
+            SiteKind::Compose,
+            "127.0.0.1:24077",
+        )
+        .expect("compose consumers should be able to route to kubernetes peers"),
+        "host.docker.internal:24077"
     );
 }
 
@@ -188,6 +233,29 @@ fn local_site_controller_addr_requires_loopback_http() {
             .expect("non-loopback controller address should be ignored"),
         None
     );
+}
+
+#[test]
+fn host_service_bind_addr_matches_component_reachability() {
+    assert_eq!(
+        supervisor::host_service_bind_addr_for_consumer(SiteKind::Compose, 24200),
+        SocketAddr::from(([0, 0, 0, 0], 24200))
+    );
+    assert_eq!(
+        supervisor::host_service_bind_addr_for_consumer(SiteKind::Kubernetes, 24201),
+        SocketAddr::from(([0, 0, 0, 0], 24201))
+    );
+    assert_eq!(
+        supervisor::host_service_bind_addr_for_consumer(SiteKind::Vm, 24202),
+        SocketAddr::from(([0, 0, 0, 0], 24202))
+    );
+
+    let direct = supervisor::host_service_bind_addr_for_consumer(SiteKind::Direct, 24203);
+    if cfg!(target_os = "linux") {
+        assert_eq!(direct, SocketAddr::from(([0, 0, 0, 0], 24203)));
+    } else {
+        assert_eq!(direct, SocketAddr::from(([127, 0, 0, 1], 24203)));
+    }
 }
 
 #[test]

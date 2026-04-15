@@ -51,6 +51,21 @@ fn kubernetes_component_mesh_peer_addr(
     Ok(format!("{service_name}:{mesh_port}"))
 }
 
+fn local_component_mesh_peer_addr(mesh_port: u16) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        std::net::SocketAddr::from((std::net::Ipv4Addr::new(10, 0, 2, 2), mesh_port)).to_string()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::net::SocketAddr::from(([127, 0, 0, 1], mesh_port)).to_string()
+    }
+}
+
+fn local_router_mesh_peer_addr(mesh_port: u16) -> String {
+    std::net::SocketAddr::from(([127, 0, 0, 1], mesh_port)).to_string()
+}
+
 fn build_dynamic_compose_route_overlay_payload(
     artifact_root: &Path,
     assigned_components: &[String],
@@ -597,7 +612,8 @@ fn collect_direct_artifact_runtime_metadata(
             component.moniker.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: component.moniker.clone(),
-                host_mesh_addr: format!("127.0.0.1:{mesh_port}"),
+                router_reachable_mesh_addr: local_router_mesh_peer_addr(mesh_port),
+                component_reachable_mesh_addr: local_component_mesh_peer_addr(mesh_port),
                 control_endpoint: Some(ControlEndpoint::Unix(
                     direct_component_control_socket_path(
                         runtime_root.join(&component.program.work_dir),
@@ -637,7 +653,8 @@ fn collect_vm_artifact_runtime_metadata(
             component.moniker.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: component.moniker.clone(),
-                host_mesh_addr: format!("127.0.0.1:{mesh_port}"),
+                router_reachable_mesh_addr: local_router_mesh_peer_addr(mesh_port),
+                component_reachable_mesh_addr: local_component_mesh_peer_addr(mesh_port),
                 control_endpoint: Some(ControlEndpoint::Unix(vm_component_control_socket_path(
                     runtime_root
                         .join("work")
@@ -722,7 +739,13 @@ fn collect_compose_artifact_runtime_metadata(
             target.config.identity.id.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: target.config.identity.id.clone(),
-                host_mesh_addr: compose_component_mesh_peer_addr(
+                router_reachable_mesh_addr: compose_component_mesh_peer_addr(
+                    artifact_root,
+                    &target.config.identity.id,
+                    &target.output,
+                    mesh_config.mesh_listen.port(),
+                )?,
+                component_reachable_mesh_addr: compose_component_mesh_peer_addr(
                     artifact_root,
                     &target.config.identity.id,
                     &target.output,
@@ -749,6 +772,14 @@ mod tests {
     use amber_mesh::MeshConfigTemplate;
 
     use super::*;
+
+    fn expected_local_component_mesh_peer_addr(mesh_port: u16) -> String {
+        local_component_mesh_peer_addr(mesh_port)
+    }
+
+    fn expected_local_router_mesh_peer_addr(mesh_port: u16) -> String {
+        local_router_mesh_peer_addr(mesh_port)
+    }
 
     #[test]
     fn direct_runtime_metadata_uses_bounded_sidecar_control_socket_paths() {
@@ -872,6 +903,16 @@ mod tests {
             panic!("direct metadata should expose a unix control socket");
         };
         assert_eq!(
+            provider.router_reachable_mesh_addr,
+            expected_local_router_mesh_peer_addr(24001),
+            "direct runtime metadata should expose the router-reachable mesh address",
+        );
+        assert_eq!(
+            provider.component_reachable_mesh_addr,
+            expected_local_component_mesh_peer_addr(24001),
+            "direct runtime metadata should expose the sidecar-reachable mesh address",
+        );
+        assert_eq!(
             path,
             &amber_mesh::stable_temp_socket_path(
                 "amber-direct-control",
@@ -953,6 +994,16 @@ mod tests {
         let Some(ControlEndpoint::Unix(path)) = provider.control_endpoint.as_ref() else {
             panic!("vm metadata should expose a unix control socket");
         };
+        assert_eq!(
+            provider.router_reachable_mesh_addr,
+            expected_local_router_mesh_peer_addr(24001),
+            "vm runtime metadata should expose the router-reachable mesh address",
+        );
+        assert_eq!(
+            provider.component_reachable_mesh_addr,
+            expected_local_component_mesh_peer_addr(24001),
+            "vm runtime metadata should expose the sidecar-reachable mesh address",
+        );
         assert_eq!(
             path,
             &amber_mesh::stable_temp_socket_path(
@@ -1138,7 +1189,13 @@ fn collect_kubernetes_artifact_runtime_metadata(
             target.config.identity.id.clone(),
             LiveComponentRuntimeMetadata {
                 moniker: target.config.identity.id.clone(),
-                host_mesh_addr: kubernetes_component_mesh_peer_addr(
+                router_reachable_mesh_addr: kubernetes_component_mesh_peer_addr(
+                    artifact_root,
+                    &target.config.identity.id,
+                    &target.output,
+                    mesh_config.mesh_listen.port(),
+                )?,
+                component_reachable_mesh_addr: kubernetes_component_mesh_peer_addr(
                     artifact_root,
                     &target.config.identity.id,
                     &target.output,

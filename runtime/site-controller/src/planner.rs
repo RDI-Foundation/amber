@@ -3307,6 +3307,10 @@ pub(super) struct SiteManagerStateView {
     #[serde(default)]
     pub(super) router_mesh_addr: Option<String>,
     #[serde(default)]
+    pub(super) compose_consumer_router_mesh_addr: Option<String>,
+    #[serde(default)]
+    pub(super) kubernetes_consumer_router_mesh_addr: Option<String>,
+    #[serde(default)]
     pub(super) router_identity_id: Option<String>,
     #[serde(default)]
     pub(super) router_public_key_b64: Option<String>,

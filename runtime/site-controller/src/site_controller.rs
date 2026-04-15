@@ -18,8 +18,7 @@ use super::{
     ccs_api::{self, FrameworkComponentInspectRequest, FrameworkComponentInspectResponse},
     control_state_api::{
         self, DynamicCapsInspectRequest, DynamicCapsInspectResponse, DynamicCapsMutateRequest,
-        DynamicCapsMutateResponse, local_component_runtime,
-        resolve_dynamic_capability_origin_internal,
+        DynamicCapsMutateResponse, resolve_dynamic_capability_origin_internal,
     },
     dynamic_caps::{
         self, ControlDynamicGrantAuthoritySyncRequest, ControlDynamicGrantAuthoritySyncResponse,
@@ -789,6 +788,7 @@ pub(super) async fn execute_site_controller_dynamic_caps_inspect(
                 );
             }
             held.sort_by(|left, right| left.held_id.cmp(&right.held_id));
+            held.dedup_by(|left, right| left.held_id == right.held_id);
             Ok(DynamicCapsInspectResponse::HeldList(HeldListResponse {
                 held,
             }))
@@ -852,9 +852,13 @@ pub(super) async fn execute_site_controller_dynamic_caps_inspect(
                     local_resolve_origin(app, request).await?,
                 ));
             }
-            let holder_runtime =
-                local_component_runtime(&app.control, &state, &request.holder_component_id)
-                    .map_err(ProtocolApiError::from)?;
+            let holder_peer = control_state_api::local_component_runtime(
+                &app.control,
+                &state,
+                &request.holder_component_id,
+            )?
+            .mesh_config
+            .identity;
             Ok(DynamicCapsInspectResponse::ResolveOrigin(
                 peer_dynamic_caps_post_via_router(
                     app,
@@ -863,9 +867,9 @@ pub(super) async fn execute_site_controller_dynamic_caps_inspect(
                     &InternalDynamicResolveOriginRequest {
                         holder_component_id: request.holder_component_id,
                         source: request.source,
-                        holder_peer_id: holder_runtime.mesh_config.identity.id.clone(),
+                        holder_peer_id: holder_peer.id,
                         holder_peer_key_b64: base64::engine::general_purpose::STANDARD
-                            .encode(holder_runtime.mesh_config.identity.public_key),
+                            .encode(holder_peer.public_key),
                         holder_site_kind: app.control.controller_plan.kind,
                     },
                 )

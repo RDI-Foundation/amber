@@ -637,3 +637,45 @@ async fn try_fetch_router_identity_times_out_stalled_control_requests() {
     );
     handle.join().expect("listener thread should finish");
 }
+
+#[tokio::test]
+async fn try_fetch_router_identity_accepts_complete_http_response_without_eof() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr");
+    let public_key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let body = format!(
+        r#"{{"id":"/site/test/router","public_key":"{}","mesh_scope":"scope"}}"#,
+        public_key
+    );
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("listener should accept");
+        let mut request = [0u8; 256];
+        let _ = stream
+            .read(&mut request)
+            .await
+            .expect("request should be readable");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("response should be writable");
+        tokio::time::sleep(CONTROL_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+    });
+
+    let identity = match try_fetch_router_identity(&ControlEndpoint::Tcp(addr.to_string())).await {
+        Ok(identity) => identity,
+        Err(_) => panic!("complete HTTP response should not require EOF"),
+    };
+    assert_eq!(identity.id, "/site/test/router");
+    assert_eq!(identity.public_key, [7u8; 32]);
+    assert_eq!(identity.mesh_scope.as_deref(), Some("scope"));
+    server.await.expect("server should finish");
+}

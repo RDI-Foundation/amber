@@ -792,6 +792,9 @@ fn render_docker_compose_inner(
         push_router_observability_env(&mut sidecar_env_entries);
         sidecar_service.environment = Some(Environment::List(sidecar_env_entries));
         sidecar_service
+            .extra_hosts
+            .push(HOST_GATEWAY_ENTRY.to_string());
+        sidecar_service
             .networks
             .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
         sidecar_service

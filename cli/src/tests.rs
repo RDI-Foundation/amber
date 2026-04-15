@@ -888,6 +888,77 @@ async fn cleanup_direct_runtime_removes_partial_startup_artifacts() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cleanup_direct_runtime_terminates_wrapper_descendants() {
+    let plan_root = tempfile::tempdir().expect("temp dir should be created");
+    let runtime_dir = tempfile::Builder::new()
+        .prefix("amber-direct-test-")
+        .tempdir()
+        .expect("runtime dir should be created");
+    let runtime_root = runtime_dir.path().to_path_buf();
+    let runtime_state_path = direct_runtime_state_path(plan_root.path());
+    fs::create_dir_all(runtime_state_path.parent().expect("state parent"))
+        .expect("state parent should be created");
+    fs::write(&runtime_state_path, "{}").expect("state file should be written");
+
+    let child_pid_path = runtime_root.join("child.pid");
+    let child = TokioCommand::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "setsid sleep 30 >/dev/null 2>&1 & echo $! > {} ; wait",
+            child_pid_path.display()
+        ))
+        .spawn()
+        .expect("wrapper should spawn");
+    let mut children = vec![ManagedChild {
+        name: "wrapper-with-descendant".to_string(),
+        wrapper: Some(child),
+        #[cfg(target_os = "linux")]
+        wrapper_pid: 0,
+        #[cfg(target_os = "linux")]
+        managed_pid: 0,
+    }];
+    #[cfg(target_os = "linux")]
+    {
+        let pid = children[0]
+            .wrapper
+            .as_ref()
+            .and_then(tokio::process::Child::id)
+            .expect("child pid should be available");
+        children[0].wrapper_pid = pid;
+        children[0].managed_pid = pid;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !child_pid_path.is_file() && Instant::now() < deadline {
+        sleep(Duration::from_millis(25)).await;
+    }
+    let child_pid = fs::read_to_string(&child_pid_path)
+        .expect("descendant pid should be recorded")
+        .trim()
+        .parse::<u32>()
+        .expect("descendant pid should parse");
+
+    cleanup_direct_runtime(
+        &mut children,
+        Vec::new(),
+        &runtime_state_path,
+        None,
+        Some(runtime_dir),
+    )
+    .await;
+
+    let stopped = !crate::unix_process::pid_is_alive(child_pid);
+    if !stopped {
+        let _ = unsafe { libc::kill(child_pid as i32, libc::SIGKILL) };
+    }
+    assert!(
+        stopped,
+        "cleanup should terminate descendants that outlive their wrapper"
+    );
+}
+
 #[test]
 fn write_direct_runtime_state_preserves_projected_router_mesh_port() {
     let plan_root = tempfile::tempdir().expect("temp dir should be created");

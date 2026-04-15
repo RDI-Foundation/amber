@@ -6,6 +6,8 @@ mod cloud_image_support;
 mod macos_vm_support;
 #[path = "test_support/outputs_root.rs"]
 mod outputs_root_support;
+#[path = "test_support/port_allocator.rs"]
+mod port_allocator_support;
 #[path = "test_support/workspace_root.rs"]
 mod workspace_root_support;
 
@@ -13,7 +15,6 @@ use std::{
     collections::BTreeMap,
     env, fs,
     hash::{Hash as _, Hasher as _},
-    net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     thread,
@@ -23,6 +24,7 @@ use std::{
 use cloud_image_support::default_host_arch_cloud_image_filename;
 use macos_vm_support::resolve_aarch64_firmware;
 use outputs_root_support::cli_test_outputs_root;
+use port_allocator_support::reserve_test_loopback_port;
 use tempfile::TempDir;
 use workspace_root_support::workspace_root;
 
@@ -35,6 +37,10 @@ const LINUX_VM_KIND_VERSION: &str = "v0.26.0";
 const LINUX_VM_KIND_NODE_IMAGE: &str =
     "kindest/node:v1.32.0@sha256:c48c62eac5da28cdadcf560d1d8616cfa6783b58f0d94cf63ad1bf49600cb027";
 const LINUX_VM_KIND_PULL_TIMEOUT: &str = "180s";
+const LINUX_VM_DIRECT_SMOKE_FILTER_ENV: &str = "AMBER_LINUX_VM_DIRECT_SMOKE_FILTER";
+const LINUX_VM_DYNAMIC_CAPABILITIES_FILTER_ENV: &str = "AMBER_LINUX_VM_DYNAMIC_CAPABILITIES_FILTER";
+const LINUX_VM_FRAMEWORK_COMPONENT_FILTER_ENV: &str = "AMBER_LINUX_VM_FRAMEWORK_COMPONENT_FILTER";
+const LINUX_VM_MIXED_RUN_FILTER_ENV: &str = "AMBER_LINUX_VM_MIXED_RUN_FILTER";
 
 struct GuestArch {
     cloud_image_filename: &'static str,
@@ -257,8 +263,7 @@ fn qemu_system_binary(arch: &GuestArch) -> PathBuf {
 }
 
 fn pick_free_port() -> u16 {
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-    listener.local_addr().unwrap().port()
+    reserve_test_loopback_port()
 }
 
 fn shell_escape(text: &str) -> String {
@@ -958,10 +963,6 @@ fn ensure_provisioned_image(profile: ProvisionProfile) -> Result<PathBuf, String
     result.map(|()| cache_path)
 }
 
-fn run_linux_guest_mixed_run_test(test_name: &str) -> Result<(), String> {
-    run_linux_guest_mixed_run_filter(test_name)
-}
-
 fn run_linux_guest_mixed_run_filter(test_filter: &str) -> Result<(), String> {
     run_linux_guest_test(
         format!("linux-vm-{test_filter}-"),
@@ -971,6 +972,15 @@ fn run_linux_guest_mixed_run_filter(test_filter: &str) -> Result<(), String> {
              --test-threads=1"
         ),
     )
+}
+
+// Keep the Linux VM live surface to one guest boot per test family. Narrow reruns can still use
+// the same aggregate test by overriding its guest-side filter env var.
+fn linux_vm_guest_filter(env_var: &str, default: &str) -> String {
+    env::var(env_var)
+        .ok()
+        .filter(|filter| !filter.trim().is_empty())
+        .unwrap_or_else(|| default.to_owned())
 }
 
 fn run_linux_guest_direct_smoke_test(test_name: &str) -> Result<(), String> {
@@ -1000,12 +1010,10 @@ fn linux_vm_runs_vm_smoke_test() {
 #[ignore = "requires qemu on macOS; boots Ubuntu and runs the real Linux mixed_run tests inside \
             the guest"]
 fn linux_vm_runs_mixed_run_tests() {
-    run_linux_guest_test(
-        "linux-vm-mixed-run-",
-        ProvisionProfile::MixedRun,
-        "cargo test -p amber-cli --test mixed_run mixed_run_ -- --ignored --nocapture \
-         --test-threads=1",
-    )
+    run_linux_guest_mixed_run_filter(&linux_vm_guest_filter(
+        LINUX_VM_MIXED_RUN_FILTER_ENV,
+        "mixed_run_",
+    ))
     .unwrap_or_else(|err| panic!("{err}"));
 }
 
@@ -1013,225 +1021,33 @@ fn linux_vm_runs_mixed_run_tests() {
 #[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component live tests \
             inside the guest"]
 fn linux_vm_runs_framework_component_live_tests() {
-    run_linux_guest_mixed_run_filter("framework_component_").unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component direct \
-            create/destroy live test inside the guest"]
-fn linux_vm_runs_framework_component_direct_create_destroy_live() {
-    run_linux_guest_mixed_run_test("framework_component_direct_create_destroy_live")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component bounded \
-            template replay live test inside the guest"]
-fn linux_vm_runs_framework_component_bounded_template_frozen_source_replay_live() {
-    run_linux_guest_mixed_run_test(
-        "framework_component_bounded_template_frozen_source_replay_live",
-    )
+    run_linux_guest_mixed_run_filter(&linux_vm_guest_filter(
+        LINUX_VM_FRAMEWORK_COMPONENT_FILTER_ENV,
+        "framework_component_",
+    ))
     .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component \
-            cross-backend matrix live test inside the guest"]
-fn linux_vm_runs_framework_component_cross_backend_matrix_live() {
-    run_linux_guest_mixed_run_test("framework_component_cross_backend_matrix_live")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component \
-            delegated-realm cross-site live test inside the guest"]
-fn linux_vm_runs_framework_component_delegated_realm_cross_site_live() {
-    run_linux_guest_mixed_run_test("framework_component_delegated_realm_cross_site_live")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component \
-            direct-parent compose-child live test inside the guest"]
-fn linux_vm_runs_framework_component_direct_parent_compose_child_live() {
-    run_linux_guest_mixed_run_test("framework_component_direct_parent_compose_child_live")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component \
-            dynamic-child teardown live test inside the guest"]
-fn linux_vm_runs_framework_component_dynamic_children_teardown_with_run_live() {
-    run_linux_guest_mixed_run_test("framework_component_dynamic_children_teardown_with_run_live")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component kind \
-            creator after compose churn live test inside the guest"]
-fn linux_vm_runs_framework_component_kind_creator_after_compose_churn_live() {
-    run_linux_guest_mixed_run_test("framework_component_kind_creator_after_compose_churn_live")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component kind \
-            creator compose-child live test inside the guest"]
-fn linux_vm_runs_framework_component_kind_creator_compose_child_live() {
-    run_linux_guest_mixed_run_test("framework_component_kind_creator_compose_child_live")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component kind \
-            root-export live test inside the guest"]
-fn linux_vm_runs_framework_component_kind_root_export_live() {
-    run_linux_guest_mixed_run_test("framework_component_kind_root_export_live")
-        .unwrap_or_else(|err| panic!("{err}"));
 }
 
 #[test]
 #[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability live tests \
             inside the guest"]
 fn linux_vm_runs_dynamic_capability_live_tests() {
-    run_linux_guest_mixed_run_filter("dynamic_capabilities_").unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability dynamic \
-            child post-create share live test inside the guest"]
-fn linux_vm_runs_dynamic_capabilities_dynamic_child_post_create_share_live() {
-    run_linux_guest_mixed_run_test("dynamic_capabilities_dynamic_child_post_create_share_live")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability manual \
-            materialization live test inside the guest"]
-fn linux_vm_runs_dynamic_capabilities_manual_materialization_live() {
-    run_linux_guest_mixed_run_test("dynamic_capabilities_manual_materialization_live")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability external \
-            slot root share live test inside the guest"]
-fn linux_vm_runs_dynamic_capabilities_external_slot_root_share_live() {
-    run_linux_guest_mixed_run_test("dynamic_capabilities_external_slot_root_share_live")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux dynamic-capability snapshot \
-            replay dynamic child live test inside the guest"]
-fn linux_vm_runs_dynamic_capabilities_snapshot_replay_dynamic_child_live() {
-    run_linux_guest_mixed_run_test("dynamic_capabilities_snapshot_replay_dynamic_child_live")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the real Linux mixed_run cleanup test \
-            inside the guest"]
-fn linux_vm_runs_mixed_run_cleanup_after_coordinator_dies_during_setup() {
-    run_linux_guest_mixed_run_test("mixed_run_cleanup_after_coordinator_dies_during_setup")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the real Linux mixed_run direct/compose \
-            proxy smoke test inside the guest"]
-fn linux_vm_runs_mixed_run_direct_compose_proxy_smoke() {
-    run_linux_guest_mixed_run_test("mixed_run_direct_compose_proxy_smoke")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the real Linux mixed_run detached stop \
-            smoke test inside the guest"]
-fn linux_vm_runs_mixed_run_detached_stop_smoke() {
-    run_linux_guest_mixed_run_test("mixed_run_detached_stop_smoke")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the real Linux mixed_run five-site \
-            startup test inside the guest"]
-fn linux_vm_runs_mixed_run_five_site_startup_state_and_teardown() {
-    run_linux_guest_mixed_run_test("mixed_run_five_site_startup_state_and_teardown")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the real Linux mixed_run local \
-            observability smoke test inside the guest"]
-fn linux_vm_runs_mixed_run_local_observability_scenario_smoke() {
-    run_linux_guest_mixed_run_test("mixed_run_local_observability_scenario_smoke")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the real Linux mixed_run recovery test \
-            inside the guest"]
-fn linux_vm_runs_mixed_run_recovers_direct_component_failure_after_setup() {
-    run_linux_guest_mixed_run_test("mixed_run_recovers_direct_component_failure_after_setup")
-        .unwrap_or_else(|err| panic!("{err}"));
+    run_linux_guest_mixed_run_filter(&linux_vm_guest_filter(
+        LINUX_VM_DYNAMIC_CAPABILITIES_FILTER_ENV,
+        "dynamic_capabilities_",
+    ))
+    .unwrap_or_else(|err| panic!("{err}"));
 }
 
 #[test]
 #[ignore = "requires qemu on macOS; boots Ubuntu and runs the real Linux direct smoke tests inside \
             the guest"]
 fn linux_vm_runs_direct_smoke_tests() {
-    run_linux_guest_direct_smoke_test("direct_smoke_").unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke http startup test \
-            inside the guest"]
-fn linux_vm_runs_direct_smoke_python_http_server_starts_and_stops() {
-    run_linux_guest_direct_smoke_test("direct_smoke_python_http_server_starts_and_stops")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke relative-path \
-            test inside the guest"]
-fn linux_vm_runs_direct_smoke_resolves_relative_program_path_from_manifest_dir() {
-    run_linux_guest_direct_smoke_test(
-        "direct_smoke_resolves_relative_program_path_from_manifest_dir",
-    )
+    run_linux_guest_direct_smoke_test(&linux_vm_guest_filter(
+        LINUX_VM_DIRECT_SMOKE_FILTER_ENV,
+        "direct_smoke_",
+    ))
     .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke helper-mount test \
-            inside the guest"]
-fn linux_vm_runs_direct_smoke_mount_under_run_with_helper() {
-    run_linux_guest_direct_smoke_test("direct_smoke_mount_under_run_with_helper")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke storage upgrade \
-            test inside the guest"]
-fn linux_vm_runs_direct_smoke_storage_persists_across_upgrade() {
-    run_linux_guest_direct_smoke_test("direct_smoke_storage_persists_across_upgrade")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke env scrub test \
-            inside the guest"]
-fn linux_vm_runs_direct_smoke_does_not_leak_host_env_into_component() {
-    run_linux_guest_direct_smoke_test("direct_smoke_does_not_leak_host_env_into_component")
-        .unwrap_or_else(|err| panic!("{err}"));
-}
-
-#[test]
-#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke host-fs isolation \
-            test inside the guest"]
-fn linux_vm_runs_direct_smoke_blocks_host_file_reads_outside_allowed_mounts() {
-    run_linux_guest_direct_smoke_test("direct_smoke_blocks_host_file_reads_outside_allowed_mounts")
-        .unwrap_or_else(|err| panic!("{err}"));
 }
 
 #[test]

@@ -273,6 +273,10 @@ pub struct SiteControllerPlan {
     pub local_router_control: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_router_mesh_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_consumer_router_mesh_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubernetes_consumer_router_mesh_addr: Option<String>,
     pub state_path: String,
     pub run_root: String,
     pub state_root: String,
@@ -1238,6 +1242,8 @@ pub fn write_site_controller_plan(
     peer_router_mesh_addrs: &BTreeMap<String, String>,
     local_router_control: Option<&str>,
     published_router_mesh_addr: Option<&str>,
+    compose_consumer_router_mesh_addr: Option<&str>,
+    kubernetes_consumer_router_mesh_addr: Option<&str>,
     state_path: &Path,
     run_root: &Path,
     state_root: &Path,
@@ -1269,6 +1275,9 @@ pub fn write_site_controller_plan(
         peer_router_mesh_addrs: peer_router_mesh_addrs.clone(),
         local_router_control: local_router_control.map(str::to_string),
         published_router_mesh_addr: published_router_mesh_addr.map(str::to_string),
+        compose_consumer_router_mesh_addr: compose_consumer_router_mesh_addr.map(str::to_string),
+        kubernetes_consumer_router_mesh_addr: kubernetes_consumer_router_mesh_addr
+            .map(str::to_string),
         state_path: state_path.display().to_string(),
         run_root: run_root.display().to_string(),
         state_root: state_root.display().to_string(),

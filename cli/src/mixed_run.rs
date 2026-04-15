@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     future::Future,
     io::{Read as _, Write as _},
@@ -46,6 +46,7 @@ use crate::{
     run_inputs::{collect_run_interface, validate_export_bindings, validate_slot_bindings},
     site_proxy_metadata::load_site_proxy_metadata,
     tcp_readiness::{wait_for_http_response, wait_for_stable_endpoint},
+    unix_process::{pid_is_alive, terminate_process_roots},
     vm_runtime::{
         TCG_VM_STARTUP_TIMEOUT, VmLaunchPreview, VmRuntimeState, VmSiteLaunchPreview,
         build_vm_site_launch_preview, vm_current_control_socket_path, vm_uses_tcg_accel,
@@ -206,16 +207,7 @@ pub(crate) struct RunReceipt {
     pub(crate) run_root: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) observability: Option<ObservabilityReceipt>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) bridge_proxies: Vec<BridgeProxyReceipt>,
     pub(crate) sites: BTreeMap<String, SiteReceipt>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct BridgeProxyReceipt {
-    pub(crate) export_name: String,
-    pub(crate) pid: u32,
-    pub(crate) listen: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -362,6 +354,10 @@ pub(crate) struct SiteReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) router_mesh_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compose_consumer_router_mesh_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kubernetes_consumer_router_mesh_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) router_identity_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) router_public_key_b64: Option<String>,
@@ -405,6 +401,10 @@ struct SiteManagerState {
     router_control: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     router_mesh_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compose_consumer_router_mesh_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kubernetes_consumer_router_mesh_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     router_identity_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -634,19 +634,6 @@ struct SupervisorChild {
     child: Child,
 }
 
-pub(crate) struct BridgeProxyHandle {
-    pub(crate) child: Child,
-    pub(crate) export_name: String,
-    pub(crate) listen: SocketAddr,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct BridgeProxyKey {
-    pub(crate) provider_output_dir: String,
-    pub(crate) export_name: String,
-    pub(crate) consumer_kind: SiteKind,
-}
-
 #[derive(Debug)]
 struct SupervisorRuntime {
     site_process: Option<Child>,
@@ -691,12 +678,36 @@ fn site_state_from_receipt(
         context: site.context.clone(),
         router_control: site.router_control.clone(),
         router_mesh_addr: site.router_mesh_addr.clone(),
+        compose_consumer_router_mesh_addr: site.compose_consumer_router_mesh_addr.clone(),
+        kubernetes_consumer_router_mesh_addr: site.kubernetes_consumer_router_mesh_addr.clone(),
         router_identity_id: site.router_identity_id.clone(),
         router_public_key_b64: site.router_public_key_b64.clone(),
         site_controller_pid: site.site_controller_pid,
         site_controller_url: site.site_controller_url.clone(),
         last_error,
     }
+}
+
+fn published_container_consumer_router_mesh_addrs(
+    site_kind: SiteKind,
+    router_mesh_addr: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(router_mesh_addr) = router_mesh_addr else {
+        return (None, None);
+    };
+    let compose = amber_site_controller::router_mesh_addr_for_consumer(
+        site_kind,
+        SiteKind::Compose,
+        router_mesh_addr,
+    )
+    .unwrap_or_else(|err| panic!("failed to compute compose consumer mesh addr: {err}"));
+    let kubernetes = amber_site_controller::router_mesh_addr_for_consumer(
+        site_kind,
+        SiteKind::Kubernetes,
+        router_mesh_addr,
+    )
+    .unwrap_or_else(|err| panic!("failed to compute kubernetes consumer mesh addr: {err}"));
+    (Some(compose), Some(kubernetes))
 }
 
 enum SiteSupervisorStopStatus {
@@ -832,6 +843,8 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
                     format!("stopped site supervisor {}", plan.site_id),
                     &[("amber.run_id", plan.run_id.clone())],
                 );
+                let (compose_consumer_router_mesh_addr, kubernetes_consumer_router_mesh_addr) =
+                    published_container_consumer_router_mesh_addrs(plan.kind, None);
                 write_site_state_if_changed(
                     &state_path,
                     &mut last_written_state,
@@ -851,6 +864,8 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
                         context: plan.context.clone(),
                         router_control: None,
                         router_mesh_addr: None,
+                        compose_consumer_router_mesh_addr,
+                        kubernetes_consumer_router_mesh_addr,
                         router_identity_id: None,
                         router_public_key_b64: None,
                         site_controller_pid: None,
@@ -865,6 +880,8 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
                 && coordinator_has_exited(&run_root, plan.coordinator_pid)?
             {
                 cleanup_site(&plan, &mut runtime).await?;
+                let (compose_consumer_router_mesh_addr, kubernetes_consumer_router_mesh_addr) =
+                    published_container_consumer_router_mesh_addrs(plan.kind, None);
                 write_site_state_if_changed(
                     &state_path,
                     &mut last_written_state,
@@ -884,6 +901,8 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
                         context: plan.context.clone(),
                         router_control: None,
                         router_mesh_addr: None,
+                        compose_consumer_router_mesh_addr,
+                        kubernetes_consumer_router_mesh_addr,
                         router_identity_id: None,
                         router_public_key_b64: None,
                         site_controller_pid: None,
@@ -973,6 +992,12 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
 
                 let public_key_b64 = base64::engine::general_purpose::STANDARD
                     .encode(discovery.router_identity.public_key);
+                let router_mesh_addr = discovery.router_addr.map(|addr| addr.to_string());
+                let (compose_consumer_router_mesh_addr, kubernetes_consumer_router_mesh_addr) =
+                    published_container_consumer_router_mesh_addrs(
+                        plan.kind,
+                        router_mesh_addr.as_deref(),
+                    );
                 write_site_state_if_changed(
                     &state_path,
                     &mut last_written_state,
@@ -991,7 +1016,9 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
                         port_forward_pid: runtime.port_forward.as_ref().map(Child::id),
                         context: plan.context.clone(),
                         router_control: Some(discovery.control_endpoint.to_string()),
-                        router_mesh_addr: discovery.router_addr.map(|addr| addr.to_string()),
+                        router_mesh_addr,
+                        compose_consumer_router_mesh_addr,
+                        kubernetes_consumer_router_mesh_addr,
                         router_identity_id: Some(discovery.router_identity.id),
                         router_public_key_b64: Some(public_key_b64),
                         site_controller_pid: None,
@@ -1400,23 +1427,6 @@ pub(crate) fn decode_public_key(value: &str) -> Result<[u8; 32]> {
         .map_err(|_| miette::miette!("invalid router public key length"))
 }
 
-fn pid_is_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let alive = unsafe {
-            libc::kill(pid as i32, 0) == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-        };
-        alive && process_status_code(pid) != Some('Z')
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
-}
-
 fn send_sigterm(pid: u32) {
     #[cfg(unix)]
     {
@@ -1573,159 +1583,37 @@ fn handle_otlp_connection(stream: &mut TcpStream, requests_log: &Path) -> Result
 }
 
 #[cfg(unix)]
-fn send_sigkill(pid: u32) {
-    let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-}
-
-#[cfg(unix)]
 async fn shutdown_recorded_processes(site: &SiteReceipt) -> Result<()> {
-    let mut roots = Vec::new();
-    if let Some(pid) = site.process_pid {
-        roots.push(pid);
-    }
-    if let Some(pid) = site.port_forward_pid {
-        roots.push(pid);
-    }
-    terminate_recorded_processes(&roots).await
+    terminate_recorded_processes(&recorded_process_roots(site)).await
 }
 
 #[cfg(not(unix))]
 async fn shutdown_recorded_processes(site: &SiteReceipt) -> Result<()> {
-    if let Some(pid) = site.process_pid {
-        send_sigterm(pid);
-    }
-    if let Some(pid) = site.port_forward_pid {
+    for pid in recorded_process_roots(site) {
         send_sigterm(pid);
     }
     Ok(())
+}
+
+fn recorded_process_roots(site: &SiteReceipt) -> Vec<u32> {
+    let mut roots = vec![site.supervisor_pid];
+    if let Some(pid) = site.process_pid {
+        roots.push(pid);
+    }
+    if let Some(pid) = site.port_forward_pid {
+        roots.push(pid);
+    }
+    roots
 }
 
 #[cfg(unix)]
 async fn terminate_recorded_processes(root_pids: &[u32]) -> Result<()> {
-    let mut seen = BTreeSet::new();
-    let mut ordered = Vec::new();
-    for root_pid in root_pids {
-        for pid in process_tree_postorder(*root_pid)? {
-            if seen.insert(pid) {
-                ordered.push(pid);
-            }
-        }
-    }
-    if ordered.is_empty() {
-        return Ok(());
-    }
-    for pid in &ordered {
-        send_sigterm(*pid);
-    }
-    wait_for_pids_exit(&ordered, PROCESS_SHUTDOWN_GRACE_PERIOD).await;
-    let survivors = ordered
-        .iter()
-        .copied()
-        .filter(|pid| pid_is_alive(*pid))
-        .collect::<Vec<_>>();
-    for pid in &survivors {
-        send_sigkill(*pid);
-    }
-    wait_for_pids_exit(&survivors, Duration::from_secs(2)).await;
-    Ok(())
+    terminate_process_roots(root_pids, PROCESS_SHUTDOWN_GRACE_PERIOD).await
 }
 
 #[cfg(unix)]
-fn process_status_code(pid: u32) -> Option<char> {
-    let output = Command::new("ps")
-        .arg("-o")
-        .arg("stat=")
-        .arg("-p")
-        .arg(pid.to_string())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_process_status_code(&String::from_utf8_lossy(&output.stdout))
-}
-
-#[cfg(unix)]
-fn parse_process_status_code(raw: &str) -> Option<char> {
-    raw.split_whitespace()
-        .next()?
-        .chars()
-        .next()
-        .map(|state| state.to_ascii_uppercase())
-}
-
-#[cfg(unix)]
-async fn wait_for_pids_exit(pids: &[u32], timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if pids.iter().all(|pid| !pid_is_alive(*pid)) {
-            return;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
-#[cfg(unix)]
-fn process_tree_postorder(root_pid: u32) -> Result<Vec<u32>> {
-    let output = Command::new("ps")
-        .arg("-axo")
-        .arg("pid=,ppid=")
-        .output()
-        .into_diagnostic()
-        .wrap_err("failed to enumerate process tree")?;
-    if !output.status.success() {
-        return Err(miette::miette!(
-            "failed to enumerate process tree: status {}",
-            output.status
-        ));
-    }
-
-    let parent_by_pid = parse_process_table(&String::from_utf8_lossy(&output.stdout))?;
-    let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
-    for (pid, ppid) in parent_by_pid {
-        children_by_parent.entry(ppid).or_default().push(pid);
-    }
-
-    let mut ordered = Vec::new();
-    collect_process_tree_postorder(root_pid, &children_by_parent, &mut ordered);
-    Ok(ordered)
-}
-
-#[cfg(unix)]
-fn collect_process_tree_postorder(
-    pid: u32,
-    children_by_parent: &HashMap<u32, Vec<u32>>,
-    ordered: &mut Vec<u32>,
-) {
-    if let Some(children) = children_by_parent.get(&pid) {
-        for child in children {
-            collect_process_tree_postorder(*child, children_by_parent, ordered);
-        }
-    }
-    ordered.push(pid);
-}
-
-fn parse_process_table(raw: &str) -> Result<HashMap<u32, u32>> {
-    let mut parent_by_pid = HashMap::new();
-    for line in raw.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(pid) = fields.next() else {
-            continue;
-        };
-        let Some(ppid) = fields.next() else {
-            continue;
-        };
-        let pid = pid
-            .parse::<u32>()
-            .into_diagnostic()
-            .wrap_err_with(|| format!("invalid process table pid `{pid}`"))?;
-        let ppid = ppid
-            .parse::<u32>()
-            .into_diagnostic()
-            .wrap_err_with(|| format!("invalid process table parent pid `{ppid}`"))?;
-        parent_by_pid.insert(pid, ppid);
-    }
-    Ok(parent_by_pid)
+fn send_sigkill(pid: u32) {
+    let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {

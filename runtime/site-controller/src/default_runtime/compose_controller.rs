@@ -1,3 +1,5 @@
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::os::unix::fs::MetadataExt;
 use std::{fs, path::Path};
 
 use serde_json::json;
@@ -11,6 +13,58 @@ const COMPOSE_ROUTER_CONTROL_INIT_SERVICE_NAME: &str = "amber-router-control-ini
 const COMPOSE_ROUTER_CONTROL_SOCKET_DIR: &str = "/amber/control";
 const COMPOSE_ROUTER_CONTROL_VOLUME_NAME: &str = "amber-router-control";
 const DOCKER_SOCK_PATH: &str = "/var/run/docker.sock";
+
+#[cfg(target_os = "macos")]
+fn compose_site_controller_user() -> String {
+    // Docker Desktop's socket mount on macOS is mediated by the host, so the controller needs
+    // root inside the Compose site to reach it reliably.
+    "0:0".to_string()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn compose_site_controller_user() -> String {
+    if fs::metadata(DOCKER_SOCK_PATH).is_ok() {
+        return format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+            libc::getegid()
+        });
+    }
+    "0:0".to_string()
+}
+
+#[cfg(not(unix))]
+fn compose_site_controller_user() -> String {
+    "0:0".to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn compose_site_controller_group_add() -> Vec<String> {
+    Vec::new()
+}
+
+fn compose_site_controller_env(plan: &SiteControllerPlan) -> serde_json::Value {
+    serde_json::Value::Object(
+        plan.launch_env
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+            .collect(),
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn compose_site_controller_group_add() -> Vec<String> {
+    if let Ok(metadata) = fs::metadata(DOCKER_SOCK_PATH) {
+        let socket_gid = metadata.gid();
+        if socket_gid != unsafe { libc::getegid() } {
+            return vec![socket_gid.to_string()];
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(not(unix))]
+fn compose_site_controller_group_add() -> Vec<String> {
+    Vec::new()
+}
 
 pub fn inject_compose_site_controller(
     artifact_root: &Path,
@@ -49,10 +103,13 @@ pub fn inject_compose_site_controller(
         COMPOSE_MESH_NETWORK_NAME.to_string(),
         serde_json::Value::Object(serde_json::Map::new()),
     )]);
+    let group_add = compose_site_controller_group_add();
     let service = json!({
         "image": controller_image,
-        "user": "0:0",
+        "user": compose_site_controller_user(),
+        "group_add": group_add,
         "command": ["--plan", plan_path.display().to_string()],
+        "environment": compose_site_controller_env(plan),
         "networks": networks,
         "extra_hosts": ["host.docker.internal:host-gateway"],
         "healthcheck": {
@@ -88,4 +145,94 @@ pub fn inject_compose_site_controller(
     fs::write(&compose_path, rendered)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write {}", compose_path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, net::SocketAddr};
+
+    use amber_compiler::run_plan::SiteKind;
+
+    use super::*;
+
+    fn test_plan(run_root: &Path) -> SiteControllerPlan {
+        SiteControllerPlan {
+            schema: "amber.framework_component.site_controller_plan".to_string(),
+            version: 1,
+            run_id: "run-test".to_string(),
+            mesh_scope: "scope".to_string(),
+            site_id: "compose_local".to_string(),
+            kind: SiteKind::Compose,
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 4100)),
+            authority_url: "http://amber-site-controller:4100".to_string(),
+            router_identity_id: "/site/compose_local/router".to_string(),
+            peer_site_router_urls: BTreeMap::new(),
+            peer_router_identities: BTreeMap::new(),
+            peer_router_mesh_addrs: BTreeMap::new(),
+            local_router_control: Some("unix:///tmp/router.sock".to_string()),
+            published_router_mesh_addr: Some("127.0.0.1:24000".to_string()),
+            compose_consumer_router_mesh_addr: Some("host.docker.internal:24000".to_string()),
+            kubernetes_consumer_router_mesh_addr: Some("192.168.65.254:24000".to_string()),
+            state_path: run_root.join("state.json").display().to_string(),
+            run_root: run_root.display().to_string(),
+            state_root: run_root.join("state-root").display().to_string(),
+            site_state_root: run_root.join("site-state").display().to_string(),
+            artifact_dir: run_root.join("artifact").display().to_string(),
+            auth_token: "token".to_string(),
+            dynamic_caps_token_verify_key_b64: "verify".to_string(),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: Some(24000),
+            compose_project: Some("compose-project".to_string()),
+            kubernetes_namespace: None,
+            context: None,
+            observability_endpoint: None,
+            launch_env: BTreeMap::from([(
+                "AMBER_DEV_IMAGE_TAGS".to_string(),
+                "router=dev-tag,helper=dev-tag".to_string(),
+            )]),
+        }
+    }
+
+    #[test]
+    fn inject_compose_site_controller_propagates_launch_env() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let compose_path = temp.path().join("compose.yaml");
+        fs::write(
+            &compose_path,
+            "services:\n  amber-router:\n    image: ghcr.io/rdi-foundation/amber-router:test\n",
+        )
+        .expect("compose file should write");
+
+        let plan = test_plan(temp.path());
+        let plan_path = temp.path().join("site-controller-plan.json");
+        fs::write(&plan_path, "{}").expect("plan file should write");
+
+        inject_compose_site_controller(
+            temp.path(),
+            &plan,
+            &plan_path,
+            "ghcr.io/rdi-foundation/amber-site-controller:test",
+        )
+        .expect("compose site controller injection should succeed");
+
+        let document = read_compose_document(&compose_path).expect("compose should parse");
+        let service = document
+            .as_mapping()
+            .and_then(|root| root.get(yaml_string("services")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|services| services.get(yaml_string(SITE_CONTROLLER_SERVICE_NAME)))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("site controller service should exist");
+        let environment = service
+            .get(yaml_string("environment"))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("site controller service should include environment");
+        assert_eq!(
+            environment
+                .get(yaml_string("AMBER_DEV_IMAGE_TAGS"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("router=dev-tag,helper=dev-tag"),
+        );
+    }
 }

@@ -130,7 +130,6 @@ struct DynamicHandleRecord {
     handle_id: String,
     held_id: String,
     descriptor: DescriptorIr,
-    upstream: Option<DynamicHandleUpstream>,
 }
 
 #[derive(Clone)]
@@ -143,6 +142,49 @@ struct DynamicHandleUpstream {
 struct DynamicHandleUpstreamTasks {
     conn_task: tokio::task::JoinHandle<()>,
     bridge_task: tokio::task::JoinHandle<Result<(), RouterError>>,
+}
+
+// Dynamic handle upstreams are established per request, so the response body
+// must retain the upstream connection until streaming completes.
+struct DynamicHandleResponseBody {
+    inner: BoxBody,
+    _upstream: DynamicHandleUpstream,
+}
+
+impl hyper::body::Body for DynamicHandleResponseBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn retain_dynamic_handle_upstream(
+    response: Response<BoxBody>,
+    upstream: DynamicHandleUpstream,
+) -> Response<BoxBody> {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        DynamicHandleResponseBody {
+            inner: body,
+            _upstream: upstream,
+        }
+        .boxed(),
+    )
 }
 
 struct DynamicHandleProxyRoute {
@@ -160,12 +202,6 @@ struct StaticRootHandleMatch {
 struct HeldWatchSnapshot {
     held: BTreeMap<String, HeldEntryDetail>,
     materializations: BTreeMap<String, Vec<MaterializedHandleSummary>>,
-}
-
-impl DynamicHandleUpstream {
-    fn is_alive(&self) -> bool {
-        !self._tasks.conn_task.is_finished() && !self._tasks.bridge_task.is_finished()
-    }
 }
 
 impl Drop for DynamicHandleUpstreamTasks {
@@ -623,7 +659,7 @@ impl DynamicCapsRuntime {
         source: DynamicCapabilityControlSourceRequest,
         descriptor_hint: Option<DescriptorIr>,
     ) -> Result<MaterializeResponse, ProtocolErrorResponse> {
-        let resolved = self.control_resolve_origin(source.clone()).await?;
+        let resolved = self.control_resolve_origin(source).await?;
         if resolved.origin_protocol != "http" {
             return Err(self.protocol_error(
                 ProtocolErrorCode::PathEstablishmentFailed,
@@ -661,13 +697,10 @@ impl DynamicCapsRuntime {
                     handle_id: handle_id.clone(),
                     held_id: resolved.held_id.clone(),
                     descriptor: descriptor_hint.unwrap_or_else(|| resolved.descriptor.clone()),
-                    upstream: None,
                 },
             );
             handle_id
         };
-        self.refresh_dynamic_handle_upstream(&handle_id, &resolved)
-            .await?;
         Ok(MaterializeResponse {
             held_id: resolved.held_id,
             handle_id: handle_id.clone(),
@@ -675,11 +708,10 @@ impl DynamicCapsRuntime {
         })
     }
 
-    async fn refresh_dynamic_handle_upstream(
+    async fn establish_dynamic_handle_upstream(
         &self,
-        handle_id: &str,
         resolved: &ControlDynamicResolveOriginResponse,
-    ) -> Result<(), ProtocolErrorResponse> {
+    ) -> Result<DynamicHandleUpstream, ProtocolErrorResponse> {
         let peer_key = base64::engine::general_purpose::STANDARD
             .decode(resolved.origin_peer_key_b64.as_bytes())
             .map_err(|err| {
@@ -742,30 +774,21 @@ impl DynamicCapsRuntime {
                 );
             }
         });
-        let upstream = DynamicHandleUpstream {
+        Ok(DynamicHandleUpstream {
             route_id: Arc::<str>::from(resolved.origin_route_id.as_str()),
             sender: Arc::new(Mutex::new(sender)),
             _tasks: Arc::new(DynamicHandleUpstreamTasks {
                 conn_task,
                 bridge_task,
             }),
-        };
-        let mut state = self.handles.lock().await;
-        let record = state.handles_by_id.get_mut(handle_id).ok_or_else(|| {
-            self.protocol_error(
-                ProtocolErrorCode::UnknownHandle,
-                "dynamic capability handle disappeared during materialization",
-            )
-        })?;
-        record.upstream = Some(upstream);
-        Ok(())
+        })
     }
 
-    async fn ensure_dynamic_handle_upstream(
+    async fn resolve_dynamic_handle_request(
         &self,
         handle_id: &str,
     ) -> Result<(DynamicHandleRecordView, DynamicHandleUpstream), ProtocolErrorResponse> {
-        let (held_id, descriptor, current_upstream) = {
+        let (held_id, descriptor) = {
             let state = self.handles.lock().await;
             let record = state.handles_by_id.get(handle_id).ok_or_else(|| {
                 self.protocol_error(
@@ -773,11 +796,7 @@ impl DynamicCapsRuntime {
                     "dynamic capability handle does not exist",
                 )
             })?;
-            (
-                record.held_id.clone(),
-                record.descriptor.clone(),
-                record.upstream.clone(),
-            )
+            (record.held_id.clone(), record.descriptor.clone())
         };
         let detail = self.control_held_detail(&held_id).await?;
         if detail.summary.state != HeldEntryState::Live {
@@ -786,39 +805,15 @@ impl DynamicCapsRuntime {
                 "dynamic capability handle has been revoked",
             ));
         }
-        if let Some(upstream) = current_upstream
-            && upstream.is_alive()
-        {
-            return Ok((
-                DynamicHandleRecordView {
-                    held_id,
-                    descriptor,
-                },
-                upstream,
-            ));
-        }
         let source = self.source_from_held_detail(&detail)?;
         let resolved = self.control_resolve_origin(source).await?;
-        self.refresh_dynamic_handle_upstream(handle_id, &resolved)
-            .await?;
-        let state = self.handles.lock().await;
-        let record = state.handles_by_id.get(handle_id).ok_or_else(|| {
-            self.protocol_error(
-                ProtocolErrorCode::UnknownHandle,
-                "dynamic capability handle disappeared during refresh",
-            )
-        })?;
+        let upstream = self.establish_dynamic_handle_upstream(&resolved).await?;
         Ok((
             DynamicHandleRecordView {
-                held_id: record.held_id.clone(),
-                descriptor: record.descriptor.clone(),
+                held_id,
+                descriptor,
             },
-            record.upstream.clone().ok_or_else(|| {
-                self.protocol_error(
-                    ProtocolErrorCode::PathEstablishmentFailed,
-                    "dynamic capability upstream was not established",
-                )
-            })?,
+            upstream,
         ))
     }
 
@@ -1043,7 +1038,7 @@ impl DynamicCapsRuntime {
         route: DynamicHandleProxyRoute,
         req: Request<Incoming>,
     ) -> Response<BoxBody> {
-        let Ok((record, upstream)) = self.ensure_dynamic_handle_upstream(&route.handle_id).await
+        let Ok((record, upstream)) = self.resolve_dynamic_handle_request(&route.handle_id).await
         else {
             return error_response(
                 StatusCode::GONE,
@@ -1068,35 +1063,42 @@ impl DynamicCapsRuntime {
             }
         }
         let req = Request::from_parts(parts.0, parts.1);
-        proxy_outbound_http_request(
-            OutboundHttpProxyState {
-                upstream: upstream.sender.clone(),
-                plugins: if record.descriptor.kind == "a2a" {
-                    Arc::from([Arc::new(a2a::A2aUrlRewritePlugin::new(
-                        self.a2a_url_rewrite_table.clone(),
-                    )) as Arc<dyn HttpExchangePlugin>])
-                } else {
-                    Arc::from(Vec::<Arc<dyn HttpExchangePlugin>>::new())
+        retain_dynamic_handle_upstream(
+            proxy_outbound_http_request(
+                OutboundHttpProxyState {
+                    upstream: upstream.sender.clone(),
+                    plugins: if record.descriptor.kind == "a2a" {
+                        Arc::from([Arc::new(a2a::A2aUrlRewritePlugin::new(
+                            self.a2a_url_rewrite_table.clone(),
+                        )) as Arc<dyn HttpExchangePlugin>])
+                    } else {
+                        Arc::from(Vec::<Arc<dyn HttpExchangePlugin>>::new())
+                    },
+                    route_id: upstream.route_id.clone(),
+                    peer_id: Arc::<str>::from(self.config.identity.id.as_str()),
+                    labels: HttpExchangeLabels {
+                        kind: HttpEdgeKind::Binding,
+                        emit_telemetry: true,
+                        slot: None,
+                        capability: Arc::<str>::from(record.descriptor.label.as_str()),
+                        capability_kind: Some(Arc::<str>::from(record.descriptor.kind.as_str())),
+                        capability_profile: record
+                            .descriptor
+                            .profile
+                            .as_deref()
+                            .map(Arc::<str>::from),
+                        source_component: Some(Arc::<str>::from(self.config.identity.id.as_str())),
+                        source_endpoint: Arc::<str>::from(record.held_id.as_str()),
+                        destination_component: None,
+                        destination_endpoint: Arc::<str>::from(record.descriptor.label.as_str()),
+                    },
+                    dynamic_caps: Some(Arc::new(self.clone())),
                 },
-                route_id: upstream.route_id.clone(),
-                peer_id: Arc::<str>::from(self.config.identity.id.as_str()),
-                labels: HttpExchangeLabels {
-                    kind: HttpEdgeKind::Binding,
-                    emit_telemetry: true,
-                    slot: None,
-                    capability: Arc::<str>::from(record.descriptor.label.as_str()),
-                    capability_kind: Some(Arc::<str>::from(record.descriptor.kind.as_str())),
-                    capability_profile: record.descriptor.profile.as_deref().map(Arc::<str>::from),
-                    source_component: Some(Arc::<str>::from(self.config.identity.id.as_str())),
-                    source_endpoint: Arc::<str>::from(record.held_id.as_str()),
-                    destination_component: None,
-                    destination_endpoint: Arc::<str>::from(record.descriptor.label.as_str()),
-                },
-                dynamic_caps: Some(Arc::new(self.clone())),
-            },
-            req,
+                req,
+            )
+            .await,
+            upstream,
         )
-        .await
     }
 }
 

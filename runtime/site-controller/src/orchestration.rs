@@ -1,9 +1,5 @@
-#[cfg(target_os = "linux")]
-use std::net::Ipv4Addr;
-
 use amber_mesh::{
-    InboundRoute, InboundTarget, MeshConfigPublic, MeshPeer, OutboundRoute,
-    router_external_route_id,
+    InboundRoute, InboundTarget, MeshConfigPublic, MeshPeer, router_external_route_id,
 };
 use amber_proxy::{ControlEndpoint, fetch_router_identity};
 
@@ -93,6 +89,7 @@ pub(crate) struct ResolveExternalLinkUrlRequest {
     pub(crate) child_id: u64,
     pub(crate) link: RunLink,
     pub(crate) consumer_kind: SiteKind,
+    pub(crate) provider_in_child: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -185,6 +182,8 @@ pub(super) fn site_receipt_from_manager_state(state: &SiteManagerStateView) -> S
         context: state.context.clone(),
         router_control: state.router_control.clone(),
         router_mesh_addr: state.router_mesh_addr.clone(),
+        compose_consumer_router_mesh_addr: state.compose_consumer_router_mesh_addr.clone(),
+        kubernetes_consumer_router_mesh_addr: state.kubernetes_consumer_router_mesh_addr.clone(),
         router_identity_id: state.router_identity_id.clone(),
         router_public_key_b64: state.router_public_key_b64.clone(),
         site_controller_pid: state.site_controller_pid,
@@ -196,6 +195,9 @@ pub(super) fn load_site_manager_state(
     app: &ControlStateApp,
     site_id: &str,
 ) -> std::result::Result<SiteManagerStateView, ProtocolErrorResponse> {
+    if site_id == app.controller_plan.site_id {
+        return Ok(local_site_manager_state_view(app));
+    }
     let state_path = site_state_path(&app.state_root, site_id);
     if state_path.is_file() {
         return read_json(&state_path, "site manager state").map_err(|err| {
@@ -204,9 +206,6 @@ pub(super) fn load_site_manager_state(
                 &format!("site `{site_id}` manager state is unavailable: {err}"),
             )
         });
-    }
-    if site_id == app.controller_plan.site_id {
-        return Ok(local_site_manager_state_view(app));
     }
     Err(protocol_error(
         ProtocolErrorCode::SiteNotActive,
@@ -219,6 +218,8 @@ pub(super) fn load_site_manager_state(
 
 fn local_site_manager_state_view(app: &ControlStateApp) -> SiteManagerStateView {
     let runtime_plan = site_controller_runtime_plan_from_controller_plan(&app.controller_plan);
+    let persisted_state =
+        load_site_manager_state_at(Path::new(&app.controller_plan.site_state_root)).ok();
     let router_identity = app
         .runtime
         .load_live_site_router_mesh_config(&runtime_plan)
@@ -239,10 +240,57 @@ fn local_site_manager_state_view(app: &ControlStateApp) -> SiteManagerStateView 
         kubernetes_namespace: app.controller_plan.kubernetes_namespace.clone(),
         port_forward_pid: None,
         context: app.controller_plan.context.clone(),
-        router_control: app.controller_plan.local_router_control.clone(),
-        router_mesh_addr: app.controller_plan.published_router_mesh_addr.clone(),
-        router_identity_id: router_identity.as_ref().map(|(id, _)| id.clone()),
-        router_public_key_b64: router_identity.map(|(_, public_key_b64)| public_key_b64),
+        router_control: app
+            .controller_plan
+            .local_router_control
+            .clone()
+            .or_else(|| {
+                persisted_state
+                    .as_ref()
+                    .and_then(|state| state.router_control.clone())
+            }),
+        router_mesh_addr: app
+            .controller_plan
+            .published_router_mesh_addr
+            .clone()
+            .or_else(|| {
+                persisted_state
+                    .as_ref()
+                    .and_then(|state| state.router_mesh_addr.clone())
+            }),
+        compose_consumer_router_mesh_addr: app
+            .controller_plan
+            .compose_consumer_router_mesh_addr
+            .clone()
+            .or_else(|| {
+                persisted_state
+                    .as_ref()
+                    .and_then(|state| state.compose_consumer_router_mesh_addr.clone())
+            }),
+        kubernetes_consumer_router_mesh_addr: app
+            .controller_plan
+            .kubernetes_consumer_router_mesh_addr
+            .clone()
+            .or_else(|| {
+                persisted_state
+                    .as_ref()
+                    .and_then(|state| state.kubernetes_consumer_router_mesh_addr.clone())
+            }),
+        router_identity_id: router_identity
+            .as_ref()
+            .map(|(id, _)| id.clone())
+            .or_else(|| {
+                persisted_state
+                    .as_ref()
+                    .and_then(|state| state.router_identity_id.clone())
+            }),
+        router_public_key_b64: router_identity
+            .map(|(_, public_key_b64)| public_key_b64)
+            .or_else(|| {
+                persisted_state
+                    .as_ref()
+                    .and_then(|state| state.router_public_key_b64.clone())
+            }),
         site_controller_pid: None,
         site_controller_url: Some(app.controller_plan.authority_url.clone()),
     }
@@ -445,16 +493,12 @@ pub(super) async fn resolve_external_link_url_local(
             ),
         ));
     }
-    let child = {
-        let state = app.control_state.lock().await;
-        cloned_child_record(&state, request.child_id)?
-    };
     let provider = load_launched_site(app, &app.controller_plan.site_id)?;
-    let provider_output_dir = provider_output_dir_for_link(
+    let provider_output_dir = provider_output_dir_for_request(
         app,
-        &child,
+        request.child_id,
         Path::new(&provider.receipt.artifact_dir),
-        &request.link,
+        request.provider_in_child,
     );
     let external_url = app
         .runtime
@@ -1002,7 +1046,6 @@ pub(super) fn dynamic_capability_origin_route_surface(
     runtime: &LiveComponentRuntimeMetadata,
     site_components: &BTreeMap<String, LiveComponentRuntimeMetadata>,
     site_router: &MeshConfigPublic,
-    site_kind: SiteKind,
     route_id: &str,
     root_authority_selector: &RootAuthoritySelectorIr,
     allowed_issuers: Vec<String>,
@@ -1034,7 +1077,7 @@ pub(super) fn dynamic_capability_origin_route_surface(
                 protocol: static_route.protocol,
                 http_plugins: static_route.http_plugins.clone(),
                 target: InboundTarget::MeshForward {
-                    peer_addr: runtime.host_mesh_addr.clone(),
+                    peer_addr: runtime.router_reachable_mesh_addr.clone(),
                     peer_id: runtime.mesh_config.identity.id.clone(),
                     route_id: static_route.route_id.clone(),
                     capability: static_route.capability.clone(),
@@ -1084,8 +1127,15 @@ pub(super) fn dynamic_capability_origin_route_surface(
                 ),
             })?
             .expect("self-provide roots should be handled before outbound route resolution");
-            let peer_addr =
-                dynamic_capability_origin_mesh_peer_addr(site_components, site_kind, route);
+            let peer_addr = if route.peer_id == runtime.mesh_config.identity.id {
+                runtime.router_reachable_mesh_addr.clone()
+            } else {
+                site_components
+                    .values()
+                    .find(|component| component.mesh_config.identity.id == route.peer_id)
+                    .map(|component| component.router_reachable_mesh_addr.clone())
+                    .unwrap_or_else(|| route.peer_addr.clone())
+            };
             Ok((
                 InboundRoute {
                     route_id: route_id.to_string(),
@@ -1137,28 +1187,6 @@ pub(super) fn dynamic_capability_origin_route_surface(
             ))
         }
     }
-}
-
-fn dynamic_capability_origin_mesh_peer_addr(
-    site_components: &BTreeMap<String, LiveComponentRuntimeMetadata>,
-    site_kind: SiteKind,
-    route: &OutboundRoute,
-) -> String {
-    if let Some(peer_runtime) = site_components
-        .values()
-        .find(|component| component.mesh_config.identity.id == route.peer_id)
-    {
-        return peer_runtime.host_mesh_addr.clone();
-    }
-    if matches!(site_kind, SiteKind::Direct | SiteKind::Vm) {
-        #[cfg(target_os = "linux")]
-        if let Ok(addr) = route.peer_addr.parse::<SocketAddr>()
-            && addr.ip() == Ipv4Addr::new(10, 0, 2, 2)
-        {
-            return SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port())).to_string();
-        }
-    }
-    route.peer_addr.clone()
 }
 
 pub(super) fn dynamic_capability_origin_target_mesh_peer(
@@ -1311,7 +1339,6 @@ pub(super) async fn publish_dynamic_capability_origin_local(
         &runtime,
         &site_components,
         &site_router,
-        site_plan.kind,
         &request.route_id,
         &request.root_authority_selector,
         allowed_issuers,
@@ -1571,6 +1598,7 @@ pub(super) async fn publish_external_slot_overlay(
         child_id: child.child_id,
         link: link.clone(),
         consumer_kind,
+        provider_in_child: provider_in_child_for_link(child, link),
     };
     let external_url = if link.provider_site == app.controller_plan.site_id {
         resolve_external_link_url_local(app, &resolve_request)
@@ -1690,23 +1718,26 @@ pub(super) fn link_still_required(
         })
 }
 
-pub(super) fn provider_output_dir_for_link(
+pub(super) fn provider_output_dir_for_request(
     app: &ControlStateApp,
-    child: &LiveChildRecord,
+    child_id: u64,
     provider_artifact_dir: &Path,
-    link: &RunLink,
+    provider_in_child: bool,
 ) -> PathBuf {
-    let provider_in_child = child.fragment.as_ref().is_some_and(|fragment| {
+    if !provider_in_child {
+        return provider_artifact_dir.to_path_buf();
+    }
+    site_controller_runtime_child_root_for_site(local_site_state_root(app), child_id)
+        .join("artifact")
+}
+
+pub(super) fn provider_in_child_for_link(child: &LiveChildRecord, link: &RunLink) -> bool {
+    child.fragment.as_ref().is_some_and(|fragment| {
         fragment
             .components
             .iter()
             .any(|component| component.moniker == link.provider_component)
-    });
-    if !provider_in_child {
-        return provider_artifact_dir.to_path_buf();
-    }
-    site_controller_runtime_child_root_for_site(local_site_state_root(app), child.child_id)
-        .join("artifact")
+    })
 }
 
 pub(super) fn export_peer_route_id(
@@ -1722,12 +1753,7 @@ pub(super) fn export_peer_route_id(
             ),
         )
     })?;
-    let provider_in_child = child.fragment.as_ref().is_some_and(|fragment| {
-        fragment
-            .components
-            .iter()
-            .any(|component| component.moniker == link.provider_component)
-    });
+    let provider_in_child = provider_in_child_for_link(child, link);
     Ok(if provider_in_child {
         router_dynamic_export_route_id(&link.provider_component, &link.export_name, protocol)
     } else {

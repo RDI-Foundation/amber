@@ -743,26 +743,7 @@ fn framework_control_state_path(run: &RunHandle) -> PathBuf {
 }
 
 fn read_framework_control_state(control_state_root: &Path) -> Value {
-    let mut live_children = Vec::new();
-    let entries = fs::read_dir(control_state_root)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", control_state_root.display()));
-    for entry in entries.filter_map(Result::ok) {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let state_path = entry.path().join("site-controller-state.json");
-        if !state_path.is_file() {
-            continue;
-        }
-        let state = read_json(&state_path);
-        if let Some(children) = state["live_children"].as_array() {
-            live_children.extend(children.iter().cloned());
-        }
-    }
-    json!({ "live_children": live_children })
+    framework_control_state_snapshot(control_state_root)
 }
 
 fn framework_site_controller_plan_path(run: &RunHandle) -> PathBuf {
@@ -816,25 +797,26 @@ fn framework_controller_post(run: &RunHandle, path: &str, payload: &Value) -> (u
         .as_str()
         .expect("site controller plan should publish auth token");
     let body = serde_json::to_string(payload).expect("request body should serialize");
-    let output = std::process::Command::new("curl")
-        .arg("-sS")
-        .arg("--max-time")
-        .arg("30.000")
-        .arg("-X")
-        .arg("POST")
-        .arg("-H")
-        .arg("content-type: application/json")
-        .arg("-H")
-        .arg(format!("x-amber-framework-auth: {auth_token}"))
-        .arg("--data")
-        .arg(body)
-        .arg("-o")
-        .arg("-")
-        .arg("-w")
-        .arg("\n%{http_code}")
-        .arg(format!("{}{path}", authority_url.trim_end_matches('/')))
-        .output()
-        .expect("site controller request should complete");
+    let output = command_output_via_tempfiles(
+        std::process::Command::new("curl")
+            .arg("-sS")
+            .arg("--max-time")
+            .arg("30.000")
+            .arg("-X")
+            .arg("POST")
+            .arg("-H")
+            .arg("content-type: application/json")
+            .arg("-H")
+            .arg(format!("x-amber-framework-auth: {auth_token}"))
+            .arg("--data")
+            .arg(body)
+            .arg("-o")
+            .arg("-")
+            .arg("-w")
+            .arg("\n%{http_code}")
+            .arg(format!("{}{path}", authority_url.trim_end_matches('/'))),
+        "framework controller request",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let (body, status) = stdout
         .rsplit_once('\n')
@@ -873,13 +855,7 @@ fn wait_for_live_child(control_state_path: &Path, name: &str) -> u64 {
 }
 
 fn framework_child_artifact(run: &RunHandle, site_id: &str, child_id: u64) -> PathBuf {
-    run.run_root
-        .join("state")
-        .join(site_id)
-        .join("framework-component")
-        .join("children")
-        .join(child_id.to_string())
-        .join("artifact")
+    framework_child_artifact_dir(&run.run_root, site_id, child_id)
 }
 
 fn framework_manifest_url(path: &Path) -> String {
@@ -923,9 +899,11 @@ fn spawn_framework_proxy_for_site(
 }
 
 fn wait_for_framework_child_absent(
+    run: &RunHandle,
     control_state_path: &Path,
     child_name: &str,
-    child_roots: &[PathBuf],
+    child_sites: &[&str],
+    child_id: u64,
     timeout: Duration,
 ) {
     wait_for_condition(
@@ -934,7 +912,10 @@ fn wait_for_framework_child_absent(
             let no_live_child = read_framework_control_state(control_state_path)["live_children"]
                 .as_array()
                 .is_some_and(|children| children.iter().all(|child| child["name"] != child_name));
-            no_live_child && child_roots.iter().all(|root| !root.exists())
+            no_live_child
+                && child_sites
+                    .iter()
+                    .all(|site_id| framework_child_is_absent(&run.run_root, site_id, child_id))
         },
         &format!("dynamic child `{child_name}` removed from control state and site artifacts"),
     );
@@ -2277,15 +2258,16 @@ fn framework_component_create_to_unoffered_site_fails_deterministically_live() {
     );
 
     let storage_root = temp.path().join("state");
-    let output = amber_command()
-        .arg("run")
-        .arg(&manifest)
-        .arg("--placement")
-        .arg(&placement)
-        .arg("--storage-root")
-        .arg(&storage_root)
-        .output()
-        .expect("failed to run amber");
+    let output = command_output_via_tempfiles(
+        amber_command()
+            .arg("run")
+            .arg(&manifest)
+            .arg("--placement")
+            .arg(&placement)
+            .arg("--storage-root")
+            .arg(&storage_root),
+        "amber run",
+    );
     assert!(
         !output.status.success(),
         "run should fail deterministically when a bounded template allows a manifest that \
@@ -3003,12 +2985,11 @@ fn framework_component_delegated_realm_cross_site_live() {
         "delegated destroy should succeed; response: {destroy_response}"
     );
     wait_for_framework_child_absent(
+        &run,
         &control_state_path,
         "sibling",
-        &[sibling_artifact
-            .parent()
-            .expect("sibling artifact should have a parent")
-            .to_path_buf()],
+        &["compose_local"],
+        sibling_id,
         Duration::from_secs(60),
     );
 
@@ -4015,15 +3996,10 @@ fn framework_component_kind_creator_after_compose_churn_live() {
              {create_response}"
         );
         let child_id = wait_for_live_child(&control_state_path, template_case.child_name);
-        let child_roots = template_case
+        let child_sites = template_case
             .exports
             .iter()
-            .map(|(site_id, _, _)| {
-                framework_child_artifact(&run, site_id, child_id)
-                    .parent()
-                    .expect("dynamic child artifact should have a parent")
-                    .to_path_buf()
-            })
+            .map(|(site_id, _, _)| *site_id)
             .collect::<Vec<_>>();
         let (destroy_status, destroy_response) =
             framework_destroy_child_via_admin(compose_creator_port, template_case.child_name);
@@ -4033,9 +4009,11 @@ fn framework_component_kind_creator_after_compose_churn_live() {
             template_case.child_name,
         );
         wait_for_framework_child_absent(
+            &run,
             &control_state_path,
             template_case.child_name,
-            &child_roots,
+            &child_sites,
+            child_id,
             Duration::from_secs(300),
         );
     }
@@ -4088,6 +4066,23 @@ fn framework_component_kind_creator_after_compose_churn_live() {
         create_status, 200,
         "kind creator create after compose churn should succeed; response: {create_response}"
     );
+    let child_id = wait_for_live_child(&control_state_path, "job-compose");
+
+    let root_artifact = framework_child_artifact(&run, "compose_local", child_id);
+    let root_port = pick_free_port();
+    let mut root_proxy = spawn_framework_proxy_for_site(
+        &root_artifact,
+        "http",
+        root_port,
+        site_state("compose_local"),
+    );
+    wait_for_path(&mut root_proxy, root_port, "/id", Duration::from_secs(300));
+    assert_eq!(
+        wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
+        "child-compose-root",
+        "kind creator should expose the recreated compose child after compose churn"
+    );
+    stop_proxy(&mut root_proxy);
 
     stop_proxy(&mut kind_creator_proxy);
     run.stop();
@@ -4193,15 +4188,10 @@ fn framework_component_cross_backend_matrix_live() {
             assert_eq!(create_json["child"]["name"], template_case.child_name);
 
             let child_id = wait_for_live_child(&control_state_path, template_case.child_name);
-            let child_roots = template_case
+            let child_sites = template_case
                 .exports
                 .iter()
-                .map(|(site_id, _, _)| {
-                    framework_child_artifact(&run, site_id, child_id)
-                        .parent()
-                        .expect("dynamic child artifact should have a parent")
-                        .to_path_buf()
-                })
+                .map(|(site_id, _, _)| *site_id)
                 .collect::<Vec<_>>();
 
             let root_site_id = template_case.exports[0].0;
@@ -4256,9 +4246,11 @@ fn framework_component_cross_backend_matrix_live() {
                 template_case.child_name,
             );
             wait_for_framework_child_absent(
+                &run,
                 &control_state_path,
                 template_case.child_name,
-                &child_roots,
+                &child_sites,
+                child_id,
                 Duration::from_secs(300),
             );
         }

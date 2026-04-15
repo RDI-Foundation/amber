@@ -4,6 +4,8 @@
 mod cloud_image_support;
 #[path = "../test_support/outputs_root.rs"]
 mod outputs_root_support;
+#[path = "../test_support/port_allocator.rs"]
+mod port_allocator_support;
 #[path = "../test_support/target_dir.rs"]
 mod target_dir_support;
 #[path = "../test_support/workspace_root.rs"]
@@ -11,7 +13,10 @@ mod workspace_root_support;
 
 use std::{
     collections::BTreeSet,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -24,9 +29,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER, AMBER_SITE_CONTROLLER};
+use amber_images::{
+    AMBER_DOCKER_GATEWAY, AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER, AMBER_SITE_CONTROLLER,
+    DEV_IMAGE_TAGS_ENV, INTERNAL_IMAGE_OVERRIDE_KEYS, ImageRef, override_reference,
+    parse_dev_image_tag_overrides,
+};
 use cloud_image_support::default_host_arch_cloud_image_filename;
 use outputs_root_support::cli_test_outputs_root;
+use port_allocator_support::reserve_test_loopback_port;
 use serde_json::{Value, json};
 use target_dir_support::cargo_target_dir;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -145,6 +155,38 @@ pub(crate) struct SpawnedProxy {
     output_dir: PathBuf,
 }
 
+#[derive(serde::Deserialize)]
+struct StaleRunReceipt {
+    run_id: String,
+    #[serde(default)]
+    observability: Option<StaleObservabilityReceipt>,
+    #[serde(default)]
+    bridge_proxies: Vec<StaleBridgeProxyReceipt>,
+    sites: std::collections::BTreeMap<String, StaleSiteReceipt>,
+}
+
+#[derive(serde::Deserialize)]
+struct StaleObservabilityReceipt {
+    #[serde(default)]
+    sink_pid: Option<u32>,
+}
+
+#[derive(serde::Deserialize)]
+struct StaleBridgeProxyReceipt {
+    pid: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct StaleSiteReceipt {
+    supervisor_pid: u32,
+    #[serde(default)]
+    process_pid: Option<u32>,
+    #[serde(default)]
+    port_forward_pid: Option<u32>,
+    #[serde(default)]
+    site_controller_pid: Option<u32>,
+}
+
 impl TestTempDir {
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -184,6 +226,7 @@ pub(crate) fn mixed_run_base_image() -> PathBuf {
 
 pub(crate) fn temp_output_dir(prefix: &str) -> TestTempDir {
     fs::create_dir_all(outputs_root()).expect("failed to create cli test outputs root");
+    cleanup_abandoned_test_runs_once();
     let temp = tempfile::Builder::new()
         .prefix(prefix)
         .tempdir_in(outputs_root())
@@ -200,41 +243,83 @@ pub(crate) fn temp_output_dir(prefix: &str) -> TestTempDir {
     }
 }
 
-pub(crate) fn pick_free_port() -> u16 {
-    const TEST_PORT_RANGE_START: u16 = 20000;
-    const TEST_PORT_RANGE_END: u16 = 30000;
-    static RESERVED_TEST_PORTS: OnceLock<Mutex<BTreeSet<u16>>> = OnceLock::new();
-
-    let reserved = RESERVED_TEST_PORTS.get_or_init(|| Mutex::new(BTreeSet::new()));
-    let mut reserved = reserved
-        .lock()
-        .expect("test port allocator should not be poisoned");
-    let span = u32::from(TEST_PORT_RANGE_END - TEST_PORT_RANGE_START);
-    let mut next =
-        TEST_PORT_RANGE_START + (std::process::id() % span) as u16 + reserved.len() as u16;
-    for _ in 0..usize::from(TEST_PORT_RANGE_END - TEST_PORT_RANGE_START) {
-        if next >= TEST_PORT_RANGE_END {
-            next = TEST_PORT_RANGE_START;
+fn cleanup_abandoned_test_runs_once() {
+    static CLEANUP_ONCE: OnceLock<()> = OnceLock::new();
+    CLEANUP_ONCE.get_or_init(|| {
+        for entry in fs::read_dir(outputs_root())
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", outputs_root().display()))
+        {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let storage_root = entry.path();
+            if storage_root.is_dir() {
+                cleanup_abandoned_test_runs_in_storage_root(&storage_root);
+            }
         }
-        let port = next;
-        next += 1;
-        if reserved.contains(&port) {
+    });
+}
+
+fn cleanup_abandoned_test_runs_in_storage_root(storage_root: &Path) {
+    let runs_dir = storage_root.join("runs");
+    let Ok(entries) = fs::read_dir(&runs_dir) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let run_root = entry.path();
+        let receipt_path = run_root.join("receipt.json");
+        if !receipt_path.is_file() {
             continue;
         }
-        match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))) {
-            Ok(listener) => {
-                drop(listener);
-                reserved.insert(port);
-                return port;
-            }
-            Err(_) => continue,
+        let Ok(receipt_bytes) = fs::read(&receipt_path) else {
+            continue;
+        };
+        let Ok(receipt) = serde_json::from_slice::<StaleRunReceipt>(&receipt_bytes) else {
+            continue;
+        };
+        if stale_run_has_live_processes(&receipt) {
+            continue;
         }
+        let _ = command_output_via_tempfiles(
+            amber_command()
+                .arg("stop")
+                .arg(&receipt.run_id)
+                .arg("--storage-root")
+                .arg(storage_root),
+            "amber stop stale test run",
+        );
     }
-    panic!(
-        "failed to allocate a unique mixed-run test port in {}-{}",
-        TEST_PORT_RANGE_START,
-        TEST_PORT_RANGE_END - 1
-    );
+}
+
+fn stale_run_has_live_processes(receipt: &StaleRunReceipt) -> bool {
+    receipt
+        .observability
+        .as_ref()
+        .and_then(|observability| observability.sink_pid)
+        .into_iter()
+        .chain(receipt.bridge_proxies.iter().map(|proxy| proxy.pid))
+        .chain(
+            receipt
+                .sites
+                .values()
+                .flat_map(|site| {
+                    [
+                        Some(site.supervisor_pid),
+                        site.process_pid,
+                        site.port_forward_pid,
+                        site.site_controller_pid,
+                    ]
+                })
+                .flatten(),
+        )
+        .any(pid_is_alive)
+}
+
+pub(crate) fn pick_free_port() -> u16 {
+    reserve_test_loopback_port()
 }
 
 pub(crate) fn docker_host_ip() -> String {
@@ -331,14 +416,18 @@ pub(crate) fn http_request_with_timeout(
             .arg("--data")
             .arg(body);
     }
-    let output = command
-        .arg("-o")
-        .arg("-")
-        .arg("-w")
-        .arg("\n%{http_code}")
-        .arg(format!("http://127.0.0.1:{port}{path}"))
-        .output()
-        .ok()?;
+    let output = command_output_via_tempfiles(
+        command
+            .arg("-o")
+            .arg("-")
+            .arg("-w")
+            .arg("\n%{http_code}")
+            .arg(format!("http://127.0.0.1:{port}{path}")),
+        "curl http request",
+    );
+    if !output.status.success() {
+        return None;
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let (body, status) = stdout.rsplit_once('\n')?;
     Some((status.trim().parse().ok()?, body.trim().to_string()))
@@ -621,6 +710,7 @@ pub(crate) fn stop_child(child: &mut std::process::Child) {
 }
 
 pub(crate) fn amber_command() -> Command {
+    ensure_local_dev_image_tag_overrides();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_amber"));
     cmd.env("AMBER_RUNTIME_BIN_DIR", runtime_bin_dir());
     if let Some(kubeconfig) = env::var_os("AMBER_TEST_KIND_KUBECONFIG") {
@@ -797,22 +887,22 @@ pub(crate) fn docker_supports_buildx() -> bool {
 pub(crate) fn ensure_amber_internal_images() {
     static READY: OnceLock<()> = OnceLock::new();
     READY.get_or_init(|| {
+        ensure_local_dev_image_tag_overrides();
         let root = workspace_root();
+        let images = amber_internal_image_refs();
+        ensure_docker_image(&images.router, &root.join("docker/amber-router/Dockerfile"));
         ensure_docker_image(
-            AMBER_ROUTER.reference,
-            &root.join("docker/amber-router/Dockerfile"),
-        );
-        ensure_docker_image(
-            AMBER_PROVISIONER.reference,
+            &images.provisioner,
             &root.join("docker/amber-provisioner/Dockerfile"),
         );
+        ensure_docker_image(&images.helper, &root.join("docker/amber-helper/Dockerfile"));
         ensure_docker_image(
-            AMBER_HELPER.reference,
-            &root.join("docker/amber-helper/Dockerfile"),
+            &images.site_controller,
+            &root.join("docker/amber-site-controller/Dockerfile"),
         );
         ensure_docker_image(
-            AMBER_SITE_CONTROLLER.reference,
-            &root.join("docker/amber-site-controller/Dockerfile"),
+            &images.docker_gateway,
+            &root.join("docker/amber-docker-gateway/Dockerfile"),
         );
     });
 }
@@ -822,6 +912,56 @@ pub(crate) fn ensure_internal_images() {
     READY.get_or_init(|| {
         ensure_local_image(TEST_APP_IMAGE);
         ensure_amber_internal_images();
+    });
+}
+
+#[derive(Clone)]
+struct AmberInternalImageRefs {
+    router: String,
+    helper: String,
+    provisioner: String,
+    docker_gateway: String,
+    site_controller: String,
+}
+
+fn amber_internal_image_refs() -> AmberInternalImageRefs {
+    let overrides = parse_dev_image_tag_overrides(INTERNAL_IMAGE_OVERRIDE_KEYS)
+        .unwrap_or_else(|err| panic!("invalid {DEV_IMAGE_TAGS_ENV}: {err}"));
+    let resolve = |image: &ImageRef, key: &str| {
+        overrides
+            .get(key)
+            .map(|tag| override_reference(image, tag))
+            .unwrap_or_else(|| image.reference.to_string())
+    };
+    AmberInternalImageRefs {
+        router: resolve(&AMBER_ROUTER, "router"),
+        helper: resolve(&AMBER_HELPER, "helper"),
+        provisioner: resolve(&AMBER_PROVISIONER, "provisioner"),
+        docker_gateway: resolve(&AMBER_DOCKER_GATEWAY, "docker_gateway"),
+        site_controller: resolve(&AMBER_SITE_CONTROLLER, "site_controller"),
+    }
+}
+
+fn ensure_local_dev_image_tag_overrides() {
+    static READY: OnceLock<()> = OnceLock::new();
+    READY.get_or_init(|| {
+        if use_prebuilt_images()
+            || env::var_os("CI").is_some()
+            || env::var_os(DEV_IMAGE_TAGS_ENV).is_some()
+        {
+            return;
+        }
+        let mut hasher = DefaultHasher::new();
+        workspace_root().hash(&mut hasher);
+        let tag = format!("dev-mixed-run-{:016x}", hasher.finish());
+        let overrides = INTERNAL_IMAGE_OVERRIDE_KEYS
+            .iter()
+            .map(|key| format!("{key}={tag}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        unsafe {
+            env::set_var(DEV_IMAGE_TAGS_ENV, overrides);
+        }
     });
 }
 
@@ -944,23 +1084,27 @@ pub(crate) fn ensure_kind_internal_images(kind_cluster: &KindCluster) {
     ensure_internal_images();
     static READY: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
     let name = kind_cluster.name.clone();
+    let images = amber_internal_image_refs();
+    let ready_key = format!(
+        "{name}|{}|{}|{}|{}|{}",
+        images.router, images.provisioner, images.helper, images.site_controller, TEST_APP_IMAGE
+    );
     let loaded = READY.get_or_init(|| Mutex::new(BTreeSet::new()));
     {
         let loaded = loaded.lock().expect("kind image-load guard should lock");
-        if loaded.contains(&name) {
+        if loaded.contains(&ready_key) {
             return;
         }
     }
-    load_kind_image(&name, AMBER_ROUTER.reference);
-    load_kind_image(&name, AMBER_PROVISIONER.reference);
-    load_kind_image(&name, AMBER_HELPER.reference);
-    load_kind_image(&name, AMBER_SITE_CONTROLLER.reference);
-    // The public test workload image is registry-pullable inside the kind cluster, so keep kind
-    // image preloading focused on the Amber images that only exist locally.
+    load_kind_image(&name, &images.router);
+    load_kind_image(&name, &images.provisioner);
+    load_kind_image(&name, &images.helper);
+    load_kind_image(&name, &images.site_controller);
+    load_kind_image(&name, TEST_APP_IMAGE);
     loaded
         .lock()
         .expect("kind image-load guard should lock")
-        .insert(name);
+        .insert(ready_key);
 }
 
 pub(crate) fn kill_pid(pid: u32) {
@@ -968,6 +1112,338 @@ pub(crate) fn kill_pid(pid: u32) {
     unsafe {
         let _ = libc::kill(pid as i32, libc::SIGTERM);
     }
+}
+
+pub(crate) fn framework_child_artifact_dir(
+    run_root: &Path,
+    site_id: &str,
+    child_id: u64,
+) -> PathBuf {
+    let manager_state = site_manager_state(run_root, site_id);
+    if manager_state["kind"].as_str() == Some("kubernetes") {
+        let artifact_dir =
+            framework_child_kubernetes_cache_artifact_dir(run_root, site_id, child_id);
+        materialize_kubernetes_child_artifact(&manager_state, child_id, &artifact_dir);
+        return artifact_dir;
+    }
+
+    framework_child_host_artifact_dir(run_root, site_id, child_id)
+}
+
+pub(crate) fn framework_control_state_snapshot(control_state_root: &Path) -> Value {
+    let mut live_children = Vec::new();
+    let entries = fs::read_dir(control_state_root)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", control_state_root.display()));
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(site_id) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        let state = framework_site_control_state(control_state_root, &site_id);
+        if let Some(children) = state["live_children"].as_array() {
+            live_children.extend(children.iter().cloned());
+        }
+    }
+    json!({ "live_children": live_children })
+}
+
+pub(crate) fn framework_child_is_absent(run_root: &Path, site_id: &str, child_id: u64) -> bool {
+    let manager_state = site_manager_state(run_root, site_id);
+    if manager_state["kind"].as_str() != Some("kubernetes") {
+        return !framework_child_host_child_root(run_root, site_id, child_id).exists();
+    }
+
+    if kubernetes_child_runtime_root_exists(&manager_state, child_id) {
+        return false;
+    }
+
+    let cache_root = framework_child_kubernetes_cache_child_root(run_root, site_id, child_id);
+    if cache_root.exists() {
+        fs::remove_dir_all(&cache_root).unwrap_or_else(|err| {
+            panic!(
+                "failed to clear stale kubernetes child cache {}: {err}",
+                cache_root.display()
+            )
+        });
+    }
+    true
+}
+
+fn framework_site_control_state(control_state_root: &Path, site_id: &str) -> Value {
+    let manager_state = site_manager_state_from_state_root(control_state_root, site_id);
+    let state_path = framework_site_control_state_path(control_state_root, site_id, &manager_state);
+    if manager_state["kind"].as_str() == Some("kubernetes") {
+        materialize_kubernetes_control_state(&manager_state, &state_path);
+    }
+    read_json(&state_path)
+}
+
+fn site_manager_state(run_root: &Path, site_id: &str) -> Value {
+    site_manager_state_from_state_root(&run_root.join("state"), site_id)
+}
+
+fn site_manager_state_from_state_root(state_root: &Path, site_id: &str) -> Value {
+    let manager_state_path = state_root.join(site_id).join("manager-state.json");
+    serde_json::from_slice(&fs::read(&manager_state_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read site manager state {}: {err}",
+            manager_state_path.display()
+        )
+    }))
+    .unwrap_or_else(|err| {
+        panic!(
+            "failed to parse site manager state {}: {err}",
+            manager_state_path.display()
+        )
+    })
+}
+
+fn framework_site_control_state_path(
+    control_state_root: &Path,
+    site_id: &str,
+    manager_state: &Value,
+) -> PathBuf {
+    if manager_state["kind"].as_str() == Some("kubernetes") {
+        return framework_kubernetes_cache_control_state_path(control_state_root, site_id);
+    }
+    control_state_root
+        .join(site_id)
+        .join("site-controller-state.json")
+}
+
+fn framework_kubernetes_cache_control_state_path(
+    control_state_root: &Path,
+    site_id: &str,
+) -> PathBuf {
+    control_state_root
+        .join(site_id)
+        .join("framework-component-kubernetes-cache")
+        .join("site-controller-state.json")
+}
+
+fn framework_child_host_child_root(run_root: &Path, site_id: &str, child_id: u64) -> PathBuf {
+    run_root
+        .join("state")
+        .join(site_id)
+        .join("framework-component")
+        .join("children")
+        .join(child_id.to_string())
+}
+
+fn framework_child_host_artifact_dir(run_root: &Path, site_id: &str, child_id: u64) -> PathBuf {
+    framework_child_host_child_root(run_root, site_id, child_id).join("artifact")
+}
+
+fn framework_child_kubernetes_cache_child_root(
+    run_root: &Path,
+    site_id: &str,
+    child_id: u64,
+) -> PathBuf {
+    run_root
+        .join("state")
+        .join(site_id)
+        .join("framework-component-kubernetes-cache")
+        .join("children")
+        .join(child_id.to_string())
+}
+
+fn framework_child_kubernetes_cache_artifact_dir(
+    run_root: &Path,
+    site_id: &str,
+    child_id: u64,
+) -> PathBuf {
+    framework_child_kubernetes_cache_child_root(run_root, site_id, child_id).join("artifact")
+}
+
+fn kubernetes_child_runtime_root_exists(manager_state: &Value, child_id: u64) -> bool {
+    let namespace = manager_state["kubernetes_namespace"]
+        .as_str()
+        .unwrap_or_else(|| panic!("kubernetes manager state is missing kubernetes_namespace"));
+    let pod = kubernetes_site_controller_pod_name(manager_state, namespace);
+    let remote_child_root = format!("/amber/site/state/framework-component/children/{child_id}");
+    let output = kubectl_for_manager_state(manager_state)
+        .arg("-n")
+        .arg(namespace)
+        .arg("exec")
+        .arg(&pod)
+        .arg("--")
+        .arg("sh")
+        .arg("-lc")
+        .arg(format!("test -d {remote_child_root}"))
+        .output()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to probe kubernetes child runtime root {remote_child_root} in {pod}: {err}"
+            )
+        });
+    match output.status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        _ => {
+            panic!(
+                "failed to probe kubernetes child runtime root {remote_child_root} in {pod}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        }
+    }
+}
+
+fn materialize_kubernetes_child_artifact(
+    manager_state: &Value,
+    child_id: u64,
+    artifact_dir: &Path,
+) {
+    if artifact_dir.is_dir() {
+        return;
+    }
+    let namespace = manager_state["kubernetes_namespace"]
+        .as_str()
+        .unwrap_or_else(|| panic!("kubernetes manager state is missing kubernetes_namespace"));
+    let pod = kubernetes_site_controller_pod_name(manager_state, namespace);
+    let remote_artifact_dir =
+        format!("/amber/site/state/framework-component/children/{child_id}/artifact");
+    let parent = artifact_dir.parent().unwrap_or_else(|| {
+        panic!(
+            "artifact dir {} should have a parent",
+            artifact_dir.display()
+        )
+    });
+    fs::create_dir_all(parent).unwrap_or_else(|err| {
+        panic!(
+            "failed to create framework child parent {}: {err}",
+            parent.display()
+        )
+    });
+    let target = parent.join(format!("artifact-kubernetes-copy-{child_id}"));
+    if target.exists() {
+        fs::remove_dir_all(&target).unwrap_or_else(|err| {
+            panic!(
+                "failed to clear previous kubernetes child artifact copy {}: {err}",
+                target.display()
+            )
+        });
+    }
+    let mut command = kubectl_for_manager_state(manager_state);
+    let status = command
+        .arg("-n")
+        .arg(namespace)
+        .arg("cp")
+        .arg(format!("{pod}:{remote_artifact_dir}"))
+        .arg(&target)
+        .status()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to copy kubernetes child artifact {remote_artifact_dir} from {pod}: {err}"
+            )
+        });
+    if !status.success() {
+        panic!(
+            "kubectl cp failed for kubernetes child artifact {remote_artifact_dir} from {pod} \
+             with status {status}"
+        );
+    }
+    fs::rename(&target, artifact_dir).unwrap_or_else(|err| {
+        panic!(
+            "failed to move kubernetes child artifact copy {} into {}: {err}",
+            target.display(),
+            artifact_dir.display()
+        )
+    });
+}
+
+fn materialize_kubernetes_control_state(manager_state: &Value, state_path: &Path) {
+    let namespace = manager_state["kubernetes_namespace"]
+        .as_str()
+        .unwrap_or_else(|| panic!("kubernetes manager state is missing kubernetes_namespace"));
+    let pod = kubernetes_site_controller_pod_name(manager_state, namespace);
+    let parent = state_path.parent().unwrap_or_else(|| {
+        panic!(
+            "framework control state path {} should have a parent",
+            state_path.display()
+        )
+    });
+    fs::create_dir_all(parent).unwrap_or_else(|err| {
+        panic!(
+            "failed to create kubernetes control state cache parent {}: {err}",
+            parent.display()
+        )
+    });
+    let target = parent.join("site-controller-state-kubernetes-copy.json");
+    let output = kubectl_for_manager_state(manager_state)
+        .arg("-n")
+        .arg(namespace)
+        .arg("exec")
+        .arg(&pod)
+        .arg("--")
+        .arg("cat")
+        .arg("/amber/site/state/site-controller-state.json")
+        .output()
+        .unwrap_or_else(|err| {
+            panic!("failed to read kubernetes control state from {pod} in {namespace}: {err}")
+        });
+    if !output.status.success() {
+        panic!(
+            "failed to read kubernetes control state from {pod} in {namespace}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::write(&target, &output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "failed to write temporary kubernetes control state cache {}: {err}",
+            target.display()
+        )
+    });
+    fs::rename(&target, state_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to move kubernetes control state cache {} into {}: {err}",
+            target.display(),
+            state_path.display()
+        )
+    });
+}
+
+fn kubernetes_site_controller_pod_name(manager_state: &Value, namespace: &str) -> String {
+    let mut command = kubectl_for_manager_state(manager_state);
+    let output = command
+        .arg("-n")
+        .arg(namespace)
+        .arg("get")
+        .arg("pods")
+        .arg("-l")
+        .arg("amber.io/component=amber-site-controller")
+        .arg("-o")
+        .arg("jsonpath={.items[0].metadata.name}")
+        .output()
+        .unwrap_or_else(|err| {
+            panic!("failed to query kubernetes site-controller pod in {namespace}: {err}")
+        });
+    if !output.status.success() {
+        panic!(
+            "failed to query kubernetes site-controller pod in {namespace}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let pod = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if pod.is_empty() {
+        panic!("kubernetes site-controller pod is missing in namespace {namespace}");
+    }
+    pod
+}
+
+fn kubectl_for_manager_state(manager_state: &Value) -> Command {
+    let mut command = Command::new("kubectl");
+    if let Some(kubeconfig) = env::var_os("AMBER_TEST_KIND_KUBECONFIG") {
+        command.env("KUBECONFIG", kubeconfig);
+    }
+    if let Some(context) = manager_state["context"].as_str() {
+        command.arg("--context").arg(context);
+    }
+    command
 }
 
 pub(crate) fn pid_is_alive(pid: u32) -> bool {
@@ -1035,14 +1511,15 @@ impl RunHandle {
         if self.stopped {
             return;
         }
-        let output = amber_command()
-            .arg("stop")
-            .arg(&self.run_id)
-            .arg("--storage-root")
-            .arg(&self.storage_root)
-            .envs(self.command_env.iter().map(|(key, value)| (key, value)))
-            .output()
-            .expect("failed to run amber stop");
+        let output = command_output_via_tempfiles(
+            amber_command()
+                .arg("stop")
+                .arg(&self.run_id)
+                .arg("--storage-root")
+                .arg(&self.storage_root)
+                .envs(self.command_env.iter().map(|(key, value)| (key, value))),
+            "amber stop",
+        );
         assert!(
             output.status.success(),
             "amber stop failed\nstdout:\n{}\nstderr:\n{}",
@@ -1058,14 +1535,44 @@ impl Drop for RunHandle {
         if self.stopped {
             return;
         }
-        let _ = amber_command()
-            .arg("stop")
-            .arg(&self.run_id)
-            .arg("--storage-root")
-            .arg(&self.storage_root)
-            .envs(self.command_env.iter().map(|(key, value)| (key, value)))
-            .output();
+        let _ = command_output_via_tempfiles(
+            amber_command()
+                .arg("stop")
+                .arg(&self.run_id)
+                .arg("--storage-root")
+                .arg(&self.storage_root)
+                .envs(self.command_env.iter().map(|(key, value)| (key, value))),
+            "amber stop",
+        );
         self.stopped = true;
+    }
+}
+
+pub(crate) fn command_output_via_tempfiles(
+    command: &mut Command,
+    label: &str,
+) -> std::process::Output {
+    let stdout_file = tempfile::NamedTempFile::new()
+        .unwrap_or_else(|err| panic!("failed to create stdout temp file for {label}: {err}"));
+    let stderr_file = tempfile::NamedTempFile::new()
+        .unwrap_or_else(|err| panic!("failed to create stderr temp file for {label}: {err}"));
+    let status = command
+        .stdout(Stdio::from(stdout_file.reopen().unwrap_or_else(|err| {
+            panic!("failed to reopen stdout temp file for {label}: {err}")
+        })))
+        .stderr(Stdio::from(stderr_file.reopen().unwrap_or_else(|err| {
+            panic!("failed to reopen stderr temp file for {label}: {err}")
+        })))
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run {label}: {err}"));
+    let stdout = fs::read(stdout_file.path())
+        .unwrap_or_else(|err| panic!("failed to read stdout temp file for {label}: {err}"));
+    let stderr = fs::read(stderr_file.path())
+        .unwrap_or_else(|err| panic!("failed to read stderr temp file for {label}: {err}"));
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
     }
 }
 
@@ -1099,17 +1606,18 @@ pub(crate) fn run_manifest_with_args_and_env(
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> RunHandle {
-    let output = amber_command()
-        .arg("run")
-        .arg(manifest)
-        .arg("--placement")
-        .arg(placement)
-        .arg("--storage-root")
-        .arg(storage_root)
-        .args(extra_args)
-        .envs(extra_env.iter().copied())
-        .output()
-        .expect("failed to run amber run");
+    let output = command_output_via_tempfiles(
+        amber_command()
+            .arg("run")
+            .arg(manifest)
+            .arg("--placement")
+            .arg(placement)
+            .arg("--storage-root")
+            .arg(storage_root)
+            .args(extra_args)
+            .envs(extra_env.iter().copied()),
+        "amber run",
+    );
     assert!(
         output.status.success(),
         "amber run failed\nstdout:\n{}\nstderr:\n{}{}",
@@ -1189,7 +1697,7 @@ pub(crate) fn run_manifest_expect_failure_with_env(
         .arg(storage_root)
         .args(extra_args)
         .envs(extra_env.iter().copied());
-    let output = cmd.output().expect("failed to run amber run");
+    let output = command_output_via_tempfiles(&mut cmd, "amber run");
     assert!(
         !output.status.success(),
         "amber run unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
@@ -1209,21 +1717,22 @@ pub(crate) fn dry_run_manifest(
     bundle_root: &Path,
     extra_args: &[&str],
 ) -> std::process::Output {
-    amber_command()
-        .arg("run")
-        .arg("-Z")
-        .arg("unstable-options")
-        .arg(manifest)
-        .arg("--placement")
-        .arg(placement)
-        .arg("--storage-root")
-        .arg(storage_root)
-        .args(extra_args)
-        .arg("--dry-run")
-        .arg("--emit-launch-bundle")
-        .arg(bundle_root)
-        .output()
-        .expect("failed to run amber run --dry-run")
+    command_output_via_tempfiles(
+        amber_command()
+            .arg("run")
+            .arg("-Z")
+            .arg("unstable-options")
+            .arg(manifest)
+            .arg("--placement")
+            .arg(placement)
+            .arg("--storage-root")
+            .arg(storage_root)
+            .args(extra_args)
+            .arg("--dry-run")
+            .arg("--emit-launch-bundle")
+            .arg(bundle_root),
+        "amber run --dry-run",
+    )
 }
 
 pub(crate) fn spawn_run_manifest_with_env(
@@ -1623,6 +2132,8 @@ pub(crate) fn serve_host_http_request(stream: &mut TcpStream) {
 pub(crate) struct KindClusterGuard {
     name: String,
     kubeconfig: PathBuf,
+    previous_cluster_name: Option<OsString>,
+    previous_kubeconfig: Option<OsString>,
 }
 
 impl KindClusterGuard {
@@ -1655,9 +2166,17 @@ impl KindClusterGuard {
                 .status();
             panic!("kind create cluster failed with status {status}");
         }
+        let previous_cluster_name = env::var_os("AMBER_TEST_KIND_CLUSTER_NAME");
+        let previous_kubeconfig = env::var_os("AMBER_TEST_KIND_KUBECONFIG");
+        unsafe {
+            env::set_var("AMBER_TEST_KIND_CLUSTER_NAME", &name);
+            env::set_var("AMBER_TEST_KIND_KUBECONFIG", kubeconfig);
+        }
         Self {
             name,
             kubeconfig: kubeconfig.to_path_buf(),
+            previous_cluster_name,
+            previous_kubeconfig,
         }
     }
 }
@@ -1672,6 +2191,16 @@ impl Drop for KindClusterGuard {
             .arg("--kubeconfig")
             .arg(&self.kubeconfig)
             .status();
+        unsafe {
+            match &self.previous_cluster_name {
+                Some(value) => env::set_var("AMBER_TEST_KIND_CLUSTER_NAME", value),
+                None => env::remove_var("AMBER_TEST_KIND_CLUSTER_NAME"),
+            }
+            match &self.previous_kubeconfig {
+                Some(value) => env::set_var("AMBER_TEST_KIND_KUBECONFIG", value),
+                None => env::remove_var("AMBER_TEST_KIND_KUBECONFIG"),
+            }
+        }
     }
 }
 
@@ -2283,6 +2812,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_output_via_tempfiles_does_not_wait_for_background_stdout_writer() {
+        let started = Instant::now();
+        let output = command_output_via_tempfiles(
+            Command::new("sh").arg("-c").arg("(sleep 2) & printf done"),
+            "background stdout writer",
+        );
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "done");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "capturing to temp files should wait for the command, not background writers"
+        );
+    }
+
+    #[test]
     fn source_is_newer_than_image_detects_newer_sources() {
         let image_created = UNIX_EPOCH + Duration::from_secs(10);
         let newest_source = Some(UNIX_EPOCH + Duration::from_secs(11));
@@ -2297,5 +2841,68 @@ mod tests {
             Some(UNIX_EPOCH + Duration::from_secs(9))
         ));
         assert!(!source_is_newer_than_image(image_created, None));
+    }
+
+    #[test]
+    fn framework_child_artifact_dir_uses_dedicated_kubernetes_cache() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let manager_state_path = temp
+            .path()
+            .join("state")
+            .join("kind_local")
+            .join("manager-state.json");
+        fs::create_dir_all(manager_state_path.parent().expect("manager state parent"))
+            .expect("manager state dir should create");
+        fs::write(
+            &manager_state_path,
+            serde_json::to_vec(&json!({
+                "kind": "kubernetes",
+                "kubernetes_namespace": "amber-test",
+            }))
+            .expect("manager state should serialize"),
+        )
+        .expect("manager state should write");
+
+        let cache_dir = framework_child_kubernetes_cache_artifact_dir(temp.path(), "kind_local", 7);
+        fs::create_dir_all(&cache_dir).expect("kubernetes cache dir should exist");
+
+        let artifact_dir = framework_child_artifact_dir(temp.path(), "kind_local", 7);
+        assert_eq!(artifact_dir, cache_dir);
+        assert!(
+            !artifact_dir.starts_with(
+                temp.path()
+                    .join("state")
+                    .join("kind_local")
+                    .join("framework-component")
+                    .join("children")
+            ),
+            "kubernetes child artifact inspection should not reuse the authoritative host state \
+             path"
+        );
+    }
+
+    #[test]
+    fn framework_control_state_path_uses_dedicated_kubernetes_cache() {
+        let state_root = Path::new("/tmp/amber-run/state");
+        let manager_state = json!({
+            "kind": "kubernetes",
+            "kubernetes_namespace": "amber-test",
+        });
+
+        let state_path =
+            framework_site_control_state_path(state_root, "kind_local", &manager_state);
+        assert_eq!(
+            state_path,
+            framework_kubernetes_cache_control_state_path(state_root, "kind_local")
+        );
+        assert!(
+            !state_path.ends_with("site-controller-state.json")
+                || state_path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "framework-component-kubernetes-cache"),
+            "kubernetes framework control state should use the dedicated cache path, got {}",
+            state_path.display()
+        );
     }
 }

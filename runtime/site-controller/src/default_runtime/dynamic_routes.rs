@@ -459,7 +459,7 @@ pub(super) fn rewrite_dynamic_direct_inputs(
             matched = true;
             route.route_id = route_id.clone();
             route.protocol = protocol;
-            route.peer_addr = provider_runtime.host_mesh_addr.clone();
+            route.peer_addr = provider_runtime.component_reachable_mesh_addr.clone();
             route.peer_id = provider_runtime.mesh_config.identity.id.clone();
             route.capability = capability.clone();
             route.capability_kind = Some(input.capability_kind.clone());
@@ -1448,7 +1448,8 @@ mod direct_input_tests {
             "/provider".to_string(),
             LiveComponentRuntimeMetadata {
                 moniker: "/provider".to_string(),
-                host_mesh_addr: "10.0.0.20:24001".to_string(),
+                router_reachable_mesh_addr: "127.0.0.1:24001".to_string(),
+                component_reachable_mesh_addr: "10.0.0.20:24001".to_string(),
                 control_endpoint: None,
                 mesh_config: MeshConfigPublic {
                     identity: MeshIdentityPublic {

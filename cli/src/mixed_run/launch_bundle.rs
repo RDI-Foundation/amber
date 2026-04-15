@@ -301,6 +301,25 @@ pub(super) fn materialize_launch_bundle(
         )?;
         let local_router_control =
             site_controller_local_router_control(site.site_plan.site.kind, &site.artifact_dir);
+        let published_router_mesh_addr = planned_router_mesh_addrs.get(site_id).map(String::as_str);
+        let compose_consumer_router_mesh_addr = published_router_mesh_addr
+            .map(|addr| {
+                amber_site_controller::router_mesh_addr_for_consumer(
+                    site.site_plan.site.kind,
+                    SiteKind::Compose,
+                    addr,
+                )
+            })
+            .transpose()?;
+        let kubernetes_consumer_router_mesh_addr = published_router_mesh_addr
+            .map(|addr| {
+                amber_site_controller::router_mesh_addr_for_consumer(
+                    site.site_plan.site.kind,
+                    SiteKind::Kubernetes,
+                    addr,
+                )
+            })
+            .transpose()?;
 
         amber_site_controller::write_site_controller_plan(
             &site.controller_plan_path,
@@ -315,7 +334,9 @@ pub(super) fn materialize_launch_bundle(
             &peer_router_identities,
             &peer_router_mesh_addrs,
             Some(local_router_control.as_str()),
-            planned_router_mesh_addrs.get(site_id).map(String::as_str),
+            published_router_mesh_addr,
+            compose_consumer_router_mesh_addr.as_deref(),
+            kubernetes_consumer_router_mesh_addr.as_deref(),
             &site.controller_state_path,
             bundle_root,
             &state_root,
@@ -1081,7 +1102,6 @@ pub(crate) async fn run_run_plan_with_id(
     let mut launched_by_site = BTreeMap::<String, LaunchedSite>::new();
     let mut started_site_receipts = BTreeMap::<String, SiteReceipt>::new();
     let mut supervisor_children = BTreeMap::<String, SupervisorChild>::new();
-    let mut bridge_proxies = BTreeMap::<BridgeProxyKey, BridgeProxyHandle>::new();
     let test_wave_delay = test_wave_delay()?;
 
     let result = async {
@@ -1120,7 +1140,6 @@ pub(crate) async fn run_run_plan_with_id(
                     &launched_by_site,
                     &run_root,
                     &state_root,
-                    &mut bridge_proxies,
                 )
                 .await?;
 
@@ -1154,14 +1173,6 @@ pub(crate) async fn run_run_plan_with_id(
             source_plan_path: source_plan_path.map(|path| path.display().to_string()),
             run_root: run_root.display().to_string(),
             observability: observability_receipt.clone(),
-            bridge_proxies: bridge_proxies
-                .values()
-                .map(|proxy| BridgeProxyReceipt {
-                    export_name: proxy.export_name.clone(),
-                    pid: proxy.child.id(),
-                    listen: proxy.listen.to_string(),
-                })
-                .collect(),
             sites: launched_by_site
                 .into_iter()
                 .map(|(site_id, launched)| (site_id, launched.receipt))
@@ -1174,14 +1185,8 @@ pub(crate) async fn run_run_plan_with_id(
 
     if result.is_err() {
         let _ = write_stop_marker(&run_root);
-        for bridge in bridge_proxies.values_mut() {
-            send_sigterm(bridge.child.id());
-        }
         for supervisor in supervisor_children.values_mut() {
             send_sigterm(supervisor.child.id());
-        }
-        for bridge in bridge_proxies.values_mut() {
-            let _ = wait_for_child_exit(&mut bridge.child, PROCESS_SHUTDOWN_GRACE_PERIOD).await;
         }
         for supervisor in supervisor_children.values_mut() {
             let _ = wait_for_child_exit(&mut supervisor.child, PROCESS_SHUTDOWN_GRACE_PERIOD).await;
@@ -1218,6 +1223,12 @@ pub(crate) async fn run_run_plan_with_id(
                     context: receipt.context.clone(),
                     router_control: receipt.router_control.clone(),
                     router_mesh_addr: receipt.router_mesh_addr.clone(),
+                    compose_consumer_router_mesh_addr: receipt
+                        .compose_consumer_router_mesh_addr
+                        .clone(),
+                    kubernetes_consumer_router_mesh_addr: receipt
+                        .kubernetes_consumer_router_mesh_addr
+                        .clone(),
                     router_identity_id: receipt.router_identity_id.clone(),
                     router_public_key_b64: receipt.router_public_key_b64.clone(),
                     site_controller_pid: receipt.site_controller_pid,
@@ -1340,19 +1351,6 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
             "observability sink (pid {pid}) did not stop within {}s",
             PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
         ));
-    }
-    for proxy in &receipt.bridge_proxies {
-        send_sigterm(proxy.pid);
-    }
-    for proxy in &receipt.bridge_proxies {
-        if !wait_for_pid_exit(proxy.pid, PROCESS_SHUTDOWN_GRACE_PERIOD).await {
-            shutdown_failures.push(format!(
-                "bridge proxy `{}` (pid {}) did not stop within {}s",
-                proxy.export_name,
-                proxy.pid,
-                PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
-            ));
-        }
     }
 
     if !shutdown_failures.is_empty() {

@@ -636,23 +636,30 @@ pub(crate) async fn supervise_children(
     }
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) async fn terminate_children(children: &mut [ManagedChild]) {
+    let wrapper_pids = children
+        .iter()
+        .filter_map(|child| child.wrapper.as_ref().and_then(tokio::process::Child::id))
+        .collect::<Vec<_>>();
+    let _ =
+        crate::unix_process::terminate_process_roots(&wrapper_pids, DIRECT_SHUTDOWN_GRACE_PERIOD)
+            .await;
+    for child in children.iter_mut() {
+        if let Some(mut wrapper) = child.wrapper.take() {
+            let _ = wrapper.wait().await;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) async fn terminate_children(children: &mut [ManagedChild]) {
     for child in children.iter_mut() {
-        #[cfg(target_os = "linux")]
-        {
-            if linux_pid_is_alive(child.managed_pid) {
-                let _ = send_sigterm(child.managed_pid);
-            }
-            if child.wrapper_pid != child.managed_pid {
-                let _ = send_sigterm(child.wrapper_pid);
-            }
+        if linux_pid_is_alive(child.managed_pid) {
+            let _ = send_sigterm(child.managed_pid);
         }
-        #[cfg(not(target_os = "linux"))]
-        if let Some(wrapper) = child.wrapper.as_mut()
-            && wrapper.try_wait().ok().flatten().is_none()
-            && let Some(pid) = wrapper.id()
-        {
-            let _ = send_sigterm(pid);
+        if child.wrapper_pid != child.managed_pid {
+            let _ = send_sigterm(child.wrapper_pid);
         }
     }
 
@@ -660,26 +667,15 @@ pub(crate) async fn terminate_children(children: &mut [ManagedChild]) {
     loop {
         let mut all_exited = true;
         for child in children.iter_mut() {
-            #[cfg(target_os = "linux")]
             if let Some(wrapper) = child.wrapper.as_mut()
                 && wrapper.try_wait().ok().flatten().is_some()
             {
                 child.wrapper = None;
             }
-            #[cfg(target_os = "linux")]
             if linux_pid_is_alive(child.managed_pid) {
                 all_exited = false;
             }
-            #[cfg(target_os = "linux")]
             if child.wrapper.is_some() {
-                all_exited = false;
-            }
-            #[cfg(not(target_os = "linux"))]
-            if child
-                .wrapper
-                .as_mut()
-                .is_some_and(|wrapper| wrapper.try_wait().ok().flatten().is_none())
-            {
                 all_exited = false;
             }
         }
@@ -690,16 +686,23 @@ pub(crate) async fn terminate_children(children: &mut [ManagedChild]) {
     }
 
     for child in children.iter_mut() {
-        #[cfg(target_os = "linux")]
-        {
-            if linux_pid_is_alive(child.managed_pid) {
-                let _ = kill_pid_force(child.managed_pid);
-            }
-            if child.wrapper_pid != child.managed_pid {
-                let _ = kill_pid_force(child.wrapper_pid);
-            }
+        if linux_pid_is_alive(child.managed_pid) {
+            let _ = kill_pid_force(child.managed_pid);
         }
-        #[cfg(not(target_os = "linux"))]
+        if child.wrapper_pid != child.managed_pid {
+            let _ = kill_pid_force(child.wrapper_pid);
+        }
+    }
+    for child in children.iter_mut() {
+        if let Some(mut wrapper) = child.wrapper.take() {
+            let _ = wrapper.wait().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn terminate_children(children: &mut [ManagedChild]) {
+    for child in children.iter_mut() {
         if let Some(wrapper) = child.wrapper.as_mut()
             && wrapper.try_wait().ok().flatten().is_none()
         {
@@ -713,7 +716,7 @@ pub(crate) async fn terminate_children(children: &mut [ManagedChild]) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn send_sigterm(pid: u32) -> std::result::Result<(), ()> {
     let pid = i32::try_from(pid).map_err(|_| ())?;
     let rc = unsafe { libc::kill(pid, libc::SIGTERM) };

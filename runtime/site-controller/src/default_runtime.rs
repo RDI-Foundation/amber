@@ -36,7 +36,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest as _, Sha256};
 use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
     sync::Mutex as AsyncMutex,
     time::{Instant, sleep},
 };
@@ -67,11 +66,11 @@ pub use self::{
 };
 use self::{
     child_runtime::{
-        BridgeProxyHandle, BridgeProxyKey, DynamicComposeChildMetadata, SiteControllerRuntimeApp,
-        SiteControllerRuntimeChildRecord, SiteControllerRuntimeState, StoredRouteOverlayPayload,
-        dynamic_compose_child_metadata_path, dynamic_route_overlay_path,
-        load_dynamic_proxy_exports_metadata, site_controller_runtime_child_runtime_root,
-        site_controller_runtime_state_path, write_dynamic_route_overlay_payload,
+        DynamicComposeChildMetadata, SiteControllerRuntimeApp, SiteControllerRuntimeChildRecord,
+        SiteControllerRuntimeState, StoredRouteOverlayPayload, dynamic_compose_child_metadata_path,
+        dynamic_route_overlay_path, load_dynamic_proxy_exports_metadata,
+        site_controller_runtime_child_runtime_root, site_controller_runtime_state_path,
+        write_dynamic_route_overlay_payload,
     },
     dynamic_routes::*,
     site_runtime_support::*,
@@ -110,7 +109,6 @@ const DESIRED_LINKS_VERSION: u32 = 1;
 const DEFAULT_EXTERNAL_ENV_FILE: &str = "router-external.env";
 const DEFAULT_K8S_OTEL_UPSTREAM: &str = "http://host.docker.internal:18890";
 const CONTAINER_HOST_ALIAS: &str = "host.docker.internal";
-const PROCESS_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const KUBERNETES_WORKLOAD_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const KUBERNETES_SITE_READY_BUFFER: Duration = Duration::from_secs(30);
 const COMPOSE_EGRESS_SUBNET_COUNT: u32 = 1 << 18;
@@ -151,6 +149,10 @@ struct SiteManagerState {
     router_control: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     router_mesh_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compose_consumer_router_mesh_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kubernetes_consumer_router_mesh_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     router_identity_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1115,10 +1117,10 @@ async fn wait_for_kubernetes_site_router_ready(
 ) -> Result<()> {
     debug_assert_eq!(plan.kind, SiteKind::Kubernetes);
 
-    let state_path = Path::new(&plan.site_state_root).join("manager-state.json");
     let deadline = Instant::now() + timeout;
     loop {
-        if state_path.is_file() {
+        let state_path = Path::new(&plan.site_state_root).join("manager-state.json");
+        let manager_state = if state_path.is_file() {
             let state: SiteManagerState = read_json(&state_path, "site manager state")?;
             if matches!(state.status, SiteLifecycleStatus::Failed) {
                 return Err(miette::miette!(
@@ -1129,35 +1131,18 @@ async fn wait_for_kubernetes_site_router_ready(
                         .unwrap_or_else(|| "unknown failure".to_string())
                 ));
             }
-            if matches!(state.status, SiteLifecycleStatus::Running)
-                && let (Some(control), Some(mesh_addr)) = (
-                    state.router_control.as_deref(),
-                    state.router_mesh_addr.as_deref(),
-                )
-            {
-                let control_addr: SocketAddr =
-                    control.parse().into_diagnostic().wrap_err_with(|| {
-                        format!("invalid kubernetes router control addr `{control}`")
-                    })?;
-                let mesh_addr: SocketAddr =
-                    mesh_addr.parse().into_diagnostic().wrap_err_with(|| {
-                        format!("invalid kubernetes router mesh addr `{mesh_addr}`")
-                    })?;
-                if probe_kubernetes_router_identity(control_addr, Duration::from_millis(250))
-                    .await?
-                    && router_mesh_listener_ready(mesh_addr).await
-                {
-                    return Ok(());
-                }
-            }
-        } else if let Some(control_target) = plan.local_router_control.as_deref() {
-            let mesh_target = kubernetes_local_router_mesh_target(plan)?;
-            if probe_kubernetes_router_identity_target(control_target, Duration::from_millis(250))
+            Some(state)
+        } else {
+            None
+        };
+
+        if let Some((control_target, mesh_target)) =
+            kubernetes_router_ready_targets(plan, manager_state.as_ref())?
+            && probe_kubernetes_router_control_ready(&control_target, Duration::from_millis(250))
                 .await?
-                && router_mesh_listener_ready_target(&mesh_target).await
-            {
-                return Ok(());
-            }
+            && router_mesh_listener_ready_target(&mesh_target).await
+        {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(miette::miette!(
@@ -1167,6 +1152,40 @@ async fn wait_for_kubernetes_site_router_ready(
         }
         sleep(Duration::from_millis(200)).await;
     }
+}
+
+fn kubernetes_router_ready_targets(
+    plan: &SiteControllerRuntimePlan,
+    manager_state: Option<&SiteManagerState>,
+) -> Result<Option<(String, String)>> {
+    if let Some(control_target) = plan.local_router_control.as_deref() {
+        return Ok(Some((
+            control_target.to_string(),
+            kubernetes_local_router_mesh_target(plan)?,
+        )));
+    }
+
+    let Some(state) = manager_state else {
+        return Ok(None);
+    };
+    if !matches!(state.status, SiteLifecycleStatus::Running) {
+        return Ok(None);
+    }
+    let (Some(control), Some(mesh_addr)) = (
+        state.router_control.as_deref(),
+        state.router_mesh_addr.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let control_addr: SocketAddr = control
+        .parse()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid kubernetes router control addr `{control}`"))?;
+    let mesh_addr: SocketAddr = mesh_addr
+        .parse()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid kubernetes router mesh addr `{mesh_addr}`"))?;
+    Ok(Some((control_addr.to_string(), mesh_addr.to_string())))
 }
 
 fn kubernetes_local_router_mesh_target(plan: &SiteControllerRuntimePlan) -> Result<String> {
@@ -1195,128 +1214,26 @@ async fn router_mesh_listener_ready_target(target: &str) -> bool {
     tokio::net::TcpStream::connect(target).await.is_ok()
 }
 
-async fn probe_kubernetes_router_identity(addr: SocketAddr, timeout: Duration) -> Result<bool> {
-    probe_kubernetes_router_identity_target(&addr.to_string(), timeout).await
-}
-
-async fn probe_kubernetes_router_identity_target(target: &str, timeout: Duration) -> Result<bool> {
-    let mut stream =
-        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(target)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err))
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::NotConnected
-                ) =>
-            {
-                return Ok(false);
-            }
-            Ok(Err(err)) => {
-                return Err(miette::miette!(
-                    "failed to connect to kubernetes router control at {target}: {err}"
-                ));
-            }
-            Err(_) => return Ok(false),
-        };
-
-    let request = b"GET /identity HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    match tokio::time::timeout(timeout, stream.write_all(request)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err))
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::NotConnected
-            ) =>
-        {
-            return Ok(false);
-        }
-        Ok(Err(err)) => {
+async fn probe_kubernetes_router_control_ready(target: &str, timeout: Duration) -> Result<bool> {
+    let url = format!("http://{target}/identity");
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .into_diagnostic()
+        .wrap_err("failed to build kubernetes router readiness client")?;
+    let response = match client.get(&url).send().await {
+        Ok(response) => response,
+        Err(err) if err.is_connect() || err.is_timeout() => return Ok(false),
+        Err(err) => {
             return Err(miette::miette!(
-                "failed to write kubernetes router identity probe to {target}: {err}"
+                "failed to probe kubernetes router control at {target}: {err}"
             ));
         }
-        Err(_) => return Ok(false),
-    }
-
-    let deadline = Instant::now() + timeout;
-    let mut buf = Vec::new();
-    loop {
-        if let Some(end) = find_header_end(&buf)
-            && let Some(content_length) = router_identity_probe_content_length(&buf[..end])?
-        {
-            let body_len = buf.len().saturating_sub(end + 4);
-            if body_len >= content_length {
-                return parse_router_identity_probe_response(&buf, end);
-            }
-        }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Ok(false);
-        };
-        let mut chunk = [0u8; 1024];
-        match tokio::time::timeout(remaining, stream.read(&mut chunk)).await {
-            Ok(Ok(0)) => return Ok(false),
-            Ok(Ok(read)) => buf.extend_from_slice(&chunk[..read]),
-            Ok(Err(err))
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::NotConnected
-                ) =>
-            {
-                return Ok(false);
-            }
-            Ok(Err(err)) => {
-                return Err(miette::miette!(
-                    "failed to read kubernetes router identity probe from {target}: {err}"
-                ));
-            }
-            Err(_) => return Ok(false),
-        }
-    }
-}
-
-fn router_identity_probe_content_length(header: &[u8]) -> Result<Option<usize>> {
-    let header = std::str::from_utf8(header)
-        .into_diagnostic()
-        .wrap_err("router identity probe returned a non-UTF-8 HTTP header")?;
-    Ok(header.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("content-length")
-            .then_some(value.trim())
-            .and_then(|value| value.parse::<usize>().ok())
-    }))
-}
-
-fn parse_router_identity_probe_response(buf: &[u8], header_end: usize) -> Result<bool> {
-    let header = std::str::from_utf8(&buf[..header_end])
-        .into_diagnostic()
-        .wrap_err("router identity probe returned a non-UTF-8 HTTP header")?;
-    let status = header
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok());
-    if status != Some(200) {
+    };
+    if !response.status().is_success() {
         return Ok(false);
     }
-    let body = std::str::from_utf8(&buf[header_end + 4..])
-        .into_diagnostic()
-        .wrap_err("router identity probe returned a non-UTF-8 body")?;
-    Ok(serde_json::from_str::<MeshIdentityPublic>(body.trim()).is_ok())
+    Ok(response.json::<MeshIdentityPublic>().await.is_ok())
 }
 
 fn filter_direct_stage_plan(artifact_root: &Path, component_ids: &[usize]) -> Result<()> {
@@ -1901,4 +1818,128 @@ fn terminate_detached_runtime(root_pid: u32, timeout: Duration) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kubernetes_router_ready_prefers_local_targets_over_manager_state() {
+        let plan = SiteControllerRuntimePlan {
+            schema: "amber.run.site_controller_runtime_plan".to_string(),
+            version: 1,
+            run_id: "run".to_string(),
+            mesh_scope: "scope".to_string(),
+            run_root: "/tmp/run".to_string(),
+            site_id: "kind_local".to_string(),
+            kind: SiteKind::Kubernetes,
+            router_identity_id: "/site/test/router".to_string(),
+            local_router_control: Some("amber-router:24100".to_string()),
+            artifact_dir: "/tmp/artifact".to_string(),
+            site_state_root: "/tmp/state".to_string(),
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 4100)),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: Some(24000),
+            compose_project: None,
+            kubernetes_namespace: Some("ns".to_string()),
+            context: None,
+            observability_endpoint: None,
+            launch_env: BTreeMap::new(),
+        };
+        let stale_manager_state = SiteManagerState {
+            schema: SITE_PLAN_SCHEMA.to_string(),
+            version: SITE_PLAN_VERSION,
+            run_id: "run".to_string(),
+            site_id: "kind_local".to_string(),
+            kind: SiteKind::Kubernetes,
+            status: SiteLifecycleStatus::Running,
+            artifact_dir: "/tmp/artifact".to_string(),
+            supervisor_pid: 1,
+            process_pid: None,
+            compose_project: None,
+            kubernetes_namespace: Some("ns".to_string()),
+            port_forward_pid: None,
+            context: None,
+            router_control: Some("127.0.0.1:9".to_string()),
+            router_mesh_addr: Some("127.0.0.1:9".to_string()),
+            compose_consumer_router_mesh_addr: None,
+            kubernetes_consumer_router_mesh_addr: None,
+            router_identity_id: None,
+            router_public_key_b64: None,
+            site_controller_pid: None,
+            site_controller_url: None,
+            last_error: None,
+        };
+
+        assert_eq!(
+            kubernetes_router_ready_targets(&plan, Some(&stale_manager_state))
+                .expect("targets should resolve"),
+            Some((
+                "amber-router:24100".to_string(),
+                "amber-router:24000".to_string()
+            )),
+            "embedded kubernetes controllers must prefer their local router service over stale \
+             manager-state loopback endpoints",
+        );
+    }
+
+    #[test]
+    fn kubernetes_router_ready_falls_back_to_manager_state_when_local_target_is_absent() {
+        let plan = SiteControllerRuntimePlan {
+            schema: "amber.run.site_controller_runtime_plan".to_string(),
+            version: 1,
+            run_id: "run".to_string(),
+            mesh_scope: "scope".to_string(),
+            run_root: "/tmp/run".to_string(),
+            site_id: "kind_local".to_string(),
+            kind: SiteKind::Kubernetes,
+            router_identity_id: "/site/test/router".to_string(),
+            local_router_control: None,
+            artifact_dir: "/tmp/artifact".to_string(),
+            site_state_root: "/tmp/state".to_string(),
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 4100)),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: Some(24000),
+            compose_project: None,
+            kubernetes_namespace: Some("ns".to_string()),
+            context: None,
+            observability_endpoint: None,
+            launch_env: BTreeMap::new(),
+        };
+        let manager_state = SiteManagerState {
+            schema: SITE_PLAN_SCHEMA.to_string(),
+            version: SITE_PLAN_VERSION,
+            run_id: "run".to_string(),
+            site_id: "kind_local".to_string(),
+            kind: SiteKind::Kubernetes,
+            status: SiteLifecycleStatus::Running,
+            artifact_dir: "/tmp/artifact".to_string(),
+            supervisor_pid: 1,
+            process_pid: None,
+            compose_project: None,
+            kubernetes_namespace: Some("ns".to_string()),
+            port_forward_pid: None,
+            context: None,
+            router_control: Some("127.0.0.1:24100".to_string()),
+            router_mesh_addr: Some("127.0.0.1:24000".to_string()),
+            compose_consumer_router_mesh_addr: None,
+            kubernetes_consumer_router_mesh_addr: None,
+            router_identity_id: None,
+            router_public_key_b64: None,
+            site_controller_pid: None,
+            site_controller_url: None,
+            last_error: None,
+        };
+
+        assert_eq!(
+            kubernetes_router_ready_targets(&plan, Some(&manager_state))
+                .expect("targets should resolve"),
+            Some(("127.0.0.1:24100".to_string(), "127.0.0.1:24000".to_string())),
+            "host-supervised kubernetes sites should still fall back to manager-state endpoints \
+             when no embedded local router target is available",
+        );
+    }
 }

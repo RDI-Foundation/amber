@@ -348,6 +348,13 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
         "{yaml}"
     );
     assert!(
+        sidecar
+            .extra_hosts
+            .iter()
+            .any(|entry| entry == super::HOST_GATEWAY_ENTRY),
+        "{yaml}"
+    );
+    assert!(
         !sidecar.networks.contains_key(super::BOUNDARY_NETWORK_NAME),
         "{yaml}"
     );

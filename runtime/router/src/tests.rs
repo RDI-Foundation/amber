@@ -2282,6 +2282,215 @@ async fn outbound_http_proxy_overwrites_internal_framework_auth_headers() {
 }
 
 #[tokio::test]
+async fn outbound_http_proxy_keeps_ephemeral_upstream_alive_for_response_body() {
+    let (upstream_client, upstream_server) = duplex(64 * 1024);
+    let upstream_task = tokio::spawn(async move {
+        let service = service_fn(|_req: Request<Incoming>| async move {
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(
+                        Full::new(Bytes::from_static(b"a"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .expect("upstream response should build"),
+            )
+        });
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(upstream_server), service)
+            .await
+            .expect("upstream server should complete");
+    });
+
+    let (sender, conn) = client_http1::handshake(TokioIo::new(upstream_client))
+        .await
+        .expect("upstream handshake should succeed");
+    let upstream_conn_task = tokio::spawn(async move {
+        conn.await.expect("upstream connection should complete");
+    });
+
+    let state_slot = Arc::new(Mutex::new(Some(OutboundHttpProxyState {
+        upstream: Arc::new(Mutex::new(sender)),
+        plugins: Arc::from(Vec::<Arc<dyn HttpExchangePlugin>>::new()),
+        route_id: Arc::<str>::from("dynamic-handle-route"),
+        peer_id: Arc::<str>::from("/component/dynamic"),
+        labels: test_http_exchange_labels(),
+        dynamic_caps: None,
+    })));
+
+    let (proxy_client, proxy_server) = duplex(64 * 1024);
+    let proxy_task = tokio::spawn(async move {
+        let service = service_fn(move |req: Request<Incoming>| {
+            let state_slot = state_slot.clone();
+            async move {
+                let state = state_slot
+                    .lock()
+                    .await
+                    .take()
+                    .expect("proxy should only serve one request");
+                Ok::<_, std::convert::Infallible>(proxy_outbound_http_request(state, req).await)
+            }
+        });
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(proxy_server), service)
+            .await
+            .expect("proxy server should complete");
+    });
+
+    let (mut client, conn) = client_http1::handshake(TokioIo::new(proxy_client))
+        .await
+        .expect("proxy handshake should succeed");
+    let proxy_conn_task = tokio::spawn(async move {
+        conn.await.expect("proxy connection should complete");
+    });
+
+    let response = client
+        .send_request(
+            Request::builder()
+                .uri("/id")
+                .body(empty_box_body())
+                .expect("request should build"),
+        )
+        .await
+        .expect("proxy request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body should collect")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"a");
+    drop(client);
+
+    proxy_task.await.expect("proxy task should join");
+    proxy_conn_task
+        .await
+        .expect("proxy connection task should join");
+    upstream_task.await.expect("upstream task should join");
+    upstream_conn_task
+        .await
+        .expect("upstream connection task should join");
+}
+
+#[tokio::test]
+async fn proxy_noise_to_plain_preserves_connection_close_response_body() {
+    let client_config = test_mesh_config();
+    let server_identity = MeshIdentity::generate("provider-router", Some("test-scope".to_string()));
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("mesh listener should bind");
+    let addr = listener.local_addr().expect("mesh listener addr");
+    let server_config = MeshConfig {
+        identity: server_identity.clone(),
+        peers: vec![MeshPeer {
+            id: client_config.identity.id.clone(),
+            public_key: client_config.identity.public_key,
+        }],
+        ..test_mesh_config()
+    };
+    let trust = Arc::new(TrustBundle::new(&server_config).expect("mesh server trust"));
+    let noise_keys = noise_keys_for_identity(&server_config.identity).expect("noise keys");
+
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("mesh peer should accept");
+        let mut session = accept_noise(stream, &noise_keys, trust.as_ref())
+            .await
+            .expect("mesh peer should accept noise");
+        let open = session.recv_open().await.expect("open frame");
+        assert_eq!(open.capability, "provider.api");
+
+        let (local, remote) = duplex(64 * 1024);
+        let bridge = tokio::spawn(async move { proxy_noise_to_plain(&mut session, local).await });
+        let service = service_fn(|req: Request<Incoming>| async move {
+            assert_eq!(req.uri().path(), "/id");
+            assert_eq!(
+                req.headers()
+                    .get(header::CONNECTION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("close"),
+            );
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(
+                        Full::new(Bytes::from_static(b"provider"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .expect("mesh response should build"),
+            )
+        });
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(remote), service)
+            .await
+            .expect("mesh http server should complete");
+        bridge
+            .await
+            .expect("mesh bridge task should complete")
+            .expect("mesh bridge should succeed");
+    });
+
+    let mut outbound = connect_noise_with_key(
+        &addr.to_string(),
+        &server_identity.id,
+        server_identity.public_key,
+        &client_config,
+    )
+    .await
+    .expect("mesh client should connect");
+    outbound
+        .send_open(&OpenFrame {
+            route_id: "dynamic-handle-route".to_string(),
+            capability: "provider.api".to_string(),
+            protocol: MeshProtocol::Http,
+            slot: None,
+            capability_kind: None,
+            capability_profile: None,
+        })
+        .await
+        .expect("open frame should send");
+
+    let (local, remote) = duplex(64 * 1024);
+    let client_bridge =
+        tokio::spawn(async move { proxy_noise_to_plain(&mut outbound, remote).await });
+    let (mut sender, conn) = client_http1::handshake(TokioIo::new(local))
+        .await
+        .expect("client handshake should succeed");
+    let conn_task = tokio::spawn(async move {
+        conn.await.expect("client connection should complete");
+    });
+
+    let response = sender
+        .send_request(
+            Request::builder()
+                .uri("/id")
+                .header(header::CONNECTION, "close")
+                .body(empty_box_body())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should arrive");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body should collect")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"provider");
+    drop(sender);
+
+    conn_task.await.expect("client connection task should join");
+    client_bridge
+        .await
+        .expect("client bridge task should complete")
+        .expect("client bridge should succeed");
+    server_task.await.expect("server task should join");
+}
+
+#[tokio::test]
 async fn framework_external_proxy_preserves_forwarded_internal_auth_headers() {
     let captured = Arc::new(StdMutex::new(None::<(String, String)>));
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))

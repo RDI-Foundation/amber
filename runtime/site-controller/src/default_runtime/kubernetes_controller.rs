@@ -35,6 +35,13 @@ const KUBERNETES_CONTROLLER_STATE_PATH: &str = "/amber/site/state/site-controlle
 const KUBERNETES_CONTROLLER_DESIRED_LINKS_PATH: &str = "/amber/site/state/desired-links.json";
 const KUBERNETES_CONTROLLER_SEED_ROOT: &str = "/amber/seed";
 
+fn kubernetes_env_entries(plan: &SiteControllerPlan) -> Vec<serde_json::Value> {
+    plan.launch_env
+        .iter()
+        .map(|(name, value)| json!({ "name": name, "value": value }))
+        .collect()
+}
+
 pub fn inject_kubernetes_site_controller(
     artifact_root: &Path,
     plan: &SiteControllerPlan,
@@ -45,6 +52,7 @@ pub fn inject_kubernetes_site_controller(
         build_kubernetes_controller_seed_configmap(artifact_root, plan, &embedded_plan)?;
     let labels = kubernetes_controller_labels();
     let selector = kubernetes_controller_selector();
+    let controller_env = kubernetes_env_entries(plan);
 
     write_yaml_artifact(
         artifact_root.join(KUBERNETES_CONTROLLER_SEED_CONFIGMAP_PATH),
@@ -148,7 +156,7 @@ pub fn inject_kubernetes_site_controller(
                         "automountServiceAccountToken": true,
                         "initContainers": [{
                             "name": "seed-site-controller",
-                            "image": "busybox:1.36.1",
+                            "image": controller_image,
                             "command": [
                                 "sh",
                                 "-lc",
@@ -181,6 +189,7 @@ pub fn inject_kubernetes_site_controller(
                             "name": SITE_CONTROLLER_SERVICE_NAME,
                             "image": controller_image,
                             "args": ["--plan", KUBERNETES_CONTROLLER_PLAN_PATH],
+                            "env": controller_env,
                             "ports": [{
                                 "name": "http",
                                 "containerPort": SITE_CONTROLLER_PORT,
@@ -558,4 +567,122 @@ fn write_yaml_artifact(path: PathBuf, value: &serde_json::Value) -> Result<()> {
     file.write_all(rendered.as_bytes())
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, net::SocketAddr};
+
+    use amber_compiler::run_plan::SiteKind;
+
+    use super::*;
+
+    fn test_plan(root: &Path) -> SiteControllerPlan {
+        SiteControllerPlan {
+            schema: "amber.framework_component.site_controller_plan".to_string(),
+            version: 1,
+            run_id: "run-test".to_string(),
+            mesh_scope: "scope".to_string(),
+            site_id: "kind_local".to_string(),
+            kind: SiteKind::Kubernetes,
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 4100)),
+            authority_url: "http://amber-site-controller:4100".to_string(),
+            router_identity_id: "/site/kind_local/router".to_string(),
+            peer_site_router_urls: BTreeMap::new(),
+            peer_router_identities: BTreeMap::new(),
+            peer_router_mesh_addrs: BTreeMap::new(),
+            local_router_control: Some("amber-router:24100".to_string()),
+            published_router_mesh_addr: Some("127.0.0.1:24000".to_string()),
+            compose_consumer_router_mesh_addr: Some("host.docker.internal:24000".to_string()),
+            kubernetes_consumer_router_mesh_addr: Some("192.168.65.254:24000".to_string()),
+            state_path: root.join("state.json").display().to_string(),
+            run_root: root.join("run").display().to_string(),
+            state_root: root.join("state-root").display().to_string(),
+            site_state_root: root.join("site-state").display().to_string(),
+            artifact_dir: root.join("artifact").display().to_string(),
+            auth_token: "token".to_string(),
+            dynamic_caps_token_verify_key_b64: "verify".to_string(),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: Some(24000),
+            compose_project: None,
+            kubernetes_namespace: Some("test-ns".to_string()),
+            context: Some("test-context".to_string()),
+            observability_endpoint: None,
+            launch_env: BTreeMap::from([(
+                "AMBER_DEV_IMAGE_TAGS".to_string(),
+                "router=dev-tag,helper=dev-tag".to_string(),
+            )]),
+        }
+    }
+
+    #[test]
+    fn inject_kubernetes_site_controller_propagates_launch_env() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let artifact_root = temp.path();
+        fs::create_dir_all(artifact_root.join("04-services")).expect("services dir");
+        fs::create_dir_all(artifact_root.join("05-networkpolicies")).expect("netpol dir");
+        fs::write(
+            artifact_root.join("kustomization.yaml"),
+            "resources:\n  - 04-services/amber-router.yaml\n  - \
+             05-networkpolicies/amber-router-netpol.yaml\n",
+        )
+        .expect("kustomization should write");
+        fs::write(
+            artifact_root.join(KUBERNETES_ROUTER_SERVICE_PATH),
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: amber-router\nspec:\n  ports:\n    \
+             - name: mesh\n      port: 24000\n      targetPort: 24000\n      protocol: TCP\n",
+        )
+        .expect("router service should write");
+        fs::write(
+            artifact_root.join(KUBERNETES_ROUTER_NETPOL_PATH),
+            "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: \
+             amber-router-netpol\nspec:\n  ingress: []\n",
+        )
+        .expect("router netpol should write");
+
+        let plan = test_plan(artifact_root);
+        fs::write(&plan.state_path, "{}").expect("state should write");
+        fs::create_dir_all(&plan.site_state_root).expect("site state dir");
+        fs::write(
+            super::desired_links_path(Path::new(&plan.site_state_root)),
+            "{}",
+        )
+        .expect("desired links should write");
+
+        inject_kubernetes_site_controller(
+            artifact_root,
+            &plan,
+            "ghcr.io/rdi-foundation/amber-site-controller:test",
+        )
+        .expect("kubernetes site controller injection should succeed");
+
+        let deployment_raw =
+            fs::read_to_string(artifact_root.join(KUBERNETES_CONTROLLER_DEPLOYMENT_PATH))
+                .expect("controller deployment should exist");
+        let deployment: serde_yaml::Value =
+            serde_yaml::from_str(&deployment_raw).expect("deployment yaml should parse");
+        let env = deployment
+            .as_mapping()
+            .and_then(|root| root.get(yaml_string("spec")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|spec| spec.get(yaml_string("template")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|template| template.get(yaml_string("spec")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|spec| spec.get(yaml_string("containers")))
+            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(|containers| containers.first())
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|container| container.get(yaml_string("env")))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("controller container should include env");
+        assert!(env.iter().any(|entry| {
+            entry.as_mapping().is_some_and(|mapping| {
+                mapping.get(yaml_string("name")) == Some(&yaml_string("AMBER_DEV_IMAGE_TAGS"))
+                    && mapping.get(yaml_string("value"))
+                        == Some(&yaml_string("router=dev-tag,helper=dev-tag"))
+            })
+        }));
+    }
 }

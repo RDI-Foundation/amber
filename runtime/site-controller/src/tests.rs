@@ -1,3 +1,5 @@
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::os::unix::fs::MetadataExt;
 use std::{
     fs,
     future::Future,
@@ -162,7 +164,8 @@ impl SiteControllerRuntime for TestSiteControllerRuntime {
                 moniker.to_string(),
                 LiveComponentRuntimeMetadata {
                     moniker: moniker.to_string(),
-                    host_mesh_addr: format!("127.0.0.1:{port}"),
+                    router_reachable_mesh_addr: format!("127.0.0.1:{port}"),
+                    component_reachable_mesh_addr: format!("127.0.0.1:{port}"),
                     control_endpoint: None,
                     mesh_config,
                 },
@@ -1242,13 +1245,15 @@ async fn compile_dynamic_caps_binding_state() -> FrameworkControlState {
 fn test_live_component_runtime(
     moniker: &str,
     peer_id: &str,
-    host_mesh_addr: &str,
+    router_reachable_mesh_addr: &str,
+    component_reachable_mesh_addr: &str,
     inbound: Vec<InboundRoute>,
     outbound: Vec<OutboundRoute>,
 ) -> LiveComponentRuntimeMetadata {
     LiveComponentRuntimeMetadata {
         moniker: moniker.to_string(),
-        host_mesh_addr: host_mesh_addr.to_string(),
+        router_reachable_mesh_addr: router_reachable_mesh_addr.to_string(),
+        component_reachable_mesh_addr: component_reachable_mesh_addr.to_string(),
         control_endpoint: None,
         mesh_config: MeshConfigPublic {
             identity: MeshIdentityPublic {
@@ -1287,11 +1292,12 @@ fn test_live_site_router(inbound: Vec<InboundRoute>) -> MeshConfigPublic {
 }
 
 #[test]
-fn dynamic_capability_origin_self_provide_routes_via_component_mesh() {
+fn dynamic_capability_origin_self_provide_routes_via_router_reachable_mesh() {
     let runtime = test_live_component_runtime(
         "/provider",
         "/provider",
         "127.0.0.1:24001",
+        "10.0.2.2:24001",
         vec![InboundRoute {
             route_id: "provider-route".to_string(),
             capability: "provider.api".to_string(),
@@ -1304,14 +1310,13 @@ fn dynamic_capability_origin_self_provide_routes_via_component_mesh() {
         }],
         Vec::new(),
     );
-    let site_components = BTreeMap::from([(runtime.moniker.clone(), runtime.clone())]);
     let site_router = test_live_site_router(Vec::new());
+    let site_components = BTreeMap::new();
 
     let (route, capability, protocol) = dynamic_capability_origin_route_surface(
         &runtime,
         &site_components,
         &site_router,
-        SiteKind::Direct,
         "dynamic-origin",
         &RootAuthoritySelectorIr::SelfProvide {
             component_id: "/provider".to_string(),
@@ -1343,6 +1348,7 @@ fn dynamic_capability_origin_binding_routes_same_site_provider_via_mesh() {
         "/consumer",
         "/consumer",
         "127.0.0.1:24002",
+        "10.0.2.2:24002",
         Vec::new(),
         vec![OutboundRoute {
             route_id: "provider-route".to_string(),
@@ -1362,21 +1368,18 @@ fn dynamic_capability_origin_binding_routes_same_site_provider_via_mesh() {
     let provider_runtime = test_live_component_runtime(
         "/provider",
         "/provider",
-        "127.0.0.1:24001",
+        "127.0.0.1:24099",
+        "10.0.2.2:24099",
         Vec::new(),
         Vec::new(),
     );
-    let site_components = BTreeMap::from([
-        (holder_runtime.moniker.clone(), holder_runtime.clone()),
-        (provider_runtime.moniker.clone(), provider_runtime.clone()),
-    ]);
     let site_router = test_live_site_router(Vec::new());
+    let site_components = BTreeMap::from([(provider_runtime.moniker.clone(), provider_runtime)]);
 
     let (route, capability, protocol) = dynamic_capability_origin_route_surface(
         &holder_runtime,
         &site_components,
         &site_router,
-        SiteKind::Direct,
         "dynamic-origin",
         &RootAuthoritySelectorIr::Binding {
             consumer_component_id: "components./consumer".to_string(),
@@ -1393,7 +1396,7 @@ fn dynamic_capability_origin_binding_routes_same_site_provider_via_mesh() {
     assert_eq!(
         route.target,
         InboundTarget::MeshForward {
-            peer_addr: "127.0.0.1:24001".to_string(),
+            peer_addr: "127.0.0.1:24099".to_string(),
             peer_id: "/provider".to_string(),
             route_id: "provider-route".to_string(),
             capability: "provider.api".to_string(),
@@ -1407,6 +1410,7 @@ fn dynamic_capability_origin_external_slot_routes_via_router_external_target() {
         "/consumer",
         "/consumer",
         "127.0.0.1:24002",
+        "10.0.2.2:24002",
         Vec::new(),
         vec![OutboundRoute {
             route_id: "router:external:catalog_api:http".to_string(),
@@ -1423,7 +1427,6 @@ fn dynamic_capability_origin_external_slot_routes_via_router_external_target() {
             capability: "catalog_api".to_string(),
         }],
     );
-    let site_components = BTreeMap::from([(runtime.moniker.clone(), runtime.clone())]);
     let site_router = test_live_site_router(vec![InboundRoute {
         route_id: "router:external:catalog_api:http".to_string(),
         capability: "catalog_api".to_string(),
@@ -1437,12 +1440,12 @@ fn dynamic_capability_origin_external_slot_routes_via_router_external_target() {
         },
         allowed_issuers: vec!["/consumer".to_string()],
     }]);
+    let site_components = BTreeMap::new();
 
     let (route, capability, protocol) = dynamic_capability_origin_route_surface(
         &runtime,
         &site_components,
         &site_router,
-        SiteKind::Direct,
         "dynamic-origin",
         &RootAuthoritySelectorIr::ExternalSlotBinding {
             consumer_component_id: "components./consumer".to_string(),
@@ -1468,61 +1471,12 @@ fn dynamic_capability_origin_external_slot_routes_via_router_external_target() {
 }
 
 #[test]
-fn dynamic_capability_origin_binding_rewrites_linux_slirp_peer_addr_for_host_router() {
-    let runtime = test_live_component_runtime(
-        "/consumer",
-        "/consumer",
-        "127.0.0.1:24002",
-        Vec::new(),
-        vec![OutboundRoute {
-            route_id: "remote-route".to_string(),
-            rewrite_route_id: None,
-            slot: "provider".to_string(),
-            capability_kind: Some("http".to_string()),
-            capability_profile: None,
-            listen_port: 20000,
-            listen_addr: None,
-            protocol: MeshProtocol::Http,
-            http_plugins: Vec::new(),
-            peer_addr: "10.0.2.2:24077".to_string(),
-            peer_id: "/remote".to_string(),
-            capability: "provider.api".to_string(),
-        }],
-    );
-    let site_components = BTreeMap::from([(runtime.moniker.clone(), runtime.clone())]);
-    let site_router = test_live_site_router(Vec::new());
-
-    let (route, _, _) = dynamic_capability_origin_route_surface(
-        &runtime,
-        &site_components,
-        &site_router,
-        SiteKind::Direct,
-        "dynamic-origin",
-        &RootAuthoritySelectorIr::Binding {
-            consumer_component_id: "components./consumer".to_string(),
-            slot_name: "provider".to_string(),
-            provider_component_id: "components./remote".to_string(),
-            provider_capability_name: "provider.api".to_string(),
-        },
-        vec!["peer-consumer".to_string()],
-    )
-    .expect("binding origin surface should resolve");
-
-    let InboundTarget::MeshForward { peer_addr, .. } = route.target else {
-        panic!("dynamic origin route should forward through mesh");
-    };
-    #[cfg(target_os = "linux")]
-    assert_eq!(peer_addr, "127.0.0.1:24077");
-    #[cfg(not(target_os = "linux"))]
-    assert_eq!(peer_addr, "10.0.2.2:24077");
-}
-
-#[test]
 fn dynamic_capability_origin_target_mesh_peer_uses_self_identity_for_self_provide() {
     let runtime = test_live_component_runtime(
         "/provider",
         "/provider",
         "127.0.0.1:24001",
+        "10.0.2.2:24001",
         vec![InboundRoute {
             route_id: "provider-route".to_string(),
             capability: "provider.api".to_string(),
@@ -1541,7 +1495,6 @@ fn dynamic_capability_origin_target_mesh_peer_uses_self_identity_for_self_provid
         &runtime,
         &site_components,
         &site_router,
-        SiteKind::Direct,
         "dynamic-origin",
         &RootAuthoritySelectorIr::SelfProvide {
             component_id: "/provider".to_string(),
@@ -1568,7 +1521,8 @@ fn dynamic_capability_origin_target_mesh_peer_uses_runtime_peer_catalog_for_bind
     };
     let runtime = LiveComponentRuntimeMetadata {
         moniker: "/consumer".to_string(),
-        host_mesh_addr: "127.0.0.1:24002".to_string(),
+        router_reachable_mesh_addr: "127.0.0.1:24002".to_string(),
+        component_reachable_mesh_addr: "127.0.0.1:24002".to_string(),
         control_endpoint: None,
         mesh_config: MeshConfigPublic {
             identity: MeshIdentityPublic {
@@ -1608,7 +1562,6 @@ fn dynamic_capability_origin_target_mesh_peer_uses_runtime_peer_catalog_for_bind
         &runtime,
         &site_components,
         &site_router,
-        SiteKind::Direct,
         "dynamic-origin",
         &RootAuthoritySelectorIr::Binding {
             consumer_component_id: "components./consumer".to_string(),
@@ -2609,6 +2562,8 @@ fn test_control_state_app(
             peer_router_mesh_addrs: BTreeMap::new(),
             local_router_control: None,
             published_router_mesh_addr: Some("127.0.0.1:24000".to_string()),
+            compose_consumer_router_mesh_addr: Some("host.docker.internal:24000".to_string()),
+            kubernetes_consumer_router_mesh_addr: Some("192.168.65.254:24000".to_string()),
             state_path: state_path.display().to_string(),
             run_root: run_root.display().to_string(),
             state_root: state_root.display().to_string(),
@@ -4073,6 +4028,7 @@ async fn install_dynamic_caps_origin_fixture(app: &ControlStateApp) -> tokio::ta
             "/provider",
             "/provider",
             "127.0.0.1:24001",
+            "10.0.2.2:24001",
             Vec::new(),
             Vec::new(),
         )
@@ -4085,6 +4041,7 @@ async fn install_dynamic_caps_origin_fixture(app: &ControlStateApp) -> tokio::ta
             "/alice",
             "/alice",
             "127.0.0.1:24002",
+            "10.0.2.2:24002",
             Vec::new(),
             vec![OutboundRoute {
                 route_id: "provider-route".to_string(),
@@ -4383,6 +4340,165 @@ async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
             .as_slice(),
         &[shared_ref],
         "inspect_ref should route exactly once through the authority site router",
+    );
+}
+
+#[tokio::test]
+async fn held_list_aggregates_remote_grants_via_peer_router() {
+    let dir = TempDir::new().expect("temp dir");
+    let base = compile_dynamic_caps_binding_state().await;
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([
+            (
+                "direct_a".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            ),
+            (
+                "direct_b".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            ),
+        ]),
+        defaults: PlacementDefaults {
+            path: Some("direct_a".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::from([
+            ("/provider".to_string(), "direct_a".to_string()),
+            ("/alice".to_string(), "direct_a".to_string()),
+            ("/bob".to_string(), "direct_b".to_string()),
+        ]),
+        dynamic_capabilities: None,
+        framework_children: None,
+    };
+    let mut authoritative = compile_control_state_from_ir_with_run_id(
+        base.base_scenario.clone(),
+        Some(&placement),
+        "test-run",
+    )
+    .await;
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &authoritative,
+        "components./alice",
+        &root_held_id_for(&authoritative, "components./alice"),
+    )
+    .expect("alice root source should resolve");
+    let share = super::dynamic_caps::share_dynamic_capability(
+        &mut authoritative,
+        "components./alice",
+        &alice_root,
+        "components./bob",
+        None,
+        &json!({}),
+    )
+    .expect("cross-site share should succeed");
+    let grant_id = match share {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } => grant_id,
+        _ => panic!("cross-site share should create a grant"),
+    };
+
+    let mut holder_state = authoritative.clone();
+    localize_framework_control_state(&mut holder_state, "direct_b")
+        .expect("holder site state should localize");
+    let state_path = dir.path().join("control-state.json");
+    write_control_state(&state_path, &holder_state).expect("holder state should write");
+
+    let hits = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let remote_grant_id = grant_id.clone();
+    let router = Router::new().route(
+        "/v1/controller/dynamic-caps/held",
+        axum::routing::post({
+            let hits = hits.clone();
+            let remote_grant_id = remote_grant_id.clone();
+            move |headers: HeaderMap,
+                  Json(request): Json<dynamic_caps::ControlDynamicHeldListRequest>| {
+                let hits = hits.clone();
+                let remote_grant_id = remote_grant_id.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("1"),
+                        "peer-routed held_list should stay local on the destination controller",
+                    );
+                    hits.lock()
+                        .expect("held-list hit log poisoned")
+                        .push(request.holder_component_id.clone());
+                    Json(amber_mesh::dynamic_caps::HeldListResponse {
+                        held: vec![HeldEntrySummary {
+                            held_id: super::dynamic_caps::held_id_for_grant(&remote_grant_id),
+                            entry_kind: HeldEntryKind::DelegatedGrant,
+                            grant_id: Some(remote_grant_id),
+                            root_authority_selector: None,
+                            state: HeldEntryState::Live,
+                            from_component: Some("components./alice".to_string()),
+                            descriptor: DescriptorIr {
+                                kind: "http".to_string(),
+                                label: "provider.http".to_string(),
+                                profile: None,
+                            },
+                            materializations: Vec::new(),
+                        }],
+                    })
+                }
+            }
+        }),
+    );
+    let (authority_base_url, _authority_handle) = spawn_test_router(router).await;
+
+    let mut app = test_control_state_app(&dir, holder_state, state_path);
+    let controller_plan = Arc::make_mut(&mut app.controller_plan);
+    controller_plan.site_id = "direct_b".to_string();
+    controller_plan.router_identity_id = "/site/direct_b/router".to_string();
+    controller_plan.peer_site_router_urls =
+        BTreeMap::from([("direct_a".to_string(), authority_base_url)]);
+    let controller_app = SiteControllerApp {
+        control: app,
+        router_auth_token: Arc::<str>::from("test-router-auth"),
+        ready: ready_site_controller_flag(),
+    };
+
+    let response = super::site_controller::execute_site_controller_dynamic_caps_inspect(
+        &controller_app,
+        super::control_state_api::DynamicCapsInspectRequest::HeldList(
+            dynamic_caps::ControlDynamicHeldListRequest {
+                holder_component_id: "components./bob".to_string(),
+            },
+        ),
+        false,
+    )
+    .await
+    .expect("holder site should aggregate remote grants through the authority site router");
+
+    let super::control_state_api::DynamicCapsInspectResponse::HeldList(response) = response else {
+        panic!("held_list should return a held list response");
+    };
+    assert!(
+        response
+            .held
+            .iter()
+            .any(|entry| entry.entry_kind == HeldEntryKind::RootAuthority),
+        "holder site should keep its local root authority entries",
+    );
+    assert!(
+        response.held.iter().any(|entry| {
+            entry.entry_kind == HeldEntryKind::DelegatedGrant
+                && entry.grant_id.as_deref() == Some(grant_id.as_str())
+        }),
+        "holder site should merge delegated grants from the authority site",
+    );
+    assert_eq!(
+        hits.lock().expect("held-list hit log poisoned").as_slice(),
+        &["components./bob".to_string()],
+        "held_list should route exactly once through the authority site router",
     );
 }
 
@@ -4722,6 +4838,69 @@ async fn dynamic_caps_resolve_origin_tolerates_missing_static_runtime_state_file
         !resolve_origin.origin_peer_addr.is_empty(),
         "static components should still resolve a live origin even when the dynamic runtime state \
          file is absent",
+    );
+}
+
+#[tokio::test]
+async fn dynamic_caps_resolve_origin_prefers_published_router_mesh_addr() {
+    let harness = DynamicCapsMcpHarness::start().await;
+
+    write_json(
+        &harness
+            ._dir
+            .path()
+            .join("state")
+            .join("direct_local")
+            .join("manager-state.json"),
+        &json!({
+            "schema": TEST_SITE_STATE_SCHEMA,
+            "version": TEST_SITE_STATE_VERSION,
+            "run_id": "test-run",
+            "site_id": "direct_local",
+            "kind": "direct",
+            "status": "running",
+            "artifact_dir": harness._dir.path().join("artifact/direct_local").display().to_string(),
+            "supervisor_pid": 1u32,
+            "router_control": test_router_control_addr(),
+            "router_mesh_addr": "127.0.0.1:1",
+            "router_identity_id": "/site/direct_local/router",
+            "router_public_key_b64": base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+            "site_controller_url": harness.base_url.clone(),
+        }),
+    )
+    .expect("stale manager state should write");
+
+    let held: amber_mesh::dynamic_caps::HeldListResponse = harness
+        .post_json(
+            "/v1/controller/dynamic-caps/held",
+            &dynamic_caps::ControlDynamicHeldListRequest {
+                holder_component_id: "components./alice".to_string(),
+            },
+        )
+        .await;
+    let root_selector = held
+        .held
+        .iter()
+        .find(|entry| entry.entry_kind == HeldEntryKind::RootAuthority)
+        .and_then(|entry| entry.root_authority_selector.clone())
+        .expect("alice should have a root authority selector");
+
+    let resolve_origin: dynamic_caps::ControlDynamicResolveOriginResponse = harness
+        .post_json(
+            "/v1/controller/dynamic-caps/resolve-origin",
+            &dynamic_caps::ControlDynamicResolveOriginRequest {
+                holder_component_id: "components./alice".to_string(),
+                source: dynamic_caps::DynamicCapabilityControlSourceRequest::RootAuthority {
+                    root_authority_selector: root_selector,
+                },
+            },
+        )
+        .await;
+
+    assert_eq!(
+        resolve_origin.origin_peer_addr, "127.0.0.1:24000",
+        "resolve-origin should use the controller plan's published router mesh address instead of \
+         stale manager-state data",
     );
 }
 
@@ -8957,6 +9136,8 @@ volumes:
         &BTreeMap::new(),
         Some("unix:///amber/control/router-control.sock"),
         Some("127.0.0.1:24000"),
+        Some("host.docker.internal:24000"),
+        Some("192.168.65.254:24000"),
         &site_state_root.join("site-controller-state.json"),
         temp.path(),
         &temp.path().join("state"),
@@ -9005,6 +9186,33 @@ volumes:
         .to_string();
     assert_eq!(command[0].as_str(), Some("--plan"));
     assert_eq!(command[1].as_str(), Some(plan_path.as_str()));
+    #[cfg(unix)]
+    let expected_user = {
+        #[cfg(target_os = "macos")]
+        {
+            Some("0:0".to_string())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if fs::metadata("/var/run/docker.sock").is_ok() {
+                Some(format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+                    libc::getegid()
+                }))
+            } else {
+                Some("0:0".to_string())
+            }
+        }
+    };
+    #[cfg(unix)]
+    assert_eq!(
+        service
+            .get(serde_yaml::Value::String("user".to_string()))
+            .and_then(serde_yaml::Value::as_str),
+        expected_user.as_deref(),
+        "compose site controller should use the host uid/gid on Linux so bind-mounted runtime \
+         state stays deletable and fall back to root on macOS where Docker Desktop mediates the \
+         socket mount"
+    );
     let volumes = service
         .get(serde_yaml::Value::String("volumes".to_string()))
         .and_then(serde_yaml::Value::as_sequence)
@@ -9033,8 +9241,31 @@ volumes:
     assert!(
         volumes
             .iter()
-            .any(|value| value.as_str() == Some("/var/run/docker.sock:/var/run/docker.sock"))
+            .any(|value| { value.as_str() == Some("/var/run/docker.sock:/var/run/docker.sock") })
     );
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Ok(metadata) = fs::metadata("/var/run/docker.sock") {
+        let expected_gid = metadata.gid().to_string();
+        let group_add = service
+            .get(serde_yaml::Value::String("group_add".to_string()))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("controller service should declare supplemental groups");
+        if expected_gid != unsafe { libc::getegid() }.to_string() {
+            assert!(
+                group_add
+                    .iter()
+                    .any(|value| value.as_str() == Some(expected_gid.as_str())),
+                "compose site controller should join the host docker socket group when the socket \
+                 gid differs from the host gid",
+            );
+        } else {
+            assert!(
+                group_add.is_empty(),
+                "compose site controller should not add a redundant supplemental group when the \
+                 host gid already owns the docker socket",
+            );
+        }
+    }
     assert!(
         extra_hosts
             .iter()
@@ -9128,6 +9359,8 @@ spec:
         &BTreeMap::new(),
         Some("amber-router:24100"),
         Some("127.0.0.1:24000"),
+        Some("host.docker.internal:24000"),
+        Some("192.168.65.254:24000"),
         &site_state_root.join("site-controller-state.json"),
         temp.path(),
         &temp.path().join("state"),
@@ -9166,6 +9399,19 @@ spec:
     assert!(deployment_raw.contains("/amber/site/state/site-controller-plan.json"));
     let deployment: serde_yaml::Value =
         serde_yaml::from_str(&deployment_raw).expect("deployment should parse");
+    let init_container = deployment["spec"]["template"]["spec"]["initContainers"]
+        .as_sequence()
+        .and_then(|containers| containers.first())
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("deployment should contain a seed init container");
+    assert_eq!(
+        init_container
+            .get(serde_yaml::Value::String("image".to_string()))
+            .and_then(serde_yaml::Value::as_str),
+        Some("ghcr.io/rdi-foundation/amber-site-controller:test"),
+        "kubernetes site controller seeding should reuse the site-controller image so tests and \
+         CI do not depend on an extra public init image pull",
+    );
     let container = deployment["spec"]["template"]["spec"]["containers"]
         .as_sequence()
         .and_then(|containers| containers.first())
@@ -9277,6 +9523,105 @@ fn local_site_manager_state_uses_controller_plan_when_host_state_is_absent() {
 
     let state = load_site_manager_state(&app, "compose-site")
         .expect("local controller should synthesize site metadata from its own plan");
+    assert_eq!(state.status, "running");
+    assert_eq!(
+        state.router_control.as_deref(),
+        Some("unix:///amber/control/router-control.sock")
+    );
+    assert_eq!(state.router_mesh_addr.as_deref(), Some("127.0.0.1:24000"));
+    let authority_url = format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{SITE_CONTROLLER_PORT}");
+    assert_eq!(
+        state.site_controller_url.as_deref(),
+        Some(authority_url.as_str())
+    );
+}
+
+#[test]
+fn load_site_manager_state_prefers_local_controller_view_over_stale_host_state() {
+    let temp = TempDir::new().expect("temp dir");
+    let state_root = temp.path().join("state");
+    let site_state_root = state_root.join("compose-site");
+    fs::create_dir_all(&site_state_root).expect("site state root should exist");
+    let state = FrameworkControlState {
+        schema: CONTROL_STATE_SCHEMA.to_string(),
+        version: CONTROL_STATE_VERSION,
+        run_id: "test-run".to_string(),
+        base_scenario: ScenarioIr {
+            schema: amber_scenario::SCENARIO_IR_SCHEMA.to_string(),
+            version: amber_scenario::SCENARIO_IR_VERSION,
+            root: 0,
+            components: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
+        },
+        run_links: Vec::new(),
+        placement: FrozenPlacementState {
+            offered_sites: BTreeMap::from([(
+                "compose-site".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Compose,
+                    context: None,
+                },
+            )]),
+            defaults: PlacementDefaults::default(),
+            standby_sites: Vec::new(),
+            initial_active_sites: vec!["compose-site".to_string()],
+            dynamic_enabled_sites: vec!["compose-site".to_string()],
+            control_only_sites: Vec::new(),
+            active_site_capabilities: BTreeMap::new(),
+            placement_components: BTreeMap::new(),
+            assignments: BTreeMap::new(),
+        },
+        generation: 0,
+        next_child_id: 1,
+        next_tx_id: 0,
+        id_stride: 1,
+        next_component_id: 0,
+        capability_instances: BTreeMap::new(),
+        journal: Vec::new(),
+        dynamic_capability_signing_seed_b64: mesh_dynamic_caps::signing_seed_b64(
+            &mesh_dynamic_caps::signing_key_from_seed(
+                mesh_dynamic_caps::generate_dynamic_capability_signing_seed(),
+            ),
+        ),
+        next_dynamic_capability_grant_id: 0,
+        dynamic_capability_grants: BTreeMap::new(),
+        dynamic_capability_grant_authority_sites: BTreeMap::new(),
+        dynamic_capability_journal: Vec::new(),
+        live_children: Vec::new(),
+        pending_creates: Vec::new(),
+        pending_destroys: Vec::new(),
+    };
+    let state_path = site_state_root.join("site-controller-state.json");
+    write_json(&state_path, &state).expect("state should write");
+    let mut app = test_control_state_app(&temp, state, state_path);
+    fs::write(
+        site_state_path(&state_root, "compose-site"),
+        serde_json::to_vec(&serde_json::json!({
+            "status": "stopped",
+            "kind": "compose",
+            "artifact_dir": "/tmp/stale-artifact",
+            "supervisor_pid": 1,
+            "compose_project": "stale-project",
+            "router_control": "unix:///tmp/stale-router.sock",
+            "router_mesh_addr": "127.0.0.1:1",
+            "site_controller_url": "http://stale-controller"
+        }))
+        .expect("stale manager state should serialize"),
+    )
+    .expect("stale manager state should write");
+    let controller_plan = Arc::make_mut(&mut app.controller_plan);
+    controller_plan.kind = SiteKind::Compose;
+    controller_plan.compose_project = Some("amber_test_compose".to_string());
+    controller_plan.local_router_control =
+        Some("unix:///amber/control/router-control.sock".to_string());
+    controller_plan.published_router_mesh_addr = Some("127.0.0.1:24000".to_string());
+    controller_plan.authority_url =
+        format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{SITE_CONTROLLER_PORT}");
+
+    let state = load_site_manager_state(&app, "compose-site")
+        .expect("local controller should not trust stale host manager state");
     assert_eq!(state.status, "running");
     assert_eq!(
         state.router_control.as_deref(),

@@ -6,6 +6,7 @@ mod run_inputs;
 mod run_logs;
 mod site_proxy_metadata;
 mod tcp_readiness;
+mod unix_process;
 mod vm_runtime;
 
 #[cfg(target_os = "linux")]

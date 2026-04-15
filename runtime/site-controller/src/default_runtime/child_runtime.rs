@@ -44,21 +44,8 @@ pub(super) struct StoredRouteOverlayPayload {
     pub(super) inbound_routes: Vec<InboundRoute>,
 }
 
-pub(crate) struct BridgeProxyHandle {
-    pub(crate) child: Child,
-    pub(crate) listen: SocketAddr,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct BridgeProxyKey {
-    pub(crate) provider_output_dir: String,
-    pub(crate) export_name: String,
-    pub(crate) consumer_kind: SiteKind,
-}
-
 #[derive(Clone, Default)]
 pub struct DefaultSiteControllerRuntime {
-    bridge_proxies: Arc<AsyncMutex<BTreeMap<BridgeProxyKey, BridgeProxyHandle>>>,
     runtime_apps: Arc<std::sync::Mutex<BTreeMap<PathBuf, SiteControllerRuntimeApp>>>,
 }
 
@@ -69,15 +56,11 @@ pub(crate) fn default_site_controller_runtime() -> SharedSiteControllerRuntime {
 impl SiteControllerRuntime for DefaultSiteControllerRuntime {
     fn cleanup<'a>(&'a self) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async move {
-            let mut bridge_proxies = {
-                let mut guard = self.bridge_proxies.lock().await;
-                std::mem::take(&mut *guard)
-            };
             self.runtime_apps
                 .lock()
                 .expect("site controller runtime app cache poisoned")
                 .clear();
-            stop_bridge_proxies(&mut bridge_proxies).await
+            Ok(())
         })
     }
 
@@ -90,14 +73,12 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
         run_root: &'a Path,
     ) -> SiteControllerRuntimeFuture<'a, String> {
         Box::pin(async move {
-            let mut bridge_proxies = self.bridge_proxies.lock().await;
             resolve_link_external_url_for_output(
                 provider,
                 provider_output_dir,
                 link,
                 consumer_kind,
                 run_root,
-                &mut bridge_proxies,
             )
             .await
         })
@@ -174,6 +155,15 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
         router_mesh_addr_for_consumer(provider_kind, consumer_kind, router_mesh_addr)
     }
 
+    fn router_mesh_addr_for_component_consumer(
+        &self,
+        provider_kind: SiteKind,
+        consumer_kind: SiteKind,
+        router_mesh_addr: &str,
+    ) -> Result<String> {
+        router_mesh_addr_for_component_consumer(provider_kind, consumer_kind, router_mesh_addr)
+    }
+
     fn update_desired_overlay_for_consumer(
         &self,
         site_state_root: &Path,
@@ -232,16 +222,6 @@ impl DefaultSiteControllerRuntime {
         runtime_apps.insert(key, app.clone());
         Ok(app)
     }
-}
-
-pub(crate) async fn stop_bridge_proxies(
-    bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
-) -> Result<()> {
-    for bridge in bridge_proxies.values_mut() {
-        stop_child(&mut bridge.child).await?;
-    }
-    bridge_proxies.clear();
-    Ok(())
 }
 
 pub(super) fn build_site_controller_runtime_app(
@@ -411,12 +391,11 @@ pub fn cleanup_dynamic_site_children(site_state_root: &Path, kind: SiteKind) -> 
         if let Some(pid) = child.process_pid {
             terminate_pid(pid, site_ready_timeout_for_kind(kind))?;
         }
-        remove_dir_if_exists(
-            &crate::runtime_api::site_controller_runtime_child_root_for_site(
-                site_state_root,
-                child.child_id,
-            ),
-        )?;
+        let child_root = crate::runtime_api::site_controller_runtime_child_root_for_site(
+            site_state_root,
+            child.child_id,
+        );
+        remove_dynamic_child_root(kind, &child_root, Some(Path::new(&child.artifact_root)))?;
     }
     if state.children.is_empty() {
         return Ok(());
@@ -458,6 +437,130 @@ fn cleanup_dynamic_compose_child(
         ));
     }
     Ok(())
+}
+
+fn compose_cleanup_image_candidates(artifact_root: &Path) -> Result<Vec<String>> {
+    let compose_path = artifact_root.join("compose.yaml");
+    if !compose_path.is_file() {
+        return Ok(vec![
+            "docker:28-cli".to_string(),
+            "python:3.13-alpine".to_string(),
+        ]);
+    }
+
+    let document = read_compose_document(&compose_path)?;
+    let Some(root) = document.as_mapping() else {
+        return Err(miette::miette!(
+            "compose file {} is not a YAML mapping",
+            compose_path.display()
+        ));
+    };
+    let Some(services) = root
+        .get(yaml_string("services"))
+        .and_then(serde_yaml::Value::as_mapping)
+    else {
+        return Err(miette::miette!(
+            "compose file {} is missing a services mapping",
+            compose_path.display()
+        ));
+    };
+
+    let mut images = BTreeSet::from([
+        "docker:28-cli".to_string(),
+        "python:3.13-alpine".to_string(),
+    ]);
+    for service in services.values() {
+        let Some(service_mapping) = service.as_mapping() else {
+            continue;
+        };
+        let Some(image) = service_mapping
+            .get(yaml_string("image"))
+            .and_then(serde_yaml::Value::as_str)
+        else {
+            continue;
+        };
+        images.insert(image.to_string());
+    }
+    Ok(images.into_iter().collect())
+}
+
+fn docker_image_exists_locally(image: &str) -> bool {
+    Command::new("docker")
+        .arg("image")
+        .arg("inspect")
+        .arg(image)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn force_remove_dir_if_exists_via_local_container(
+    path: &Path,
+    artifact_root: &Path,
+) -> Result<bool> {
+    if !path.exists() {
+        return Ok(true);
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+
+    for image in compose_cleanup_image_candidates(artifact_root)? {
+        if !docker_image_exists_locally(&image) {
+            continue;
+        }
+        let status = Command::new("docker")
+            .arg("run")
+            .arg("--rm")
+            .arg("--user")
+            .arg("0:0")
+            .arg("-v")
+            .arg(format!("{}:{}", parent.display(), parent.display()))
+            .arg("--entrypoint")
+            .arg("rm")
+            .arg(&image)
+            .arg("-rf")
+            .arg(path)
+            .status()
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to launch fallback cleanup container `{image}` for {}",
+                    path.display()
+                )
+            })?;
+        if status.success() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn remove_dynamic_child_root(
+    kind: SiteKind,
+    child_root: &Path,
+    artifact_root: Option<&Path>,
+) -> Result<()> {
+    match remove_dir_if_exists(child_root) {
+        Ok(()) => Ok(()),
+        Err(err) if matches!(kind, SiteKind::Compose) => {
+            let Some(artifact_root) = artifact_root else {
+                return Err(err.wrap_err(format!(
+                    "compose child root {} is missing its artifact directory",
+                    child_root.display()
+                )));
+            };
+            if force_remove_dir_if_exists_via_local_container(child_root, artifact_root)? {
+                return Ok(());
+            }
+            Err(err.wrap_err(format!(
+                "compose child root {} could not be removed with a local cleanup container",
+                child_root.display()
+            )))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub(super) async fn site_controller_runtime_prepare_child(
@@ -892,6 +995,20 @@ pub(super) async fn site_controller_runtime_publish_child(
                 )
                 .await?;
             }
+            {
+                let mut state = app.state.lock().await;
+                let record = state
+                    .children
+                    .get_mut(&child_id)
+                    .expect("prepared child should remain present");
+                // Compose workloads can make one-shot startup calls through their sidecars.
+                // Mark the child publishable as soon as its sidecars are up so same-site
+                // direct-input grants are reconciled before the workload process starts.
+                record.published = true;
+                write_json(&app.state_path, &*state)?;
+            }
+            reconcile_dynamic_site_router_overlays(app).await?;
+            reconcile_dynamic_direct_input_overlays(app).await?;
             if !workload_services.is_empty() {
                 let status =
                     compose_command(Some(compose_project), Path::new(&child.artifact_root))
@@ -921,16 +1038,6 @@ pub(super) async fn site_controller_runtime_publish_child(
                 site_ready_timeout_for_kind(SiteKind::Compose),
             )
             .await?;
-            let mut state = app.state.lock().await;
-            let record = state
-                .children
-                .get_mut(&child_id)
-                .expect("prepared child should remain present");
-            record.published = true;
-            write_json(&app.state_path, &*state)?;
-            drop(state);
-            reconcile_dynamic_site_router_overlays(app).await?;
-            reconcile_dynamic_direct_input_overlays(app).await?;
         }
         SiteKind::Kubernetes => {
             let artifact_root = Path::new(&child.artifact_root);
@@ -1001,7 +1108,12 @@ pub(super) async fn site_controller_runtime_rollback_child(
     if let Some(pid) = child.process_pid {
         terminate_pid(pid, site_ready_timeout_for_kind(app.plan.kind))?;
     }
-    remove_dir_if_exists(&site_controller_runtime_child_root(&app.plan, child_id))
+    let child_root = site_controller_runtime_child_root(&app.plan, child_id);
+    remove_dynamic_child_root(
+        app.plan.kind,
+        &child_root,
+        Some(Path::new(&child.artifact_root)),
+    )
 }
 
 pub(super) async fn site_controller_runtime_destroy_child(
@@ -1015,7 +1127,9 @@ pub(super) async fn site_controller_runtime_destroy_child(
         state.children.get(&child_id).cloned()
     };
     if child.is_none() {
-        remove_dir_if_exists(&site_controller_runtime_child_root(&app.plan, child_id))?;
+        let child_root = site_controller_runtime_child_root(&app.plan, child_id);
+        let artifact_root = child_root.join("artifact");
+        remove_dynamic_child_root(app.plan.kind, &child_root, Some(&artifact_root))?;
         return Ok(());
     }
     if let Some(child) = child.as_ref()
@@ -1130,5 +1244,38 @@ pub(super) async fn site_controller_runtime_destroy_child(
         reconcile_dynamic_site_router_overlays(app).await?;
         reconcile_dynamic_direct_input_overlays(app).await?;
     }
-    remove_dir_if_exists(&site_controller_runtime_child_root(&app.plan, child_id))
+    let child_root = site_controller_runtime_child_root(&app.plan, child_id);
+    remove_dynamic_child_root(
+        app.plan.kind,
+        &child_root,
+        child.as_ref().map(|child| Path::new(&child.artifact_root)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_cleanup_image_candidates_include_service_images_and_fallbacks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        fs::write(
+            temp.path().join("compose.yaml"),
+            "services:\n  app:\n    image: python:3.13-alpine\n  helper:\n    image: \
+             ghcr.io/rdi-foundation/amber-helper:test-tag\n",
+        )
+        .expect("compose file should write");
+
+        let images = compose_cleanup_image_candidates(temp.path())
+            .expect("compose cleanup images should load");
+
+        assert_eq!(
+            images,
+            vec![
+                "docker:28-cli".to_string(),
+                "ghcr.io/rdi-foundation/amber-helper:test-tag".to_string(),
+                "python:3.13-alpine".to_string(),
+            ],
+        );
+    }
 }
