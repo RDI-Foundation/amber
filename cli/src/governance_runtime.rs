@@ -22,7 +22,7 @@ use tokio::{
 };
 use url::Url;
 
-use crate::{mixed_run, run_inputs::collect_run_interface};
+use crate::{mixed_run, run_inputs::{collect_run_interface, missing_required_root_inputs}};
 
 pub(crate) struct CliGovernanceRuntime {
     client: Client,
@@ -73,6 +73,21 @@ impl GovernanceRuntime for CliGovernanceRuntime {
                     "failed to inspect governance exports: {err}"
                 ))
             })?;
+            let ambient_env: BTreeMap<String, String> = std::env::vars()
+                .filter(|(k, _)| k.starts_with("AMBER_CONFIG_"))
+                .collect();
+            let missing = missing_required_root_inputs(&ambient_env, &interface);
+            if !missing.is_empty() {
+                let names: Vec<String> = missing
+                    .iter()
+                    .map(|i| format!("config.{} ({})", i.path, i.env_var))
+                    .collect();
+                return Err(GovernanceRuntimeError::message(format!(
+                    "governance policy is missing required config values - add defaults or set \
+                     environment variables before running: {}",
+                    names.join(", ")
+                )));
+            }
             let receipt = mixed_run::run_run_plan(
                 None,
                 &run_plan,
@@ -303,11 +318,10 @@ async fn wait_for_governance_exports_ready(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            let logs = governance_log_excerpt(run_root);
+            print_governance_logs(run_root);
             return Err(GovernanceRuntimeError::message(format!(
-                "governance exports did not become ready in time: {}{}",
+                "governance exports did not become ready in time: {}",
                 pending.join(", "),
-                logs
             )));
         }
 
@@ -315,46 +329,39 @@ async fn wait_for_governance_exports_ready(
     }
 }
 
-fn governance_log_excerpt(run_root: &Path) -> String {
-    let mut excerpts = Vec::new();
-    let mut candidates = vec![run_root.join("outside-proxy.log")];
+fn print_governance_logs(run_root: &Path) {
     let state_root = run_root.join("state");
-    if let Ok(entries) = fs::read_dir(&state_root) {
-        for entry in entries.flatten() {
-            let site_root = entry.path();
-            if !site_root.is_dir() {
-                continue;
-            }
-            candidates.push(site_root.join("site.log"));
-            candidates.push(site_root.join("supervisor.log"));
+    let Ok(entries) = fs::read_dir(&state_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let site_root = entry.path();
+        if !site_root.is_dir() {
+            continue;
         }
-    }
-
-    for path in candidates {
-        let Ok(raw) = fs::read_to_string(&path) else {
+        let Ok(raw) = fs::read_to_string(site_root.join("site.log")) else {
             continue;
         };
-        let all_lines = raw.lines().collect::<Vec<_>>();
-        if all_lines.is_empty() {
-            continue;
+        let stderr_lines: Vec<&str> = raw
+            .lines()
+            .filter(|l| l.contains("amber.node.logs") && l.contains("amber_stream=\"stderr\""))
+            .filter_map(policy_log_message)
+            .collect();
+        if !stderr_lines.is_empty() {
+            eprintln!("\npolicy process stderr:");
+            for line in stderr_lines {
+                eprintln!("  {line}");
+            }
         }
-        let mut excerpt = Vec::new();
-        excerpt.extend(all_lines.iter().take(20).copied());
-
-        let tail_start = all_lines.len().saturating_sub(20);
-        if tail_start > 20 {
-            excerpt.push("...");
-        }
-        excerpt.extend(all_lines.iter().skip(tail_start).copied());
-
-        excerpts.push(format!(
-            "\n\n{}:\n{}",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("log"),
-            excerpt.join("\n")
-        ));
     }
+}
 
-    excerpts.concat()
+fn policy_log_message(line: &str) -> Option<&str> {
+    let msg_start = line.find("}: ")?.saturating_add(3);
+    let msg_end = line[msg_start..]
+        .find(" amber_stream=")
+        .map(|i| msg_start + i)
+        .unwrap_or(line.len());
+    let msg = line[msg_start..msg_end].trim();
+    if msg.is_empty() { None } else { Some(msg) }
 }

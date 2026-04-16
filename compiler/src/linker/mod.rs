@@ -9,16 +9,16 @@ mod sites;
 mod provenance;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
 use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
-    ComponentDecl, ComponentRef, ExportName, ExportTarget, InterpolatedPart, InterpolatedString,
-    InterpolationSource, Manifest, ManifestDigest, ManifestRef, PolicyRef, ProgramConfigUseSite,
-    RawManifest, framework_capability, span_for_json_pointer,
+    ComponentDecl, ComponentRef, ConfigSchema, ExportName, ExportTarget, InterpolatedPart,
+    InterpolatedString, InterpolationSource, Manifest, ManifestDigest, ManifestRef, PolicyRef,
+    ProgramConfigUseSite, RawManifest, framework_capability, span_for_json_pointer,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
@@ -94,6 +94,7 @@ fn component_local_name(component: &Component) -> &str {
 
 #[derive(Clone, Debug)]
 struct ScopeBuild {
+    root_id: ComponentId,
     root_moniker: amber_scenario::Moniker,
     manifest_url: Url,
     uses: BTreeMap<String, ResolvedNode>,
@@ -418,6 +419,18 @@ pub enum Error {
         label: String,
         #[related]
         related: Vec<RelatedSpan>,
+    },
+
+    #[error("invalid config for use `{use_name}` in {component_path}: {message}")]
+    #[diagnostic(code(compiler::invalid_use_config))]
+    InvalidUseConfig {
+        component_path: String,
+        use_name: String,
+        message: String,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "config declared here")]
+        span: Option<SourceSpan>,
     },
 
     #[error("unsupported manifest feature `{feature}` in {component_path}")]
@@ -835,7 +848,7 @@ pub fn link(
         exports,
         manifest_catalog,
     };
-    let governance = build_governance(&scope_builds, store)?;
+    let governance = build_governance(&scope_builds, &config_analysis, store)?;
     scenario.normalize_order();
 
     if !errors.is_empty() {
@@ -856,8 +869,97 @@ pub fn link(
     Ok((scenario, governance, provenance))
 }
 
+fn compose_use_config(
+    use_config: &Value,
+    scope_template: &rc::RootConfigTemplate,
+    scope_schema: Option<&serde_json::Value>,
+) -> Result<rc::ConfigNode, rc::ConfigError> {
+    let parsed =
+        crate::config::template::parse_instance_config_template(Some(use_config), scope_schema)?;
+    rc::compose_config_template(parsed, scope_template)
+}
+
+fn collect_config_ref_paths(node: &rc::ConfigNode) -> BTreeSet<String> {
+    fn go(node: &rc::ConfigNode, out: &mut BTreeSet<String>) {
+        use amber_template::TemplatePart;
+        match node {
+            rc::ConfigNode::ConfigRef(path) => {
+                out.insert(path.clone());
+            }
+            rc::ConfigNode::StringTemplate(parts) => {
+                for part in parts {
+                    if let TemplatePart::Config { config } = part {
+                        out.insert(config.clone());
+                    }
+                }
+            }
+            rc::ConfigNode::Array(items) => items.iter().for_each(|n| go(n, out)),
+            rc::ConfigNode::Object(map) => map.values().for_each(|n| go(n, out)),
+            _ => {}
+        }
+    }
+    let mut paths = BTreeSet::new();
+    go(node, &mut paths);
+    paths
+}
+
+fn governance_root_schema_for_paths(path_schemas: &BTreeMap<String, (Value, bool)>) -> Value {
+    fn insert_path(
+        props: &mut serde_json::Map<String, Value>,
+        required: &mut Vec<Value>,
+        path: &str,
+        leaf_schema: &Value,
+        is_required: bool,
+    ) {
+        match path.split_once('.') {
+            Some((head, tail)) => {
+                let entry = props.entry(head.to_string()).or_insert_with(|| {
+                    serde_json::json!({ "type": "object", "properties": {} })
+                });
+                if let Value::Object(obj) = entry {
+                    obj.entry("properties")
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    let mut nested_required: Vec<Value> = match obj.get("required") {
+                        Some(Value::Array(arr)) => arr.clone(),
+                        _ => Vec::new(),
+                    };
+                    if let Some(Value::Object(nested_props)) = obj.get_mut("properties") {
+                        insert_path(nested_props, &mut nested_required, tail, leaf_schema, is_required);
+                    }
+                    if !nested_required.is_empty() {
+                        obj.insert("required".to_string(), Value::Array(nested_required));
+                    }
+                }
+                if is_required && !required.iter().any(|r| r == head) {
+                    required.push(Value::String(head.to_string()));
+                }
+            }
+            None => {
+                props
+                    .entry(path.to_string())
+                    .or_insert_with(|| leaf_schema.clone());
+                if is_required && !required.iter().any(|r| r == path) {
+                    required.push(Value::String(path.to_string()));
+                }
+            }
+        }
+    }
+
+    let mut properties = serde_json::Map::new();
+    let mut required: Vec<Value> = Vec::new();
+    for (path, (leaf_schema, is_required)) in path_schemas {
+        insert_path(&mut properties, &mut required, path, leaf_schema, *is_required);
+    }
+    let mut schema = serde_json::json!({ "type": "object", "properties": properties });
+    if !required.is_empty() {
+        schema["required"] = Value::Array(required);
+    }
+    schema
+}
+
 fn build_governance(
     scope_builds: &[ScopeBuild],
+    config_analysis: &ScenarioConfigAnalysis,
     store: &DigestStore,
 ) -> Result<Option<Governance>, Error> {
     if scope_builds.is_empty() {
@@ -870,18 +972,64 @@ fn build_governance(
     let mut governance_children = BTreeMap::new();
     let mut governance_root_components = BTreeMap::new();
     let mut governance_root_exports = BTreeMap::new();
+    let mut governance_root_path_schemas: BTreeMap<String, (Value, bool)> = BTreeMap::new();
     let mut scopes = Vec::with_capacity(scope_builds.len());
 
     for (scope_index, scope) in scope_builds.iter().enumerate() {
+        let scope_ca = config_analysis.component(scope.root_id);
+
         let mut use_child_names = BTreeMap::new();
         for (use_index, (use_name, use_node)) in scope.uses.iter().enumerate() {
             let child_name = format!("use_{scope_index}_{use_index}");
+            let composed_config = match (use_node.config.as_ref(), scope_ca) {
+                (Some(raw_config), Some(sa)) => {
+                    let composed =
+                        compose_use_config(raw_config, sa.template(), sa.component_schema())
+                            .map_err(|err| {
+                                let (src, span) =
+                                    store.diagnostic_source(&scope.manifest_url).map_or(
+                                        (None, None),
+                                        |(src, spans)| {
+                                            let span = spans
+                                                .uses
+                                                .get(use_name.as_str())
+                                                .and_then(|s| s.config);
+                                            (Some(src), span)
+                                        },
+                                    );
+                                Error::InvalidUseConfig {
+                                    component_path: scope.root_moniker.to_string(),
+                                    use_name: use_name.clone(),
+                                    message: err.to_string(),
+                                    src,
+                                    span,
+                                }
+                            })?;
+                    for path in collect_config_ref_paths(&composed) {
+                        governance_root_path_schemas.entry(path.clone()).or_insert_with(|| {
+                            let root_schema = sa.root_schema();
+                            let leaf = root_schema
+                                .and_then(|s| rc::schema_lookup_ref(s, &path).ok().cloned())
+                                .unwrap_or(Value::Bool(true));
+                            let is_required = root_schema
+                                .and_then(|s| rc::schema_path_is_required(s, &path).ok())
+                                .unwrap_or(false);
+                            (leaf, is_required)
+                        });
+                    }
+                    Some(composed.to_manifest_value())
+                }
+                _ => use_node.config.clone(),
+            };
+
             let mut child_node = use_node.clone();
             child_node.name = child_name.clone();
+            child_node.config = composed_config.clone();
             governance_children.insert(child_name.clone(), child_node.clone());
+
             let manifest_ref =
                 ManifestRef::new(child_node.resolved_url.clone(), Some(child_node.digest));
-            let component_ref = match child_node.config.clone() {
+            let component_ref = match composed_config {
                 Some(config) => ComponentRef::builder()
                     .manifest(manifest_ref)
                     .config(config)
@@ -965,6 +1113,13 @@ fn build_governance(
     let mut raw_manifest = RawManifest::from(&Manifest::empty());
     raw_manifest.components = governance_root_components;
     raw_manifest.exports = governance_root_exports;
+    if !governance_root_path_schemas.is_empty() {
+        let schema = governance_root_schema_for_paths(&governance_root_path_schemas);
+        raw_manifest.config_schema = Some(
+            ConfigSchema::new(schema)
+                .expect("synthetic governance root config schema should be valid"),
+        );
+    }
     let root_manifest: Manifest = raw_manifest
         .try_into()
         .expect("synthetic governance root manifest should be valid");
@@ -1123,6 +1278,7 @@ fn flatten(
         .expect("resolved manifest should exist in digest store");
     if !manifest.policies().is_empty() {
         state.scope_builds.push(ScopeBuild {
+            root_id: id,
             root_moniker: moniker.clone(),
             manifest_url: node.resolved_url.clone(),
             uses: node.uses.clone(),

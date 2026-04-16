@@ -810,6 +810,163 @@ async fn resolve_tree_keeps_use_entries_out_of_component_tree() {
 }
 
 #[tokio::test]
+async fn use_config_with_config_interpolation_compiles() {
+    let dir = tmp_dir("scenario-use-config-interp");
+    let root_path = dir.path().join("root.json5");
+    let policy_path = dir.path().join("policy.json5");
+
+    write_file(
+        &policy_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { token: { type: "string" } },
+          },
+          program: {
+            image: "policy",
+            entrypoint: ["policy"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          exports: { apply: "apply" },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              config_schema: {{
+                type: "object",
+                properties: {{ api_key: {{ type: "string" }} }},
+              }},
+              use: {{
+                policy_comp: {{
+                  manifest: "{policy}",
+                  config: {{ token: "${{config.api_key}}" }},
+                }},
+              }},
+              policies: ["#policy_comp.apply"],
+            }}
+            "##,
+            policy = file_url(&policy_path),
+        ),
+    );
+
+    let compiler = compiler_with_noop_governance();
+    let output = compiler
+        .compile(manifest_ref_for_path(&root_path), standard_compile_options())
+        .await
+        .expect("use config with config interpolation should compile");
+
+    let governance = output.governance.as_ref().expect("governance should be present");
+    let root_id = governance.scenario.root;
+    let root_digest = governance.scenario.component(root_id).digest;
+    let root_manifest = output.store.get(&root_digest).expect("governance root manifest in store");
+    let config_schema = root_manifest.config_schema().expect("governance root should have config schema");
+    // The governance root schema should expose the api_key path from the outer scenario
+    let schema_value = &config_schema.0;
+    let props = schema_value.get("properties").expect("schema should have properties");
+    assert!(props.get("api_key").is_some(), "api_key should appear in governance root schema properties");
+}
+
+#[tokio::test]
+async fn use_config_with_config_interpolation_in_child_scope_compiles() {
+    let dir = tmp_dir("scenario-use-config-interp-child");
+    let root_path = dir.path().join("root.json5");
+    let scope_path = dir.path().join("scope.json5");
+    let policy_path = dir.path().join("policy.json5");
+
+    write_file(
+        &policy_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { token: { type: "string" } },
+          },
+          program: {
+            image: "policy",
+            entrypoint: ["policy"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          exports: { apply: "apply" },
+        }
+        "#,
+    );
+    write_file(
+        &scope_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              config_schema: {{
+                type: "object",
+                properties: {{ api_key: {{ type: "string" }} }},
+              }},
+              use: {{
+                policy_comp: {{
+                  manifest: "{policy}",
+                  config: {{ token: "${{config.api_key}}" }},
+                }},
+              }},
+              policies: ["#policy_comp.apply"],
+            }}
+            "##,
+            policy = file_url(&policy_path),
+        ),
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              config_schema: {{
+                type: "object",
+                properties: {{ root_api_key: {{ type: "string" }} }},
+              }},
+              components: {{
+                scope: {{
+                  manifest: "{scope}",
+                  config: {{ api_key: "${{config.root_api_key}}" }},
+                }},
+              }},
+            }}
+            "##,
+            scope = file_url(&scope_path),
+        ),
+    );
+
+    let compiler = compiler_with_noop_governance();
+    let output = compiler
+        .compile(manifest_ref_for_path(&root_path), standard_compile_options())
+        .await
+        .expect("use config interpolation through child scope template should compile");
+
+    let governance = output.governance.as_ref().expect("governance should be present");
+    let root_id = governance.scenario.root;
+    let root_digest = governance.scenario.component(root_id).digest;
+    let root_manifest = output.store.get(&root_digest).expect("governance root manifest in store");
+    let config_schema = root_manifest.config_schema().expect("governance root should have config schema");
+    // The child scope's api_key config is threaded through the outer root_api_key config ref,
+    // so the governance root schema should expose root_api_key (not api_key).
+    let schema_value = &config_schema.0;
+    let props = schema_value.get("properties").expect("schema should have properties");
+    assert!(props.get("root_api_key").is_some(), "root_api_key should appear in governance root schema properties");
+    assert!(props.get("api_key").is_none(), "api_key is scoped to the child and should not appear directly in governance root schema");
+}
+
+#[tokio::test]
 async fn used_manifest_must_not_require_root_slots() {
     let dir = tmp_dir("scenario-use-required-slot");
     let root_path = dir.path().join("root.json5");

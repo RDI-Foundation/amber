@@ -181,6 +181,41 @@ impl ConfigNode {
         Ok(self.get_path(path)?.clone())
     }
 
+    pub fn to_manifest_value(&self) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::Bool(b) => Value::Bool(*b),
+            Self::Number(n) => Value::Number(n.clone()),
+            Self::String(s) => Value::String(s.clone()),
+            Self::Array(items) => {
+                Value::Array(items.iter().map(|n| n.to_manifest_value()).collect())
+            }
+            Self::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), v.to_manifest_value()))
+                    .collect(),
+            ),
+            Self::ConfigRef(path) => Value::String(format!("${{config.{path}}}")),
+            Self::StringTemplate(parts) => {
+                let mut s = String::new();
+                for part in parts {
+                    match part {
+                        TemplatePart::Lit { lit } => s.push_str(lit),
+                        TemplatePart::Config { config } => {
+                            s.push_str(&format!("${{config.{config}}}"));
+                        }
+                        _ => unreachable!(
+                            "slot/item template parts cannot appear in ConfigNodes derived from \
+                             instance config templates; parse_instance_config_template rejects \
+                             non-config interpolation sources"
+                        ),
+                    }
+                }
+                Value::String(s)
+            }
+        }
+    }
+
     pub fn simplify(self) -> ConfigNode {
         match self {
             Self::Array(items) => Self::Array(items.into_iter().map(|n| n.simplify()).collect()),

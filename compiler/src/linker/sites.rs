@@ -208,24 +208,25 @@ fn config_site_for_component(
 ) -> Option<ConfigSite> {
     let component = component(components, id);
     if let Some(parent) = component.parent {
-        let (src, spans) = source_for_component(provenance, store, parent)?;
-        let component_spans = spans.components.get(component_local_name(component))?;
-        if component.config.is_some() {
-            let span = component_spans
-                .config_key
-                .or(component_spans.config)
-                .unwrap_or(component_spans.whole);
+        if let Some((src, spans)) = source_for_component(provenance, store, parent) {
+            let component_spans = spans.components.get(component_local_name(component))?;
+            if component.config.is_some() {
+                let span = component_spans
+                    .config_key
+                    .or(component_spans.config)
+                    .unwrap_or(component_spans.whole);
+                return Some(ConfigSite {
+                    src,
+                    span,
+                    label: "config provided here".to_string(),
+                });
+            }
             return Some(ConfigSite {
                 src,
-                span,
-                label: "config provided here".to_string(),
+                span: component_spans.name,
+                label: "config required here".to_string(),
             });
         }
-        return Some(ConfigSite {
-            src,
-            span: component_spans.name,
-            label: "config required here".to_string(),
-        });
     }
 
     let (src, spans) = source_for_component(provenance, store, id)?;
