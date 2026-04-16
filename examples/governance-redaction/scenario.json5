@@ -1,0 +1,41 @@
+{
+  manifest_version: "0.1.0",
+  experimental_features: ["governance"],
+
+  config_schema: {
+    type: "object",
+    properties: {
+      secret: { type: "string", default: "swordfish" },
+    },
+    required: ["secret"],
+  },
+
+  use: {
+    redaction: {
+      manifest: "./policy.json5",
+      config: {
+        secrets: ["${config.secret}"],
+      },
+    },
+  },
+
+  policies: ["#redaction.apply"],
+
+  components: {
+    responder: "./a2a-responder.json5",
+    caller: {
+      manifest: "./a2a-caller.json5",
+      config: {
+        secret: "${config.secret}",
+      },
+    },
+  },
+
+  bindings: [
+    { to: "#caller.agent", from: "#responder.a2a" },
+  ],
+
+  exports: {
+    status: "#caller.status",
+  },
+}

@@ -170,7 +170,7 @@ enum ExampleBackend {
 fn example_backend(example: &example_catalog::Example) -> ExampleBackend {
     if matches!(
         example.name.as_str(),
-        "direct-security" | "framework-component"
+        "direct-security" | "framework-component" | "governance-redaction"
     ) {
         ExampleBackend::Direct
     } else if example.name == "vm-network-storage" {
