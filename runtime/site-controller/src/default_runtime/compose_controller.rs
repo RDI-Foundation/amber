@@ -1,5 +1,3 @@
-#[cfg(all(unix, not(target_os = "macos")))]
-use std::os::unix::fs::MetadataExt;
 use std::{fs, path::Path};
 
 use serde_json::json;
@@ -14,33 +12,6 @@ const COMPOSE_ROUTER_CONTROL_SOCKET_DIR: &str = "/amber/control";
 const COMPOSE_ROUTER_CONTROL_VOLUME_NAME: &str = "amber-router-control";
 const DOCKER_SOCK_PATH: &str = "/var/run/docker.sock";
 
-#[cfg(target_os = "macos")]
-fn compose_site_controller_user() -> String {
-    // Docker Desktop's socket mount on macOS is mediated by the host, so the controller needs
-    // root inside the Compose site to reach it reliably.
-    "0:0".to_string()
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn compose_site_controller_user() -> String {
-    if fs::metadata(DOCKER_SOCK_PATH).is_ok() {
-        return format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
-            libc::getegid()
-        });
-    }
-    "0:0".to_string()
-}
-
-#[cfg(not(unix))]
-fn compose_site_controller_user() -> String {
-    "0:0".to_string()
-}
-
-#[cfg(target_os = "macos")]
-fn compose_site_controller_group_add() -> Vec<String> {
-    Vec::new()
-}
-
 fn compose_site_controller_env(plan: &SiteControllerPlan) -> serde_json::Value {
     serde_json::Value::Object(
         plan.launch_env
@@ -48,22 +19,6 @@ fn compose_site_controller_env(plan: &SiteControllerPlan) -> serde_json::Value {
             .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
             .collect(),
     )
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn compose_site_controller_group_add() -> Vec<String> {
-    if let Ok(metadata) = fs::metadata(DOCKER_SOCK_PATH) {
-        let socket_gid = metadata.gid();
-        if socket_gid != unsafe { libc::getegid() } {
-            return vec![socket_gid.to_string()];
-        }
-    }
-    Vec::new()
-}
-
-#[cfg(not(unix))]
-fn compose_site_controller_group_add() -> Vec<String> {
-    Vec::new()
 }
 
 pub fn inject_compose_site_controller(
@@ -103,11 +58,12 @@ pub fn inject_compose_site_controller(
         COMPOSE_MESH_NETWORK_NAME.to_string(),
         serde_json::Value::Object(serde_json::Map::new()),
     )]);
-    let group_add = compose_site_controller_group_add();
     let service = json!({
         "image": controller_image,
-        "user": compose_site_controller_user(),
-        "group_add": group_add,
+        // The controller must be able to reach both the router-control volume and the mounted
+        // run root. The router-control init service locks `/amber/control` down to `0700`, so a
+        // host-derived UID/GID breaks Linux compose startup.
+        "user": "0:0",
         "command": ["--plan", plan_path.display().to_string()],
         "environment": compose_site_controller_env(plan),
         "networks": networks,

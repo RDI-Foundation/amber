@@ -9,6 +9,9 @@ use tempfile::TempDir;
 
 use super::*;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+
 #[test]
 fn site_state_paths_are_site_scoped() {
     let root = Path::new("/tmp/amber-run/state");
@@ -167,6 +170,26 @@ fn site_controller_image_includes_the_amber_cli_binary() {
         dockerfile.contains("COPY README.md ./"),
         "site-controller image must include the workspace README because amber-cli embeds \
          it:\n{dockerfile}"
+    );
+}
+
+#[test]
+fn provisioner_image_supports_debug_builds() {
+    let dockerfile = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker/amber-provisioner/Dockerfile"),
+    )
+    .expect("provisioner Dockerfile should read");
+    assert!(
+        dockerfile.contains("ARG BUILD_MODE=release"),
+        "provisioner image should accept the shared BUILD_MODE argument so mixed-run tests can use \
+         debug builds:\n{dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("if [ \"$BUILD_MODE\" = \"release\" ]; then")
+            && dockerfile.contains("cargo build -p amber-provisioner --release --locked")
+            && dockerfile.contains("cargo build -p amber-provisioner --locked")
+            && dockerfile.contains("\"${build_dir}\"/amber-provisioner"),
+        "provisioner image should support both release and debug output paths:\n{dockerfile}"
     );
 }
 
@@ -374,4 +397,64 @@ fn reserve_loopback_port_shares_allocator_with_site_controller_runtime() {
             "mixed-run and site-controller loopback reservations must use the same shared pool",
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_kubernetes_namespace_force_deletes_stuck_pods_before_retrying() {
+    let temp = TempDir::new().expect("temp dir");
+    let kubectl = temp.path().join("kubectl");
+    let log_path = temp.path().join("kubectl.log");
+    let state_path = temp.path().join("namespace-state");
+    fs::write(
+        &kubectl,
+        format!(
+            "#!/bin/sh\nset -eu\nlog_path='{}'\nstate_path='{}'\nprintf '%s\\n' \"$*\" >> \
+             \"$log_path\"\nif [ \"${{1:-}}\" = \"--context\" ]; then\n  shift 2\nfi\nstate=alive\n\
+             if [ -f \"$state_path\" ]; then\n  state=$(cat \"$state_path\")\nfi\nif [ \"${{1:-}}\" \
+             = \"delete\" ] && [ \"${{2:-}}\" = \"namespace\" ]; then\n  exit 0\nfi\nif [ \
+             \"${{1:-}}\" = \"get\" ] && [ \"${{2:-}}\" = \"namespace\" ]; then\n  if [ \"$state\" = \
+             \"gone\" ]; then\n    echo 'Error from server (NotFound): namespaces \"'\"${{3:-}}\"'\" \
+             not found' >&2\n    exit 1\n  fi\n  printf '{{\"metadata\":{{\"name\":\"%s\",\
+             \"deletionTimestamp\":\"2026-04-16T02:33:55Z\"}}}}\\n' \"${{3:-}}\"\n  exit 0\nfi\nif \
+             [ \"${{1:-}}\" = \"-n\" ] && [ \"${{2:-}}\" = \"test-ns\" ] && [ \"${{3:-}}\" = \
+             \"delete\" ] && [ \"${{4:-}}\" = \"pods\" ]; then\n  printf 'gone' > \"$state_path\"\n  \
+             exit 0\nfi\necho \"unexpected kubectl invocation: $*\" >&2\nexit 1\n",
+            log_path.display(),
+            state_path.display(),
+        ),
+    )
+    .expect("kubectl stub");
+    let mut permissions = fs::metadata(&kubectl)
+        .expect("kubectl metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&kubectl, permissions).expect("kubectl chmod");
+
+    stop_kubernetes_namespace_with_kubectl(
+        &kubectl,
+        Some("test-context"),
+        "test-ns",
+        Duration::from_millis(20),
+    )
+    .expect("namespace stop should force-delete remaining pods and retry");
+
+    let log = fs::read_to_string(&log_path).expect("kubectl log");
+    let delete_namespace_calls = log
+        .lines()
+        .filter(|line| {
+            line.contains("delete namespace test-ns --ignore-not-found --wait=false")
+        })
+        .count();
+    assert_eq!(
+        delete_namespace_calls, 2,
+        "namespace deletion should be retried after forced pod cleanup:\n{log}"
+    );
+    assert!(
+        log.lines().any(|line| {
+            line.contains("-n test-ns delete pods --all --ignore-not-found --force \
+                           --grace-period=0")
+        }),
+        "forced pod cleanup should run before the retry:\n{log}"
+    );
 }

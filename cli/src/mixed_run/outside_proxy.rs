@@ -358,22 +358,14 @@ pub(super) async fn stop_site_from_receipt(
                 send_sigterm(pid);
             }
             if let Some(namespace) = site.kubernetes_namespace.as_deref() {
-                let status = kubectl_command(site.context.as_deref())
-                    .arg("delete")
-                    .arg("namespace")
-                    .arg(namespace)
-                    .arg("--ignore-not-found")
-                    .status()
-                    .into_diagnostic()
-                    .wrap_err_with(|| {
-                        format!("failed to stop orphaned kubernetes site `{namespace}`")
-                    })?;
-                if !status.success() {
-                    return Err(miette::miette!(
-                        "orphaned kubernetes site `{namespace}` failed to stop with status \
-                         {status}"
-                    ));
-                }
+                stop_kubernetes_namespace(
+                    site.context.as_deref(),
+                    namespace,
+                    KUBERNETES_NAMESPACE_DELETE_TIMEOUT,
+                )
+                .wrap_err_with(|| {
+                    format!("failed to stop orphaned kubernetes site `{namespace}`")
+                })?;
             }
         }
     }

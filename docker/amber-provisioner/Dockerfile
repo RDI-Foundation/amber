@@ -51,9 +51,16 @@ COPY compiler ./compiler
 COPY runtime/mesh ./runtime/mesh
 COPY runtime/provisioner ./runtime/provisioner
 
+ARG BUILD_MODE=release
 RUN target=$(cat /tmp/rust-target) && \
-    cargo build -p amber-provisioner --release --locked --target "${target}" && \
-    install -D -m 0755 /app/target/"${target}"/release/amber-provisioner /out/amber-provisioner && \
+    if [ "$BUILD_MODE" = "release" ]; then \
+      cargo build -p amber-provisioner --release --locked --target "${target}"; \
+      build_dir=release; \
+    else \
+      cargo build -p amber-provisioner --locked --target "${target}"; \
+      build_dir=debug; \
+    fi && \
+    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-provisioner /out/amber-provisioner && \
     mkdir -p /out/amber/plan /out/amber/provision && \
     touch /out/amber/plan/mesh-provision-plan.json
 

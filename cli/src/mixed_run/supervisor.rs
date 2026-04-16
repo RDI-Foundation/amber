@@ -346,8 +346,10 @@ pub(super) async fn wait_for_site_ready(
             ));
         }
         if Instant::now() >= deadline {
+            let diagnostics =
+                site_startup_timeout_diagnostics(site_plan, site_state_root, &state_path);
             return Err(miette::miette!(
-                "timed out waiting for site `{site_id}` to become ready"
+                "timed out waiting for site `{site_id}` to become ready{diagnostics}"
             ));
         }
         sleep(Duration::from_millis(200)).await;
@@ -1016,6 +1018,125 @@ pub(super) fn parse_container_runtime_status(raw: &str) -> Option<(&str, Option<
     Some((status, health))
 }
 
+fn tail_lines(raw: &str, keep: usize) -> String {
+    let lines = raw.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(keep);
+    lines[start..].join("\n")
+}
+
+fn timeout_file_section(label: &str, path: &Path, keep_lines: usize) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{label} ({}):\n{}",
+        path.display(),
+        tail_lines(trimmed, keep_lines)
+    ))
+}
+
+fn timeout_command_section(label: &str, command: &mut Command) -> Option<String> {
+    let output = command.output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let body = if output.status.success() {
+        stdout.trim().to_string()
+    } else if stdout.trim().is_empty() {
+        stderr.trim().to_string()
+    } else if stderr.trim().is_empty() {
+        stdout.trim().to_string()
+    } else {
+        format!("stdout:\n{}\n\nstderr:\n{}", stdout.trim(), stderr.trim())
+    };
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!("{label}:\n{body}"))
+}
+
+fn compose_site_timeout_sections(plan: &SiteSupervisorPlan) -> Vec<String> {
+    let mut sections = Vec::new();
+    if let Ok(status) = inspect_compose_site_controller_status(plan) {
+        let summary = status
+            .map(|(status, health)| match health {
+                Some(health) => format!("{status} {health}"),
+                None => status,
+            })
+            .unwrap_or_else(|| "unavailable".to_string());
+        sections.push(format!(
+            "compose site controller status (`{}`): {summary}",
+            compose_site_controller_container_name(plan)
+                .unwrap_or_else(|| "<missing>".to_string())
+        ));
+    }
+    if let Some(compose_ps) = timeout_command_section(
+        "docker compose ps --all",
+        compose_command(plan.compose_project.as_deref(), Path::new(&plan.artifact_dir))
+            .arg("ps")
+            .arg("--all"),
+    ) {
+        sections.push(compose_ps);
+    }
+    if let Some(container_name) = compose_site_controller_container_name(plan) {
+        if let Some(inspect_state) = timeout_command_section(
+            &format!("docker inspect state for `{container_name}`"),
+            Command::new("docker")
+                .arg("inspect")
+                .arg("--format")
+                .arg("{{json .State}}")
+                .arg(&container_name),
+        ) {
+            sections.push(inspect_state);
+        }
+        if let Some(container_logs) = timeout_command_section(
+            &format!("docker logs `{container_name}`"),
+            Command::new("docker")
+                .arg("logs")
+                .arg("--tail")
+                .arg("200")
+                .arg(&container_name),
+        ) {
+            sections.push(container_logs);
+        }
+    }
+    sections
+}
+
+fn site_startup_timeout_diagnostics(
+    site_plan: &RunSitePlan,
+    site_state_root: &Path,
+    state_path: &Path,
+) -> String {
+    let mut sections = Vec::new();
+    if let Some(section) = timeout_file_section("manager state", state_path, 200) {
+        sections.push(section);
+    }
+    if let Some(section) =
+        timeout_file_section("supervisor log", &site_state_root.join("supervisor.log"), 200)
+    {
+        sections.push(section);
+    }
+    if let Some(section) = timeout_file_section("site log", &site_state_root.join("site.log"), 200)
+    {
+        sections.push(section);
+    }
+    if site_plan.site.kind == SiteKind::Compose
+        && let Ok(plan) = read_json::<SiteSupervisorPlan>(
+            &site_supervisor_plan_path(site_state_root),
+            "site supervisor plan",
+        )
+    {
+        sections.extend(compose_site_timeout_sections(&plan));
+    }
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!("\nstartup diagnostics:\n{}", sections.join("\n\n"))
+    }
+}
+
 fn inspect_compose_site_controller_status(
     plan: &SiteSupervisorPlan,
 ) -> Result<Option<(String, Option<String>)>> {
@@ -1238,22 +1359,17 @@ pub(super) async fn cleanup_site(
         }
         SiteKind::Kubernetes => {
             if let Some(namespace) = plan.kubernetes_namespace.as_deref() {
-                let status = kubectl_command(plan.context.as_deref())
-                    .arg("delete")
-                    .arg("namespace")
-                    .arg(namespace)
-                    .arg("--ignore-not-found")
-                    .status()
-                    .into_diagnostic()
-                    .wrap_err_with(|| {
-                        format!("failed to stop kubernetes site `{}`", plan.site_id)
-                    })?;
-                if !status.success() {
-                    return Err(miette::miette!(
-                        "kubernetes site `{}` failed to stop with status {status}",
+                stop_kubernetes_namespace(
+                    plan.context.as_deref(),
+                    namespace,
+                    KUBERNETES_NAMESPACE_DELETE_TIMEOUT,
+                )
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to stop kubernetes site `{}` in namespace `{namespace}`",
                         plan.site_id
-                    ));
-                }
+                    )
+                })?;
             }
         }
         SiteKind::Direct | SiteKind::Vm => {}

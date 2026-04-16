@@ -796,6 +796,7 @@ impl LinuxVmHarness {
             &format!(
                 "set -euxo pipefail\n. \"$HOME/.cargo/env\"\ncd {guest}\nexport \
                  AMBER_TEST_KEEP_OUTPUTS=1\nexport \
+                 AMBER_TEST_INTERNAL_IMAGE_BUILD_MODE=debug\nexport \
                  AMBER_VM_SMOKE_BASE_IMAGE=\"$HOME/{image_filename}\"\nexport \
                  AMBER_MIXED_RUN_BASE_IMAGE=\"$HOME/{image_filename}\"\nexport \
                  CARGO_TARGET_DIR=\"$HOME/amber-target\"\nexport CARGO_TERM_QUIET=true\nexport \

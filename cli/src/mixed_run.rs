@@ -85,8 +85,11 @@ const PROCESS_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const SITE_SUPERVISOR_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 const FORCED_SUPERVISOR_EXIT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const KUBERNETES_NAMESPACE_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const KUBERNETES_NAMESPACE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+const KUBERNETES_NAMESPACE_FORCE_DELETE_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const KUBERNETES_WORKLOAD_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const KUBERNETES_SITE_READY_BUFFER: Duration = Duration::from_secs(30);
+const KUBERNETES_NAMESPACE_DELETE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const VM_LOCAL_TARGET_READY_TIMEOUT: Duration = Duration::from_secs(1);
 
 const DEFAULT_EXTERNAL_ENV_FILE: &str = "router-external.env";
@@ -1168,6 +1171,197 @@ fn coordinator_lock_path(run_root: &Path) -> PathBuf {
 
 fn stop_marker_path(run_root: &Path) -> PathBuf {
     run_root.join("stop-requested")
+}
+
+fn kubectl_command_with_bin(kubectl_bin: &Path, context: Option<&str>) -> Command {
+    let mut cmd = Command::new(kubectl_bin);
+    if let Some(context) = context {
+        cmd.arg("--context").arg(context);
+    }
+    cmd
+}
+
+fn kubectl_stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).trim().to_string()
+}
+
+fn kubectl_stdout(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn kubectl_detail(output: &std::process::Output) -> String {
+    let stdout = kubectl_stdout(output);
+    let stderr = kubectl_stderr(output);
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
+        (false, true) => format!("stdout:\n{stdout}"),
+        (true, false) => format!("stderr:\n{stderr}"),
+        (true, true) => format!("status {}", output.status),
+    }
+}
+
+fn kubectl_is_not_found(output: &std::process::Output) -> bool {
+    let stderr = kubectl_stderr(output);
+    stderr.contains("(NotFound)") || stderr.contains("not found")
+}
+
+fn kubectl_force_delete_namespace_pods_with_bin(
+    kubectl_bin: &Path,
+    context: Option<&str>,
+    namespace: &str,
+) -> Result<()> {
+    let output = kubectl_command_with_bin(kubectl_bin, context)
+        .args([
+            "-n",
+            namespace,
+            "delete",
+            "pods",
+            "--all",
+            "--ignore-not-found",
+            "--force",
+            "--grace-period=0",
+        ])
+        .output()
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!("failed to force-delete remaining pods in kubernetes namespace `{namespace}`")
+        })?;
+    if !output.status.success() && !kubectl_is_not_found(&output) {
+        return Err(miette::miette!(
+            "force-delete of remaining pods in kubernetes namespace `{namespace}` failed:\n{}",
+            kubectl_detail(&output)
+        ));
+    }
+    Ok(())
+}
+
+fn kubectl_list_namespace_pods_with_bin(
+    kubectl_bin: &Path,
+    context: Option<&str>,
+    namespace: &str,
+) -> Result<Vec<String>> {
+    let output = kubectl_command_with_bin(kubectl_bin, context)
+        .args(["-n", namespace, "get", "pods", "--ignore-not-found", "-o", "name"])
+        .output()
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!("failed to list remaining pods in kubernetes namespace `{namespace}`")
+        })?;
+    if !output.status.success() {
+        if kubectl_is_not_found(&output) {
+            return Ok(Vec::new());
+        }
+        return Err(miette::miette!(
+            "listing remaining pods in kubernetes namespace `{namespace}` failed:\n{}",
+            kubectl_detail(&output)
+        ));
+    }
+    Ok(kubectl_stdout(&output)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+pub(super) fn stop_kubernetes_namespace(
+    context: Option<&str>,
+    namespace: &str,
+    timeout: Duration,
+) -> Result<()> {
+    stop_kubernetes_namespace_with_kubectl(Path::new("kubectl"), context, namespace, timeout)
+}
+
+fn stop_kubernetes_namespace_with_kubectl(
+    kubectl_bin: &Path,
+    context: Option<&str>,
+    namespace: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let delete_output = kubectl_command_with_bin(kubectl_bin, context)
+        .args([
+            "delete",
+            "namespace",
+            namespace,
+            "--ignore-not-found",
+            "--wait=false",
+        ])
+        .output()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to start deletion of kubernetes namespace `{namespace}`"))?;
+    if !delete_output.status.success() && !kubectl_is_not_found(&delete_output) {
+        return Err(miette::miette!(
+            "starting deletion of kubernetes namespace `{namespace}` failed:\n{}",
+            kubectl_detail(&delete_output)
+        ));
+    }
+
+    let mut deadline = Instant::now() + timeout;
+    let mut forced_pod_cleanup = false;
+    let mut last_namespace_detail = None::<String>;
+    loop {
+        let get_output = kubectl_command_with_bin(kubectl_bin, context)
+            .args(["get", "namespace", namespace, "-o", "json"])
+            .output()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to query kubernetes namespace `{namespace}`"))?;
+        if !get_output.status.success() {
+            if kubectl_is_not_found(&get_output) {
+                return Ok(());
+            }
+            last_namespace_detail = Some(kubectl_detail(&get_output));
+        } else {
+            last_namespace_detail = Some(kubectl_stdout(&get_output));
+        }
+
+        if Instant::now() >= deadline {
+            if !forced_pod_cleanup {
+                kubectl_force_delete_namespace_pods_with_bin(kubectl_bin, context, namespace)?;
+                let retry_output = kubectl_command_with_bin(kubectl_bin, context)
+                    .args([
+                        "delete",
+                        "namespace",
+                        namespace,
+                        "--ignore-not-found",
+                        "--wait=false",
+                    ])
+                    .output()
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!("failed to retry deletion of kubernetes namespace `{namespace}`")
+                    })?;
+                if !retry_output.status.success() && !kubectl_is_not_found(&retry_output) {
+                    return Err(miette::miette!(
+                        "retrying deletion of kubernetes namespace `{namespace}` failed:\n{}",
+                        kubectl_detail(&retry_output)
+                    ));
+                }
+                forced_pod_cleanup = true;
+                deadline = Instant::now() + KUBERNETES_NAMESPACE_FORCE_DELETE_GRACE_PERIOD;
+                std::thread::sleep(KUBERNETES_NAMESPACE_DELETE_POLL_INTERVAL);
+                continue;
+            }
+
+            let remaining_pods =
+                kubectl_list_namespace_pods_with_bin(kubectl_bin, context, namespace)?;
+            let pod_detail = if remaining_pods.is_empty() {
+                "remaining pods: none".to_string()
+            } else {
+                format!("remaining pods: {}", remaining_pods.join(", "))
+            };
+            let namespace_detail = last_namespace_detail
+                .as_deref()
+                .filter(|detail| !detail.is_empty())
+                .map(|detail| format!("last namespace response:\n{detail}"))
+                .unwrap_or_else(|| "last namespace response: <empty>".to_string());
+            return Err(miette::miette!(
+                "timed out waiting for kubernetes namespace `{namespace}` to delete after {}s\n{pod_detail}\n{namespace_detail}",
+                timeout.as_secs() + KUBERNETES_NAMESPACE_FORCE_DELETE_GRACE_PERIOD.as_secs()
+            ));
+        }
+
+        std::thread::sleep(KUBERNETES_NAMESPACE_DELETE_POLL_INTERVAL);
+    }
 }
 
 async fn wait_for_stop_request(stop_requested: &AtomicBool, run_root: &Path) {

@@ -654,45 +654,17 @@ pub(crate) async fn terminate_children(children: &mut [ManagedChild]) {
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn terminate_children(children: &mut [ManagedChild]) {
-    for child in children.iter_mut() {
-        if linux_pid_is_alive(child.managed_pid) {
-            let _ = send_sigterm(child.managed_pid);
-        }
-        if child.wrapper_pid != child.managed_pid {
-            let _ = send_sigterm(child.wrapper_pid);
-        }
-    }
+    let root_pids = children
+        .iter()
+        .flat_map(|child| {
+            let managed = (child.managed_pid != child.wrapper_pid).then_some(child.managed_pid);
+            [Some(child.wrapper_pid), managed]
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    let _ = crate::unix_process::terminate_process_roots(&root_pids, DIRECT_SHUTDOWN_GRACE_PERIOD)
+        .await;
 
-    let deadline = Instant::now() + DIRECT_SHUTDOWN_GRACE_PERIOD;
-    loop {
-        let mut all_exited = true;
-        for child in children.iter_mut() {
-            if let Some(wrapper) = child.wrapper.as_mut()
-                && wrapper.try_wait().ok().flatten().is_some()
-            {
-                child.wrapper = None;
-            }
-            if linux_pid_is_alive(child.managed_pid) {
-                all_exited = false;
-            }
-            if child.wrapper.is_some() {
-                all_exited = false;
-            }
-        }
-        if all_exited || Instant::now() >= deadline {
-            break;
-        }
-        sleep(DIRECT_CHILD_POLL_INTERVAL).await;
-    }
-
-    for child in children.iter_mut() {
-        if linux_pid_is_alive(child.managed_pid) {
-            let _ = kill_pid_force(child.managed_pid);
-        }
-        if child.wrapper_pid != child.managed_pid {
-            let _ = kill_pid_force(child.wrapper_pid);
-        }
-    }
     for child in children.iter_mut() {
         if let Some(mut wrapper) = child.wrapper.take() {
             let _ = wrapper.wait().await;
@@ -717,13 +689,6 @@ pub(crate) async fn terminate_children(children: &mut [ManagedChild]) {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn send_sigterm(pid: u32) -> std::result::Result<(), ()> {
-    let pid = i32::try_from(pid).map_err(|_| ())?;
-    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-    if rc == 0 { Ok(()) } else { Err(()) }
-}
-
-#[cfg(target_os = "linux")]
 pub(crate) fn linux_pid_is_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
@@ -733,13 +698,6 @@ pub(crate) fn linux_pid_is_alive(pid: u32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn kill_pid_force(pid: u32) -> std::result::Result<(), ()> {
-    let pid = i32::try_from(pid).map_err(|_| ())?;
-    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
-    if rc == 0 { Ok(()) } else { Err(()) }
 }
 
 #[cfg(all(target_os = "linux", unix))]

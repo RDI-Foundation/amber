@@ -587,14 +587,93 @@ pub(crate) fn append_debug_file(out: &mut String, label: &str, path: &Path) {
     ));
 }
 
+fn manager_state_value(state_path: &Path) -> Option<Value> {
+    fs::read_to_string(state_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+}
+
+fn append_docker_project_debug(out: &mut String, project: &str) {
+    let project_filter = format!("label=com.docker.compose.project={project}");
+    let ps_output = match Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            project_filter.as_str(),
+            "--format",
+            "{{.ID}}\t{{.Names}}\t{{.Status}}",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            out.push_str(&format!(
+                "\ndocker compose project `{project}` status query failed:\n{err}\n"
+            ));
+            return;
+        }
+    };
+
+    if !ps_output.status.success() {
+        out.push_str(&format!(
+            "\ndocker compose project `{project}` status query failed\nstdout:\n{}\nstderr:\n{}\n",
+            String::from_utf8_lossy(&ps_output.stdout),
+            String::from_utf8_lossy(&ps_output.stderr),
+        ));
+        return;
+    }
+
+    let containers = String::from_utf8_lossy(&ps_output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            Some((
+                parts.next()?.trim().to_string(),
+                parts.next()?.trim().to_string(),
+                parts.next()?.trim().to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    if containers.is_empty() {
+        out.push_str(&format!(
+            "\ndocker compose project `{project}` containers:\n<none>\n"
+        ));
+        return;
+    }
+
+    out.push_str(&format!("\ndocker compose project `{project}` containers:\n"));
+    for (_, name, status) in &containers {
+        out.push_str(&format!("{name}\t{status}\n"));
+    }
+
+    for (id, name, status) in containers {
+        let logs_output = match Command::new("docker")
+            .args(["logs", "--tail", "80", id.as_str()])
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) => {
+                out.push_str(&format!(
+                    "\ndocker logs {name} ({status}) failed:\n{err}\n"
+                ));
+                continue;
+            }
+        };
+        out.push_str(&format!(
+            "\ndocker logs {name} ({status}):\nstdout:\n{}\nstderr:\n{}\n",
+            String::from_utf8_lossy(&logs_output.stdout),
+            String::from_utf8_lossy(&logs_output.stderr),
+        ));
+    }
+}
+
 pub(crate) fn site_debug_context(run_root: &Path, site_id: &str) -> String {
     let state_root = run_root.join("state").join(site_id);
+    let manager_state_path = state_root.join("manager-state.json");
     let mut out = String::new();
-    append_debug_file(
-        &mut out,
-        "manager state",
-        &state_root.join("manager-state.json"),
-    );
+    append_debug_file(&mut out, "manager state", &manager_state_path);
     append_debug_file(
         &mut out,
         "supervisor log",
@@ -606,6 +685,11 @@ pub(crate) fn site_debug_context(run_root: &Path, site_id: &str) -> String {
         &state_root.join("port-forward.log"),
     );
     append_debug_file(&mut out, "site log", &state_root.join("site.log"));
+    if let Some(project) = manager_state_value(&manager_state_path)
+        .and_then(|state| state["compose_project"].as_str().map(ToOwned::to_owned))
+    {
+        append_docker_project_debug(&mut out, &project);
+    }
     out
 }
 
@@ -723,6 +807,22 @@ pub(crate) fn use_prebuilt_images() -> bool {
     env::var_os("AMBER_TEST_USE_PREBUILT_IMAGES").is_some()
 }
 
+fn internal_image_build_mode() -> &'static str {
+    static MODE: OnceLock<&'static str> = OnceLock::new();
+    MODE.get_or_init(|| match env::var("AMBER_TEST_INTERNAL_IMAGE_BUILD_MODE") {
+        Ok(mode) if mode == "release" => "release",
+        Ok(mode) if mode == "debug" => "debug",
+        Ok(mode) => panic!(
+            "AMBER_TEST_INTERNAL_IMAGE_BUILD_MODE must be `debug` or `release`, got `{mode}`"
+        ),
+        Err(env::VarError::NotPresent) => "debug",
+        Err(env::VarError::NotUnicode(value)) => panic!(
+            "AMBER_TEST_INTERNAL_IMAGE_BUILD_MODE must be valid UTF-8, got {:?}",
+            value
+        ),
+    })
+}
+
 pub(crate) fn image_platform_opt(tag: &str) -> Option<String> {
     let output = Command::new("docker")
         .arg("image")
@@ -761,12 +861,19 @@ pub(crate) fn ensure_docker_image(tag: &str, dockerfile: &Path) {
     for attempt in 1..=3 {
         let mut command = Command::new("docker");
         if docker_supports_buildx() {
-            command.arg("buildx").arg("build").arg("--load");
+            command
+                .arg("buildx")
+                .arg("build")
+                .arg("--load")
+                .arg("--progress")
+                .arg("plain");
         } else {
             command.env("DOCKER_BUILDKIT", "1");
             command.arg("build");
         }
         let status = command
+            .arg("--build-arg")
+            .arg(format!("BUILD_MODE={}", internal_image_build_mode()))
             .arg("-t")
             .arg(tag)
             .arg("-f")
@@ -953,7 +1060,12 @@ fn ensure_local_dev_image_tag_overrides() {
         }
         let mut hasher = DefaultHasher::new();
         workspace_root().hash(&mut hasher);
-        let tag = format!("dev-mixed-run-{:016x}", hasher.finish());
+        internal_image_build_mode().hash(&mut hasher);
+        let tag = format!(
+            "dev-mixed-run-{}-{:016x}",
+            internal_image_build_mode(),
+            hasher.finish()
+        );
         let overrides = INTERNAL_IMAGE_OVERRIDE_KEYS
             .iter()
             .map(|key| format!("{key}={tag}"))
@@ -1015,27 +1127,47 @@ fn kind_load_docker_image(cluster_name: &str, image: &str) -> Result<(), String>
 }
 
 fn kind_load_image_archive(cluster_name: &str, image: &str) -> Result<(), String> {
-    let mut docker = Command::new("docker")
+    let archive = tempfile::Builder::new()
+        .prefix("amber-kind-image-")
+        .suffix(".tar")
+        .tempfile()
+        .map_err(|err| {
+            format!("failed to create temporary image archive for {image} in {cluster_name}: {err}")
+        })?;
+    kind_load_image_archive_with_binaries(Path::new("kind"), Path::new("docker"), cluster_name, image, archive)
+}
+
+fn kind_load_image_archive_with_binaries(
+    kind_bin: &Path,
+    docker_bin: &Path,
+    cluster_name: &str,
+    image: &str,
+    archive: tempfile::NamedTempFile,
+) -> Result<(), String> {
+    let archive_path = archive.path().to_path_buf();
+    let docker_output = Command::new(docker_bin)
         .arg("image")
         .arg("save")
+        .arg("--output")
+        .arg(&archive_path)
         .arg(image)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .output()
         .map_err(|err| {
             format!("failed to run `docker image save` for {image} in {cluster_name}: {err}")
         })?;
-    let docker_stdout = docker
-        .stdout
-        .take()
-        .ok_or_else(|| format!("docker image save for {image} did not expose stdout"))?;
-    let kind = Command::new("kind")
+    if !docker_output.status.success() {
+        return Err(format_command_output(
+            &format!("docker image save failed for {image}"),
+            &docker_output,
+        ));
+    }
+
+    let kind = Command::new(kind_bin)
         .arg("load")
         .arg("image-archive")
         .arg("--name")
         .arg(cluster_name)
-        .arg("-")
-        .stdin(Stdio::from(docker_stdout))
+        .arg(&archive_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -1045,30 +1177,14 @@ fn kind_load_image_archive(cluster_name: &str, image: &str) -> Result<(), String
                  {err}"
             )
         })?;
-    let docker_output = docker.wait_with_output().map_err(|err| {
-        format!("failed to collect `docker image save` output for {image}: {err}")
-    })?;
-    if kind.status.success() && docker_output.status.success() {
+    if kind.status.success() {
         return Ok(());
     }
 
-    let mut message = String::new();
-    if !docker_output.status.success() {
-        message.push_str(&format_command_output(
-            &format!("docker image save failed for {image}"),
-            &docker_output,
-        ));
-    }
-    if !kind.status.success() {
-        if !message.is_empty() {
-            message.push_str("\n\n");
-        }
-        message.push_str(&format_command_output(
-            &format!("kind load image-archive failed for {image} in cluster {cluster_name}"),
-            &kind,
-        ));
-    }
-    Err(message)
+    Err(format_command_output(
+        &format!("kind load image-archive failed for {image} in cluster {cluster_name}"),
+        &kind,
+    ))
 }
 
 fn format_command_output(label: &str, output: &std::process::Output) -> String {
@@ -2809,6 +2925,9 @@ pub(crate) fn namespace_exists(namespace: &str, kubeconfig: &Path, context: &str
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
 
     #[test]
@@ -2903,6 +3022,60 @@ mod tests {
                     .is_some_and(|name| name == "framework-component-kubernetes-cache"),
             "kubernetes framework control state should use the dedicated cache path, got {}",
             state_path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kind_load_image_archive_uses_real_archive_path() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let kind = temp.path().join("kind");
+        let log_path = temp.path().join("commands.log");
+
+        fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nset -eu\nprintf 'docker %s\\n' \"$*\" >> '{}'\nif [ \"$1\" = image ] && [ \"$2\" = save ] && [ \"$3\" = --output ]; then\n  printf 'archive' > \"$4\"\n  exit 0\nfi\necho \"unexpected docker invocation: $*\" >&2\nexit 1\n",
+                log_path.display()
+            ),
+        )
+        .expect("docker stub should write");
+        fs::write(
+            &kind,
+            format!(
+                "#!/bin/sh\nset -eu\nprintf 'kind %s\\n' \"$*\" >> '{}'\narchive=\"${{5:-}}\"\nif [ \"$1\" = load ] && [ \"$2\" = image-archive ] && [ \"$3\" = --name ] && [ \"$5\" != '-' ] && [ -f \"$archive\" ]; then\n  exit 0\nfi\necho \"unexpected kind invocation: $*\" >&2\nexit 1\n",
+                log_path.display()
+            ),
+        )
+        .expect("kind stub should write");
+        for path in [&docker, &kind] {
+            let mut permissions = fs::metadata(path)
+                .expect("stub metadata should read")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("stub should chmod");
+        }
+
+        let archive = tempfile::Builder::new()
+            .prefix("kind-archive-")
+            .suffix(".tar")
+            .tempfile_in(temp.path())
+            .expect("temp archive should create");
+        kind_load_image_archive_with_binaries(&kind, &docker, "test-cluster", "test:image", archive)
+            .expect("kind image-archive fallback should use a real archive path");
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        assert!(
+            log.lines().any(|line| line.contains("docker image save --output ")),
+            "docker should save to a concrete archive path:\n{log}"
+        );
+        assert!(
+            log.lines().any(|line| {
+                line.starts_with("kind load image-archive --name test-cluster ")
+                    && !line.ends_with(" -")
+            }),
+            "kind should receive the archive filename, not stdin:\n{log}"
         );
     }
 }

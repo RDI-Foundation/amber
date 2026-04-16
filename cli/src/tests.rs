@@ -903,12 +903,23 @@ async fn cleanup_direct_runtime_terminates_wrapper_descendants() {
     fs::write(&runtime_state_path, "{}").expect("state file should be written");
 
     let child_pid_path = runtime_root.join("child.pid");
-    let child = TokioCommand::new("sh")
+    // Use a real wrapper process so the test records the long-lived descendant PID rather than
+    // relying on shell job-control or `setsid` utility behavior.
+    let child = TokioCommand::new("python3")
         .arg("-c")
-        .arg(format!(
-            "setsid sleep 30 >/dev/null 2>&1 & echo $! > {} ; wait",
-            child_pid_path.display()
-        ))
+        .arg(
+            r#"
+import pathlib
+import subprocess
+import sys
+
+pid_path = pathlib.Path(sys.argv[1])
+child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+pid_path.write_text(f"{child.pid}\n", encoding="utf-8")
+child.wait()
+"#,
+        )
+        .arg(&child_pid_path)
         .spawn()
         .expect("wrapper should spawn");
     let mut children = vec![ManagedChild {
@@ -939,6 +950,20 @@ async fn cleanup_direct_runtime_terminates_wrapper_descendants() {
         .trim()
         .parse::<u32>()
         .expect("descendant pid should parse");
+    let wrapper_pid = children[0]
+        .wrapper
+        .as_ref()
+        .and_then(tokio::process::Child::id)
+        .expect("wrapper pid should be available");
+    let tree_deadline = Instant::now() + Duration::from_secs(5);
+    while descendant_parent_pid(child_pid) != Some(wrapper_pid) && Instant::now() < tree_deadline {
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        descendant_parent_pid(child_pid),
+        Some(wrapper_pid),
+        "descendant should appear in the process table under its wrapper before cleanup"
+    );
 
     cleanup_direct_runtime(
         &mut children,
@@ -950,13 +975,41 @@ async fn cleanup_direct_runtime_terminates_wrapper_descendants() {
     .await;
 
     let stopped = !crate::unix_process::pid_is_alive(child_pid);
+    let survivor = if stopped {
+        None
+    } else {
+        Some(
+            std::process::Command::new("ps")
+                .args(["-o", "pid=,ppid=,pgid=,stat=,command=", "-p"])
+                .arg(child_pid.to_string())
+                .output()
+                .ok()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .filter(|line| !line.is_empty())
+                .unwrap_or_else(|| "<survivor ps unavailable>".to_string()),
+        )
+    };
     if !stopped {
         let _ = unsafe { libc::kill(child_pid as i32, libc::SIGKILL) };
     }
     assert!(
         stopped,
-        "cleanup should terminate descendants that outlive their wrapper"
+        "cleanup should terminate descendants that outlive their wrapper; surviving process: {}",
+        survivor.unwrap_or_default()
     );
+}
+
+#[cfg(unix)]
+fn descendant_parent_pid(pid: u32) -> Option<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p"])
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 #[test]

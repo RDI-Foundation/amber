@@ -9186,32 +9186,13 @@ volumes:
         .to_string();
     assert_eq!(command[0].as_str(), Some("--plan"));
     assert_eq!(command[1].as_str(), Some(plan_path.as_str()));
-    #[cfg(unix)]
-    let expected_user = {
-        #[cfg(target_os = "macos")]
-        {
-            Some("0:0".to_string())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            if fs::metadata("/var/run/docker.sock").is_ok() {
-                Some(format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
-                    libc::getegid()
-                }))
-            } else {
-                Some("0:0".to_string())
-            }
-        }
-    };
-    #[cfg(unix)]
     assert_eq!(
         service
             .get(serde_yaml::Value::String("user".to_string()))
             .and_then(serde_yaml::Value::as_str),
-        expected_user.as_deref(),
-        "compose site controller should use the host uid/gid on Linux so bind-mounted runtime \
-         state stays deletable and fall back to root on macOS where Docker Desktop mediates the \
-         socket mount"
+        Some("0:0"),
+        "compose site controller must stay root so it can access the router-control volume, which \
+         compose initializes as a root-owned mount point for the router runtime"
     );
     let volumes = service
         .get(serde_yaml::Value::String("volumes".to_string()))
@@ -9243,29 +9224,13 @@ volumes:
             .iter()
             .any(|value| { value.as_str() == Some("/var/run/docker.sock:/var/run/docker.sock") })
     );
-    #[cfg(all(unix, not(target_os = "macos")))]
-    if let Ok(metadata) = fs::metadata("/var/run/docker.sock") {
-        let expected_gid = metadata.gid().to_string();
-        let group_add = service
+    assert!(
+        service
             .get(serde_yaml::Value::String("group_add".to_string()))
-            .and_then(serde_yaml::Value::as_sequence)
-            .expect("controller service should declare supplemental groups");
-        if expected_gid != unsafe { libc::getegid() }.to_string() {
-            assert!(
-                group_add
-                    .iter()
-                    .any(|value| value.as_str() == Some(expected_gid.as_str())),
-                "compose site controller should join the host docker socket group when the socket \
-                 gid differs from the host gid",
-            );
-        } else {
-            assert!(
-                group_add.is_empty(),
-                "compose site controller should not add a redundant supplemental group when the \
-                 host gid already owns the docker socket",
-            );
-        }
-    }
+            .is_none(),
+        "compose site controller should not override its supplemental groups; it runs as root to \
+         preserve access to both the Docker socket and the router-control volume"
+    );
     assert!(
         extra_hosts
             .iter()
