@@ -1,5 +1,3 @@
-#[cfg(all(unix, not(target_os = "macos")))]
-use std::os::unix::fs::MetadataExt;
 use std::{
     fs,
     future::Future,

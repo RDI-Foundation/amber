@@ -358,7 +358,7 @@ pub fn vm_uses_tcg_accel() -> bool {
 
     #[cfg(target_os = "linux")]
     {
-        return env::var_os("AMBER_VM_FORCE_TCG").is_some() || !Path::new("/dev/kvm").exists();
+        env::var_os("AMBER_VM_FORCE_TCG").is_some() || !Path::new("/dev/kvm").exists()
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
