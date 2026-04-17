@@ -1241,7 +1241,15 @@ fn kubectl_list_namespace_pods_with_bin(
     namespace: &str,
 ) -> Result<Vec<String>> {
     let output = kubectl_command_with_bin(kubectl_bin, context)
-        .args(["-n", namespace, "get", "pods", "--ignore-not-found", "-o", "name"])
+        .args([
+            "-n",
+            namespace,
+            "get",
+            "pods",
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ])
         .output()
         .into_diagnostic()
         .wrap_err_with(|| {
@@ -1288,7 +1296,9 @@ fn stop_kubernetes_namespace_with_kubectl(
         ])
         .output()
         .into_diagnostic()
-        .wrap_err_with(|| format!("failed to start deletion of kubernetes namespace `{namespace}`"))?;
+        .wrap_err_with(|| {
+            format!("failed to start deletion of kubernetes namespace `{namespace}`")
+        })?;
     if !delete_output.status.success() && !kubectl_is_not_found(&delete_output) {
         return Err(miette::miette!(
             "starting deletion of kubernetes namespace `{namespace}` failed:\n{}",
@@ -1355,7 +1365,8 @@ fn stop_kubernetes_namespace_with_kubectl(
                 .map(|detail| format!("last namespace response:\n{detail}"))
                 .unwrap_or_else(|| "last namespace response: <empty>".to_string());
             return Err(miette::miette!(
-                "timed out waiting for kubernetes namespace `{namespace}` to delete after {}s\n{pod_detail}\n{namespace_detail}",
+                "timed out waiting for kubernetes namespace `{namespace}` to delete after \
+                 {}s\n{pod_detail}\n{namespace_detail}",
                 timeout.as_secs() + KUBERNETES_NAMESPACE_FORCE_DELETE_GRACE_PERIOD.as_secs()
             ));
         }

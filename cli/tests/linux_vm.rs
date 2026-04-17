@@ -433,6 +433,33 @@ fn write_ssh_keypair(private_key: &Path) -> Result<String, String> {
     })
 }
 
+fn append_ssh_transport_args(
+    command: &mut Command,
+    port_flag: &str,
+    ssh_private_key: &Path,
+    ssh_port: u16,
+) {
+    command
+        .arg("-i")
+        .arg(ssh_private_key)
+        .arg(port_flag)
+        .arg(ssh_port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=4")
+        .arg("-o")
+        .arg("LogLevel=ERROR");
+}
+
 impl LinuxVmHarness {
     fn start(output_dir: &Path, base_image: &Path) -> Result<Self, String> {
         let arch = guest_arch();
@@ -573,18 +600,8 @@ impl LinuxVmHarness {
 
     fn ssh_base_command(&self) -> Command {
         let mut command = Command::new("/usr/bin/ssh");
-        command
-            .arg("-i")
-            .arg(&self.ssh_private_key)
-            .arg("-p")
-            .arg(self.ssh_port.to_string())
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("LogLevel=ERROR")
-            .arg(format!("{GUEST_USER}@127.0.0.1"));
+        append_ssh_transport_args(&mut command, "-p", &self.ssh_private_key, self.ssh_port);
+        command.arg(format!("{GUEST_USER}@127.0.0.1"));
         command
     }
 
@@ -634,17 +651,7 @@ impl LinuxVmHarness {
 
     fn scp_to_guest(&self, sources: &[&Path], description: &str) -> Result<(), String> {
         let mut command = Command::new("/usr/bin/scp");
-        command
-            .arg("-i")
-            .arg(&self.ssh_private_key)
-            .arg("-P")
-            .arg(self.ssh_port.to_string())
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("LogLevel=ERROR");
+        append_ssh_transport_args(&mut command, "-P", &self.ssh_private_key, self.ssh_port);
         for source in sources {
             command.arg(source);
         }
@@ -1059,4 +1066,28 @@ fn provisioned_cache_keys_track_guest_setup() {
     assert!(vm_smoke_cache_key.starts_with("vm-smoke-"));
     assert!(mixed_run_cache_key.starts_with("mixed-run-"));
     assert_ne!(vm_smoke_cache_key, mixed_run_cache_key);
+}
+
+#[test]
+fn ssh_transport_args_include_fail_fast_liveness_bounds() {
+    let mut command = Command::new("/usr/bin/ssh");
+    append_ssh_transport_args(&mut command, "-p", Path::new("/tmp/test-key"), 2222);
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    for expected in [
+        ["-o", "BatchMode=yes"],
+        ["-o", "ConnectTimeout=5"],
+        ["-o", "ServerAliveInterval=15"],
+        ["-o", "ServerAliveCountMax=4"],
+    ] {
+        assert!(
+            args.windows(2)
+                .any(|window| window[0] == expected[0] && window[1] == expected[1]),
+            "ssh transport args should include {} {} so dead guests fail fast: {args:?}",
+            expected[0],
+            expected[1],
+        );
+    }
 }

@@ -350,8 +350,25 @@ fn write_vm_runtime_state(plan_root: &Path, state: &VmRuntimeState) -> Result<()
 
 const TCG_VM_STARTUP_TIMEOUT: Duration = Duration::from_secs(720);
 
-fn vm_endpoint_forward_ready_timeout() -> Duration {
-    if cfg!(target_os = "macos") && env::var_os("AMBER_VM_FORCE_TCG").is_some() {
+pub fn vm_uses_tcg_accel() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        env::var_os("AMBER_VM_FORCE_TCG").is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return env::var_os("AMBER_VM_FORCE_TCG").is_some() || !Path::new("/dev/kvm").exists();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        env::var_os("AMBER_VM_FORCE_TCG").is_some()
+    }
+}
+
+pub fn vm_endpoint_forward_ready_timeout() -> Duration {
+    if vm_uses_tcg_accel() {
         TCG_VM_STARTUP_TIMEOUT
     } else {
         Duration::from_secs(120)
@@ -1822,7 +1839,11 @@ fn terminate_detached_runtime(root_pid: u32, timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    static VM_ACCEL_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn kubernetes_router_ready_prefers_local_targets_over_manager_state() {
@@ -1941,5 +1962,26 @@ mod tests {
             "host-supervised kubernetes sites should still fall back to manager-state endpoints \
              when no embedded local router target is available",
         );
+    }
+
+    #[test]
+    fn vm_endpoint_forward_ready_timeout_honors_forced_tcg() {
+        let _guard = VM_ACCEL_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock should not be poisoned");
+        let previous = env::var_os("AMBER_VM_FORCE_TCG");
+        unsafe {
+            env::set_var("AMBER_VM_FORCE_TCG", "1");
+        }
+        assert_eq!(
+            vm_endpoint_forward_ready_timeout(),
+            TCG_VM_STARTUP_TIMEOUT,
+            "forced TCG must extend VM readiness timeouts on every supported host platform",
+        );
+        match previous {
+            Some(value) => unsafe { env::set_var("AMBER_VM_FORCE_TCG", value) },
+            None => unsafe { env::remove_var("AMBER_VM_FORCE_TCG") },
+        }
     }
 }

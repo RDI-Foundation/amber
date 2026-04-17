@@ -84,7 +84,8 @@ pub use self::{
         inject_site_controller_peer_router_routes, observability_endpoint_for_site,
         prepare_kubernetes_artifact_namespace, reserve_loopback_port,
         router_mesh_addr_for_consumer, set_compose_router_published_mesh_port,
-        set_site_artifact_mesh_identity_seed, site_controller_peer_router_url, walk_files,
+        set_site_artifact_mesh_identity_seed, site_controller_peer_router_url,
+        vm_endpoint_forward_ready_timeout, vm_uses_tcg_accel, walk_files,
     },
     runtime_api::{
         DesiredExportPeerOverlay, DesiredExternalSlotOverlay, DesiredRouteOverlay, LaunchedSite,

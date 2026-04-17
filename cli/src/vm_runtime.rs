@@ -797,13 +797,13 @@ fn resolve_vm_runtime_host_path(raw_path: &str, source_dir: Option<&str>) -> Res
 }
 
 pub(crate) fn vm_uses_tcg_accel() -> bool {
-    matches!(detect_qemu_accel(), QemuAccel::Tcg)
+    amber_site_controller::vm_uses_tcg_accel()
 }
 
 fn detect_qemu_accel() -> QemuAccel {
     #[cfg(target_os = "macos")]
     {
-        if env::var_os("AMBER_VM_FORCE_TCG").is_some() {
+        if vm_uses_tcg_accel() {
             QemuAccel::Tcg
         } else {
             QemuAccel::Hvf
@@ -812,12 +812,10 @@ fn detect_qemu_accel() -> QemuAccel {
 
     #[cfg(target_os = "linux")]
     {
-        if env::var_os("AMBER_VM_FORCE_TCG").is_some() {
+        if vm_uses_tcg_accel() {
             QemuAccel::Tcg
-        } else if Path::new("/dev/kvm").exists() {
-            QemuAccel::Kvm
         } else {
-            QemuAccel::Tcg
+            QemuAccel::Kvm
         }
     }
 

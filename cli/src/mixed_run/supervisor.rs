@@ -1067,15 +1067,17 @@ fn compose_site_timeout_sections(plan: &SiteSupervisorPlan) -> Vec<String> {
             .unwrap_or_else(|| "unavailable".to_string());
         sections.push(format!(
             "compose site controller status (`{}`): {summary}",
-            compose_site_controller_container_name(plan)
-                .unwrap_or_else(|| "<missing>".to_string())
+            compose_site_controller_container_name(plan).unwrap_or_else(|| "<missing>".to_string())
         ));
     }
     if let Some(compose_ps) = timeout_command_section(
         "docker compose ps --all",
-        compose_command(plan.compose_project.as_deref(), Path::new(&plan.artifact_dir))
-            .arg("ps")
-            .arg("--all"),
+        compose_command(
+            plan.compose_project.as_deref(),
+            Path::new(&plan.artifact_dir),
+        )
+        .arg("ps")
+        .arg("--all"),
     ) {
         sections.push(compose_ps);
     }
@@ -1113,9 +1115,11 @@ fn site_startup_timeout_diagnostics(
     if let Some(section) = timeout_file_section("manager state", state_path, 200) {
         sections.push(section);
     }
-    if let Some(section) =
-        timeout_file_section("supervisor log", &site_state_root.join("supervisor.log"), 200)
-    {
+    if let Some(section) = timeout_file_section(
+        "supervisor log",
+        &site_state_root.join("supervisor.log"),
+        200,
+    ) {
         sections.push(section);
     }
     if let Some(section) = timeout_file_section("site log", &site_state_root.join("site.log"), 200)

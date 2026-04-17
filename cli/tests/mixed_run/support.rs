@@ -138,7 +138,14 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 "#;
 
-pub(crate) const TEST_APP_IMAGE: &str = "python:3.13-alpine";
+const TEST_APP_SOURCE_IMAGE: &str = "python:3.13-alpine";
+const TEST_APP_LOCAL_IMAGE_REPOSITORY: &str = "amber-mixed-run-test-app";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DockerImageMeta {
+    id: String,
+    arch: String,
+}
 
 pub(crate) fn outputs_root() -> PathBuf {
     cli_test_outputs_root(&workspace_root())
@@ -331,7 +338,7 @@ pub(crate) fn docker_host_ip() -> String {
             .arg("host.docker.internal:host-gateway");
     }
     let output = cmd
-        .arg(TEST_APP_IMAGE)
+        .arg(test_app_image())
         .arg("python3")
         .arg("-c")
         .arg("import socket; print(socket.gethostbyname('host.docker.internal'))")
@@ -346,22 +353,137 @@ pub(crate) fn docker_host_ip() -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-pub(crate) fn ensure_local_image(tag: &str) {
-    let inspect = Command::new("docker")
+fn docker_platform_arch() -> &'static str {
+    match env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => panic!("mixed-run tests support only aarch64 and x86_64 hosts, found {other}"),
+    }
+}
+
+fn docker_platform(expected_arch: &str) -> String {
+    format!("linux/{expected_arch}")
+}
+
+fn docker_image_meta_with_binaries(
+    docker_bin: &Path,
+    tag: &str,
+) -> Result<Option<DockerImageMeta>, String> {
+    let output = Command::new(docker_bin)
         .arg("image")
         .arg("inspect")
+        .arg("-f")
+        .arg("{{.Id}}|{{.Architecture}}")
         .arg(tag)
-        .status()
-        .unwrap_or_else(|err| panic!("failed to inspect docker image {tag}: {err}"));
-    if inspect.success() {
-        return;
+        .output()
+        .map_err(|err| format!("failed to inspect docker image {tag}: {err}"))?;
+    if !output.status.success() {
+        return Ok(None);
     }
-    let status = Command::new("docker")
+    let meta = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if meta.is_empty() {
+        return Ok(None);
+    }
+    let (id, arch) = meta.split_once('|').ok_or_else(|| {
+        format!("docker image inspect for {tag} returned malformed metadata: {meta}")
+    })?;
+    if id.is_empty() || arch.is_empty() {
+        return Err(format!(
+            "docker image inspect for {tag} returned incomplete metadata: {meta}"
+        ));
+    }
+    Ok(Some(DockerImageMeta {
+        id: id.to_string(),
+        arch: arch.to_string(),
+    }))
+}
+
+fn ensure_local_image_with_binaries(
+    docker_bin: &Path,
+    tag: &str,
+    expected_arch: &str,
+) -> Result<DockerImageMeta, String> {
+    if let Some(meta) = docker_image_meta_with_binaries(docker_bin, tag)?
+        && meta.arch == expected_arch
+    {
+        return Ok(meta);
+    }
+
+    let output = Command::new(docker_bin)
         .arg("pull")
+        .arg("--platform")
+        .arg(docker_platform(expected_arch))
         .arg(tag)
-        .status()
-        .unwrap_or_else(|err| panic!("failed to pull docker image {tag}: {err}"));
-    assert!(status.success(), "docker pull failed for {tag}");
+        .output()
+        .map_err(|err| format!("failed to pull docker image {tag}: {err}"))?;
+    if !output.status.success() {
+        return Err(format_command_output(
+            &format!("docker pull failed for {tag}"),
+            &output,
+        ));
+    }
+
+    let meta = docker_image_meta_with_binaries(docker_bin, tag)?
+        .ok_or_else(|| format!("docker image {tag} is still unavailable after pull"))?;
+    if meta.arch != expected_arch {
+        return Err(format!(
+            "docker pull resolved {tag} to linux/{} instead of {}",
+            meta.arch,
+            docker_platform(expected_arch)
+        ));
+    }
+    Ok(meta)
+}
+
+fn build_test_app_image_with_binaries(
+    docker_bin: &Path,
+    source_image: &str,
+    expected_arch: &str,
+) -> Result<String, String> {
+    let _ = ensure_local_image_with_binaries(docker_bin, source_image, expected_arch)?;
+    let local_tag = format!("{TEST_APP_LOCAL_IMAGE_REPOSITORY}:{expected_arch}");
+    let build_root = tempfile::tempdir()
+        .map_err(|err| format!("failed to create temp dir for {local_tag}: {err}"))?;
+    fs::write(
+        build_root.path().join("Dockerfile"),
+        format!("FROM {source_image}\n"),
+    )
+    .map_err(|err| {
+        format!(
+            "failed to write Dockerfile for test app image {local_tag} in {}: {err}",
+            build_root.path().display()
+        )
+    })?;
+    let output = Command::new(docker_bin)
+        .arg("build")
+        .arg("--platform")
+        .arg(docker_platform(expected_arch))
+        .arg("-t")
+        .arg(&local_tag)
+        .arg(build_root.path())
+        .output()
+        .map_err(|err| format!("failed to build docker image {local_tag}: {err}"))?;
+    if !output.status.success() {
+        return Err(format_command_output(
+            &format!("docker build failed for {local_tag} from {source_image}"),
+            &output,
+        ));
+    }
+    Ok(local_tag)
+}
+
+pub(crate) fn test_app_image() -> &'static str {
+    static IMAGE: OnceLock<String> = OnceLock::new();
+    IMAGE
+        .get_or_init(|| {
+            build_test_app_image_with_binaries(
+                Path::new("docker"),
+                TEST_APP_SOURCE_IMAGE,
+                docker_platform_arch(),
+            )
+            .unwrap_or_else(|err| panic!("{err}"))
+        })
+        .as_str()
 }
 
 pub(crate) fn docker_host_http_url(port: u16) -> String {
@@ -395,6 +517,14 @@ pub(crate) fn http_get_with_timeout(
     http_request_with_timeout("GET", port, path, None, timeout)
 }
 
+pub(crate) fn http_get_with_timeout_result(
+    port: u16,
+    path: &str,
+    timeout: Duration,
+) -> Result<(u16, String), String> {
+    http_request_with_timeout_result("GET", port, path, None, timeout)
+}
+
 pub(crate) fn http_request_with_timeout(
     method: &str,
     port: u16,
@@ -402,6 +532,16 @@ pub(crate) fn http_request_with_timeout(
     body: Option<&str>,
     timeout: Duration,
 ) -> Option<(u16, String)> {
+    http_request_with_timeout_result(method, port, path, body, timeout).ok()
+}
+
+pub(crate) fn http_request_with_timeout_result(
+    method: &str,
+    port: u16,
+    path: &str,
+    body: Option<&str>,
+    timeout: Duration,
+) -> Result<(u16, String), String> {
     let mut command = Command::new("curl");
     command
         .arg("-sS")
@@ -416,21 +556,46 @@ pub(crate) fn http_request_with_timeout(
             .arg("--data")
             .arg(body);
     }
+    let url = format!("http://127.0.0.1:{port}{path}");
     let output = command_output_via_tempfiles(
         command
             .arg("-o")
             .arg("-")
             .arg("-w")
             .arg("\n%{http_code}")
-            .arg(format!("http://127.0.0.1:{port}{path}")),
+            .arg(&url),
         "curl http request",
     );
     if !output.status.success() {
-        return None;
+        return Err(format_command_output(
+            &format!(
+                "curl {method} {url} failed after {:.3}s",
+                timeout.as_secs_f64()
+            ),
+            &output,
+        ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let (body, status) = stdout.rsplit_once('\n')?;
-    Some((status.trim().parse().ok()?, body.trim().to_string()))
+    let Some((body, status)) = stdout.rsplit_once('\n') else {
+        return Err(format!(
+            "curl {method} {url} returned a malformed response after \
+             {:.3}s\nstdout:\n{}\nstderr:\n{}",
+            timeout.as_secs_f64(),
+            stdout,
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    };
+    let status = status.trim().parse().map_err(|err| {
+        format!(
+            "curl {method} {url} returned a malformed HTTP status `{}` after {:.3}s: \
+             {err}\nstdout:\n{}\nstderr:\n{}",
+            status.trim(),
+            timeout.as_secs_f64(),
+            stdout,
+            String::from_utf8_lossy(&output.stderr),
+        )
+    })?;
+    Ok((status, body.trim().to_string()))
 }
 
 pub(crate) fn wait_for_body(
@@ -643,7 +808,9 @@ fn append_docker_project_debug(out: &mut String, project: &str) {
         return;
     }
 
-    out.push_str(&format!("\ndocker compose project `{project}` containers:\n"));
+    out.push_str(&format!(
+        "\ndocker compose project `{project}` containers:\n"
+    ));
     for (_, name, status) in &containers {
         out.push_str(&format!("{name}\t{status}\n"));
     }
@@ -655,9 +822,7 @@ fn append_docker_project_debug(out: &mut String, project: &str) {
         {
             Ok(output) => output,
             Err(err) => {
-                out.push_str(&format!(
-                    "\ndocker logs {name} ({status}) failed:\n{err}\n"
-                ));
+                out.push_str(&format!("\ndocker logs {name} ({status}) failed:\n{err}\n"));
                 continue;
             }
         };
@@ -1017,7 +1182,7 @@ pub(crate) fn ensure_amber_internal_images() {
 pub(crate) fn ensure_internal_images() {
     static READY: OnceLock<()> = OnceLock::new();
     READY.get_or_init(|| {
-        ensure_local_image(TEST_APP_IMAGE);
+        let _ = test_app_image();
         ensure_amber_internal_images();
     });
 }
@@ -1078,36 +1243,54 @@ fn ensure_local_dev_image_tag_overrides() {
 }
 
 pub(crate) fn load_kind_image(cluster_name: &str, image: &str) {
-    let mut last_error = None;
+    load_kind_image_with_binaries(Path::new("kind"), Path::new("docker"), cluster_name, image)
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+fn load_kind_image_with_binaries(
+    kind_bin: &Path,
+    docker_bin: &Path,
+    cluster_name: &str,
+    image: &str,
+) -> Result<(), String> {
+    let mut direct_error = None;
     for attempt in 1..=3 {
-        let direct_error = match kind_load_docker_image(cluster_name, image) {
-            Ok(()) => return,
-            Err(err) => err,
-        };
-        match kind_load_image_archive(cluster_name, image) {
-            Ok(()) => return,
-            Err(archive_error) => {
-                last_error = Some(format!(
-                    "{direct_error}\n\nkind load image-archive fallback failed for {image} in \
-                     cluster {cluster_name}:\n{archive_error}"
-                ));
+        match kind_load_docker_image(kind_bin, cluster_name, image) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                direct_error = Some(err);
+                if attempt < 3 {
+                    eprintln!(
+                        "kind load docker-image attempt {attempt} failed for {image} in cluster \
+                         {cluster_name}; retrying"
+                    );
+                    thread::sleep(Duration::from_secs(attempt * 2));
+                }
             }
-        }
-        if attempt < 3 {
-            eprintln!(
-                "kind load docker-image attempt {attempt} failed for {image} in cluster \
-                 {cluster_name}; retrying"
-            );
-            thread::sleep(Duration::from_secs(attempt * 2));
         }
     }
 
-    let error = last_error.expect("kind image load should record a failure");
-    panic!("{error}");
+    let direct_error = direct_error.expect("kind image load should record a failure");
+    let archive = tempfile::Builder::new()
+        .prefix("amber-kind-image-")
+        .suffix(".tar")
+        .tempfile()
+        .map_err(|err| {
+            format!("failed to create temporary image archive for {image} in {cluster_name}: {err}")
+        })?;
+    kind_load_image_archive_with_binaries(kind_bin, docker_bin, cluster_name, image, archive)
+        .map_err(|archive_error| {
+            format!(
+                "{direct_error}
+
+kind load image-archive fallback failed for {image} in cluster {cluster_name}:
+{archive_error}"
+            )
+        })
 }
 
-fn kind_load_docker_image(cluster_name: &str, image: &str) -> Result<(), String> {
-    let output = Command::new("kind")
+fn kind_load_docker_image(kind_bin: &Path, cluster_name: &str, image: &str) -> Result<(), String> {
+    let output = Command::new(kind_bin)
         .arg("load")
         .arg("docker-image")
         .arg("--name")
@@ -1124,17 +1307,6 @@ fn kind_load_docker_image(cluster_name: &str, image: &str) -> Result<(), String>
         &format!("kind load docker-image failed for {image} in cluster {cluster_name}"),
         &output,
     ))
-}
-
-fn kind_load_image_archive(cluster_name: &str, image: &str) -> Result<(), String> {
-    let archive = tempfile::Builder::new()
-        .prefix("amber-kind-image-")
-        .suffix(".tar")
-        .tempfile()
-        .map_err(|err| {
-            format!("failed to create temporary image archive for {image} in {cluster_name}: {err}")
-        })?;
-    kind_load_image_archive_with_binaries(Path::new("kind"), Path::new("docker"), cluster_name, image, archive)
 }
 
 fn kind_load_image_archive_with_binaries(
@@ -1203,7 +1375,11 @@ pub(crate) fn ensure_kind_internal_images(kind_cluster: &KindCluster) {
     let images = amber_internal_image_refs();
     let ready_key = format!(
         "{name}|{}|{}|{}|{}|{}",
-        images.router, images.provisioner, images.helper, images.site_controller, TEST_APP_IMAGE
+        images.router,
+        images.provisioner,
+        images.helper,
+        images.site_controller,
+        test_app_image()
     );
     let loaded = READY.get_or_init(|| Mutex::new(BTreeSet::new()));
     {
@@ -1216,7 +1392,7 @@ pub(crate) fn ensure_kind_internal_images(kind_cluster: &KindCluster) {
     load_kind_image(&name, &images.provisioner);
     load_kind_image(&name, &images.helper);
     load_kind_image(&name, &images.site_controller);
-    load_kind_image(&name, TEST_APP_IMAGE);
+    load_kind_image(&name, test_app_image());
     loaded
         .lock()
         .expect("kind image-load guard should lock")
@@ -1958,7 +2134,7 @@ pub(crate) fn write_image_component(
             "manifest_version": "0.3.0",
             "slots": upstreams.iter().map(|(alias, _)| ((*alias).to_string(), json!({"kind": "http"}))).collect::<serde_json::Map<_, _>>(),
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["python3", "-u", "-c", { "file": "./app.py" }],
                 "env": env,
                 "network": {
@@ -3036,7 +3212,12 @@ mod tests {
         fs::write(
             &docker,
             format!(
-                "#!/bin/sh\nset -eu\nprintf 'docker %s\\n' \"$*\" >> '{}'\nif [ \"$1\" = image ] && [ \"$2\" = save ] && [ \"$3\" = --output ]; then\n  printf 'archive' > \"$4\"\n  exit 0\nfi\necho \"unexpected docker invocation: $*\" >&2\nexit 1\n",
+                "#!/bin/sh\nset -eu\nprintf 'docker %s\\n' \"$*\" >> '{}'\nif [ \"$1\" = image ] \
+                 && [ \"$2\" = inspect ] && [ \"$3\" = -f ] && [ \"$4\" = \
+                 '{{{{.Id}}}}|{{{{.Architecture}}}}' ] && [ \"$5\" = 'test:image' ]; then\n  exit \
+                 1\nfi\nif [ \"$1\" = image ] && [ \"$2\" = save ] && [ \"$3\" = --output ]; \
+                 then\n  printf 'archive' > \"$4\"\n  exit 0\nfi\necho \"unexpected docker \
+                 invocation: $*\" >&2\nexit 1\n",
                 log_path.display()
             ),
         )
@@ -3044,7 +3225,10 @@ mod tests {
         fs::write(
             &kind,
             format!(
-                "#!/bin/sh\nset -eu\nprintf 'kind %s\\n' \"$*\" >> '{}'\narchive=\"${{5:-}}\"\nif [ \"$1\" = load ] && [ \"$2\" = image-archive ] && [ \"$3\" = --name ] && [ \"$5\" != '-' ] && [ -f \"$archive\" ]; then\n  exit 0\nfi\necho \"unexpected kind invocation: $*\" >&2\nexit 1\n",
+                "#!/bin/sh\nset -eu\nprintf 'kind %s\\n' \"$*\" >> '{}'\narchive=\"${{5:-}}\"\nif \
+                 [ \"$1\" = load ] && [ \"$2\" = image-archive ] && [ \"$3\" = --name ] && [ \
+                 \"$5\" != '-' ] && [ -f \"$archive\" ]; then\n  exit 0\nfi\necho \"unexpected \
+                 kind invocation: $*\" >&2\nexit 1\n",
                 log_path.display()
             ),
         )
@@ -3062,12 +3246,19 @@ mod tests {
             .suffix(".tar")
             .tempfile_in(temp.path())
             .expect("temp archive should create");
-        kind_load_image_archive_with_binaries(&kind, &docker, "test-cluster", "test:image", archive)
-            .expect("kind image-archive fallback should use a real archive path");
+        kind_load_image_archive_with_binaries(
+            &kind,
+            &docker,
+            "test-cluster",
+            "test:image",
+            archive,
+        )
+        .expect("kind image-archive fallback should use a real archive path");
 
         let log = fs::read_to_string(&log_path).expect("commands log should read");
         assert!(
-            log.lines().any(|line| line.contains("docker image save --output ")),
+            log.lines()
+                .any(|line| line.contains("docker image save --output ")),
             "docker should save to a concrete archive path:\n{log}"
         );
         assert!(
@@ -3076,6 +3267,357 @@ mod tests {
                     && !line.ends_with(" -")
             }),
             "kind should receive the archive filename, not stdin:\n{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kind_load_image_archive_saves_the_requested_image_tag() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let kind = temp.path().join("kind");
+        let log_path = temp.path().join("commands.log");
+
+        fs::write(
+            &docker,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf 'docker %s
+' "$*" >> '{}'
+if [ "$1" = image ] && [ "$2" = save ] && [ "$3" = --output ] && [ "$5" = 'test:image' ]; then
+  printf 'archive' > "$4"
+  exit 0
+fi
+echo "unexpected docker invocation: $*" >&2
+exit 1
+"#,
+                log_path.display()
+            ),
+        )
+        .expect("docker stub should write");
+        fs::write(
+            &kind,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf 'kind %s
+' "$*" >> '{}'
+archive="${{5:-}}"
+if [ "$1" = load ] && [ "$2" = image-archive ] && [ "$3" = --name ] && [ -f "$archive" ]; then
+  exit 0
+fi
+echo "unexpected kind invocation: $*" >&2
+exit 1
+"#,
+                log_path.display()
+            ),
+        )
+        .expect("kind stub should write");
+        for path in [&docker, &kind] {
+            let mut permissions = fs::metadata(path)
+                .expect("stub metadata should read")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("stub should chmod");
+        }
+
+        let archive = tempfile::Builder::new()
+            .prefix("kind-archive-")
+            .suffix(".tar")
+            .tempfile_in(temp.path())
+            .expect("temp archive should create");
+        kind_load_image_archive_with_binaries(
+            &kind,
+            &docker,
+            "test-cluster",
+            "test:image",
+            archive,
+        )
+        .expect("kind image-archive fallback should save the requested image tag");
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        assert!(
+            log.lines().any(|line| {
+                line.contains("docker image save --output ") && line.ends_with(" test:image")
+            }),
+            "docker save should export the requested image tag:
+{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_kind_image_retries_direct_load_before_single_archive_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let kind = temp.path().join("kind");
+        let log_path = temp.path().join("commands.log");
+
+        fs::write(
+            &docker,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf 'docker %s
+' "$*" >> '{}'
+if [ "$1" = image ] && [ "$2" = save ] && [ "$3" = --output ] && [ "$5" = 'test:image' ]; then
+  printf 'archive' > "$4"
+  exit 0
+fi
+echo "unexpected docker invocation: $*" >&2
+exit 1
+"#,
+                log_path.display()
+            ),
+        )
+        .expect("docker stub should write");
+        fs::write(
+            &kind,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf 'kind %s
+' "$*" >> '{}'
+archive="${{5:-}}"
+if [ "$1" = load ] && [ "$2" = docker-image ]; then
+  exit 1
+fi
+if [ "$1" = load ] && [ "$2" = image-archive ] && [ "$3" = --name ] && [ -f "$archive" ]; then
+  exit 0
+fi
+echo "unexpected kind invocation: $*" >&2
+exit 1
+"#,
+                log_path.display()
+            ),
+        )
+        .expect("kind stub should write");
+        for path in [&docker, &kind] {
+            let mut permissions = fs::metadata(path)
+                .expect("stub metadata should read")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("stub should chmod");
+        }
+
+        load_kind_image_with_binaries(&kind, &docker, "test-cluster", "test:image")
+            .expect("archive fallback should run once after direct load retries are exhausted");
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        let direct_count = log
+            .lines()
+            .filter(|line| line == &"kind load docker-image --name test-cluster test:image")
+            .count();
+        let archive_count = log
+            .lines()
+            .filter(|line| line.starts_with("kind load image-archive --name test-cluster "))
+            .count();
+        let save_count = log
+            .lines()
+            .filter(|line| {
+                line.contains("docker image save --output ") && line.ends_with(" test:image")
+            })
+            .count();
+        assert_eq!(
+            direct_count, 3,
+            "kind load docker-image should retry exactly three times before falling back:
+{log}"
+        );
+        assert_eq!(
+            archive_count, 1,
+            "kind image-archive fallback should run once after retries are exhausted:
+{log}"
+        );
+        assert_eq!(
+            save_count, 1,
+            "docker image save should run once for the single archive fallback:
+{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_local_image_pulls_expected_platform_when_missing() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let log_path = temp.path().join("commands.log");
+        let state_path = temp.path().join("inspect-state");
+
+        fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nset -eu\nlog_path='{}'\nstate_path='{}'\nprintf 'docker %s\\n' \"$*\" \
+                 >> \"$log_path\"\nif [ \"$1\" = image ] && [ \"$2\" = inspect ] && [ \"$3\" = -f \
+                 ] && [ \"$4\" = '{{{{.Id}}}}|{{{{.Architecture}}}}' ] && [ \"$5\" = \
+                 'python:3.13-alpine' ]; then\n  if [ ! -f \"$state_path\" ]; then\n    exit 1\n  \
+                 fi\n  printf 'sha256:test|arm64\\n'\n  exit 0\nfi\nif [ \"$1\" = pull ] && [ \
+                 \"$2\" = --platform ] && [ \"$3\" = 'linux/arm64' ] && [ \"$4\" = \
+                 'python:3.13-alpine' ]; then\n  printf pulled > \"$state_path\"\n  exit \
+                 0\nfi\necho \"unexpected docker invocation: $*\" >&2\nexit 1\n",
+                log_path.display(),
+                state_path.display(),
+            ),
+        )
+        .expect("docker stub should write");
+        let mut permissions = fs::metadata(&docker)
+            .expect("stub metadata should read")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&docker, permissions).expect("stub should chmod");
+
+        let meta = ensure_local_image_with_binaries(&docker, "python:3.13-alpine", "arm64")
+            .expect("missing image should be pulled for the expected platform");
+        assert_eq!(
+            meta,
+            DockerImageMeta {
+                id: "sha256:test".to_string(),
+                arch: "arm64".to_string(),
+            }
+        );
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        assert!(
+            log.lines()
+                .any(|line| line == "docker pull --platform linux/arm64 python:3.13-alpine"),
+            "docker pull should request the expected platform:\n{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_local_image_repulls_expected_platform_when_local_arch_is_wrong() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let log_path = temp.path().join("commands.log");
+        let state_path = temp.path().join("inspect-state");
+
+        fs::write(
+            &docker,
+            format!(
+                r#"#!/bin/sh
+set -eu
+log_path='{}'
+state_path='{}'
+printf 'docker %s
+' "$*" >> "$log_path"
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = -f ] && [ "$4" = '{{{{.Id}}}}|{{{{.Architecture}}}}' ] && [ "$5" = 'python:3.13-alpine' ]; then
+  if [ -f "$state_path" ]; then
+    printf 'sha256:test|arm64
+'
+  else
+    printf 'sha256:stale|amd64
+'
+  fi
+  exit 0
+fi
+if [ "$1" = pull ] && [ "$2" = --platform ] && [ "$3" = 'linux/arm64' ] && [ "$4" = 'python:3.13-alpine' ]; then
+  printf pulled > "$state_path"
+  exit 0
+fi
+echo "unexpected docker invocation: $*" >&2
+exit 1
+"#,
+                log_path.display(),
+                state_path.display(),
+            ),
+        )
+        .expect("docker stub should write");
+        let mut permissions = fs::metadata(&docker)
+            .expect("stub metadata should read")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&docker, permissions).expect("stub should chmod");
+
+        let meta = ensure_local_image_with_binaries(&docker, "python:3.13-alpine", "arm64")
+            .expect("wrong-arch image should be repulled for the expected platform");
+        assert_eq!(
+            meta,
+            DockerImageMeta {
+                id: "sha256:test".to_string(),
+                arch: "arm64".to_string(),
+            }
+        );
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        assert!(
+            log.lines()
+                .any(|line| line == "docker pull --platform linux/arm64 python:3.13-alpine"),
+            "wrong-arch local images should be repulled for the expected platform:
+{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_app_image_builds_a_local_wrapper_image() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let log_path = temp.path().join("commands.log");
+        let state_path = temp.path().join("inspect-state");
+        let dockerfile_copy = temp.path().join("Dockerfile");
+
+        fs::write(
+            &docker,
+            format!(
+                r#"#!/bin/sh
+set -eu
+log_path='{}'
+state_path='{}'
+dockerfile_copy='{}'
+printf 'docker %s
+' "$*" >> "$log_path"
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = -f ] && [ "$4" = '{{{{.Id}}}}|{{{{.Architecture}}}}' ] && [ "$5" = 'python:3.13-alpine' ]; then
+  if [ ! -f "$state_path" ]; then
+    exit 1
+  fi
+  printf 'sha256:test|arm64
+'
+  exit 0
+fi
+if [ "$1" = pull ] && [ "$2" = --platform ] && [ "$3" = 'linux/arm64' ] && [ "$4" = 'python:3.13-alpine' ]; then
+  printf pulled > "$state_path"
+  exit 0
+fi
+if [ "$1" = build ] && [ "$2" = --platform ] && [ "$3" = 'linux/arm64' ] && [ "$4" = -t ] && [ "$5" = 'amber-mixed-run-test-app:arm64' ]; then
+  cp "$6/Dockerfile" "$dockerfile_copy"
+  exit 0
+fi
+echo "unexpected docker invocation: $*" >&2
+exit 1
+"#,
+                log_path.display(),
+                state_path.display(),
+                dockerfile_copy.display(),
+            ),
+        )
+        .expect("docker stub should write");
+        let mut permissions = fs::metadata(&docker)
+            .expect("stub metadata should read")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&docker, permissions).expect("stub should chmod");
+
+        let local_tag = build_test_app_image_with_binaries(&docker, "python:3.13-alpine", "arm64")
+            .expect("test app image should build a local wrapper image");
+        assert_eq!(local_tag, "amber-mixed-run-test-app:arm64");
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        assert!(
+            log.lines().any(|line| {
+                line == "docker build --platform linux/arm64 -t amber-mixed-run-test-app:arm64"
+                    || line.starts_with(
+                        "docker build --platform linux/arm64 -t amber-mixed-run-test-app:arm64 ",
+                    )
+            }),
+            "test app image should be built as a local wrapper image:
+{log}"
+        );
+        assert_eq!(
+            fs::read_to_string(&dockerfile_copy).expect("copied Dockerfile should read"),
+            "FROM python:3.13-alpine
+",
+            "test app image wrapper should inherit from the upstream python base image",
         );
     }
 }

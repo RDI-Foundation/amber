@@ -766,24 +766,29 @@ pub(super) async fn site_controller_runtime_publish_child(
             fs::create_dir_all(&storage_root)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("failed to create {}", storage_root.display()))?;
-            let process = spawn_detached_child(&child_root, &child_root.join("site.log"), |cmd| {
-                cmd.arg("run-direct-init")
-                    .arg("--plan")
-                    .arg(Path::new(&child.artifact_root).join("direct-plan.json"))
-                    .arg("--storage-root")
-                    .arg(&storage_root)
-                    .arg("--runtime-root")
-                    .arg(&runtime_root)
-                    .arg("--existing-peer-ports")
-                    .arg(site_controller_runtime_child_peer_ports_path(
-                        &app.plan, child_id,
-                    ))
-                    .arg("--existing-peer-identities")
-                    .arg(site_controller_runtime_child_peer_identities_path(
-                        &app.plan, child_id,
-                    ))
-                    .arg("--skip-router");
-            })?;
+            let process = spawn_detached_child(
+                &child_root,
+                &child_root.join("site.log"),
+                &app.plan.launch_env,
+                |cmd| {
+                    cmd.arg("run-direct-init")
+                        .arg("--plan")
+                        .arg(Path::new(&child.artifact_root).join("direct-plan.json"))
+                        .arg("--storage-root")
+                        .arg(&storage_root)
+                        .arg("--runtime-root")
+                        .arg(&runtime_root)
+                        .arg("--existing-peer-ports")
+                        .arg(site_controller_runtime_child_peer_ports_path(
+                            &app.plan, child_id,
+                        ))
+                        .arg("--existing-peer-identities")
+                        .arg(site_controller_runtime_child_peer_identities_path(
+                            &app.plan, child_id,
+                        ))
+                        .arg("--skip-router");
+                },
+            )?;
             {
                 let mut state = app.state.lock().await;
                 let record = state
@@ -866,24 +871,29 @@ pub(super) async fn site_controller_runtime_publish_child(
             fs::create_dir_all(&storage_root)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("failed to create {}", storage_root.display()))?;
-            let process = spawn_detached_child(&child_root, &child_root.join("site.log"), |cmd| {
-                cmd.arg("run-vm-init")
-                    .arg("--plan")
-                    .arg(Path::new(&child.artifact_root).join("vm-plan.json"))
-                    .arg("--storage-root")
-                    .arg(&storage_root)
-                    .arg("--runtime-root")
-                    .arg(&runtime_root)
-                    .arg("--existing-peer-ports")
-                    .arg(site_controller_runtime_child_peer_ports_path(
-                        &app.plan, child_id,
-                    ))
-                    .arg("--existing-peer-identities")
-                    .arg(site_controller_runtime_child_peer_identities_path(
-                        &app.plan, child_id,
-                    ))
-                    .arg("--skip-router");
-            })?;
+            let process = spawn_detached_child(
+                &child_root,
+                &child_root.join("site.log"),
+                &app.plan.launch_env,
+                |cmd| {
+                    cmd.arg("run-vm-init")
+                        .arg("--plan")
+                        .arg(Path::new(&child.artifact_root).join("vm-plan.json"))
+                        .arg("--storage-root")
+                        .arg(&storage_root)
+                        .arg("--runtime-root")
+                        .arg(&runtime_root)
+                        .arg("--existing-peer-ports")
+                        .arg(site_controller_runtime_child_peer_ports_path(
+                            &app.plan, child_id,
+                        ))
+                        .arg("--existing-peer-identities")
+                        .arg(site_controller_runtime_child_peer_identities_path(
+                            &app.plan, child_id,
+                        ))
+                        .arg("--skip-router");
+                },
+            )?;
             {
                 let mut state = app.state.lock().await;
                 let record = state

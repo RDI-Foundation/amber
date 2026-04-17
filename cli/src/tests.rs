@@ -942,14 +942,26 @@ child.wait()
     }
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !child_pid_path.is_file() && Instant::now() < deadline {
+    let child_pid = loop {
+        if Instant::now() >= deadline {
+            let contents = fs::read_to_string(&child_pid_path).unwrap_or_default();
+            panic!(
+                "descendant pid should be recorded before cleanup starts; last contents: {:?}",
+                contents,
+            );
+        }
+        match fs::read_to_string(&child_pid_path) {
+            Ok(contents) => {
+                let trimmed = contents.trim();
+                if let Ok(pid) = trimmed.parse::<u32>() {
+                    break pid;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("descendant pid file should be readable: {err}"),
+        }
         sleep(Duration::from_millis(25)).await;
-    }
-    let child_pid = fs::read_to_string(&child_pid_path)
-        .expect("descendant pid should be recorded")
-        .trim()
-        .parse::<u32>()
-        .expect("descendant pid should parse");
+    };
     let wrapper_pid = children[0]
         .wrapper
         .as_ref()

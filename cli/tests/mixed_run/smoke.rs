@@ -1,6 +1,28 @@
 use super::*;
 
-const FRAMEWORK_MUTATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const FRAMEWORK_CONTROL_RESPONSE_GRACE: Duration = Duration::from_secs(30);
+
+fn framework_control_timeout_for_vm_ready_timeout(vm_ready_timeout: Duration) -> Duration {
+    vm_ready_timeout.max(Duration::from_secs(300))
+}
+
+fn framework_control_timeout() -> Duration {
+    framework_control_timeout_for_vm_ready_timeout(
+        amber_site_controller::vm_endpoint_forward_ready_timeout(),
+    )
+}
+
+fn framework_mutation_request_timeout_for_control_timeout(control_timeout: Duration) -> Duration {
+    control_timeout + FRAMEWORK_CONTROL_RESPONSE_GRACE
+}
+
+fn framework_mutation_request_timeout() -> Duration {
+    framework_mutation_request_timeout_for_control_timeout(framework_control_timeout())
+}
+
+fn framework_control_timeout_env_value() -> String {
+    format!("{:.3}", framework_control_timeout().as_secs_f64())
+}
 
 const FRAMEWORK_ADMIN_APP: &str = r#"import json
 import os
@@ -11,7 +33,7 @@ from urllib.request import Request, urlopen
 NAME = os.environ["NAME"]
 PORT = int(os.environ["PORT"])
 CTL_URL = os.environ["CTL_URL"].rstrip("/")
-CONTROL_TIMEOUT = 300.0
+CONTROL_TIMEOUT = float(os.environ.get("CONTROL_TIMEOUT", "300.0"))
 
 def send(handler, status, body, content_type="text/plain; charset=utf-8"):
     payload = body.encode("utf-8")
@@ -567,12 +589,13 @@ ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 fn write_framework_admin_component(root: &Path, file_name: &str, image: bool, port: u16) {
     let program = if image {
         json!({
-            "image": TEST_APP_IMAGE,
+            "image": test_app_image(),
             "entrypoint": ["python3", "-u", "-c", { "file": "./admin.py" }],
             "env": {
                 "NAME": "admin",
                 "PORT": port.to_string(),
-                "CTL_URL": "${slots.ctl.url}"
+                "CTL_URL": "${slots.ctl.url}",
+                "CONTROL_TIMEOUT": framework_control_timeout_env_value()
             },
             "network": {
                 "endpoints": [
@@ -587,7 +610,8 @@ fn write_framework_admin_component(root: &Path, file_name: &str, image: bool, po
             "env": {
                 "NAME": "admin",
                 "PORT": port.to_string(),
-                "CTL_URL": "${slots.ctl.url}"
+                "CTL_URL": "${slots.ctl.url}",
+                "CONTROL_TIMEOUT": framework_control_timeout_env_value()
             },
             "network": {
                 "endpoints": [
@@ -623,7 +647,7 @@ fn write_framework_worker_component(
 ) {
     let program = if image {
         json!({
-            "image": TEST_APP_IMAGE,
+            "image": test_app_image(),
             "entrypoint": ["python3", "-u", "-c", { "file": "./worker.py" }],
             "env": {
                 "NAME": name,
@@ -701,7 +725,7 @@ fn write_dynamic_caps_component(
         .collect::<serde_json::Map<_, _>>();
     let program = if image {
         json!({
-            "image": TEST_APP_IMAGE,
+            "image": test_app_image(),
             "entrypoint": ["python3", "-u", "-c", { "file": "./dynamic_caps_app.py" }],
             "env": env,
             "network": {
@@ -947,6 +971,7 @@ write_files:
       Environment=NAME=admin
       Environment=PORT={port}
       Environment=CTL_URL=${{slots.ctl.url}}
+      Environment=CONTROL_TIMEOUT={control_timeout}
       ExecStart=/usr/bin/python3 /usr/local/bin/framework-admin.py
       Restart=always
 
@@ -957,6 +982,7 @@ runcmd:
   - [systemctl, enable, --now, framework-admin.service]
 "#,
         script = indent_block(FRAMEWORK_ADMIN_APP, 6),
+        control_timeout = framework_control_timeout_env_value(),
     )
 }
 
@@ -1417,40 +1443,76 @@ fn assert_string_array_members(value: &Value, expected: &[&str], message: &str) 
     assert_eq!(actual, expected, "{message}");
 }
 
+fn framework_admin_request(
+    method: &str,
+    port: u16,
+    path: &str,
+    body: Option<&str>,
+    purpose: &str,
+) -> (u16, String) {
+    let timeout = framework_mutation_request_timeout();
+    http_request_with_timeout_result(method, port, path, body, timeout).unwrap_or_else(|err| {
+        panic!("{purpose} via framework admin {method} http://127.0.0.1:{port}{path} failed: {err}")
+    })
+}
+
+fn framework_admin_get(port: u16, path: &str, purpose: &str) -> (u16, String) {
+    let timeout = framework_mutation_request_timeout();
+    http_get_with_timeout_result(port, path, timeout).unwrap_or_else(|err| {
+        panic!("{purpose} via framework admin GET http://127.0.0.1:{port}{path} failed: {err}")
+    })
+}
+
 fn framework_create_child_with_request(port: u16, request: &Value) -> (u16, String) {
     let body = serde_json::to_string(request).expect("create request should serialize");
-    http_request_with_timeout(
-        "POST",
-        port,
-        "/create",
-        Some(&body),
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("create request should return an HTTP response")
+    framework_admin_request("POST", port, "/create", Some(&body), "create request")
 }
 
 fn framework_destroy_child_via_admin(port: u16, name: &str) -> (u16, String) {
-    http_request_with_timeout(
+    framework_admin_request(
         "DELETE",
         port,
         &format!("/destroy/{name}"),
         None,
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
+        "destroy request",
     )
-    .expect("destroy request should return an HTTP response")
 }
 
 fn framework_snapshot_via_admin(port: u16) -> Value {
-    let (status, body) = http_request_with_timeout(
-        "POST",
-        port,
-        "/snapshot",
-        Some("{}"),
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("snapshot request should return an HTTP response");
+    let (status, body) =
+        framework_admin_request("POST", port, "/snapshot", Some("{}"), "snapshot request");
     assert_eq!(status, 200, "snapshot request should succeed: {body}");
     serde_json::from_str(&body).expect("snapshot response should be valid json")
+}
+
+#[test]
+fn framework_control_timeout_tracks_vm_ready_budget() {
+    assert_eq!(
+        framework_control_timeout_for_vm_ready_timeout(Duration::from_secs(120)),
+        Duration::from_secs(300),
+        "fast VM environments should keep the existing 300s framework control budget",
+    );
+    assert_eq!(
+        framework_control_timeout_for_vm_ready_timeout(Duration::from_secs(720)),
+        Duration::from_secs(720),
+        "slow TCG VM environments should inherit the full VM-ready budget",
+    );
+}
+
+#[test]
+fn framework_mutation_request_timeout_keeps_response_grace_after_control_budget() {
+    assert_eq!(
+        framework_mutation_request_timeout_for_control_timeout(Duration::from_secs(300)),
+        Duration::from_secs(330),
+        "framework admin curl requests should outlive the inner control timeout long enough to \
+         receive the terminal response",
+    );
+    assert_eq!(
+        framework_mutation_request_timeout_for_control_timeout(Duration::from_secs(720)),
+        Duration::from_secs(750),
+        "slow TCG control paths should keep the same response grace instead of truncating the \
+         request at 300s",
+    );
 }
 
 fn write_snapshot_run_inputs(root: &Path, snapshot: &Value) -> (PathBuf, PathBuf) {
@@ -1964,7 +2026,7 @@ fn framework_component_concurrent_create_serialization_live() {
                 "required": ["name"]
             },
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["python3", "-u", "-c", { "file": "./worker.py" }],
                 "env": {
                     "NAME": "${config.name}",
@@ -2324,7 +2386,7 @@ fn framework_component_root_external_binding_live() {
                 "catalog_api": { "kind": "http" }
             },
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["python3", "-u", "-c", { "file": "./external_bind.py" }],
                 "env": {
                     "NAME": "external-worker",
@@ -2379,7 +2441,7 @@ fn framework_component_root_external_binding_live() {
                 "catalog_api": { "kind": "http" }
             },
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["sleep", "3600"]
             },
             "components": {
@@ -2580,7 +2642,7 @@ fn framework_component_nonweak_publication_barrier_live() {
                 "weak_api": { "kind": "http" }
             },
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["python3", "-u", "-c", { "file": "./barrier_probe.py" }],
                 "env": {
                     "NAME": "consumer",
@@ -2612,7 +2674,7 @@ fn framework_component_nonweak_publication_barrier_live() {
                 "delayed_api": { "kind": "http" }
             },
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["sleep", "3600"]
             },
             "components": {
@@ -3100,12 +3162,11 @@ fn framework_component_compose_parent_standby_direct_live() {
         "admin"
     );
 
-    let (create_status, create_response) = http_get_with_timeout(
+    let (create_status, create_response) = framework_admin_get(
         proxy_port,
         "/create/worker/job-1",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("create request should return an HTTP response");
+        "create request should return an HTTP response",
+    );
     assert_eq!(create_status, 200, "create request should succeed");
     let create_json: Value =
         serde_json::from_str(&create_response).expect("create response should be valid json");
@@ -3239,12 +3300,11 @@ fn framework_component_direct_parent_compose_child_live() {
         "admin"
     );
 
-    let (create_status, create_response) = http_get_with_timeout(
+    let (create_status, create_response) = framework_admin_get(
         proxy_port,
         "/create/job-1",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("create request should return an HTTP response");
+        "create request should return an HTTP response",
+    );
     assert_eq!(create_status, 200, "create request should succeed");
     let create_json: Value =
         serde_json::from_str(&create_response).expect("create response should be valid json");
@@ -3373,12 +3433,11 @@ fn framework_component_dynamic_children_teardown_with_run_live() {
     );
     wait_for_path(&mut admin_proxy, proxy_port, "/id", Duration::from_secs(60));
 
-    let (create_direct_status, create_direct_response) = http_get_with_timeout(
+    let (create_direct_status, create_direct_response) = framework_admin_get(
         proxy_port,
         "/create/worker_direct/job-direct",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("direct create request should return an HTTP response");
+        "direct create request should return an HTTP response",
+    );
     assert_eq!(
         create_direct_status, 200,
         "direct child create request should succeed"
@@ -3387,12 +3446,11 @@ fn framework_component_dynamic_children_teardown_with_run_live() {
         .expect("direct child create response should be valid json");
     assert_eq!(create_direct_json["child"]["name"], "job-direct");
 
-    let (create_compose_status, create_compose_response) = http_get_with_timeout(
+    let (create_compose_status, create_compose_response) = framework_admin_get(
         proxy_port,
         "/create/worker_compose/job-compose",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("compose create request should return an HTTP response");
+        "compose create request should return an HTTP response",
+    );
     assert_eq!(
         create_compose_status, 200,
         "compose child create request should succeed"
@@ -3576,12 +3634,11 @@ fn framework_component_destroy_of_provider_keeps_consumer_live() {
     );
     wait_for_path(&mut admin_proxy, proxy_port, "/id", Duration::from_secs(60));
 
-    let (create_provider_status, create_provider_response) = http_get_with_timeout(
+    let (create_provider_status, create_provider_response) = framework_admin_get(
         proxy_port,
         "/create/producer/source",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("producer create request should return an HTTP response");
+        "producer create request should return an HTTP response",
+    );
     assert_eq!(
         create_provider_status, 200,
         "producer create request should succeed"
@@ -3732,7 +3789,7 @@ fn framework_component_kind_root_export_live() {
         &run.run_root,
         "vm_local",
         "running",
-        Duration::from_secs(240),
+        framework_control_timeout(),
     );
     let site_state = |site_id: &str| match site_id {
         "compose_local" => &compose_state,
@@ -3754,7 +3811,7 @@ fn framework_component_kind_root_export_live() {
         &mut creator_proxy,
         creator_port,
         "/id",
-        Duration::from_secs(240),
+        framework_mutation_request_timeout(),
     );
     assert_eq!(
         wait_for_body(
@@ -3766,12 +3823,11 @@ fn framework_component_kind_root_export_live() {
         "admin",
     );
 
-    let (create_status, create_response) = http_get_with_timeout(
+    let (create_status, create_response) = framework_admin_get(
         creator_port,
         "/create/child_kind/job-kind",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("create request should return an HTTP response");
+        "create request should return an HTTP response",
+    );
     assert_eq!(
         create_status, 200,
         "create request should succeed; response: {create_response}"
@@ -3782,7 +3838,12 @@ fn framework_component_kind_root_export_live() {
     let root_port = pick_free_port();
     let mut root_proxy =
         spawn_framework_proxy_for_site(&root_artifact, "http", root_port, site_state("kind_local"));
-    wait_for_path(&mut root_proxy, root_port, "/id", Duration::from_secs(300));
+    wait_for_path(
+        &mut root_proxy,
+        root_port,
+        "/id",
+        framework_mutation_request_timeout(),
+    );
     assert_eq!(
         wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
         "child-kind-root"
@@ -3835,7 +3896,7 @@ fn framework_component_kind_creator_compose_child_live() {
         &run.run_root,
         "vm_local",
         "running",
-        Duration::from_secs(240),
+        framework_control_timeout(),
     );
     let site_state = |site_id: &str| match site_id {
         "compose_local" => &compose_state,
@@ -3857,7 +3918,7 @@ fn framework_component_kind_creator_compose_child_live() {
         &mut creator_proxy,
         creator_port,
         "/id",
-        Duration::from_secs(240),
+        framework_mutation_request_timeout(),
     );
     assert_eq!(
         wait_for_body(
@@ -3870,12 +3931,11 @@ fn framework_component_kind_creator_compose_child_live() {
         "kind creator should expose the framework admin app"
     );
 
-    let (create_status, create_response) = http_get_with_timeout(
+    let (create_status, create_response) = framework_admin_get(
         creator_port,
         "/create/child_compose/job-compose",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("create request should return an HTTP response");
+        "create request should return an HTTP response",
+    );
     assert_eq!(
         create_status, 200,
         "create request should succeed; response: {create_response}"
@@ -3890,7 +3950,12 @@ fn framework_component_kind_creator_compose_child_live() {
         root_port,
         site_state("compose_local"),
     );
-    wait_for_path(&mut root_proxy, root_port, "/id", Duration::from_secs(300));
+    wait_for_path(
+        &mut root_proxy,
+        root_port,
+        "/id",
+        framework_mutation_request_timeout(),
+    );
     assert_eq!(
         wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
         "child-compose-root"
@@ -3943,7 +4008,7 @@ fn framework_component_kind_creator_after_compose_churn_live() {
         &run.run_root,
         "vm_local",
         "running",
-        Duration::from_secs(240),
+        framework_control_timeout(),
     );
     let site_state = |site_id: &str| match site_id {
         "compose_local" => &compose_state,
@@ -3966,7 +4031,7 @@ fn framework_component_kind_creator_after_compose_churn_live() {
         &mut compose_creator_proxy,
         compose_creator_port,
         "/id",
-        Duration::from_secs(240),
+        framework_mutation_request_timeout(),
     );
     assert_eq!(
         wait_for_body(
@@ -3984,12 +4049,11 @@ fn framework_component_kind_creator_after_compose_churn_live() {
             "/create/{}/{}",
             template_case.template, template_case.child_name
         );
-        let (create_status, create_response) = http_get_with_timeout(
+        let (create_status, create_response) = framework_admin_get(
             compose_creator_port,
             &create_path,
-            FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-        )
-        .expect("compose churn create request should return an HTTP response");
+            "compose churn create request should return an HTTP response",
+        );
         assert_eq!(
             create_status, 200,
             "compose churn create request {create_path} should succeed; response: \
@@ -4014,7 +4078,7 @@ fn framework_component_kind_creator_after_compose_churn_live() {
             template_case.child_name,
             &child_sites,
             child_id,
-            Duration::from_secs(300),
+            framework_mutation_request_timeout(),
         );
     }
     stop_proxy(&mut compose_creator_proxy);
@@ -4030,7 +4094,7 @@ fn framework_component_kind_creator_after_compose_churn_live() {
         &mut kind_creator_proxy,
         kind_creator_port,
         "/id",
-        Duration::from_secs(240),
+        framework_mutation_request_timeout(),
     );
     assert_eq!(
         wait_for_body(
@@ -4056,12 +4120,11 @@ fn framework_component_kind_creator_after_compose_churn_live() {
         "kind creator control path should be healthy after compose churn"
     );
 
-    let (create_status, create_response) = http_get_with_timeout(
+    let (create_status, create_response) = framework_admin_get(
         kind_creator_port,
         "/create/child_compose/job-compose",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("kind create request should return an HTTP response");
+        "kind create request should return an HTTP response",
+    );
     assert_eq!(
         create_status, 200,
         "kind creator create after compose churn should succeed; response: {create_response}"
@@ -4076,7 +4139,12 @@ fn framework_component_kind_creator_after_compose_churn_live() {
         root_port,
         site_state("compose_local"),
     );
-    wait_for_path(&mut root_proxy, root_port, "/id", Duration::from_secs(300));
+    wait_for_path(
+        &mut root_proxy,
+        root_port,
+        "/id",
+        framework_mutation_request_timeout(),
+    );
     assert_eq!(
         wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
         "child-compose-root",
@@ -4130,7 +4198,7 @@ fn framework_component_cross_backend_matrix_live() {
         &run.run_root,
         "vm_local",
         "running",
-        Duration::from_secs(240),
+        framework_control_timeout(),
     );
     let site_state = |site_id: &str| match site_id {
         "compose_local" => &compose_state,
@@ -4154,7 +4222,7 @@ fn framework_component_cross_backend_matrix_live() {
             &mut creator_proxy,
             creator_port,
             "/id",
-            Duration::from_secs(240),
+            framework_mutation_request_timeout(),
         );
         assert_eq!(
             wait_for_body(
@@ -4172,12 +4240,11 @@ fn framework_component_cross_backend_matrix_live() {
                 "/create/{}/{}",
                 template_case.template, template_case.child_name
             );
-            let (create_status, create_response) = http_get_with_timeout(
+            let (create_status, create_response) = framework_admin_get(
                 creator_port,
                 &create_path,
-                FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-            )
-            .expect("create request should return an HTTP response");
+                "create request should return an HTTP response",
+            );
             assert_eq!(
                 create_status, 200,
                 "create request {create_path} from {creator_site} should succeed; response: \
@@ -4203,7 +4270,12 @@ fn framework_component_cross_backend_matrix_live() {
                 root_port,
                 site_state(root_site_id),
             );
-            wait_for_path(&mut root_proxy, root_port, "/id", Duration::from_secs(300));
+            wait_for_path(
+                &mut root_proxy,
+                root_port,
+                "/id",
+                framework_mutation_request_timeout(),
+            );
             assert_eq!(
                 wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
                 template_case.exports[0].2
@@ -4218,7 +4290,12 @@ fn framework_component_cross_backend_matrix_live() {
                     port,
                     site_state(site_id),
                 );
-                wait_for_path(&mut proxy, port, "/id", Duration::from_secs(300));
+                wait_for_path(
+                    &mut proxy,
+                    port,
+                    "/id",
+                    framework_mutation_request_timeout(),
+                );
                 assert_eq!(
                     wait_for_body(&mut proxy, port, "/id", Duration::from_secs(30)),
                     *expected_id,
@@ -4251,7 +4328,7 @@ fn framework_component_cross_backend_matrix_live() {
                 template_case.child_name,
                 &child_sites,
                 child_id,
-                Duration::from_secs(300),
+                framework_mutation_request_timeout(),
             );
         }
 

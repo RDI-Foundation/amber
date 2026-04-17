@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::{
     fs,
     net::{SocketAddr, TcpListener},
@@ -8,9 +10,6 @@ use std::{
 use tempfile::TempDir;
 
 use super::*;
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt as _;
 
 #[test]
 fn site_state_paths_are_site_scoped() {
@@ -181,8 +180,8 @@ fn provisioner_image_supports_debug_builds() {
     .expect("provisioner Dockerfile should read");
     assert!(
         dockerfile.contains("ARG BUILD_MODE=release"),
-        "provisioner image should accept the shared BUILD_MODE argument so mixed-run tests can use \
-         debug builds:\n{dockerfile}"
+        "provisioner image should accept the shared BUILD_MODE argument so mixed-run tests can \
+         use debug builds:\n{dockerfile}"
     );
     assert!(
         dockerfile.contains("if [ \"$BUILD_MODE\" = \"release\" ]; then")
@@ -410,16 +409,17 @@ fn stop_kubernetes_namespace_force_deletes_stuck_pods_before_retrying() {
         &kubectl,
         format!(
             "#!/bin/sh\nset -eu\nlog_path='{}'\nstate_path='{}'\nprintf '%s\\n' \"$*\" >> \
-             \"$log_path\"\nif [ \"${{1:-}}\" = \"--context\" ]; then\n  shift 2\nfi\nstate=alive\n\
-             if [ -f \"$state_path\" ]; then\n  state=$(cat \"$state_path\")\nfi\nif [ \"${{1:-}}\" \
-             = \"delete\" ] && [ \"${{2:-}}\" = \"namespace\" ]; then\n  exit 0\nfi\nif [ \
-             \"${{1:-}}\" = \"get\" ] && [ \"${{2:-}}\" = \"namespace\" ]; then\n  if [ \"$state\" = \
-             \"gone\" ]; then\n    echo 'Error from server (NotFound): namespaces \"'\"${{3:-}}\"'\" \
-             not found' >&2\n    exit 1\n  fi\n  printf '{{\"metadata\":{{\"name\":\"%s\",\
-             \"deletionTimestamp\":\"2026-04-16T02:33:55Z\"}}}}\\n' \"${{3:-}}\"\n  exit 0\nfi\nif \
-             [ \"${{1:-}}\" = \"-n\" ] && [ \"${{2:-}}\" = \"test-ns\" ] && [ \"${{3:-}}\" = \
-             \"delete\" ] && [ \"${{4:-}}\" = \"pods\" ]; then\n  printf 'gone' > \"$state_path\"\n  \
-             exit 0\nfi\necho \"unexpected kubectl invocation: $*\" >&2\nexit 1\n",
+             \"$log_path\"\nif [ \"${{1:-}}\" = \"--context\" ]; then\n  shift \
+             2\nfi\nstate=alive\nif [ -f \"$state_path\" ]; then\n  state=$(cat \
+             \"$state_path\")\nfi\nif [ \"${{1:-}}\" = \"delete\" ] && [ \"${{2:-}}\" = \
+             \"namespace\" ]; then\n  exit 0\nfi\nif [ \"${{1:-}}\" = \"get\" ] && [ \"${{2:-}}\" \
+             = \"namespace\" ]; then\n  if [ \"$state\" = \"gone\" ]; then\n    echo 'Error from \
+             server (NotFound): namespaces \"'\"${{3:-}}\"'\" not found' >&2\n    exit 1\n  fi\n  \
+             printf '{{\"metadata\":{{\"name\":\"%s\",\"deletionTimestamp\":\"2026-04-16T02:33:\
+             55Z\"}}}}\\n' \"${{3:-}}\"\n  exit 0\nfi\nif [ \"${{1:-}}\" = \"-n\" ] && [ \
+             \"${{2:-}}\" = \"test-ns\" ] && [ \"${{3:-}}\" = \"delete\" ] && [ \"${{4:-}}\" = \
+             \"pods\" ]; then\n  printf 'gone' > \"$state_path\"\n  exit 0\nfi\necho \"unexpected \
+             kubectl invocation: $*\" >&2\nexit 1\n",
             log_path.display(),
             state_path.display(),
         ),
@@ -442,9 +442,7 @@ fn stop_kubernetes_namespace_force_deletes_stuck_pods_before_retrying() {
     let log = fs::read_to_string(&log_path).expect("kubectl log");
     let delete_namespace_calls = log
         .lines()
-        .filter(|line| {
-            line.contains("delete namespace test-ns --ignore-not-found --wait=false")
-        })
+        .filter(|line| line.contains("delete namespace test-ns --ignore-not-found --wait=false"))
         .count();
     assert_eq!(
         delete_namespace_calls, 2,
@@ -452,8 +450,9 @@ fn stop_kubernetes_namespace_force_deletes_stuck_pods_before_retrying() {
     );
     assert!(
         log.lines().any(|line| {
-            line.contains("-n test-ns delete pods --all --ignore-not-found --force \
-                           --grace-period=0")
+            line.contains(
+                "-n test-ns delete pods --all --ignore-not-found --force --grace-period=0",
+            )
         }),
         "forced pod cleanup should run before the retry:\n{log}"
     );

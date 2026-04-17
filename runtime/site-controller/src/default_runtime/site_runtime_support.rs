@@ -738,12 +738,23 @@ pub(super) fn amber_cli_executable() -> Result<PathBuf> {
 pub(crate) fn spawn_detached_child(
     work_dir: &Path,
     log_path: &Path,
+    extra_env: &BTreeMap<String, String>,
+    build: impl FnOnce(&mut Command),
+) -> Result<Child> {
+    let exe = amber_cli_executable()?;
+    spawn_detached_child_with_executable(&exe, work_dir, log_path, extra_env, build)
+}
+
+fn spawn_detached_child_with_executable(
+    executable: &Path,
+    work_dir: &Path,
+    log_path: &Path,
+    extra_env: &BTreeMap<String, String>,
     build: impl FnOnce(&mut Command),
 ) -> Result<Child> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt as _;
 
-    let exe = amber_cli_executable()?;
     let log = fs::File::create(log_path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create log {}", log_path.display()))?;
@@ -751,8 +762,9 @@ pub(crate) fn spawn_detached_child(
         .try_clone()
         .into_diagnostic()
         .wrap_err("failed to clone log handle")?;
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(executable);
     cmd.current_dir(work_dir);
+    cmd.envs(extra_env);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(log));
     cmd.stderr(Stdio::from(log_err));
@@ -1243,6 +1255,49 @@ mod tests {
         );
 
         assert_eq!(tree, vec![7, 9, 8, 42]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_detached_child_propagates_launch_env() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempdir().expect("temp dir should create");
+        let executable = temp.path().join("amber-stub");
+        let log_path = temp.path().join("child.log");
+        let env_output_path = temp.path().join("env.txt");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+set -eu
+printf '%s' "${AMBER_VM_FORCE_TCG:-missing}" > "$1"
+"#,
+        )
+        .expect("stub executable should write");
+        let mut permissions = fs::metadata(&executable)
+            .expect("stub metadata should read")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).expect("stub should chmod");
+
+        let launch_env = BTreeMap::from([("AMBER_VM_FORCE_TCG".to_string(), "1".to_string())]);
+        let mut child = super::spawn_detached_child_with_executable(
+            &executable,
+            temp.path(),
+            &log_path,
+            &launch_env,
+            |cmd| {
+                cmd.arg(&env_output_path);
+            },
+        )
+        .expect("detached child should spawn");
+        let status = child.wait().expect("stub child should exit");
+        assert!(status.success(), "stub child should succeed: {status}");
+        assert_eq!(
+            fs::read_to_string(&env_output_path).expect("env output should read"),
+            "1",
+            "detached children must inherit launch_env so VM child runtimes see TCG forcing",
+        );
     }
 
     #[test]
