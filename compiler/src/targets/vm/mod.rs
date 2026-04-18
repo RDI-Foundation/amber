@@ -224,6 +224,18 @@ pub(crate) fn emit_vm_artifact_with_options(
     options: VmArtifactBuildOptions<'_>,
 ) -> Result<VmArtifact, MeshError> {
     let scenario = compiled.scenario();
+    if scenario.bindings.iter().any(|binding| {
+        matches!(
+            &binding.from,
+            amber_scenario::BindingFrom::Framework(framework)
+                if framework.capability.as_str() == "component"
+        )
+    }) {
+        return Err(MeshError::new(
+            "vm reporter does not support framework.component without an explicit controlling \
+             direct site; use mixed-site placement instead",
+        ));
+    }
     let endpoint_plan = crate::targets::program_config::build_endpoint_plan(scenario)?;
     let mesh_plan = build_mesh_plan(
         scenario,
@@ -1105,4 +1117,89 @@ fn component_source_dir(
 
 fn vm_runtime_addresses_is_empty(plan: &DirectRuntimeAddressPlan) -> bool {
     plan.slots_by_scope.is_empty() && plan.slot_items_by_scope.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use amber_manifest::ManifestRef;
+    use amber_resolver::Resolver;
+    use tempfile::TempDir;
+    use url::Url;
+
+    use super::*;
+    use crate::{CompileOptions, Compiler, DigestStore};
+
+    fn write_file(path: &Path, contents: &str) {
+        std::fs::write(path, contents).expect("fixture file should write");
+    }
+
+    fn file_url(path: &Path) -> Url {
+        Url::from_file_path(path).expect("fixture path should convert to file url")
+    }
+
+    #[test]
+    fn vm_reporter_rejects_framework_component_without_a_controller_site() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        let admin_path = dir.path().join("admin.json5");
+
+        write_file(
+            &admin_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                ctl: { kind: "component" }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["admin", "${slots.ctl.url}"],
+                network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+              },
+              provides: { http: { kind: "http", endpoint: "http" } },
+              exports: { http: "provides.http" }
+            }
+            "#,
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r##"
+                {{
+                  manifest_version: "0.3.0",
+                  components: {{
+                    admin: "{admin}"
+                  }},
+                  bindings: [
+                    {{ to: "#admin.ctl", from: "framework.component" }}
+                  ],
+                  exports: {{
+                    admin_http: "#admin.http"
+                  }}
+                }}
+                "##,
+                admin = file_url(&admin_path),
+            ),
+        );
+
+        let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let output = runtime
+            .block_on(compiler.compile(
+                ManifestRef::from_url(file_url(&root_path)),
+                CompileOptions::default(),
+            ))
+            .expect("fixture should compile");
+        let compiled = CompiledScenario::from_compile_output(&output)
+            .expect("fixture should materialize compiled scenario");
+        let err = emit_vm_artifact(&compiled, false)
+            .expect_err("vm reporter should reject framework.component");
+        assert!(
+            err.to_string().contains("explicit controlling direct site"),
+            "vm reporter should explain that framework.component requires a controlling direct \
+             site: {err}",
+        );
+    }
 }

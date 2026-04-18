@@ -66,6 +66,52 @@ fn local_router_mesh_peer_addr(mesh_port: u16) -> String {
     std::net::SocketAddr::from(([127, 0, 0, 1], mesh_port)).to_string()
 }
 
+fn site_controller_component_target(plan: &MeshProvisionPlan) -> Result<&MeshProvisionTarget> {
+    plan.targets
+        .iter()
+        .find(|target| {
+            matches!(target.kind, MeshProvisionTargetKind::Component)
+                && target.config.inbound.iter().any(|route| {
+                    route.capability
+                        == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+                })
+        })
+        .ok_or_else(|| {
+            miette::miette!(
+                "mesh provision plan is missing the lowered framework.component controller target"
+            )
+        })
+}
+
+fn local_site_controller_inbound_target(
+    artifact_root: &Path,
+    plan: &MeshProvisionPlan,
+    embedded_kind: Option<EmbeddedMeshPlanKind>,
+) -> Result<InboundTarget> {
+    let target = site_controller_component_target(plan)?;
+    let peer_id = target.config.identity.id.clone();
+    let mesh_port = target.config.mesh_listen.port();
+    let peer_addr = match embedded_kind {
+        Some(EmbeddedMeshPlanKind::Compose) => {
+            compose_component_mesh_peer_addr(artifact_root, &peer_id, &target.output, mesh_port)?
+        }
+        Some(EmbeddedMeshPlanKind::Kubernetes) => {
+            kubernetes_component_mesh_peer_addr(artifact_root, &peer_id, &target.output, mesh_port)?
+        }
+        None => local_component_mesh_peer_addr(mesh_port),
+    };
+    Ok(InboundTarget::MeshForward {
+        peer_addr,
+        peer_id: peer_id.clone(),
+        route_id: component_route_id(
+            &peer_id,
+            amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+            MeshProtocol::Http,
+        ),
+        capability: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME.to_string(),
+    })
+}
+
 fn build_dynamic_compose_route_overlay_payload(
     artifact_root: &Path,
     assigned_components: &[String],
@@ -1519,8 +1565,11 @@ pub fn inject_site_controller_peer_router_routes(
         ));
     };
 
+    let local_inbound_target =
+        local_site_controller_inbound_target(artifact_root, &plan, write_embedded)?;
     inject_site_controller_peer_router_routes_into_plan(
         &mut plan,
+        local_inbound_target,
         local_site_id,
         allowed_issuers,
         routes,
@@ -1597,6 +1646,7 @@ fn set_compose_router_published_port(
         .wrap_err_with(|| format!("failed to write {}", path.display()))
 }
 
+#[derive(Clone, Copy, Debug)]
 enum EmbeddedMeshPlanKind {
     Compose,
     Kubernetes,
@@ -1604,6 +1654,7 @@ enum EmbeddedMeshPlanKind {
 
 fn inject_site_controller_peer_router_routes_into_plan(
     plan: &mut MeshProvisionPlan,
+    local_inbound_target: InboundTarget,
     local_site_id: &str,
     allowed_issuers: &[String],
     routes: &[SiteControllerPeerRouterRoute],
@@ -1625,10 +1676,7 @@ fn inject_site_controller_peer_router_routes_into_plan(
         capability_profile: None,
         protocol: MeshProtocol::Http,
         http_plugins: Vec::new(),
-        target: InboundTarget::External {
-            url_env: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV.to_string(),
-            optional: false,
-        },
+        target: local_inbound_target,
         allowed_issuers: allowed_issuers.to_vec(),
     });
     router

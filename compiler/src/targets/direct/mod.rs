@@ -19,6 +19,10 @@ use crate::{
             GENERATED_ENV_SAMPLE_FILENAME, GENERATED_README_FILENAME, build_execution_guide,
         },
     },
+    run_plan::{
+        SiteDefinition, SiteKind, framework_component_controller_metadata,
+        lower_framework_component_bindings_for_single_site,
+    },
     targets::{
         common::{TargetError as MeshError, component_label},
         mesh::{
@@ -170,6 +174,7 @@ pub enum DirectProgramExecutionPlan {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mount_spec_b64: Option<String>,
     },
+    InternalSiteController,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -230,6 +235,17 @@ pub(crate) fn emit_direct_artifact_with_options(
     compiled: &CompiledScenario,
     options: DirectArtifactBuildOptions<'_>,
 ) -> Result<DirectArtifact, MeshError> {
+    let lowered = lower_framework_component_bindings_for_single_site(
+        compiled,
+        "direct_local",
+        SiteDefinition {
+            kind: SiteKind::Direct,
+            context: None,
+            controller_site: None,
+        },
+    )
+    .map_err(|err| MeshError::new(err.to_string()))?;
+    let compiled = &lowered;
     let scenario = compiled.scenario();
     let endpoint_plan = crate::targets::program_config::build_endpoint_plan(scenario)?;
     let mesh_plan = build_mesh_plan(
@@ -490,11 +506,15 @@ fn build_component_plans(
             .map(|deps| deps.iter().map(|dep| dep.0).collect::<Vec<_>>())
             .unwrap_or_default();
         let source_dir = component_source_dir(compiled, *id, component.moniker.as_str())?;
-        let execution = resolve_direct_execution_plan(
-            direct_execution_plan(runtime_plan.execution),
-            source_dir.as_deref(),
-            component.moniker.as_str(),
-        )?;
+        let execution = if let Some(execution) = direct_internal_execution_plan(component) {
+            execution
+        } else {
+            resolve_direct_execution_plan(
+                direct_execution_plan(runtime_plan.execution),
+                source_dir.as_deref(),
+                component.moniker.as_str(),
+            )?
+        };
 
         out.push(DirectComponentPlan {
             id: id.0,
@@ -522,6 +542,13 @@ fn build_component_plans(
         });
     }
     Ok(out)
+}
+
+fn direct_internal_execution_plan(
+    component: &amber_scenario::Component,
+) -> Option<DirectProgramExecutionPlan> {
+    framework_component_controller_metadata(component.metadata.as_ref())
+        .map(|_| DirectProgramExecutionPlan::InternalSiteController)
 }
 
 fn inject_direct_dynamic_caps_env(
@@ -552,6 +579,9 @@ fn inject_direct_dynamic_caps_env(
             runtime_config,
             mount_spec_b64,
         },
+        DirectProgramExecutionPlan::InternalSiteController => {
+            DirectProgramExecutionPlan::InternalSiteController
+        }
     }
 }
 
@@ -705,6 +735,9 @@ fn resolve_direct_execution_plan(
             runtime_config,
             mount_spec_b64,
         }),
+        DirectProgramExecutionPlan::InternalSiteController => {
+            Ok(DirectProgramExecutionPlan::InternalSiteController)
+        }
     }
 }
 
@@ -1109,9 +1142,6 @@ mod tests {
     };
 
     use amber_manifest::{Manifest, ManifestRef};
-    use amber_mesh::{
-        FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV, FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV,
-    };
     use amber_resolver::Resolver;
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
     use tempfile::TempDir;
@@ -1195,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_router_passthrough_includes_framework_controller_auth() {
+    fn direct_framework_component_is_lowered_to_an_internal_site_controller_component() {
         let dir = TempDir::new().expect("temp dir");
         let root_path = dir.path().join("root.json5");
         let admin_path = dir.path().join("admin.json5");
@@ -1224,9 +1254,6 @@ mod tests {
                 r##"
                 {{
                   manifest_version: "0.3.0",
-                  slots: {{
-                    realm: {{ kind: "component", optional: true }}
-                  }},
                   components: {{
                     admin: "{admin}"
                   }},
@@ -1260,23 +1287,13 @@ mod tests {
                 .expect("direct plan should be emitted"),
         )
         .expect("direct plan should deserialize");
-        let router = direct_plan
-            .router
-            .expect("framework.component binding should force a router");
 
         assert!(
-            router
-                .env_passthrough
-                .iter()
-                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV),
-            "router must receive the framework controller URL env passthrough",
-        );
-        assert!(
-            router
-                .env_passthrough
-                .iter()
-                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV),
-            "router must receive the framework controller auth env passthrough",
+            direct_plan.components.iter().any(|component| matches!(
+                component.program.execution,
+                DirectProgramExecutionPlan::InternalSiteController
+            )),
+            "framework.component should lower to an injected internal site controller component"
         );
     }
 

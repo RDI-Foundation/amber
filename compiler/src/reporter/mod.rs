@@ -86,7 +86,32 @@ impl CompiledScenario {
 
     pub fn derive_from_ir(&self, scenario_ir: ScenarioIr) -> Result<Self, CompiledScenarioError> {
         let mut compiled = Self::from_ir(scenario_ir)?;
+        let required_slots = compiled
+            .scenario
+            .components
+            .len()
+            .max(compiled.scenario.root.0 + 1);
         compiled.resolved_urls = self.resolved_urls.clone();
+        if compiled.resolved_urls.len() < required_slots {
+            compiled.resolved_urls.resize(required_slots, None);
+        }
+        let previous_components = self
+            .scenario_ir
+            .components
+            .iter()
+            .map(|component| (component.id, component))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for component in &mut compiled.scenario_ir.components {
+            let Some(previous) = previous_components.get(&component.id) else {
+                continue;
+            };
+            if component.resolved_url.is_none() {
+                component.resolved_url = previous.resolved_url.clone();
+            }
+            if component.exports.is_empty() {
+                component.exports = previous.exports.clone();
+            }
+        }
         compiled.source_context = self.source_context.clone();
         Ok(compiled)
     }

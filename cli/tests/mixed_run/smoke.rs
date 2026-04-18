@@ -817,9 +817,6 @@ fn framework_controller_post(run: &RunHandle, path: &str, payload: &Value) -> (u
     let authority_url = plan["authority_url"]
         .as_str()
         .expect("site controller plan should publish authority_url");
-    let auth_token = plan["auth_token"]
-        .as_str()
-        .expect("site controller plan should publish auth token");
     let body = serde_json::to_string(payload).expect("request body should serialize");
     let output = command_output_via_tempfiles(
         std::process::Command::new("curl")
@@ -831,7 +828,22 @@ fn framework_controller_post(run: &RunHandle, path: &str, payload: &Value) -> (u
             .arg("-H")
             .arg("content-type: application/json")
             .arg("-H")
-            .arg(format!("x-amber-framework-auth: {auth_token}"))
+            .arg("-H")
+            .arg("x-amber-site-controller-local-only: 1")
+            .arg("-H")
+            .arg(format!(
+                "x-amber-route-id: site-controller:{}",
+                plan["site_id"]
+                    .as_str()
+                    .expect("site controller plan should publish site_id")
+            ))
+            .arg("-H")
+            .arg(format!(
+                "x-amber-peer-id: {}",
+                plan["router_identity_id"]
+                    .as_str()
+                    .expect("site controller plan should publish router identity")
+            ))
             .arg("--data")
             .arg(body)
             .arg("-o")

@@ -27,10 +27,7 @@ use super::{
         ControlDynamicRevokeRequest, ControlDynamicShareRequest,
         InternalDynamicResolveOriginRequest,
     },
-    http::{
-        authorize_framework_auth_header, cleanup_dynamic_bridge_proxies, read_json,
-        required_header, shutdown_signal,
-    },
+    http::{cleanup_dynamic_bridge_proxies, read_json, required_header, shutdown_signal},
     orchestration::{
         ClearExportPeerOverlayRequest, ClearExternalSlotOverlayRequest, ProtocolApiError,
         PublishExportPeerOverlayRequest, PublishExternalSlotOverlayRequest,
@@ -69,7 +66,7 @@ pub(crate) async fn run_site_controller(
         run_root: PathBuf::from(&plan.run_root),
         state_root: PathBuf::from(&plan.state_root),
         mesh_scope: Arc::<str>::from(plan.mesh_scope.clone()),
-        control_state_auth_token: Arc::<str>::from(plan.auth_token.clone()),
+        control_state_auth_token: Arc::<str>::from(plan.control_state_auth_token.clone()),
         controller_plan: Arc::new(plan.clone()),
         authority_locks: Arc::new(Mutex::new(BTreeMap::new())),
         runtime,
@@ -77,7 +74,6 @@ pub(crate) async fn run_site_controller(
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let app_state = SiteControllerApp {
         control: control.clone(),
-        router_auth_token: Arc::<str>::from(plan.auth_token),
         ready: ready.clone(),
     };
     let app = site_controller_router(app_state.clone());
@@ -238,7 +234,7 @@ async fn get_site_controller_state_route(
     State(app): State<SiteControllerApp>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<FrameworkControlState>, ProtocolApiError> {
-    authorize_framework_auth_header(&headers, app.control.control_state_auth_token.as_ref())?;
+    authorize_local_controller_request(&app, &headers)?;
     Ok(Json(app.control.control_state.lock().await.clone()))
 }
 
@@ -248,15 +244,34 @@ pub(crate) struct RouterIdentityResponse {
     pub(crate) public_key_b64: String,
 }
 
-fn authorize_local_controller_request(
+pub(super) fn authorize_local_controller_request(
     app: &SiteControllerApp,
     headers: &HeaderMap,
 ) -> std::result::Result<(), ProtocolApiError> {
-    authorize_framework_auth_header(headers, app.router_auth_token.as_ref())?;
     if !controller_local_only(headers) {
         return Err(ProtocolApiError::unauthorized(
             "local controller endpoint requires router-local forwarding".to_string(),
         ));
+    }
+    let route_id = required_header(headers, FRAMEWORK_ROUTE_ID_HEADER)?;
+    let expected_route_id = site_controller_internal_route_id(&app.control.controller_plan.site_id);
+    if route_id != expected_route_id {
+        return Err(ProtocolApiError::unauthorized(format!(
+            "local controller endpoint requires internal route `{expected_route_id}`"
+        )));
+    }
+    let peer_id = required_header(headers, FRAMEWORK_PEER_ID_HEADER)?;
+    let local_router_id = app.control.controller_plan.router_identity_id.as_str();
+    let known_peer_router = app
+        .control
+        .controller_plan
+        .peer_router_identities
+        .values()
+        .any(|identity| identity.id == peer_id);
+    if peer_id != local_router_id && !known_peer_router {
+        return Err(ProtocolApiError::unauthorized(format!(
+            "local controller endpoint received an unknown router peer `{peer_id}`"
+        )));
     }
     Ok(())
 }
@@ -314,14 +329,41 @@ pub(super) async fn authorize_public_request(
     app: &SiteControllerApp,
     headers: &HeaderMap,
 ) -> std::result::Result<(CapabilityInstanceRecord, FrameworkControlState), ProtocolApiError> {
-    authorize_framework_auth_header(headers, app.router_auth_token.as_ref())?;
     let route_id = required_header(headers, FRAMEWORK_ROUTE_ID_HEADER)?;
     let peer_id = required_header(headers, FRAMEWORK_PEER_ID_HEADER)?;
     let state = app.control.control_state.lock().await.clone();
-    let record = super::api::authorize_capability_instance(&state, &route_id, &peer_id)
+    let record = super::api::authorize_capability_route(&state, &route_id, &peer_id)
         .map_err(ProtocolApiError::from)?
         .clone();
     Ok((record, state))
+}
+
+pub(super) fn authorize_dynamic_caps_sidecar_request(
+    _app: &SiteControllerApp,
+    headers: &HeaderMap,
+    expected_component_id: &str,
+) -> std::result::Result<(), ProtocolApiError> {
+    let route_id = required_header(headers, FRAMEWORK_ROUTE_ID_HEADER)?;
+    if !route_id.ends_with(&format!(
+        ":{}:http",
+        amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+    )) {
+        return Err(ProtocolApiError::unauthorized(
+            "dynamic capability control requests must arrive over the site controller internal \
+             route"
+                .to_string(),
+        ));
+    }
+    let peer_id = required_header(headers, FRAMEWORK_PEER_ID_HEADER)?;
+    let expected_peer_id = dynamic_caps::moniker_from_logical_component_id(expected_component_id)
+        .map_err(ProtocolApiError::from)?;
+    if peer_id != expected_peer_id {
+        return Err(ProtocolApiError::unauthorized(format!(
+            "dynamic capability control request for `{expected_component_id}` came from \
+             `{peer_id}`"
+        )));
+    }
+    Ok(())
 }
 
 fn controller_local_only(headers: &HeaderMap) -> bool {
@@ -700,10 +742,19 @@ fn site_for_dynamic_ref(
 }
 
 fn framework_request_site_id(
-    state: &FrameworkControlState,
+    _state: &FrameworkControlState,
     record: &CapabilityInstanceRecord,
 ) -> std::result::Result<String, ProtocolApiError> {
-    framework_authority_site_id(state, record).map_err(ProtocolApiError::from)
+    if !record.controller_site_id.is_empty() {
+        return Ok(record.controller_site_id.clone());
+    }
+    Err(ProtocolApiError::from(protocol_error(
+        ProtocolErrorCode::ControlStateUnavailable,
+        &format!(
+            "framework.component capability instance `{}` is missing its controller_site_id",
+            record.cap_instance_id
+        ),
+    )))
 }
 
 pub(super) async fn execute_site_controller_framework_inspect(
@@ -716,8 +767,8 @@ pub(super) async fn execute_site_controller_framework_inspect(
     let authority_site = framework_request_site_id(state, record)?;
     if authority_site != app.control.controller_plan.site_id {
         return Err(ProtocolApiError::control_state_unavailable(format!(
-            "framework.component request for authority site `{authority_site}` reached site \
-             controller `{}`; router framework route overlays are stale",
+            "framework.component request is bound to controller site `{authority_site}` but \
+             reached site controller `{}`",
             app.control.controller_plan.site_id
         )));
     }
@@ -737,8 +788,8 @@ pub(super) async fn execute_site_controller_framework_mutate(
     let authority_site = framework_request_site_id(state, record)?;
     if authority_site != app.control.controller_plan.site_id {
         return Err(ProtocolApiError::control_state_unavailable(format!(
-            "framework.component request for authority site `{authority_site}` reached site \
-             controller `{}`; router framework route overlays are stale",
+            "framework.component request is bound to controller site `{authority_site}` but \
+             reached site controller `{}`",
             app.control.controller_plan.site_id
         )));
     }
@@ -1244,7 +1295,7 @@ async fn control_dynamic_held_list_route(
     headers: HeaderMap,
     Json(request): Json<ControlDynamicHeldListRequest>,
 ) -> std::result::Result<Json<HeldListResponse>, ProtocolApiError> {
-    authorize_framework_auth_header(&headers, app.control.control_state_auth_token.as_ref())?;
+    authorize_dynamic_caps_sidecar_request(&app, &headers, &request.holder_component_id)?;
     match execute_site_controller_dynamic_caps_inspect(
         &app,
         DynamicCapsInspectRequest::HeldList(request),
@@ -1262,7 +1313,7 @@ async fn control_dynamic_held_detail_route(
     headers: HeaderMap,
     Json(request): Json<ControlDynamicHeldDetailRequest>,
 ) -> std::result::Result<Json<HeldEntryDetail>, ProtocolApiError> {
-    authorize_framework_auth_header(&headers, app.control.control_state_auth_token.as_ref())?;
+    authorize_dynamic_caps_sidecar_request(&app, &headers, &request.holder_component_id)?;
     match execute_site_controller_dynamic_caps_inspect(
         &app,
         DynamicCapsInspectRequest::HeldDetail(request),
@@ -1280,7 +1331,7 @@ async fn control_dynamic_share_route(
     headers: HeaderMap,
     Json(request): Json<ControlDynamicShareRequest>,
 ) -> std::result::Result<Json<amber_mesh::dynamic_caps::ShareResponse>, ProtocolApiError> {
-    authorize_framework_auth_header(&headers, app.control.control_state_auth_token.as_ref())?;
+    authorize_dynamic_caps_sidecar_request(&app, &headers, &request.caller_component_id)?;
     match execute_site_controller_dynamic_caps_mutate(
         &app,
         DynamicCapsMutateRequest::Share(request),
@@ -1298,7 +1349,7 @@ async fn control_dynamic_grant_authorities_sync_route(
     headers: HeaderMap,
     Json(request): Json<ControlDynamicGrantAuthoritySyncRequest>,
 ) -> std::result::Result<Json<ControlDynamicGrantAuthoritySyncResponse>, ProtocolApiError> {
-    authorize_framework_auth_header(&headers, app.control.control_state_auth_token.as_ref())?;
+    authorize_local_controller_request(&app, &headers)?;
     Ok(Json(
         local_sync_dynamic_grant_authorities(&app, request).await?,
     ))
@@ -1309,7 +1360,7 @@ async fn control_dynamic_inspect_ref_route(
     headers: HeaderMap,
     Json(request): Json<ControlDynamicInspectRefRequest>,
 ) -> std::result::Result<Json<amber_mesh::dynamic_caps::InspectRefResponse>, ProtocolApiError> {
-    authorize_framework_auth_header(&headers, app.control.control_state_auth_token.as_ref())?;
+    authorize_dynamic_caps_sidecar_request(&app, &headers, &request.holder_component_id)?;
     match execute_site_controller_dynamic_caps_inspect(
         &app,
         DynamicCapsInspectRequest::InspectRef(request),
@@ -1327,7 +1378,7 @@ async fn control_dynamic_revoke_route(
     headers: HeaderMap,
     Json(request): Json<ControlDynamicRevokeRequest>,
 ) -> std::result::Result<Json<amber_mesh::dynamic_caps::RevokeResponse>, ProtocolApiError> {
-    authorize_framework_auth_header(&headers, app.control.control_state_auth_token.as_ref())?;
+    authorize_dynamic_caps_sidecar_request(&app, &headers, &request.caller_component_id)?;
     match execute_site_controller_dynamic_caps_mutate(
         &app,
         DynamicCapsMutateRequest::Revoke(request),
@@ -1346,7 +1397,7 @@ async fn control_dynamic_resolve_origin_route(
     Json(request): Json<ControlDynamicResolveOriginRequest>,
 ) -> std::result::Result<Json<dynamic_caps::ControlDynamicResolveOriginResponse>, ProtocolApiError>
 {
-    authorize_framework_auth_header(&headers, app.control.control_state_auth_token.as_ref())?;
+    authorize_dynamic_caps_sidecar_request(&app, &headers, &request.holder_component_id)?;
     match execute_site_controller_dynamic_caps_inspect(
         &app,
         DynamicCapsInspectRequest::ResolveOrigin(request),

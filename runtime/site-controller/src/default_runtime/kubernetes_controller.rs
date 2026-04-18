@@ -24,6 +24,7 @@ const KUBERNETES_CONTROLLER_ROLE_PATH: &str = "02-rbac/amber-site-controller-rol
 const KUBERNETES_CONTROLLER_ROLE_BINDING_PATH: &str =
     "02-rbac/amber-site-controller-rolebinding.yaml";
 const KUBERNETES_CONTROLLER_DEPLOYMENT_PATH: &str = "03-deployments/amber-site-controller.yaml";
+#[cfg(test)]
 const KUBERNETES_CONTROLLER_SERVICE_PATH: &str = "04-services/amber-site-controller.yaml";
 const KUBERNETES_CONTROLLER_SEED_VOLUME: &str = "controller-seed";
 const KUBERNETES_CONTROLLER_STATE_VOLUME: &str = "controller-state";
@@ -35,13 +36,6 @@ const KUBERNETES_CONTROLLER_STATE_PATH: &str = "/amber/site/state/site-controlle
 const KUBERNETES_CONTROLLER_DESIRED_LINKS_PATH: &str = "/amber/site/state/desired-links.json";
 const KUBERNETES_CONTROLLER_SEED_ROOT: &str = "/amber/seed";
 
-fn kubernetes_env_entries(plan: &SiteControllerPlan) -> Vec<serde_json::Value> {
-    plan.launch_env
-        .iter()
-        .map(|(name, value)| json!({ "name": name, "value": value }))
-        .collect()
-}
-
 pub fn inject_kubernetes_site_controller(
     artifact_root: &Path,
     plan: &SiteControllerPlan,
@@ -51,8 +45,6 @@ pub fn inject_kubernetes_site_controller(
     let seed_configmap =
         build_kubernetes_controller_seed_configmap(artifact_root, plan, &embedded_plan)?;
     let labels = kubernetes_controller_labels();
-    let selector = kubernetes_controller_selector();
-    let controller_env = kubernetes_env_entries(plan);
 
     write_yaml_artifact(
         artifact_root.join(KUBERNETES_CONTROLLER_SEED_CONFIGMAP_PATH),
@@ -133,110 +125,10 @@ pub fn inject_kubernetes_site_controller(
             }
         }),
     )?;
-    write_yaml_artifact(
+    patch_kubernetes_controller_deployment(
         artifact_root.join(KUBERNETES_CONTROLLER_DEPLOYMENT_PATH),
-        &json!({
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": {
-                "name": SITE_CONTROLLER_SERVICE_NAME,
-                "labels": labels,
-            },
-            "spec": {
-                "replicas": 1,
-                "selector": {
-                    "matchLabels": selector,
-                },
-                "template": {
-                    "metadata": {
-                        "labels": labels,
-                    },
-                    "spec": {
-                        "serviceAccountName": SITE_CONTROLLER_SERVICE_NAME,
-                        "automountServiceAccountToken": true,
-                        "initContainers": [{
-                            "name": "seed-site-controller",
-                            "image": controller_image,
-                            "command": [
-                                "sh",
-                                "-lc",
-                                format!(
-                                    "set -eu\nmkdir -p {KUBERNETES_CONTROLLER_STATE_ROOT} \
-                                     {KUBERNETES_CONTROLLER_ARTIFACT_ROOT}\ncp \
-                                     {KUBERNETES_CONTROLLER_SEED_ROOT}/site-controller-plan.json \
-                                     {KUBERNETES_CONTROLLER_PLAN_PATH}\ncp \
-                                     {KUBERNETES_CONTROLLER_SEED_ROOT}/site-controller-state.json \
-                                     {KUBERNETES_CONTROLLER_STATE_PATH}\ncp \
-                                     {KUBERNETES_CONTROLLER_SEED_ROOT}/desired-links.json \
-                                     {KUBERNETES_CONTROLLER_DESIRED_LINKS_PATH}\nbase64 -d \
-                                     {KUBERNETES_CONTROLLER_SEED_ROOT}/artifact.tar.b64 | tar \
-                                     -xf - -C {KUBERNETES_CONTROLLER_ARTIFACT_ROOT}\n"
-                                )
-                            ],
-                            "volumeMounts": [
-                                {
-                                    "name": KUBERNETES_CONTROLLER_SEED_VOLUME,
-                                    "mountPath": KUBERNETES_CONTROLLER_SEED_ROOT,
-                                    "readOnly": true,
-                                },
-                                {
-                                    "name": KUBERNETES_CONTROLLER_STATE_VOLUME,
-                                    "mountPath": KUBERNETES_CONTROLLER_SITE_ROOT,
-                                }
-                            ]
-                        }],
-                        "containers": [{
-                            "name": SITE_CONTROLLER_SERVICE_NAME,
-                            "image": controller_image,
-                            "args": ["--plan", KUBERNETES_CONTROLLER_PLAN_PATH],
-                            "env": controller_env,
-                            "ports": [{
-                                "name": "http",
-                                "containerPort": SITE_CONTROLLER_PORT,
-                                "protocol": "TCP",
-                            }],
-                            "volumeMounts": [{
-                                "name": KUBERNETES_CONTROLLER_STATE_VOLUME,
-                                "mountPath": KUBERNETES_CONTROLLER_SITE_ROOT,
-                            }]
-                        }],
-                        "volumes": [
-                            {
-                                "name": KUBERNETES_CONTROLLER_SEED_VOLUME,
-                                "configMap": {
-                                    "name": format!("{SITE_CONTROLLER_SERVICE_NAME}-seed"),
-                                }
-                            },
-                            {
-                                "name": KUBERNETES_CONTROLLER_STATE_VOLUME,
-                                "emptyDir": {}
-                            }
-                        ]
-                    }
-                }
-            }
-        }),
-    )?;
-    write_yaml_artifact(
-        artifact_root.join(KUBERNETES_CONTROLLER_SERVICE_PATH),
-        &json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {
-                "name": SITE_CONTROLLER_SERVICE_NAME,
-                "labels": labels,
-            },
-            "spec": {
-                "selector": selector,
-                "ports": [{
-                    "name": "http",
-                    "port": SITE_CONTROLLER_PORT,
-                    "targetPort": SITE_CONTROLLER_PORT,
-                    "protocol": "TCP",
-                }],
-                "type": "ClusterIP",
-            }
-        }),
+        plan,
+        controller_image,
     )?;
     add_kubernetes_resource_paths(
         artifact_root,
@@ -245,8 +137,6 @@ pub fn inject_kubernetes_site_controller(
             KUBERNETES_CONTROLLER_SERVICE_ACCOUNT_PATH,
             KUBERNETES_CONTROLLER_ROLE_PATH,
             KUBERNETES_CONTROLLER_ROLE_BINDING_PATH,
-            KUBERNETES_CONTROLLER_DEPLOYMENT_PATH,
-            KUBERNETES_CONTROLLER_SERVICE_PATH,
         ],
     )?;
     ensure_kubernetes_router_allows_site_controller_ingress(
@@ -255,11 +145,226 @@ pub fn inject_kubernetes_site_controller(
     )
 }
 
+fn upsert_named_sequence_entry(
+    sequence: &mut serde_yaml::Sequence,
+    name: &str,
+    value: serde_yaml::Value,
+) {
+    if let Some(existing) = sequence.iter_mut().find(|entry| {
+        entry
+            .as_mapping()
+            .and_then(|mapping| mapping.get(yaml_string("name")))
+            .and_then(serde_yaml::Value::as_str)
+            .is_some_and(|existing| existing == name)
+    }) {
+        *existing = value;
+    } else {
+        sequence.push(value);
+    }
+}
+
+fn merge_kubernetes_controller_env(
+    container: &mut serde_yaml::Mapping,
+    plan: &SiteControllerPlan,
+) -> Result<()> {
+    if plan.launch_env.is_empty() {
+        return Ok(());
+    }
+    let env = container
+        .entry(yaml_string("env"))
+        .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
+        .as_sequence_mut()
+        .ok_or_else(|| miette::miette!("controller deployment env must be a sequence"))?;
+    for (name, value) in &plan.launch_env {
+        upsert_named_sequence_entry(
+            env,
+            name,
+            serde_yaml::to_value(json!({ "name": name, "value": value }))
+                .into_diagnostic()
+                .wrap_err("failed to serialize controller env entry")?,
+        );
+    }
+    Ok(())
+}
+
+fn ensure_kubernetes_volume_mount(
+    container: &mut serde_yaml::Mapping,
+    name: &str,
+    mount_path: &str,
+    read_only: Option<bool>,
+) -> Result<()> {
+    let mounts = container
+        .entry(yaml_string("volumeMounts"))
+        .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
+        .as_sequence_mut()
+        .ok_or_else(|| miette::miette!("controller deployment volumeMounts must be a sequence"))?;
+    let mut mount = json!({
+        "name": name,
+        "mountPath": mount_path,
+    });
+    if let Some(read_only) = read_only {
+        mount["readOnly"] = serde_json::Value::Bool(read_only);
+    }
+    upsert_named_sequence_entry(
+        mounts,
+        name,
+        serde_yaml::to_value(mount)
+            .into_diagnostic()
+            .wrap_err("failed to serialize controller volume mount")?,
+    );
+    Ok(())
+}
+
+fn patch_kubernetes_controller_deployment(
+    path: PathBuf,
+    plan: &SiteControllerPlan,
+    controller_image: &str,
+) -> Result<()> {
+    let raw = fs::read_to_string(&path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    let mut deployment: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid {}", path.display()))?;
+    let pod_spec = deployment
+        .as_mapping_mut()
+        .and_then(|root| root.get_mut(yaml_string("spec")))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .and_then(|spec| spec.get_mut(yaml_string("template")))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .and_then(|template| template.get_mut(yaml_string("spec")))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or_else(|| {
+            miette::miette!(
+                "controller deployment {} is missing spec.template.spec",
+                path.display()
+            )
+        })?;
+    pod_spec.insert(
+        yaml_string("serviceAccountName"),
+        yaml_string(SITE_CONTROLLER_SERVICE_NAME),
+    );
+    pod_spec.insert(
+        yaml_string("automountServiceAccountToken"),
+        serde_yaml::Value::Bool(true),
+    );
+
+    let init_containers = pod_spec
+        .entry(yaml_string("initContainers"))
+        .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
+        .as_sequence_mut()
+        .ok_or_else(|| {
+            miette::miette!("controller deployment initContainers must be a sequence")
+        })?;
+    upsert_named_sequence_entry(
+        init_containers,
+        "seed-site-controller",
+        serde_yaml::to_value(json!({
+            "name": "seed-site-controller",
+            "image": controller_image,
+            "command": [
+                "sh",
+                "-lc",
+                format!(
+                    "set -eu
+        mkdir -p {KUBERNETES_CONTROLLER_STATE_ROOT} \
+                     {KUBERNETES_CONTROLLER_ARTIFACT_ROOT}
+cp \
+                     {KUBERNETES_CONTROLLER_SEED_ROOT}/site-controller-plan.json \
+                     {KUBERNETES_CONTROLLER_PLAN_PATH}
+cp \
+                     {KUBERNETES_CONTROLLER_SEED_ROOT}/site-controller-state.json \
+                     {KUBERNETES_CONTROLLER_STATE_PATH}
+cp \
+                     {KUBERNETES_CONTROLLER_SEED_ROOT}/desired-links.json \
+                     {KUBERNETES_CONTROLLER_DESIRED_LINKS_PATH}
+base64 -d \
+                     {KUBERNETES_CONTROLLER_SEED_ROOT}/artifact.tar.b64 | tar \
+                     -xf - -C {KUBERNETES_CONTROLLER_ARTIFACT_ROOT}
+"
+                )
+            ],
+            "volumeMounts": [
+                {
+                    "name": KUBERNETES_CONTROLLER_SEED_VOLUME,
+                    "mountPath": KUBERNETES_CONTROLLER_SEED_ROOT,
+                    "readOnly": true,
+                },
+                {
+                    "name": KUBERNETES_CONTROLLER_STATE_VOLUME,
+                    "mountPath": KUBERNETES_CONTROLLER_SITE_ROOT,
+                }
+            ]
+        }))
+        .into_diagnostic()
+        .wrap_err("failed to serialize controller seed init container")?,
+    );
+
+    let containers = pod_spec
+        .get_mut(yaml_string("containers"))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or_else(|| {
+            miette::miette!("controller deployment is missing spec.template.spec.containers")
+        })?;
+    let main_index = containers
+        .iter()
+        .position(|container| {
+            container
+                .as_mapping()
+                .and_then(|mapping| mapping.get(yaml_string("name")))
+                .and_then(serde_yaml::Value::as_str)
+                .is_some_and(|name| name == "main")
+        })
+        .unwrap_or(0);
+    let main = containers
+        .get_mut(main_index)
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or_else(|| miette::miette!("controller deployment has no mutable main container"))?;
+    main.insert(yaml_string("image"), yaml_string(controller_image));
+    merge_kubernetes_controller_env(main, plan)?;
+    ensure_kubernetes_volume_mount(
+        main,
+        KUBERNETES_CONTROLLER_STATE_VOLUME,
+        KUBERNETES_CONTROLLER_SITE_ROOT,
+        None,
+    )?;
+
+    let volumes = pod_spec
+        .entry(yaml_string("volumes"))
+        .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
+        .as_sequence_mut()
+        .ok_or_else(|| miette::miette!("controller deployment volumes must be a sequence"))?;
+    upsert_named_sequence_entry(
+        volumes,
+        KUBERNETES_CONTROLLER_SEED_VOLUME,
+        serde_yaml::to_value(json!({
+            "name": KUBERNETES_CONTROLLER_SEED_VOLUME,
+            "configMap": {
+                "name": format!("{SITE_CONTROLLER_SERVICE_NAME}-seed"),
+            }
+        }))
+        .into_diagnostic()
+        .wrap_err("failed to serialize controller seed volume")?,
+    );
+    upsert_named_sequence_entry(
+        volumes,
+        KUBERNETES_CONTROLLER_STATE_VOLUME,
+        serde_yaml::to_value(json!({
+            "name": KUBERNETES_CONTROLLER_STATE_VOLUME,
+            "emptyDir": {}
+        }))
+        .into_diagnostic()
+        .wrap_err("failed to serialize controller state volume")?,
+    );
+
+    write_yaml_artifact(path, &deployment)
+}
+
 fn build_embedded_kubernetes_controller_plan(plan: &SiteControllerPlan) -> SiteControllerPlan {
     let mut embedded = plan.clone();
-    embedded.listen_addr = SocketAddr::from(([0, 0, 0, 0], SITE_CONTROLLER_PORT));
-    embedded.authority_url =
-        format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{SITE_CONTROLLER_PORT}");
+    let port = plan.listen_addr.port();
+    embedded.listen_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    embedded.authority_url = format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{port}");
     embedded.local_router_control = Some(format!(
         "{KUBERNETES_ROUTER_NAME}:{KUBERNETES_ROUTER_CONTROL_PORT}"
     ));
@@ -551,7 +656,7 @@ fn kubernetes_controller_selector() -> BTreeMap<String, String> {
     )])
 }
 
-fn write_yaml_artifact(path: PathBuf, value: &serde_json::Value) -> Result<()> {
+fn write_yaml_artifact(path: PathBuf, value: &impl serde::Serialize) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         miette::miette!("artifact path {} has no parent directory", path.display())
     })?;
@@ -578,6 +683,7 @@ mod tests {
     use super::*;
 
     fn test_plan(root: &Path) -> SiteControllerPlan {
+        let controller_port = 32123;
         SiteControllerPlan {
             schema: "amber.framework_component.site_controller_plan".to_string(),
             version: 1,
@@ -585,8 +691,8 @@ mod tests {
             mesh_scope: "scope".to_string(),
             site_id: "kind_local".to_string(),
             kind: SiteKind::Kubernetes,
-            listen_addr: SocketAddr::from(([127, 0, 0, 1], 4100)),
-            authority_url: "http://amber-site-controller:4100".to_string(),
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], controller_port)),
+            authority_url: format!("http://amber-site-controller:{controller_port}"),
             router_identity_id: "/site/kind_local/router".to_string(),
             peer_site_router_urls: BTreeMap::new(),
             peer_router_identities: BTreeMap::new(),
@@ -600,7 +706,7 @@ mod tests {
             state_root: root.join("state-root").display().to_string(),
             site_state_root: root.join("site-state").display().to_string(),
             artifact_dir: root.join("artifact").display().to_string(),
-            auth_token: "token".to_string(),
+            control_state_auth_token: "token".to_string(),
             dynamic_caps_token_verify_key_b64: "verify".to_string(),
             storage_root: None,
             runtime_root: None,
@@ -624,7 +730,8 @@ mod tests {
         fs::create_dir_all(artifact_root.join("05-networkpolicies")).expect("netpol dir");
         fs::write(
             artifact_root.join("kustomization.yaml"),
-            "resources:\n  - 04-services/amber-router.yaml\n  - \
+            "resources:\n  - 03-deployments/amber-site-controller.yaml\n  - \
+             04-services/amber-site-controller.yaml\n  - 04-services/amber-router.yaml\n  - \
              05-networkpolicies/amber-router-netpol.yaml\n",
         )
         .expect("kustomization should write");
@@ -640,6 +747,47 @@ mod tests {
              amber-router-netpol\nspec:\n  ingress: []\n",
         )
         .expect("router netpol should write");
+        fs::create_dir_all(artifact_root.join("03-deployments")).expect("deployments dir");
+        fs::write(
+            artifact_root.join(KUBERNETES_CONTROLLER_DEPLOYMENT_PATH),
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amber-site-controller
+spec:
+  template:
+    spec:
+      containers:
+        - name: main
+          image: __amber_internal/site-controller
+          args:
+            - --plan
+            - /amber/site/state/site-controller-plan.json
+          env:
+            - name: EXISTING_ENV
+              value: kept
+        - name: sidecar
+          image: ghcr.io/rdi-foundation/amber-router:test
+"#,
+        )
+        .expect("controller deployment should write");
+        fs::write(
+            artifact_root.join(KUBERNETES_CONTROLLER_SERVICE_PATH),
+            r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: amber-site-controller
+spec:
+  ports:
+    - name: framework-component
+      port: 32123
+      targetPort: 32123
+      protocol: TCP
+"#,
+        )
+        .expect("controller service should write");
 
         let plan = test_plan(artifact_root);
         fs::write(&plan.state_path, "{}").expect("state should write");
@@ -662,7 +810,7 @@ mod tests {
                 .expect("controller deployment should exist");
         let deployment: serde_yaml::Value =
             serde_yaml::from_str(&deployment_raw).expect("deployment yaml should parse");
-        let env = deployment
+        let containers = deployment
             .as_mapping()
             .and_then(|root| root.get(yaml_string("spec")))
             .and_then(serde_yaml::Value::as_mapping)
@@ -672,16 +820,38 @@ mod tests {
             .and_then(serde_yaml::Value::as_mapping)
             .and_then(|spec| spec.get(yaml_string("containers")))
             .and_then(serde_yaml::Value::as_sequence)
-            .and_then(|containers| containers.first())
+            .expect("controller deployment should include containers");
+        assert_eq!(
+            containers.len(),
+            2,
+            "bootstrap should patch the rendered controller deployment instead of replacing it"
+        );
+        let main = containers
+            .iter()
+            .find(|container| {
+                container
+                    .as_mapping()
+                    .and_then(|mapping| mapping.get(yaml_string("name")))
+                    .and_then(serde_yaml::Value::as_str)
+                    .is_some_and(|name| name == "main")
+            })
             .and_then(serde_yaml::Value::as_mapping)
-            .and_then(|container| container.get(yaml_string("env")))
+            .expect("controller deployment should keep the main container");
+        let env = main
+            .get(yaml_string("env"))
             .and_then(serde_yaml::Value::as_sequence)
-            .expect("controller container should include env");
+            .expect("controller main container should include env");
         assert!(env.iter().any(|entry| {
             entry.as_mapping().is_some_and(|mapping| {
                 mapping.get(yaml_string("name")) == Some(&yaml_string("AMBER_DEV_IMAGE_TAGS"))
                     && mapping.get(yaml_string("value"))
                         == Some(&yaml_string("router=dev-tag,helper=dev-tag"))
+            })
+        }));
+        assert!(env.iter().any(|entry| {
+            entry.as_mapping().is_some_and(|mapping| {
+                mapping.get(yaml_string("name")) == Some(&yaml_string("EXISTING_ENV"))
+                    && mapping.get(yaml_string("value")) == Some(&yaml_string("kept"))
             })
         }));
     }

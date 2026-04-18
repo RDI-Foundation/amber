@@ -74,7 +74,6 @@ pub(super) fn site_supervisor_plan_for_site_runtime(
         port_forward_mesh_port: None,
         port_forward_control_port: None,
         observability_endpoint: plan.observability_endpoint.clone(),
-        site_controller_plan_path: None,
         site_controller_url: None,
         launch_env: plan.launch_env.clone(),
     }
@@ -1225,7 +1224,6 @@ mod tests {
             port_forward_mesh_port: None,
             port_forward_control_port: None,
             observability_endpoint: None,
-            site_controller_plan_path: None,
             site_controller_url: None,
             launch_env: BTreeMap::new(),
         }
@@ -1420,7 +1418,6 @@ printf '%s' "${AMBER_VM_FORCE_TCG:-missing}" > "$1"
                 kubernetes_consumer_router_mesh_addr: None,
                 router_identity_id: Some(router_identity.id.clone()),
                 router_public_key_b64: None,
-                site_controller_pid: None,
                 site_controller_url: None,
             },
             router_control: ControlEndpoint::Tcp("127.0.0.1:24100".to_string()),
@@ -1503,7 +1500,6 @@ printf '%s' "${AMBER_VM_FORCE_TCG:-missing}" > "$1"
                 router_public_key_b64: Some(
                     base64::engine::general_purpose::STANDARD.encode(router_identity.public_key),
                 ),
-                site_controller_pid: None,
                 site_controller_url: None,
             },
             router_control: ControlEndpoint::Tcp("127.0.0.1:24100".to_string()),
@@ -1572,7 +1568,6 @@ printf '%s' "${AMBER_VM_FORCE_TCG:-missing}" > "$1"
                 router_public_key_b64: Some(
                     base64::engine::general_purpose::STANDARD.encode(router_identity.public_key),
                 ),
-                site_controller_pid: None,
                 site_controller_url: None,
             },
             router_control: ControlEndpoint::Tcp("127.0.0.1:24100".to_string()),

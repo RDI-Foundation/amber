@@ -69,6 +69,19 @@ pub(super) async fn prepare_child_record(
         BTreeMap::from([(wrapper_url.to_string(), wrapper_manifest)]),
     )
     .await?;
+    let compiled = amber_compiler::run_plan::lower_framework_component_bindings_for_placement(
+        &compiled,
+        &placement_file_from_state(state),
+    )
+    .map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "failed to lower framework.component bindings in dynamic child `{}`: {err}",
+                request.name
+            ),
+        )
+    })?;
     let (fragment, outputs) = extract_live_child_fragment(
         state,
         &compiled,
@@ -1034,23 +1047,11 @@ pub(super) fn build_wrapper_manifest(
             synthetic_sources.insert(
                 synthetic_name.clone(),
                 SyntheticSourceRecord {
-                    slot_name: binding.slot_name.clone(),
                     actual_source,
                     source_child_id,
                     weak: source.weak,
                 },
             );
-
-            if let BindingFrom::Framework(framework) = &source.from {
-                bindings.push(raw_binding(
-                    &format!("#{child_name}"),
-                    binding.slot_name.clone(),
-                    "framework",
-                    framework.capability.to_string(),
-                    source.weak,
-                )?);
-                continue;
-            }
 
             slots.insert(
                 synthetic_name.clone(),
@@ -1990,25 +1991,6 @@ pub(super) fn extract_live_child_fragment(
             }
             BindingFromIr::Framework {
                 authority_realm, ..
-            } if *authority_realm == wrapper_root => {
-                let Some(synthetic) = synthetic_sources.values().find(|source| {
-                    source.slot_name == binding.to.slot
-                        && matches!(source.actual_source, BindingFrom::Framework(_))
-                }) else {
-                    return Err(protocol_error(
-                        ProtocolErrorCode::ControlStateUnavailable,
-                        &format!(
-                            "missing framework synthetic source mapping for slot `{}`",
-                            binding.to.slot
-                        ),
-                    ));
-                };
-                rewritten.from = BindingFromIr::from(&synthetic.actual_source);
-                rewritten.weak = synthetic.weak;
-                synthetic.source_child_id
-            }
-            BindingFromIr::Framework {
-                authority_realm, ..
             } => {
                 if let Some(remapped) = id_map.get(authority_realm) {
                     *authority_realm = *remapped;
@@ -2154,6 +2136,17 @@ pub(super) fn collect_capability_instances(
         .iter()
         .map(|component| (component.id, component.moniker.clone()))
         .collect::<BTreeMap<_, _>>();
+    let mut controller_metadata_by_id = state
+        .base_scenario
+        .components
+        .iter()
+        .filter_map(|component| {
+            amber_compiler::run_plan::framework_component_controller_metadata(
+                component.metadata.as_ref(),
+            )
+            .map(|metadata| (component.id, metadata))
+        })
+        .collect::<BTreeMap<_, _>>();
     for child in &active_children {
         let Some(fragment) = child.fragment.as_ref() else {
             continue;
@@ -2164,6 +2157,12 @@ pub(super) fn collect_capability_instances(
                 .iter()
                 .map(|component| (component.id, component.moniker.clone())),
         );
+        controller_metadata_by_id.extend(fragment.components.iter().filter_map(|component| {
+            amber_compiler::run_plan::framework_component_controller_metadata(
+                component.metadata.as_ref(),
+            )
+            .map(|metadata| (component.id, metadata))
+        }));
     }
 
     let mut site_by_moniker = state.placement.assignments.clone();
@@ -2178,6 +2177,7 @@ pub(super) fn collect_capability_instances(
             binding,
             &moniker_by_id,
             &site_by_moniker,
+            &controller_metadata_by_id,
             state.generation,
         )?;
     }
@@ -2191,6 +2191,7 @@ pub(super) fn collect_capability_instances(
                 &binding.binding,
                 &moniker_by_id,
                 &site_by_moniker,
+                &controller_metadata_by_id,
                 state.generation,
             )?;
         }
@@ -2203,68 +2204,90 @@ pub(super) fn collect_capability_instance_from_binding(
     binding: &BindingIr,
     moniker_by_id: &BTreeMap<usize, String>,
     site_by_moniker: &BTreeMap<String, String>,
+    controller_metadata_by_id: &BTreeMap<
+        usize,
+        amber_compiler::run_plan::FrameworkComponentControllerMetadata,
+    >,
     generation: u64,
 ) -> Result<()> {
-    let BindingFromIr::Framework {
-        authority_realm,
-        capability,
-    } = &binding.from
-    else {
-        return Ok(());
-    };
-    if capability != "component" {
-        return Ok(());
-    }
-
-    let authority_realm_moniker = moniker_by_id.get(authority_realm).cloned().ok_or_else(|| {
-        miette::miette!(
-            "framework.component authority realm id {authority_realm} is missing from the \
-             authoritative live graph"
-        )
-    })?;
     let recipient_component_moniker = moniker_by_id
         .get(&binding.to.component)
         .cloned()
         .ok_or_else(|| {
             miette::miette!(
-                "framework.component recipient component id {} is missing from the authoritative \
-                 live graph",
-                binding.to.component
-            )
+                    "framework.component recipient component id {} is missing from the \
+                     authoritative                  live graph",
+                    binding.to.component
+                )
         })?;
     let recipient_site_id = site_by_moniker
         .get(&recipient_component_moniker)
         .cloned()
         .ok_or_else(|| {
             miette::miette!(
-                "framework.component recipient `{recipient_component_moniker}` is missing a site \
-                 assignment in the authoritative live graph"
-            )
+                    "framework.component recipient `{recipient_component_moniker}` is missing a \
+                     site                  assignment in the authoritative live graph"
+                )
         })?;
-    let cap_instance_id = framework_cap_instance_id(
-        authority_realm_moniker.as_str(),
-        recipient_component_moniker.as_str(),
-        &binding.to.component.to_string(),
-        &binding.to.slot,
-        capability,
-    );
-    records.insert(
-        cap_instance_id.clone(),
-        CapabilityInstanceRecord {
-            cap_instance_id: cap_instance_id.clone(),
-            route_id: cap_instance_id,
-            authority_realm_id: *authority_realm,
-            authority_realm_moniker,
-            recipient_component_id: binding.to.component,
-            recipient_component_moniker: recipient_component_moniker.clone(),
-            recipient_peer_id: recipient_component_moniker,
-            recipient_site_id,
-            capability: capability.clone(),
-            slot: binding.to.slot.clone(),
-            generation,
-        },
-    );
-    Ok(())
+
+    match &binding.from {
+        BindingFromIr::Framework { capability, .. } => {
+            if capability != "component" {
+                return Ok(());
+            }
+            Err(miette::miette!(
+                "framework.component binding {}.{} must be lowered before capability refresh",
+                recipient_component_moniker,
+                binding.to.slot,
+            ))
+        }
+        BindingFromIr::Component { component, provide } => {
+            let Some(metadata) = controller_metadata_by_id.get(component) else {
+                return Ok(());
+            };
+            let Some(grant) = metadata.grants.get(provide) else {
+                return Ok(());
+            };
+            let provider_moniker = moniker_by_id.get(component).cloned().ok_or_else(|| {
+                miette::miette!(
+                        "framework.component controller component id {component} is missing from \
+                         the                      authoritative live graph"
+                    )
+            })?;
+            let route_id = amber_mesh::component_route_id(
+                provider_moniker.as_str(),
+                provide,
+                amber_mesh::MeshProtocol::Http,
+            );
+            let cap_instance_id = framework_cap_instance_id(
+                grant.authority_realm_moniker.as_str(),
+                recipient_component_moniker.as_str(),
+                &binding.to.component.to_string(),
+                &binding.to.slot,
+                "component",
+            );
+            records.insert(
+                cap_instance_id.clone(),
+                CapabilityInstanceRecord {
+                    cap_instance_id,
+                    route_id,
+                    authority_realm_id: grant.authority_realm_id,
+                    authority_realm_moniker: grant.authority_realm_moniker.clone(),
+                    recipient_component_id: binding.to.component,
+                    recipient_component_moniker: recipient_component_moniker.clone(),
+                    recipient_peer_id: recipient_component_moniker,
+                    recipient_site_id,
+                    controller_site_id: metadata.execution_site.clone(),
+                    managed_site_id: grant.managed_site.clone(),
+                    capability: "component".to_string(),
+                    slot: binding.to.slot.clone(),
+                    generation,
+                },
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 pub(super) fn template_mode(template: &ChildTemplate) -> TemplateMode {
@@ -3276,7 +3299,6 @@ pub(super) struct ControlStateApp {
 #[derive(Clone)]
 pub(super) struct SiteControllerApp {
     pub(super) control: ControlStateApp,
-    pub(super) router_auth_token: Arc<str>,
     pub(super) ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -3314,8 +3336,6 @@ pub(super) struct SiteManagerStateView {
     pub(super) router_identity_id: Option<String>,
     #[serde(default)]
     pub(super) router_public_key_b64: Option<String>,
-    #[serde(default)]
-    pub(super) site_controller_pid: Option<u32>,
     #[serde(default)]
     pub(super) site_controller_url: Option<String>,
 }

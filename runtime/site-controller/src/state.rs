@@ -8,10 +8,9 @@ pub(super) const SITE_CONTROLLER_PLAN_VERSION: u32 = 1;
 pub(super) const SITE_CONTROLLER_STATE_PATH: &str = "/v1/controller/state";
 pub(super) const FRAMEWORK_ROUTE_ID_HEADER: &str = "x-amber-route-id";
 pub(super) const FRAMEWORK_PEER_ID_HEADER: &str = "x-amber-peer-id";
-pub(super) const FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
+pub(super) const CONTROL_STATE_AUTH_HEADER: &str = "x-amber-control-state-auth";
 pub const SITE_CONTROLLER_INTERNAL_CAPABILITY: &str = "amber.internal.site_controller";
 pub const SITE_CONTROLLER_SERVICE_NAME: &str = "amber-site-controller";
-pub const SITE_CONTROLLER_PORT: u16 = 4100;
 
 pub fn site_controller_internal_route_id(site_id: &str) -> String {
     format!("site-controller:{site_id}")
@@ -46,6 +45,10 @@ pub(crate) struct CapabilityInstanceRecord {
     pub(crate) recipient_component_moniker: String,
     pub(crate) recipient_peer_id: String,
     pub(crate) recipient_site_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) controller_site_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) managed_site_id: String,
     pub(crate) capability: String,
     pub(crate) slot: String,
     pub(crate) generation: u64,
@@ -282,7 +285,7 @@ pub struct SiteControllerPlan {
     pub state_root: String,
     pub site_state_root: String,
     pub artifact_dir: String,
-    pub auth_token: String,
+    pub control_state_auth_token: String,
     pub dynamic_caps_token_verify_key_b64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_root: Option<String>,
@@ -1073,7 +1076,7 @@ fn remap_output_handle_for_snapshot(
     })
 }
 
-pub fn generate_framework_auth_token(mesh_scope: &str, purpose: &str) -> String {
+pub fn generate_control_state_auth_token(mesh_scope: &str, purpose: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(
         MeshIdentity::generate(
             format!("/framework/{purpose}"),
@@ -1249,7 +1252,7 @@ pub fn write_site_controller_plan(
     state_root: &Path,
     site_state_root: &Path,
     artifact_dir: &Path,
-    auth_token: &str,
+    control_state_auth_token: &str,
     dynamic_caps_token_verify_key_b64: &str,
     storage_root: Option<&str>,
     runtime_root: Option<&str>,
@@ -1283,7 +1286,7 @@ pub fn write_site_controller_plan(
         state_root: state_root.display().to_string(),
         site_state_root: site_state_root.display().to_string(),
         artifact_dir: artifact_dir.display().to_string(),
-        auth_token: auth_token.to_string(),
+        control_state_auth_token: control_state_auth_token.to_string(),
         dynamic_caps_token_verify_key_b64: dynamic_caps_token_verify_key_b64.to_string(),
         storage_root: storage_root.map(str::to_string),
         runtime_root: runtime_root.map(str::to_string),
@@ -1296,72 +1299,6 @@ pub fn write_site_controller_plan(
     };
     write_json(path, &plan)?;
     Ok(plan)
-}
-
-pub(crate) fn site_id_for_authority_realm(
-    state: &FrameworkControlState,
-    authority_realm_id: usize,
-) -> std::result::Result<String, ProtocolErrorResponse> {
-    let authority_moniker = decode_live_scenario(state)?
-        .component(ComponentId(authority_realm_id))
-        .moniker
-        .to_string();
-    site_id_for_moniker(
-        state,
-        authority_moniker.as_str(),
-        &format!("authority realm `{authority_moniker}`"),
-    )
-}
-
-pub(crate) fn framework_authority_site_id(
-    state: &FrameworkControlState,
-    record: &CapabilityInstanceRecord,
-) -> std::result::Result<String, ProtocolErrorResponse> {
-    if let Ok(site_id) = site_id_for_authority_realm(state, record.authority_realm_id) {
-        return Ok(site_id);
-    }
-    let authority = record.authority_realm_moniker.as_str();
-    let recipient = record.recipient_component_moniker.as_str();
-    if authority != "/"
-        && recipient != authority
-        && !recipient.starts_with(&format!("{authority}/"))
-    {
-        return Err(protocol_error(
-            ProtocolErrorCode::ControlStateUnavailable,
-            &format!(
-                "framework.component recipient `{recipient}` is not inside authority realm \
-                 `{authority}`"
-            ),
-        ));
-    }
-    let assignments = planned_component_site_map(state);
-    let recipient_segments = recipient
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    let authority_depth = authority
-        .trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .count();
-    for depth in authority_depth..=recipient_segments.len() {
-        let moniker = if depth == 0 {
-            "/".to_string()
-        } else {
-            format!("/{}", recipient_segments[..depth].join("/"))
-        };
-        if let Some(site_id) = assignments.get(&moniker) {
-            return Ok(site_id.clone());
-        }
-    }
-    Err(protocol_error(
-        ProtocolErrorCode::ControlStateUnavailable,
-        &format!(
-            "framework.component authority realm `{authority}` has no assigned component on the \
-             path to recipient `{recipient}`"
-        ),
-    ))
 }
 
 pub(crate) fn site_id_for_dynamic_grant(

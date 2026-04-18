@@ -63,7 +63,7 @@ impl FrameworkDynamicCapsMcp {
             .extensions
             .get::<Parts>()
             .ok_or_else(|| McpError::invalid_request("missing HTTP request context", None))?;
-        super::http::authorize_framework_auth_header(
+        super::http::authorize_control_state_auth_header(
             &parts.headers,
             self.app.control.control_state_auth_token.as_ref(),
         )

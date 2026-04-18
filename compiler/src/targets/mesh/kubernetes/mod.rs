@@ -26,6 +26,10 @@ use crate::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{GENERATED_README_FILENAME, build_execution_guide},
     },
+    run_plan::{
+        SiteDefinition, SiteKind, framework_component_controller_metadata,
+        lower_framework_component_bindings_for_single_site,
+    },
     runtime_interface::{RootInputDescriptor, build_runtime_interface},
     targets::{
         mesh::{
@@ -66,6 +70,7 @@ const MESH_CONFIG_DIR: &str = "/amber/mesh";
 const MESH_SECRET_VOLUME_NAME: &str = "amber-mesh";
 const ROUTER_NAME: &str = "amber-router";
 const PROVISIONER_NAME: &str = "amber-provisioner";
+const SITE_CONTROLLER_SERVICE_NAME: &str = "amber-site-controller";
 const PROVISIONER_CONFIGMAP_NAME: &str = "amber-mesh-provision";
 const PROVISIONER_SERVICE_ACCOUNT: &str = "amber-provisioner";
 const PROVISIONER_ROLE_NAME: &str = "amber-provisioner";
@@ -193,6 +198,17 @@ pub(crate) fn emit_kubernetes_artifact_with_options(
     compiled: &CompiledScenario,
     options: KubernetesArtifactBuildOptions<'_>,
 ) -> KubernetesResult<KubernetesArtifact> {
+    let lowered = lower_framework_component_bindings_for_single_site(
+        compiled,
+        "kubernetes_local",
+        SiteDefinition {
+            kind: SiteKind::Kubernetes,
+            context: None,
+            controller_site: None,
+        },
+    )
+    .map_err(|err| ReporterError::new(err.to_string()))?;
+    let compiled = &lowered;
     let s = compiled.scenario();
     let scenario_digest =
         scenario_ir_digest(s).map_err(|err| ReporterError::new(err.to_string()))?;
@@ -237,7 +253,13 @@ pub(crate) fn emit_kubernetes_artifact_with_options(
 
     let names: HashMap<ComponentId, ComponentNames> =
         map_program_components(s, program_components, |id, local_name| {
-            let base = service_name(id, local_name);
+            let base = if framework_component_controller_metadata(s.component(id).metadata.as_ref())
+                .is_some()
+            {
+                SITE_CONTROLLER_SERVICE_NAME.to_string()
+            } else {
+                service_name(id, local_name)
+            };
             ComponentNames {
                 service: base.clone(),
                 netpol: format!("{base}-netpol"),
@@ -731,6 +753,8 @@ pub(crate) fn emit_kubernetes_artifact_with_options(
         let mesh_port = *mesh_ports_by_component.get(id).expect("mesh port missing");
         let label = component_label(s, *id);
         let pod_annotations = component_pod_annotations(&label);
+        let is_site_controller =
+            framework_component_controller_metadata(s.component(*id).metadata.as_ref()).is_some();
         let image_origin = program_plan.image_origin().ok_or_else(|| {
             ReporterError::new(format!(
                 "internal error: {} is missing a container image origin",
@@ -743,14 +767,18 @@ pub(crate) fn emit_kubernetes_artifact_with_options(
                 component_label(s, *id)
             ))
         })?;
-        let image_source = program_image_source(compiled, s, *id, image_origin);
-        let (program_image, image_source_env_var) = render_kubernetes_image(
-            image_plan,
-            &root_leaf_by_path,
-            &cnames.service,
-            &label,
-            image_source.as_ref(),
-        )?;
+        let (program_image, image_source_env_var) = if is_site_controller {
+            (images.site_controller.clone(), None)
+        } else {
+            let image_source = program_image_source(compiled, s, *id, image_origin);
+            render_kubernetes_image(
+                image_plan,
+                &root_leaf_by_path,
+                &cnames.service,
+                &label,
+                image_source.as_ref(),
+            )?
+        };
         let mount_specs = config_plan.mount_specs.get(id).map(Vec::as_slice);
         let runtime_plan = build_component_runtime_plan(
             &label,

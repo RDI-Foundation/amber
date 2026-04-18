@@ -66,6 +66,8 @@ fn empty_box_body() -> BoxBody {
         .boxed()
 }
 
+const FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
+
 async fn response_text(response: Response<Incoming>) -> String {
     String::from_utf8(
         response
@@ -1796,28 +1798,6 @@ fn resolve_http_external_target_with_override_rejects_loopback_ip_literals() {
 }
 
 #[test]
-fn resolve_http_external_target_with_override_accepts_framework_loopback_ip_literals() {
-    let target = ExternalTarget {
-        name: "component".to_string(),
-        url_env: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV.to_string(),
-        optional: false,
-        url_override: None,
-    };
-
-    let resolved = resolve_http_external_target_with_override(
-        &target,
-        Some("http://127.0.0.1:6167/base"),
-        &Uri::from_static("/v1/children"),
-    )
-    .expect("framework target should resolve");
-
-    let ResolvedHttpExternalTarget::Http(url) = resolved else {
-        panic!("expected direct http target");
-    };
-    assert_eq!(url.as_str(), "http://127.0.0.1:6167/base/v1/children");
-}
-
-#[test]
 fn resolve_http_external_target_with_override_accepts_external_slot_loopback_ip_literals() {
     let target = ExternalTarget {
         name: "catalog_api".to_string(),
@@ -2282,6 +2262,100 @@ async fn outbound_http_proxy_overwrites_internal_framework_auth_headers() {
 }
 
 #[tokio::test]
+async fn outbound_http_proxy_does_not_attach_framework_auth_header_to_noise_hops() {
+    let captured = Arc::new(StdMutex::new(None::<String>));
+    let (upstream_client, upstream_server) = duplex(64 * 1024);
+    let captured_upstream = captured.clone();
+    let upstream_task = tokio::spawn(async move {
+        let service = service_fn(move |req: Request<Incoming>| {
+            let captured = captured_upstream.clone();
+            async move {
+                *captured.lock().expect("capture lock") = req
+                    .headers()
+                    .get(FRAMEWORK_AUTH_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(empty_box_body())
+                        .expect("upstream response should build"),
+                )
+            }
+        });
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(upstream_server), service)
+            .await
+            .expect("upstream server should complete");
+    });
+
+    let (sender, conn) = client_http1::handshake(TokioIo::new(upstream_client))
+        .await
+        .expect("upstream handshake should succeed");
+    let upstream_conn_task = tokio::spawn(async move {
+        conn.await.expect("upstream connection should complete");
+    });
+
+    let state = OutboundHttpProxyState {
+        upstream: Arc::new(Mutex::new(sender)),
+        plugins: Arc::from(Vec::<Arc<dyn HttpExchangePlugin>>::new()),
+        route_id: Arc::<str>::from("binding-route"),
+        peer_id: Arc::<str>::from("/component/provider"),
+        labels: test_http_exchange_labels(),
+        dynamic_caps: None,
+    };
+
+    let (proxy_client, proxy_server) = duplex(64 * 1024);
+    let proxy_task = tokio::spawn(async move {
+        let service = service_fn(move |req: Request<Incoming>| {
+            let state = state.clone();
+            async move {
+                Ok::<_, std::convert::Infallible>(proxy_outbound_http_request(state, req).await)
+            }
+        });
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(proxy_server), service)
+            .await
+            .expect("proxy server should complete");
+    });
+
+    let (mut client, conn) = client_http1::handshake(TokioIo::new(proxy_client))
+        .await
+        .expect("proxy handshake should succeed");
+    let proxy_conn_task = tokio::spawn(async move {
+        conn.await.expect("proxy connection should complete");
+    });
+
+    let response = client
+        .send_request(
+            Request::builder()
+                .uri("/binding")
+                .body(empty_box_body())
+                .expect("request should build"),
+        )
+        .await
+        .expect("proxy request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    drop(client);
+
+    assert_eq!(
+        *captured.lock().expect("capture lock"),
+        None,
+        "ordinary noise-to-noise binding hops must not carry the framework controller auth header",
+    );
+
+    proxy_task.await.expect("proxy task should join");
+    proxy_conn_task
+        .await
+        .expect("proxy connection task should join");
+    upstream_task.await.expect("upstream task should join");
+    upstream_conn_task
+        .await
+        .expect("upstream connection task should join");
+}
+
+#[tokio::test]
 async fn outbound_http_proxy_keeps_ephemeral_upstream_alive_for_response_body() {
     let (upstream_client, upstream_server) = duplex(64 * 1024);
     let upstream_task = tokio::spawn(async move {
@@ -2491,7 +2565,106 @@ async fn proxy_noise_to_plain_preserves_connection_close_response_body() {
 }
 
 #[tokio::test]
-async fn framework_external_proxy_preserves_forwarded_internal_auth_headers() {
+async fn external_proxies_do_not_attach_framework_auth_headers() {
+    let captured = Arc::new(StdMutex::new(None::<String>));
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr");
+    let captured_upstream = captured.clone();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("upstream should accept");
+        let service = service_fn(move |req: Request<Incoming>| {
+            let captured = captured_upstream.clone();
+            async move {
+                *captured.lock().expect("capture lock") = req
+                    .headers()
+                    .get(FRAMEWORK_AUTH_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(empty_box_body())
+                        .expect("upstream response should build"),
+                )
+            }
+        });
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .await
+            .expect("upstream server should complete");
+    });
+
+    let (client, vetted_external_addrs) = build_client();
+    let external_overrides: ExternalOverrides = Arc::new(RwLock::new(HashMap::from([(
+        "catalog".to_string(),
+        format!("http://127.0.0.1:{}/", addr.port()),
+    )])));
+    let state = HttpProxyState {
+        client,
+        target: ExternalTarget {
+            name: "catalog".to_string(),
+            url_env: "AMBER_EXTERNAL_SLOT_CATALOG_URL".to_string(),
+            optional: false,
+            url_override: None,
+        },
+        labels: test_http_exchange_labels(),
+        config: Arc::new(test_mesh_config()),
+        external_overrides,
+        vetted_external_addrs,
+        mesh_upstream: Arc::new(Mutex::new(None)),
+        route_id: None,
+        peer_id: None,
+    };
+
+    let (proxy_client, proxy_server) = duplex(64 * 1024);
+    let proxy_task = tokio::spawn(async move {
+        let service = service_fn(move |req: Request<Incoming>| {
+            let state = state.clone();
+            async move { Ok::<_, std::convert::Infallible>(proxy_http_request(state, req).await) }
+        });
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(proxy_server), service)
+            .await
+            .expect("proxy server should complete");
+    });
+
+    let (mut client, conn) = client_http1::handshake(TokioIo::new(proxy_client))
+        .await
+        .expect("proxy handshake should succeed");
+    let proxy_conn_task = tokio::spawn(async move {
+        conn.await.expect("proxy connection should complete");
+    });
+
+    let response = client
+        .send_request(
+            Request::builder()
+                .uri("/catalog")
+                .body(empty_box_body())
+                .expect("request should build"),
+        )
+        .await
+        .expect("proxy request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    drop(client);
+
+    assert_eq!(
+        *captured.lock().expect("capture lock"),
+        None,
+        "ordinary external slots must not receive the framework auth header",
+    );
+
+    proxy_task.await.expect("proxy task should join");
+    proxy_conn_task
+        .await
+        .expect("proxy connection task should join");
+    upstream_task.await.expect("upstream task should join");
+}
+
+#[tokio::test]
+async fn external_proxy_preserves_forwarded_internal_auth_headers() {
     let captured = Arc::new(StdMutex::new(None::<(String, String)>));
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -2532,14 +2705,14 @@ async fn framework_external_proxy_preserves_forwarded_internal_auth_headers() {
 
     let (client, vetted_external_addrs) = build_client();
     let external_overrides: ExternalOverrides = Arc::new(RwLock::new(HashMap::from([(
-        "framework".to_string(),
+        "gateway".to_string(),
         format!("http://127.0.0.1:{}/", addr.port()),
     )])));
     let state = HttpProxyState {
         client,
         target: ExternalTarget {
-            name: "framework".to_string(),
-            url_env: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV.to_string(),
+            name: "gateway".to_string(),
+            url_env: "AMBER_EXTERNAL_SLOT_GATEWAY_URL".to_string(),
             optional: false,
             url_override: None,
         },

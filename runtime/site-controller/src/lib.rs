@@ -97,9 +97,9 @@ pub use self::{
     },
     state::{
         DynamicInputDirectRecord, DynamicInputRouteRecord, DynamicInputRouteTarget,
-        DynamicProxyExportRecord, SITE_CONTROLLER_INTERNAL_CAPABILITY, SITE_CONTROLLER_PORT,
+        DynamicProxyExportRecord, SITE_CONTROLLER_INTERNAL_CAPABILITY,
         SITE_CONTROLLER_SERVICE_NAME, SiteControllerPlan, authority_url_for_listen_addr,
-        build_site_controller_state, generate_framework_auth_token,
+        build_site_controller_state, generate_control_state_auth_token,
         site_controller_internal_route_id, write_control_state, write_site_controller_plan,
     },
 };

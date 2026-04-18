@@ -29,6 +29,10 @@ use crate::{
             build_execution_guide,
         },
     },
+    run_plan::{
+        SiteDefinition, SiteKind, framework_component_controller_metadata,
+        lower_framework_component_bindings_for_single_site,
+    },
     runtime_interface::{RootInputDescriptor, collect_root_inputs},
     targets::{
         mesh::{
@@ -59,6 +63,7 @@ const BOUNDARY_NETWORK_NAME: &str = "amber_boundary";
 
 const ROUTER_SERVICE_NAME: &str = "amber-router";
 const ROUTER_CONTROL_INIT_SERVICE_NAME: &str = "amber-router-control-init";
+const SITE_CONTROLLER_SERVICE_NAME: &str = "amber-site-controller";
 const PROVISIONER_SERVICE_NAME: &str = "amber-provisioner";
 const HELPER_VOLUME_NAME: &str = "amber-helper-bin";
 const HELPER_INIT_SERVICE: &str = "amber-init";
@@ -393,8 +398,18 @@ pub(crate) fn emit_docker_compose_artifact_with_options(
     compiled: &CompiledScenario,
     options: DockerComposeArtifactBuildOptions<'_>,
 ) -> Result<DockerComposeArtifact, ReporterError> {
+    let lowered = lower_framework_component_bindings_for_single_site(
+        compiled,
+        "compose_local",
+        SiteDefinition {
+            kind: SiteKind::Compose,
+            context: None,
+            controller_site: None,
+        },
+    )
+    .map_err(|err| ReporterError::new(err.to_string()))?;
     render_docker_compose_inner(
-        compiled.scenario(),
+        lowered.scenario(),
         options.force_router,
         options.router_identity_id,
         options.mesh_scope,
@@ -428,7 +443,13 @@ fn render_docker_compose_inner(
     // Precompute service names (injective & stable).
     let names: HashMap<ComponentId, ServiceNames> =
         map_program_components(s, program_components, |id, local_name| {
-            let base = service_base_name(id, local_name);
+            let base = if framework_component_controller_metadata(s.component(id).metadata.as_ref())
+                .is_some()
+            {
+                SITE_CONTROLLER_SERVICE_NAME.to_string()
+            } else {
+                service_base_name(id, local_name)
+            };
             let sidecar = format!("{base}-net");
             ServiceNames {
                 program: base.clone(),
@@ -857,6 +878,10 @@ fn render_docker_compose_inner(
         let program_plan = program_plans.get(id).expect("program plan computed");
         let image = if Some(*id) == docker_gateway_component {
             images.docker_gateway.clone()
+        } else if framework_component_controller_metadata(s.component(*id).metadata.as_ref())
+            .is_some()
+        {
+            images.site_controller.clone()
         } else {
             let image_plan = program_plan.image().ok_or_else(|| {
                 DockerComposeError::Other(format!(

@@ -1725,6 +1725,7 @@ mod tests {
             site: SiteDefinition {
                 kind,
                 context: None,
+                controller_site: None,
             },
             router_identity_id: "/site/test/router".to_string(),
             assigned_components: vec!["/app".to_string()],
@@ -1805,6 +1806,7 @@ mod tests {
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             )]),
             defaults: PlacementDefaults::default(),

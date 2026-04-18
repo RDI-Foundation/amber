@@ -158,8 +158,6 @@ struct SiteManagerState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     router_public_key_b64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    site_controller_pid: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     site_controller_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
@@ -195,8 +193,6 @@ struct SiteSupervisorPlan {
     port_forward_control_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     observability_endpoint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    site_controller_plan_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     site_controller_url: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1889,7 +1885,6 @@ mod tests {
             kubernetes_consumer_router_mesh_addr: None,
             router_identity_id: None,
             router_public_key_b64: None,
-            site_controller_pid: None,
             site_controller_url: None,
             last_error: None,
         };
@@ -1950,7 +1945,6 @@ mod tests {
             kubernetes_consumer_router_mesh_addr: None,
             router_identity_id: None,
             router_public_key_b64: None,
-            site_controller_pid: None,
             site_controller_url: None,
             last_error: None,
         };

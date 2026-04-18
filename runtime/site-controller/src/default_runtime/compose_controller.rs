@@ -4,34 +4,66 @@ use serde_json::json;
 
 use super::*;
 
-const COMPOSE_MESH_NETWORK_NAME: &str = "amber_mesh";
 const COMPOSE_PROVISIONER_SERVICE_NAME: &str = "amber-provisioner";
 const COMPOSE_ROUTER_SERVICE_NAME: &str = "amber-router";
 const COMPOSE_ROUTER_CONTROL_INIT_SERVICE_NAME: &str = "amber-router-control-init";
 const COMPOSE_ROUTER_CONTROL_SOCKET_DIR: &str = "/amber/control";
 const COMPOSE_ROUTER_CONTROL_VOLUME_NAME: &str = "amber-router-control";
 const DOCKER_SOCK_PATH: &str = "/var/run/docker.sock";
+const COMPOSE_CONTROLLER_PLAN_PATH: &str = "/amber/site/state/site-controller-plan.json";
 
-fn compose_site_controller_env(plan: &SiteControllerPlan) -> serde_json::Value {
-    serde_json::Value::Object(
-        plan.launch_env
-            .iter()
-            .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
-            .collect(),
-    )
+fn ensure_string_sequence_contains(sequence: &mut serde_yaml::Sequence, value: &str) {
+    if sequence
+        .iter()
+        .any(|entry| entry.as_str().is_some_and(|existing| existing == value))
+    {
+        return;
+    }
+    sequence.push(yaml_string(value));
 }
 
-pub fn inject_compose_site_controller(
-    artifact_root: &Path,
+fn ensure_controller_environment(
+    service: &mut serde_yaml::Mapping,
     plan: &SiteControllerPlan,
-    plan_path: &Path,
-    controller_image: &str,
 ) -> Result<()> {
-    let compose_path = artifact_root.join("compose.yaml");
-    let mut document = read_compose_document(&compose_path)?;
-    let services = compose_services_mut(&mut document, &compose_path)?;
+    if plan.launch_env.is_empty() {
+        return Ok(());
+    }
+    match service
+        .entry(yaml_string("environment"))
+        .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
+    {
+        serde_yaml::Value::Sequence(sequence) => {
+            for (key, value) in &plan.launch_env {
+                let entry = format!("{key}={value}");
+                let already_present = sequence.iter().any(|existing| {
+                    existing.as_str().is_some_and(|existing| {
+                        existing == entry || existing.starts_with(&format!("{key}="))
+                    })
+                });
+                if !already_present {
+                    sequence.push(yaml_string(&entry));
+                }
+            }
+            Ok(())
+        }
+        serde_yaml::Value::Mapping(mapping) => {
+            for (key, value) in &plan.launch_env {
+                mapping.insert(yaml_string(key), yaml_string(value));
+            }
+            Ok(())
+        }
+        _ => Err(miette::miette!(
+            "compose site controller service has an unsupported environment shape"
+        )),
+    }
+}
 
-    let mut depends_on = serde_yaml::Mapping::new();
+fn ensure_controller_depends_on(
+    service: &mut serde_yaml::Mapping,
+    available_services: &serde_yaml::Mapping,
+) -> Result<()> {
+    let mut desired = serde_yaml::Mapping::new();
     for (service_name, condition) in [
         (
             COMPOSE_PROVISIONER_SERVICE_NAME,
@@ -43,8 +75,8 @@ pub fn inject_compose_site_controller(
         ),
         (COMPOSE_ROUTER_SERVICE_NAME, "service_started"),
     ] {
-        if services.contains_key(yaml_string(service_name)) {
-            depends_on.insert(
+        if available_services.contains_key(yaml_string(service_name)) {
+            desired.insert(
                 yaml_string(service_name),
                 serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([(
                     yaml_string("condition"),
@@ -53,47 +85,118 @@ pub fn inject_compose_site_controller(
             );
         }
     }
+    if desired.is_empty() {
+        return Ok(());
+    }
 
-    let networks = std::collections::BTreeMap::from([(
-        COMPOSE_MESH_NETWORK_NAME.to_string(),
-        serde_json::Value::Object(serde_json::Map::new()),
-    )]);
-    let service = json!({
-        "image": controller_image,
-        // The controller must be able to reach both the router-control volume and the mounted
-        // run root. The router-control init service locks `/amber/control` down to `0700`, so a
-        // host-derived UID/GID breaks Linux compose startup.
-        "user": "0:0",
-        "command": ["--plan", plan_path.display().to_string()],
-        "environment": compose_site_controller_env(plan),
-        "networks": networks,
-        "extra_hosts": ["host.docker.internal:host-gateway"],
-        "healthcheck": {
+    let current = service
+        .entry(yaml_string("depends_on"))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    match current {
+        serde_yaml::Value::Mapping(mapping) => {
+            for (key, value) in desired {
+                mapping.insert(key, value);
+            }
+            Ok(())
+        }
+        serde_yaml::Value::Sequence(sequence) => {
+            let mut mapping = serde_yaml::Mapping::new();
+            for value in sequence.iter() {
+                let Some(name) = value.as_str() else {
+                    return Err(miette::miette!(
+                        "compose site controller service depends_on sequence contains a \
+                         non-string entry"
+                    ));
+                };
+                mapping.insert(
+                    yaml_string(name),
+                    serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([(
+                        yaml_string("condition"),
+                        yaml_string("service_started"),
+                    )])),
+                );
+            }
+            for (key, value) in desired {
+                mapping.insert(key, value);
+            }
+            *current = serde_yaml::Value::Mapping(mapping);
+            Ok(())
+        }
+        _ => Err(miette::miette!(
+            "compose site controller service has an unsupported depends_on shape"
+        )),
+    }
+}
+
+pub fn inject_compose_site_controller(
+    artifact_root: &Path,
+    plan: &SiteControllerPlan,
+    plan_path: &Path,
+    controller_image: &str,
+) -> Result<()> {
+    let compose_path = artifact_root.join("compose.yaml");
+    let mut document = read_compose_document(&compose_path)?;
+    let services = compose_services_mut(&mut document, &compose_path)?;
+    let available_services = services.clone();
+    let service = services
+        .get_mut(yaml_string(SITE_CONTROLLER_SERVICE_NAME))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or_else(|| {
+            miette::miette!(
+                "compose file {} is missing services.{SITE_CONTROLLER_SERVICE_NAME}",
+                compose_path.display()
+            )
+        })?;
+
+    service.insert(yaml_string("image"), yaml_string(controller_image));
+    service.insert(yaml_string("user"), yaml_string("0:0"));
+    service.insert(
+        yaml_string("healthcheck"),
+        serde_yaml::to_value(json!({
             "test": [
                 "CMD-SHELL",
-                "wget -qO- http://127.0.0.1:4100/healthz | grep -q '\"ok\":true'"
+                format!(
+                    "wget -qO- http://127.0.0.1:{}/healthz | grep -q '\"ok\":true'",
+                    plan.listen_addr.port()
+                )
             ],
             "interval": "2s",
             "timeout": "2s",
             "retries": 30,
             "start_period": "1s"
-        },
-        "volumes": [
-            format!("{}:{}", plan.run_root, plan.run_root),
-            format!(
-                "{COMPOSE_ROUTER_CONTROL_VOLUME_NAME}:{COMPOSE_ROUTER_CONTROL_SOCKET_DIR}"
-            ),
-            format!("{DOCKER_SOCK_PATH}:{DOCKER_SOCK_PATH}")
-        ],
-        "depends_on": depends_on,
-        "restart": "unless-stopped"
-    });
-    services.insert(
-        yaml_string(SITE_CONTROLLER_SERVICE_NAME),
-        serde_yaml::to_value(service)
-            .into_diagnostic()
-            .wrap_err("failed to serialize compose site controller service")?,
+        }))
+        .into_diagnostic()
+        .wrap_err("failed to serialize compose site controller healthcheck")?,
     );
+    service.insert(yaml_string("restart"), yaml_string("unless-stopped"));
+
+    let extra_hosts = service
+        .entry(yaml_string("extra_hosts"))
+        .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
+        .as_sequence_mut()
+        .ok_or_else(|| {
+            miette::miette!("compose site controller service has a non-sequence extra_hosts field")
+        })?;
+    ensure_string_sequence_contains(extra_hosts, "host.docker.internal:host-gateway");
+
+    let volumes = service
+        .entry(yaml_string("volumes"))
+        .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
+        .as_sequence_mut()
+        .ok_or_else(|| {
+            miette::miette!("compose site controller service has a non-sequence volumes field")
+        })?;
+    for volume in [
+        format!("{}:{}", plan.run_root, plan.run_root),
+        format!("{}:{COMPOSE_CONTROLLER_PLAN_PATH}", plan_path.display()),
+        format!("{COMPOSE_ROUTER_CONTROL_VOLUME_NAME}:{COMPOSE_ROUTER_CONTROL_SOCKET_DIR}"),
+        format!("{DOCKER_SOCK_PATH}:{DOCKER_SOCK_PATH}"),
+    ] {
+        ensure_string_sequence_contains(volumes, &volume);
+    }
+
+    ensure_controller_environment(service, plan)?;
+    ensure_controller_depends_on(service, &available_services)?;
 
     let rendered = serde_yaml::to_string(&document)
         .into_diagnostic()
@@ -134,7 +237,7 @@ mod tests {
             state_root: run_root.join("state-root").display().to_string(),
             site_state_root: run_root.join("site-state").display().to_string(),
             artifact_dir: run_root.join("artifact").display().to_string(),
-            auth_token: "token".to_string(),
+            control_state_auth_token: "token".to_string(),
             dynamic_caps_token_verify_key_b64: "verify".to_string(),
             storage_root: None,
             runtime_root: None,
@@ -156,7 +259,7 @@ mod tests {
         let compose_path = temp.path().join("compose.yaml");
         fs::write(
             &compose_path,
-            "services:\n  amber-router:\n    image: ghcr.io/rdi-foundation/amber-router:test\n",
+            "services:\n  amber-router:\n    image: ghcr.io/rdi-foundation/amber-router:test\n  amber-site-controller:\n    image: __amber_internal/site-controller\n    environment:\n      - AMBER_DYNAMIC_CAPS_API_URL=http://127.0.0.1:19000\n",
         )
         .expect("compose file should write");
 
@@ -182,13 +285,34 @@ mod tests {
             .expect("site controller service should exist");
         let environment = service
             .get(yaml_string("environment"))
-            .and_then(serde_yaml::Value::as_mapping)
-            .expect("site controller service should include environment");
-        assert_eq!(
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("site controller service should include environment entries");
+        assert!(
             environment
-                .get(yaml_string("AMBER_DEV_IMAGE_TAGS"))
-                .and_then(serde_yaml::Value::as_str),
-            Some("router=dev-tag,helper=dev-tag"),
+                .iter()
+                .any(|value| value.as_str().is_some_and(|value| {
+                    value == "AMBER_DEV_IMAGE_TAGS=router=dev-tag,helper=dev-tag"
+                })),
+            "launch env should be merged into the existing environment list: {service:?}"
+        );
+        assert!(
+            environment
+                .iter()
+                .any(|value| value.as_str().is_some_and(|value| {
+                    value == "AMBER_DYNAMIC_CAPS_API_URL=http://127.0.0.1:19000"
+                })),
+            "existing controller program env must be preserved: {service:?}"
+        );
+        let volumes = service
+            .get(yaml_string("volumes"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("site controller service should include volumes");
+        assert!(
+            volumes.iter().any(|value| value
+                .as_str()
+                .is_some_and(|value| { value == format!("{}:{}", plan.run_root, plan.run_root) })),
+            "compose controller bootstrap should mount the run root into the existing service: \
+             {service:?}"
         );
     }
 }

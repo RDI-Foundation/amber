@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, env, sync::Arc};
 
 use amber_mesh::{
     MeshProtocol,
@@ -34,7 +34,6 @@ const DYNAMIC_CAPS_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug)]
 struct DynamicCapsControllerEnv {
     control_url: String,
-    control_auth_token: String,
     verify_key_raw: String,
     run_id: String,
 }
@@ -111,7 +110,6 @@ pub(super) struct DynamicCapsRuntime {
     component_id: Arc<str>,
     run_id: Arc<str>,
     control_url: Arc<str>,
-    control_auth_token: Arc<str>,
     verify_key: ed25519_dalek::VerifyingKey,
     config: Arc<MeshConfig>,
     client: Arc<HttpClient>,
@@ -220,7 +218,7 @@ impl DynamicCapsRuntime {
         let Some(listen_addr) = config.dynamic_caps_listen else {
             return Ok(None);
         };
-        let Some(control_env) = resolve_dynamic_caps_controller_env()? else {
+        let Some(control_env) = resolve_dynamic_caps_controller_env(config.as_ref())? else {
             tracing::warn!(
                 target: "amber.internal",
                 component_id = %config.identity.id,
@@ -236,7 +234,6 @@ impl DynamicCapsRuntime {
             component_id: Arc::<str>::from(format!("components.{}", config.identity.id)),
             run_id: Arc::<str>::from(control_env.run_id),
             control_url: Arc::<str>::from(control_env.control_url),
-            control_auth_token: Arc::<str>::from(control_env.control_auth_token),
             verify_key,
             config,
             client,
@@ -278,14 +275,11 @@ impl DynamicCapsRuntime {
                 format!("failed to serialize dynamic capability control request: {err}"),
             )
         })?;
-        let request = Request::builder()
+        let request_builder = Request::builder()
             .method(Method::POST)
             .uri(&url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(
-                AMBER_FRAMEWORK_AUTH_HEADER,
-                self.control_auth_token.as_ref(),
-            )
+            .header(header::CONTENT_TYPE, "application/json");
+        let request = request_builder
             .body(
                 Full::new(Bytes::from(request_body))
                     .map_err(|never| match never {})
@@ -1120,25 +1114,35 @@ fn required_dynamic_caps_env_var(
     })
 }
 
-fn resolve_dynamic_caps_controller_env() -> Result<Option<DynamicCapsControllerEnv>, RouterError> {
-    let control_url = nonempty_env_var(amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV);
-    let control_auth_token =
-        nonempty_env_var(amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV);
+fn local_dynamic_caps_controller_url(config: &MeshConfig) -> Option<String> {
+    config
+        .outbound
+        .iter()
+        .find(|route| {
+            route.protocol == MeshProtocol::Http
+                && route.capability
+                    == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+        })
+        .map(|route| format!("http://127.0.0.1:{}", route.listen_port))
+}
+
+fn resolve_dynamic_caps_controller_env(
+    config: &MeshConfig,
+) -> Result<Option<DynamicCapsControllerEnv>, RouterError> {
+    let local_control_url = local_dynamic_caps_controller_url(config);
     let verify_key_raw = nonempty_env_var(amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV);
-    if control_url.is_none() && control_auth_token.is_none() && verify_key_raw.is_none() {
+    if local_control_url.is_none() && verify_key_raw.is_none() {
         return Ok(None);
     }
     let run_id =
         required_dynamic_caps_env_var(SCENARIO_RUN_ID_ENV, nonempty_env_var(SCENARIO_RUN_ID_ENV))?;
+    let control_url = local_control_url.ok_or_else(|| {
+        RouterError::InvalidConfig(
+            "dynamic_caps_listen requires a local framework.component controller route".to_string(),
+        )
+    })?;
     Ok(Some(DynamicCapsControllerEnv {
-        control_url: required_dynamic_caps_env_var(
-            amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV,
-            control_url,
-        )?,
-        control_auth_token: required_dynamic_caps_env_var(
-            amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV,
-            control_auth_token,
-        )?,
+        control_url,
         verify_key_raw: required_dynamic_caps_env_var(
             amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
             verify_key_raw,
@@ -1160,7 +1164,7 @@ mod tests {
     }
 
     impl EnvGuard {
-        fn replace(pairs: [(&'static str, Option<&str>); 4]) -> Self {
+        fn replace(pairs: [(&'static str, Option<&str>); 2]) -> Self {
             let saved = pairs
                 .iter()
                 .map(|(name, value)| {
@@ -1191,6 +1195,40 @@ mod tests {
         }
     }
 
+    fn mesh_config_with_internal_controller_route() -> MeshConfig {
+        MeshConfig {
+            identity: amber_mesh::MeshIdentity::generate("/component/test", None),
+            mesh_listen: "127.0.0.1:23000".parse().expect("mesh listen"),
+            control_listen: None,
+            dynamic_caps_listen: Some("127.0.0.1:19000".parse().expect("dynamic caps listen")),
+            control_allow: None,
+            peers: Vec::new(),
+            inbound: Vec::new(),
+            outbound: vec![OutboundRoute {
+                route_id: "component:/controller:__amber_internal_site_controller:http".to_string(),
+                rewrite_route_id: None,
+                slot: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME.to_string(),
+                capability_kind: None,
+                capability_profile: None,
+                listen_port: 19001,
+                listen_addr: None,
+                protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
+                peer_addr: "controller:23000".to_string(),
+                peer_id: "/controller".to_string(),
+                capability: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+                    .to_string(),
+            }],
+            transport: amber_mesh::TransportConfig::NoiseIk {},
+        }
+    }
+
+    fn mesh_config_without_internal_controller_route() -> MeshConfig {
+        let mut config = mesh_config_with_internal_controller_route();
+        config.outbound.clear();
+        config
+    }
+
     #[test]
     fn resolve_dynamic_caps_controller_env_disables_listener_when_control_env_is_absent() {
         let _guard = ENV_LOCK
@@ -1198,17 +1236,12 @@ mod tests {
             .lock()
             .expect("env lock");
         let _env = EnvGuard::replace([
-            (amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV, None),
-            (
-                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV,
-                None,
-            ),
             (amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, None),
             (SCENARIO_RUN_ID_ENV, Some("run-1234")),
         ]);
 
         assert!(
-            resolve_dynamic_caps_controller_env()
+            resolve_dynamic_caps_controller_env(&mesh_config_without_internal_controller_route())
                 .expect("dynamic caps env should resolve")
                 .is_none(),
             "sidecars without dynamic caps controller env should leave the listener disabled",
@@ -1216,33 +1249,51 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dynamic_caps_controller_env_rejects_partial_configuration() {
+    fn resolve_dynamic_caps_controller_env_rejects_missing_local_controller_route() {
         let _guard = ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env lock");
         let _env = EnvGuard::replace([
             (
-                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV,
-                Some("http://127.0.0.1:24000"),
+                amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
+                Some("verify-key"),
             ),
-            (
-                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV,
-                None,
-            ),
-            (amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, None),
             (SCENARIO_RUN_ID_ENV, Some("run-1234")),
         ]);
 
-        let err = resolve_dynamic_caps_controller_env().expect_err("partial env must fail");
+        let err =
+            resolve_dynamic_caps_controller_env(&mesh_config_without_internal_controller_route())
+                .expect_err("dynamic caps without a local controller route must fail");
         assert!(
             matches!(
                 &err,
                 RouterError::InvalidConfig(message)
-                    if message.contains(amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN_ENV)
+                    if message.contains("local framework.component controller route")
             ),
-            "partial dynamic caps controller env should fail with the missing variable name: {err}",
+            "missing local controller route should produce a targeted error: {err}",
         );
+    }
+
+    #[test]
+    fn resolve_dynamic_caps_controller_env_prefers_local_controller_route_without_auth_token() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock");
+        let _env = EnvGuard::replace([
+            (
+                amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
+                Some("verify-key"),
+            ),
+            (SCENARIO_RUN_ID_ENV, Some("run-1234")),
+        ]);
+
+        let config = mesh_config_with_internal_controller_route();
+        let env = resolve_dynamic_caps_controller_env(&config)
+            .expect("dynamic caps env should resolve")
+            .expect("local controller route should enable dynamic caps");
+        assert_eq!(env.control_url, "http://127.0.0.1:19001");
     }
 }
 

@@ -71,7 +71,6 @@ fn recorded_process_roots_include_site_supervisor() {
         kubernetes_consumer_router_mesh_addr: None,
         router_identity_id: None,
         router_public_key_b64: None,
-        site_controller_pid: None,
         site_controller_url: None,
     };
 
@@ -239,7 +238,6 @@ fn local_site_controller_addr_requires_loopback_http() {
         port_forward_mesh_port: None,
         port_forward_control_port: None,
         observability_endpoint: None,
-        site_controller_plan_path: None,
         site_controller_url: Some("http://127.0.0.1:24200".to_string()),
         launch_env: BTreeMap::new(),
     };
@@ -313,7 +311,6 @@ fn local_site_controller_ready_waits_for_http_listener() {
         port_forward_mesh_port: None,
         port_forward_control_port: None,
         observability_endpoint: None,
-        site_controller_plan_path: None,
         site_controller_url: Some(format!("http://127.0.0.1:{}", addr.port())),
         launch_env: BTreeMap::new(),
     };
@@ -361,7 +358,6 @@ fn compose_site_controller_container_name_uses_compose_project() {
         port_forward_mesh_port: None,
         port_forward_control_port: None,
         observability_endpoint: None,
-        site_controller_plan_path: None,
         site_controller_url: Some("http://amber-site-controller:4100".to_string()),
         launch_env: BTreeMap::new(),
     };
@@ -369,6 +365,40 @@ fn compose_site_controller_container_name_uses_compose_project() {
     assert_eq!(
         supervisor::compose_site_controller_container_name(&plan).as_deref(),
         Some("amber_run_compose-site-amber-site-controller-1")
+    );
+}
+
+#[test]
+fn compose_site_without_controller_has_no_controller_container_name() {
+    let plan = SiteSupervisorPlan {
+        schema: "amber.run.site_supervisor_plan".to_string(),
+        version: 2,
+        run_id: "run".to_string(),
+        mesh_scope: "scope".to_string(),
+        run_root: "/tmp/run".to_string(),
+        coordinator_pid: 1,
+        site_id: "compose-site".to_string(),
+        kind: SiteKind::Compose,
+        artifact_dir: "/tmp/artifact".to_string(),
+        site_state_root: "/tmp/state".to_string(),
+        storage_root: None,
+        runtime_root: None,
+        router_mesh_port: None,
+        compose_project: Some("amber_run_compose-site".to_string()),
+        kubernetes_namespace: None,
+        context: None,
+        port_forward_mesh_port: None,
+        port_forward_control_port: None,
+        observability_endpoint: None,
+        site_controller_url: None,
+        launch_env: BTreeMap::new(),
+    };
+
+    assert_eq!(
+        supervisor::compose_site_controller_container_name(&plan),
+        None,
+        "compose sites without a lowered controller should not be treated as if they had a \
+         special controller container"
     );
 }
 

@@ -105,7 +105,45 @@ pub(crate) fn component_program_spec(
                 network: ProcessNetwork::Host,
             })
         }
+        DirectProgramExecutionPlan::InternalSiteController => {
+            let (program, args) =
+                split_entrypoint(&internal_site_controller_entrypoint(runtime_root)?)?;
+            Ok(ProcessSpec {
+                name: component.program.log_name.clone(),
+                program,
+                args,
+                env: BTreeMap::new(),
+                work_dir,
+                sandbox: ProcessSandbox::Unsandboxed,
+                drop_all_caps: true,
+                #[cfg(target_os = "linux")]
+                read_only_mounts: Vec::new(),
+                writable_dirs,
+                bind_dirs: Vec::new(),
+                bind_mounts,
+                hidden_paths: Vec::new(),
+                network: ProcessNetwork::Host,
+            })
+        }
     }
+}
+
+fn internal_site_controller_plan_path(runtime_root: &Path) -> PathBuf {
+    let site_state_root = runtime_root.parent().unwrap_or(runtime_root);
+    mixed_run::site_controller_plan_path(site_state_root)
+}
+
+fn internal_site_controller_entrypoint(runtime_root: &Path) -> Result<Vec<String>> {
+    let command = mixed_run::site_controller_command()?;
+    let mut argv = vec![command.executable.display().to_string()];
+    argv.extend(command.prefix_args.iter().map(|arg| (*arg).to_string()));
+    argv.push("--plan".to_string());
+    argv.push(
+        internal_site_controller_plan_path(runtime_root)
+            .display()
+            .to_string(),
+    );
+    Ok(argv)
 }
 
 pub(crate) fn build_direct_site_launch_preview(
@@ -265,9 +303,6 @@ pub(crate) fn build_direct_site_launch_preview(
         );
         for passthrough in &component.sidecar.env_passthrough {
             if let Ok(value) = env::var(passthrough) {
-                #[cfg(target_os = "linux")]
-                let value =
-                    rewrite_sidecar_env_passthrough_for_slirp(passthrough.as_str(), value.as_str());
                 env.insert(passthrough.clone(), value);
             }
         }
@@ -326,6 +361,7 @@ pub(crate) fn build_direct_site_launch_preview(
             DirectProgramExecutionPlan::HelperRunner { .. } => {
                 Some(direct_resolved_process_preview(&spec.env)?)
             }
+            DirectProgramExecutionPlan::InternalSiteController => None,
         };
         processes.push(direct_process_preview(
             spec,
@@ -343,12 +379,12 @@ pub(crate) fn build_direct_site_launch_preview(
     })
 }
 
-fn missing_existing_peer_identity(err: &miette::Report) -> bool {
+pub(crate) fn missing_existing_peer_identity(err: &miette::Report) -> bool {
     err.to_string()
         .contains("mesh provision plan requires existing peer identity")
 }
 
-fn preview_placeholder_peer_mesh_state(
+pub(crate) fn preview_placeholder_peer_mesh_state(
     mesh_plan: &MeshProvisionPlan,
 ) -> (BTreeMap<String, MeshIdentityPublic>, BTreeMap<String, u16>) {
     let target_ids = mesh_plan
@@ -893,6 +929,7 @@ pub(crate) fn component_execution_program_path(
             }
             Ok(None)
         }
+        DirectProgramExecutionPlan::InternalSiteController => Ok(None),
     }
 }
 

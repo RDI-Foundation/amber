@@ -190,8 +190,6 @@ struct StaleSiteReceipt {
     process_pid: Option<u32>,
     #[serde(default)]
     port_forward_pid: Option<u32>,
-    #[serde(default)]
-    site_controller_pid: Option<u32>,
 }
 
 impl TestTempDir {
@@ -317,7 +315,6 @@ fn stale_run_has_live_processes(receipt: &StaleRunReceipt) -> bool {
                         Some(site.supervisor_pid),
                         site.process_pid,
                         site.port_forward_pid,
-                        site.site_controller_pid,
                     ]
                 })
                 .flatten(),

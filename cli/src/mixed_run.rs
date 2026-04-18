@@ -365,8 +365,6 @@ pub(crate) struct SiteReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) router_public_key_b64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) site_controller_pid: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) site_controller_url: Option<String>,
 }
 
@@ -413,8 +411,6 @@ struct SiteManagerState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     router_public_key_b64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    site_controller_pid: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     site_controller_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
@@ -451,8 +447,6 @@ pub(crate) struct SiteSupervisorPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     observability_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    site_controller_plan_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     site_controller_url: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     launch_env: BTreeMap<String, String>,
@@ -467,7 +461,6 @@ struct SupervisorPlanInput<'a> {
     artifact_dir: &'a Path,
     site_state_root: &'a Path,
     observability_endpoint: Option<&'a str>,
-    site_controller_plan_path: Option<&'a Path>,
     site_controller_url: Option<&'a str>,
 }
 
@@ -478,14 +471,19 @@ struct MaterializedObservability {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct MaterializedSiteController {
+    pub(crate) state_path: PathBuf,
+    pub(crate) plan_path: PathBuf,
+    pub(crate) listen_addr: SocketAddr,
+    pub(crate) url: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct MaterializedSite {
     pub(crate) site_plan: RunSitePlan,
     pub(crate) artifact_dir: PathBuf,
     pub(crate) site_state_root: PathBuf,
-    pub(crate) controller_state_path: PathBuf,
-    pub(crate) controller_plan_path: PathBuf,
-    pub(crate) controller_listen_addr: SocketAddr,
-    pub(crate) controller_url: String,
+    pub(crate) controller: Option<MaterializedSiteController>,
     pub(crate) base_supervisor_plan: SiteSupervisorPlan,
 }
 
@@ -642,7 +640,6 @@ struct SupervisorRuntime {
     site_process: Option<Child>,
     site_started: bool,
     port_forward: Option<Child>,
-    site_controller: Option<Child>,
     last_start_attempt: Option<Instant>,
     last_stitch_refresh: Option<Instant>,
     ready_since: Option<Instant>,
@@ -685,7 +682,6 @@ fn site_state_from_receipt(
         kubernetes_consumer_router_mesh_addr: site.kubernetes_consumer_router_mesh_addr.clone(),
         router_identity_id: site.router_identity_id.clone(),
         router_public_key_b64: site.router_public_key_b64.clone(),
-        site_controller_pid: site.site_controller_pid,
         site_controller_url: site.site_controller_url.clone(),
         last_error,
     }
@@ -825,7 +821,6 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
         site_process: None,
         site_started: false,
         port_forward: None,
-        site_controller: None,
         last_start_attempt: None,
         last_stitch_refresh: None,
         ready_since: None,
@@ -871,7 +866,6 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
                         kubernetes_consumer_router_mesh_addr,
                         router_identity_id: None,
                         router_public_key_b64: None,
-                        site_controller_pid: None,
                         site_controller_url: None,
                         last_error: None,
                     },
@@ -908,7 +902,6 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
                         kubernetes_consumer_router_mesh_addr,
                         router_identity_id: None,
                         router_public_key_b64: None,
-                        site_controller_pid: None,
                         site_controller_url: None,
                         last_error: Some("coordinator exited before commit".to_string()),
                     },
@@ -1024,7 +1017,6 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
                         kubernetes_consumer_router_mesh_addr,
                         router_identity_id: Some(discovery.router_identity.id),
                         router_public_key_b64: Some(public_key_b64),
-                        site_controller_pid: None,
                         site_controller_url: None,
                         last_error: None,
                     },

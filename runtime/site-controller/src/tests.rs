@@ -1227,6 +1227,7 @@ async fn compile_dynamic_caps_binding_state() -> FrameworkControlState {
             SiteDefinition {
                 kind: SiteKind::Direct,
                 context: None,
+                controller_site: None,
             },
         )]),
         defaults: PlacementDefaults {
@@ -1669,6 +1670,7 @@ async fn compile_dynamic_caps_external_root_state() -> FrameworkControlState {
             SiteDefinition {
                 kind: SiteKind::Direct,
                 context: None,
+                controller_site: None,
             },
         )]),
         defaults: PlacementDefaults {
@@ -1768,6 +1770,7 @@ async fn same_site_dynamic_child_output_bindings_reuse_provider_component_routes
             SiteDefinition {
                 kind: SiteKind::Compose,
                 context: None,
+                controller_site: None,
             },
         )]),
         defaults: PlacementDefaults {
@@ -1926,6 +1929,7 @@ async fn same_site_static_child_export_bindings_reuse_provider_component_routes(
             SiteDefinition {
                 kind: SiteKind::Compose,
                 context: None,
+                controller_site: None,
             },
         )]),
         defaults: PlacementDefaults {
@@ -2011,6 +2015,7 @@ async fn dynamic_grant_routes_to_holder_site_not_offered_site_order() {
         SiteDefinition {
             kind: SiteKind::Compose,
             context: None,
+            controller_site: None,
         },
     );
     let share = super::dynamic_caps::share_dynamic_capability(
@@ -2057,6 +2062,7 @@ async fn dynamic_caps_cross_site_share_syncs_holder_authority_through_site_route
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -2064,6 +2070,7 @@ async fn dynamic_caps_cross_site_share_syncs_holder_authority_through_site_route
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
         ]),
@@ -2140,7 +2147,6 @@ async fn dynamic_caps_cross_site_share_syncs_holder_authority_through_site_route
         BTreeMap::from([("direct_b".to_string(), holder_base_url)]);
     let controller_app = SiteControllerApp {
         control: app,
-        router_auth_token: Arc::<str>::from("test-router-auth"),
         ready: ready_site_controller_flag(),
     };
 
@@ -2200,6 +2206,7 @@ async fn compile_empty_control_state() -> (TempDir, FrameworkControlState, PathB
             SiteDefinition {
                 kind: SiteKind::Direct,
                 context: None,
+                controller_site: None,
             },
         )]),
         defaults: PlacementDefaults {
@@ -2214,6 +2221,80 @@ async fn compile_empty_control_state() -> (TempDir, FrameworkControlState, PathB
     let state_path = dir.path().join("control-state.json");
     write_control_state(&state_path, &state).expect("state should write");
     (dir, state, state_path)
+}
+
+#[tokio::test]
+async fn wrapper_manifest_lowers_framework_sources_to_synthetic_slots() {
+    let (dir, mut state, _) = compile_empty_control_state().await;
+    let child_path = dir.path().join("child.json5");
+    state.base_scenario.manifest_catalog.insert(
+        "child".to_string(),
+        amber_scenario::ir::ManifestCatalogEntryIr {
+            source_ref: file_url(&child_path),
+            digest: amber_manifest::ManifestDigest::new([7; 32]),
+            manifest: amber_manifest::Manifest::empty(),
+        },
+    );
+
+    let (manifest, synthetic_sources) = build_wrapper_manifest(
+        &state,
+        &ResolvedTemplateContract {
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            slot_decls: BTreeMap::new(),
+            visible_exports: Vec::new(),
+        },
+        "child",
+        "child",
+        None,
+        &[ResolvedTemplateBinding {
+            slot_name: "creator".to_string(),
+            slot_decl: amber_manifest::SlotDecl::builder()
+                .decl(
+                    amber_manifest::CapabilityDecl::builder()
+                        .kind(amber_manifest::CapabilityKind::Http)
+                        .build(),
+                )
+                .build(),
+            sources: vec![ResolvedBindingSource {
+                from: BindingFrom::Framework(amber_scenario::FrameworkRef {
+                    authority: amber_scenario::ComponentId(state.base_scenario.root),
+                    capability: amber_manifest::FrameworkCapabilityName::try_from("component")
+                        .expect("framework capability name should parse"),
+                }),
+                weak: true,
+            }],
+            source_child_id: None,
+        }],
+    )
+    .expect("wrapper manifest should build");
+
+    assert!(
+        manifest.bindings().iter().all(|binding| !matches!(
+            binding.binding.from,
+            amber_manifest::BindingSource::Framework(_)
+        )),
+        "wrapper manifest should not recreate raw framework bindings: {:?}",
+        manifest.bindings()
+    );
+    assert_eq!(
+        manifest.slots().len(),
+        1,
+        "framework sources should lower to synthetic wrapper slots"
+    );
+    assert_eq!(
+        synthetic_sources.len(),
+        1,
+        "framework source mapping should still be recorded"
+    );
+    assert!(matches!(
+        synthetic_sources
+            .values()
+            .next()
+            .expect("synthetic source should exist")
+            .actual_source,
+        BindingFrom::Framework(_)
+    ));
 }
 
 async fn compile_exact_template_control_state() -> (TempDir, FrameworkControlState, PathBuf) {
@@ -2261,6 +2342,7 @@ async fn compile_exact_template_control_state() -> (TempDir, FrameworkControlSta
             SiteDefinition {
                 kind: SiteKind::Direct,
                 context: None,
+                controller_site: None,
             },
         )]),
         defaults: PlacementDefaults {
@@ -2347,6 +2429,7 @@ async fn compile_framework_binding_control_state() -> (
             SiteDefinition {
                 kind: SiteKind::Direct,
                 context: None,
+                controller_site: None,
             },
         )]),
         defaults: PlacementDefaults {
@@ -2496,6 +2579,7 @@ fn test_control_state_app(
             SiteDefinition {
                 kind: SiteKind::Direct,
                 context: None,
+                controller_site: None,
             },
         )])
     } else {
@@ -2567,7 +2651,7 @@ fn test_control_state_app(
             state_root: state_root.display().to_string(),
             site_state_root: site_state_root.display().to_string(),
             artifact_dir: artifact_dir.display().to_string(),
-            auth_token: "test-control-state-auth".to_string(),
+            control_state_auth_token: "test-control-state-auth".to_string(),
             dynamic_caps_token_verify_key_b64: String::new(),
             storage_root: Some(storage_root.display().to_string()),
             runtime_root: Some(runtime_root.display().to_string()),
@@ -2810,7 +2894,6 @@ async fn install_framework_site_controller_fixture(
             "router_mesh_addr": format!("127.0.0.1:{}", plan.router_mesh_port.expect("router mesh port")),
             "router_identity_id": plan.router_identity_id,
             "router_public_key_b64": base64::engine::general_purpose::STANDARD.encode([11; 32]),
-            "site_controller_pid": 1,
             "site_controller_url": plan.authority_url,
         }),
     )
@@ -3056,7 +3139,6 @@ struct FrameworkMcpHarness {
     base_url: String,
     route_id: String,
     peer_id: String,
-    auth_token: String,
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -3079,10 +3161,8 @@ impl FrameworkMcpHarness {
         } else {
             Vec::new()
         };
-        let auth_token = "test-router-auth".to_string();
         let controller_app = SiteControllerApp {
             control: app,
-            router_auth_token: Arc::<str>::from(auth_token.clone()),
             ready: ready_site_controller_flag(),
         };
         handles.push(tokio::spawn(async move {
@@ -3098,16 +3178,14 @@ impl FrameworkMcpHarness {
             _dir: dir,
             client: Client::new(),
             base_url,
-            route_id: record.cap_instance_id,
+            route_id: record.route_id,
             peer_id: record.recipient_peer_id,
-            auth_token,
             handles,
         }
     }
 
     fn http_headers(&self) -> Vec<(String, String)> {
         vec![
-            (FRAMEWORK_AUTH_HEADER.to_string(), self.auth_token.clone()),
             (FRAMEWORK_ROUTE_ID_HEADER.to_string(), self.route_id.clone()),
             (FRAMEWORK_PEER_ID_HEADER.to_string(), self.peer_id.clone()),
         ]
@@ -3371,7 +3449,6 @@ async fn framework_component_rejects_stale_nonlocal_controller_delivery() {
             authority_locks: app.authority_locks.clone(),
             runtime: app.runtime.clone(),
         },
-        router_auth_token: Arc::<str>::from("test-router-auth"),
         ready: ready_site_controller_flag(),
     };
 
@@ -3388,9 +3465,7 @@ async fn framework_component_rejects_stale_nonlocal_controller_delivery() {
     };
     assert_eq!(err.0.code, ProtocolErrorCode::ControlStateUnavailable);
     assert!(
-        err.0
-            .message
-            .contains("router framework route overlays are stale"),
+        err.0.message.contains("bound to controller site"),
         "unexpected error: {}",
         err.0.message
     );
@@ -3401,7 +3476,6 @@ async fn framework_component_rejects_requests_while_controller_recovers() {
     let (_dir, state, state_path, record) = compile_framework_binding_control_state().await;
     let controller_app = SiteControllerApp {
         control: test_control_state_app(&_dir, state.clone(), state_path),
-        router_auth_token: Arc::<str>::from("test-router-auth"),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
@@ -3422,210 +3496,27 @@ async fn framework_component_rejects_requests_while_controller_recovers() {
 }
 
 #[tokio::test]
-async fn framework_component_cross_site_routes_forward_through_site_routers() {
-    let (dir, mut state, _state_path, _) = compile_framework_binding_control_state().await;
-    state.placement.offered_sites = BTreeMap::from([
-        (
-            "authority".to_string(),
-            SiteDefinition {
-                kind: SiteKind::Direct,
-                context: None,
-            },
-        ),
-        (
-            "consumer".to_string(),
-            SiteDefinition {
-                kind: SiteKind::Direct,
-                context: None,
-            },
-        ),
-    ]);
-    state.placement.defaults = PlacementDefaults {
-        path: Some("authority".to_string()),
-        ..PlacementDefaults::default()
-    };
-    state.placement.placement_components = BTreeMap::from([
-        ("/".to_string(), "authority".to_string()),
-        ("/admin".to_string(), "consumer".to_string()),
-    ]);
-    state.placement.assignments = state.placement.placement_components.clone();
-    refresh_capability_instances(&mut state).expect("framework routes should refresh");
-    let state_path = dir.path().join("control-state.json");
-    write_control_state(&state_path, &state).expect("state should write");
-    let app = test_control_state_app(&dir, state, state_path);
-    let router_public_key_b64 = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
-    let authority_router = Router::new().route(
-        "/v1/controller/router-identity",
-        axum::routing::get({
-            let router_public_key_b64 = router_public_key_b64.clone();
-            move || {
-                let router_public_key_b64 = router_public_key_b64.clone();
-                async move {
-                    Json(RouterIdentityResponse {
-                        id: "/site/authority/router".to_string(),
-                        public_key_b64: router_public_key_b64,
-                    })
-                }
-            }
-        }),
-    );
-    let consumer_router = Router::new().route(
-        "/v1/controller/router-identity",
-        axum::routing::get({
-            let router_public_key_b64 = router_public_key_b64.clone();
-            move || {
-                let router_public_key_b64 = router_public_key_b64.clone();
-                async move {
-                    Json(RouterIdentityResponse {
-                        id: "/site/consumer/router".to_string(),
-                        public_key_b64: router_public_key_b64,
-                    })
-                }
-            }
-        }),
-    );
-    let (authority_base_url, _authority_handle) = spawn_test_router(authority_router).await;
-    let (consumer_base_url, _consumer_handle) = spawn_test_router(consumer_router).await;
-
-    let mut authority_plan = app.controller_plan.as_ref().clone();
-    authority_plan.peer_site_router_urls =
-        BTreeMap::from([("consumer".to_string(), consumer_base_url)]);
-    let authority_app = ControlStateApp {
-        controller_plan: Arc::new(authority_plan),
-        ..app.clone()
+async fn refresh_capability_instances_rejects_unlowered_framework_component_bindings() {
+    let (_dir, mut state, _state_path, _) = compile_framework_binding_control_state().await;
+    let binding = state
+        .base_scenario
+        .bindings
+        .iter_mut()
+        .find(|binding| binding.to.slot == "ctl")
+        .expect("framework binding should exist");
+    binding.from = BindingFromIr::Framework {
+        authority_realm: state.base_scenario.root,
+        capability: "component".to_string(),
     };
 
-    let mut consumer_plan = app.controller_plan.as_ref().clone();
-    consumer_plan.site_id = "consumer".to_string();
-    consumer_plan.router_identity_id = "/site/consumer/router".to_string();
-    consumer_plan.peer_site_router_urls =
-        BTreeMap::from([("authority".to_string(), authority_base_url)]);
-    consumer_plan.peer_router_mesh_addrs =
-        BTreeMap::from([("authority".to_string(), "127.0.0.1:24000".to_string())]);
-    let consumer_app = ControlStateApp {
-        controller_plan: Arc::new(consumer_plan),
-        ..app.clone()
-    };
-
-    let authority_overlay = framework_route_overlay_payload(&authority_app)
-        .await
-        .expect("authority framework routes should materialize")
-        .expect("authority site should get a framework route overlay");
-    let consumer_overlay = framework_route_overlay_payload(&consumer_app)
-        .await
-        .expect("consumer framework routes should materialize")
-        .expect("consumer site should get a framework route overlay");
-
+    let err = refresh_capability_instances(&mut state)
+        .expect_err("unlowered framework.component bindings must be rejected");
     assert!(
-        authority_overlay
-            .peers
-            .iter()
-            .any(|peer| peer.id == "/site/consumer/router"),
-        "authority router should accept framework traffic from the consumer router",
-    );
-    assert!(
-        consumer_overlay
-            .peers
-            .iter()
-            .any(|peer| peer.id == "/site/authority/router"),
-        "consumer router should forward framework traffic to the authority router",
-    );
-
-    assert!(
-        consumer_overlay.inbound_routes.iter().any(|route| matches!(
-            &route.target,
-            InboundTarget::MeshForward {
-                peer_id,
-                peer_addr,
-                route_id,
-                capability,
-            } if peer_id == "/site/authority/router"
-                && peer_addr == "127.0.0.1:24000"
-                && route_id == &route.route_id
-                && capability == &route.capability
-        )),
-        "cross-site framework requests must enter the consumer router and cross the router mesh",
-    );
-
-    assert!(
-        authority_overlay
-            .inbound_routes
-            .iter()
-            .any(|route| matches!(
-                &route.target,
-                InboundTarget::External { url_env, optional }
-                    if url_env == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV && !optional
-            )),
-        "the authority router should hand framework requests to its local site controller only \
-         after the router hop",
+        err.to_string()
+            .contains("must be lowered before capability refresh"),
+        "unexpected framework lowering error: {err}",
     );
 }
-
-#[tokio::test]
-async fn framework_route_overlay_payload_uses_planned_peer_router_identities() {
-    let (dir, mut state, state_path, _) = compile_framework_binding_control_state().await;
-    state.placement.offered_sites = BTreeMap::from([
-        (
-            "authority".to_string(),
-            SiteDefinition {
-                kind: SiteKind::Direct,
-                context: None,
-            },
-        ),
-        (
-            "consumer".to_string(),
-            SiteDefinition {
-                kind: SiteKind::Direct,
-                context: None,
-            },
-        ),
-    ]);
-    state.placement.defaults = PlacementDefaults {
-        path: Some("authority".to_string()),
-        ..PlacementDefaults::default()
-    };
-    state.placement.placement_components = BTreeMap::from([
-        ("/".to_string(), "authority".to_string()),
-        ("/admin".to_string(), "consumer".to_string()),
-    ]);
-    state.placement.assignments = state.placement.placement_components.clone();
-    refresh_capability_instances(&mut state).expect("framework routes should refresh");
-    write_control_state(&state_path, &state).expect("state should write");
-    let app = test_control_state_app(&dir, state, state_path);
-
-    let mut consumer_plan = app.controller_plan.as_ref().clone();
-    consumer_plan.site_id = "consumer".to_string();
-    consumer_plan.router_identity_id = "/site/consumer/router".to_string();
-    consumer_plan.peer_router_identities = BTreeMap::from([(
-        "authority".to_string(),
-        MeshIdentityPublic {
-            id: "/site/authority/router".to_string(),
-            public_key: [9u8; 32],
-            mesh_scope: Some("test-mesh".to_string()),
-        },
-    )]);
-    consumer_plan.peer_router_mesh_addrs =
-        BTreeMap::from([("authority".to_string(), "127.0.0.1:24000".to_string())]);
-    let consumer_app = ControlStateApp {
-        controller_plan: Arc::new(consumer_plan),
-        ..app
-    };
-
-    let overlay = framework_route_overlay_payload(&consumer_app)
-        .await
-        .expect("consumer framework routes should materialize")
-        .expect("consumer site should get a framework route overlay");
-
-    assert!(
-        overlay
-            .peers
-            .iter()
-            .any(|peer| peer.id == "/site/authority/router" && peer.public_key == [9u8; 32]),
-        "consumer overlay should use the planned authority router identity without a peer \
-         controller round trip",
-    );
-}
-
 #[tokio::test]
 async fn recover_control_state_reconciles_framework_routes_without_live_peer_controllers() {
     let (dir, mut state, state_path, _) = compile_framework_binding_control_state().await;
@@ -3635,6 +3526,7 @@ async fn recover_control_state_reconciles_framework_routes_without_live_peer_con
             SiteDefinition {
                 kind: SiteKind::Direct,
                 context: None,
+                controller_site: None,
             },
         ),
         (
@@ -3642,6 +3534,7 @@ async fn recover_control_state_reconciles_framework_routes_without_live_peer_con
             SiteDefinition {
                 kind: SiteKind::Direct,
                 context: None,
+                controller_site: None,
             },
         ),
     ]);
@@ -3690,26 +3583,63 @@ fn inject_site_controller_peer_router_routes_records_peer_router_identities() {
             version: amber_mesh::MESH_PROVISION_PLAN_VERSION.to_string(),
             identity_seed: None,
             existing_peer_identities: Vec::new(),
-            targets: vec![amber_mesh::MeshProvisionTarget {
-                kind: amber_mesh::MeshProvisionTargetKind::Router,
-                config: amber_mesh::MeshConfigTemplate {
-                    identity: amber_mesh::MeshIdentityTemplate {
-                        id: "/site/local/router".to_string(),
-                        mesh_scope: Some("test-mesh".to_string()),
+            targets: vec![
+                amber_mesh::MeshProvisionTarget {
+                    kind: amber_mesh::MeshProvisionTargetKind::Component,
+                    config: amber_mesh::MeshConfigTemplate {
+                        identity: amber_mesh::MeshIdentityTemplate {
+                            id: "/site/local/controller".to_string(),
+                            mesh_scope: Some("test-mesh".to_string()),
+                        },
+                        mesh_listen: "127.0.0.1:23001".parse().expect("mesh listen"),
+                        control_listen: None,
+                        dynamic_caps_listen: None,
+                        control_allow: None,
+                        peers: Vec::new(),
+                        inbound: vec![amber_mesh::InboundRoute {
+                            route_id: amber_mesh::component_route_id(
+                                "/site/local/controller",
+                                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+                                MeshProtocol::Http,
+                            ),
+                            capability:
+                                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+                                    .to_string(),
+                            capability_kind: None,
+                            capability_profile: None,
+                            protocol: MeshProtocol::Http,
+                            http_plugins: Vec::new(),
+                            target: amber_mesh::InboundTarget::Local { port: 8080 },
+                            allowed_issuers: vec!["/site/local/router".to_string()],
+                        }],
+                        outbound: Vec::new(),
+                        transport: TransportConfig::NoiseIk {},
                     },
-                    mesh_listen: "127.0.0.1:24000".parse().expect("mesh listen"),
-                    control_listen: None,
-                    dynamic_caps_listen: None,
-                    control_allow: None,
-                    peers: Vec::new(),
-                    inbound: Vec::new(),
-                    outbound: Vec::new(),
-                    transport: TransportConfig::NoiseIk {},
+                    output: amber_mesh::MeshProvisionOutput::Filesystem {
+                        dir: "mesh/controller".to_string(),
+                    },
                 },
-                output: amber_mesh::MeshProvisionOutput::Filesystem {
-                    dir: "mesh/router".to_string(),
+                amber_mesh::MeshProvisionTarget {
+                    kind: amber_mesh::MeshProvisionTargetKind::Router,
+                    config: amber_mesh::MeshConfigTemplate {
+                        identity: amber_mesh::MeshIdentityTemplate {
+                            id: "/site/local/router".to_string(),
+                            mesh_scope: Some("test-mesh".to_string()),
+                        },
+                        mesh_listen: "127.0.0.1:24000".parse().expect("mesh listen"),
+                        control_listen: None,
+                        dynamic_caps_listen: None,
+                        control_allow: None,
+                        peers: Vec::new(),
+                        inbound: Vec::new(),
+                        outbound: Vec::new(),
+                        transport: TransportConfig::NoiseIk {},
+                    },
+                    output: amber_mesh::MeshProvisionOutput::Filesystem {
+                        dir: "mesh/router".to_string(),
+                    },
                 },
-            }],
+            ],
         },
     )
     .expect("mesh provision plan should write");
@@ -3749,6 +3679,37 @@ fn inject_site_controller_peer_router_routes_records_peer_router_identities() {
         .iter()
         .find(|target| matches!(target.kind, amber_mesh::MeshProvisionTargetKind::Router))
         .expect("router target should remain present");
+    assert!(
+        router.config.inbound.iter().any(|route| {
+            route.route_id == site_controller_internal_route_id("local")
+                && route.capability == SITE_CONTROLLER_INTERNAL_CAPABILITY
+                && matches!(
+                    route.target,
+                    amber_mesh::InboundTarget::MeshForward {
+                        ref peer_id,
+                        ref peer_addr,
+                        ref route_id,
+                        ref capability,
+                    } if peer_id == "/site/local/controller"
+                        && peer_addr
+                            == if cfg!(target_os = "linux") {
+                                "10.0.2.2:23001"
+                            } else {
+                                "127.0.0.1:23001"
+                            }
+                        && route_id
+                            == &amber_mesh::component_route_id(
+                                "/site/local/controller",
+                                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+                                MeshProtocol::Http,
+                            )
+                        && capability
+                            == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+                )
+        }),
+        "the injected router plan should terminate peer site-controller traffic at the lowered \
+         controller component",
+    );
     assert!(
         router
             .config
@@ -3824,7 +3785,7 @@ struct DynamicCapsMcpHarness {
     _dir: TempDir,
     client: Client,
     base_url: String,
-    auth_token: String,
+    control_state_auth_token: String,
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -3847,7 +3808,6 @@ impl DynamicCapsMcpHarness {
         let mut handles = vec![install_dynamic_caps_origin_fixture(&app).await];
         let controller_app = SiteControllerApp {
             control: app,
-            router_auth_token: Arc::<str>::from("test-router-auth"),
             ready: ready_site_controller_flag(),
         };
         handles.push(tokio::spawn(async move {
@@ -3862,20 +3822,44 @@ impl DynamicCapsMcpHarness {
             _dir: dir,
             client: Client::new(),
             base_url,
-            auth_token: "test-control-state-auth".to_string(),
+            control_state_auth_token: "test-control-state-auth".to_string(),
             handles,
         }
     }
 
-    fn http_headers(&self) -> Vec<(String, String)> {
-        vec![(FRAMEWORK_AUTH_HEADER.to_string(), self.auth_token.clone())]
+    fn mcp_headers(&self) -> Vec<(String, String)> {
+        vec![(
+            CONTROL_STATE_AUTH_HEADER.to_string(),
+            self.control_state_auth_token.clone(),
+        )]
+    }
+
+    fn dynamic_caps_http_headers<Req: Serialize>(&self, body: &Req) -> Vec<(String, String)> {
+        let body = serde_json::to_value(body).expect("dynamic caps request should serialize");
+        let component_id = body
+            .get("holder_component_id")
+            .or_else(|| body.get("caller_component_id"))
+            .and_then(Value::as_str)
+            .expect("dynamic caps control requests should identify the caller component");
+        let peer_id = dynamic_caps::moniker_from_logical_component_id(component_id)
+            .expect("logical component id should map to a moniker")
+            .to_string();
+        let route_id = amber_mesh::component_route_id(
+            peer_id.as_str(),
+            amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+            amber_mesh::MeshProtocol::Http,
+        );
+        vec![
+            (FRAMEWORK_ROUTE_ID_HEADER.to_string(), route_id),
+            (FRAMEWORK_PEER_ID_HEADER.to_string(), peer_id),
+        ]
     }
 
     async fn connect(&self) -> TestMcpClient {
         TestMcpClient::connect_endpoint(
             &format!("{}/v1/controller/dynamic-caps/mcp", self.base_url),
             "framework-dynamic-caps-test",
-            self.http_headers(),
+            self.mcp_headers(),
         )
         .await
     }
@@ -3884,7 +3868,7 @@ impl DynamicCapsMcpHarness {
         http_post_json(
             &self.client,
             &format!("{}{}", self.base_url, path),
-            &self.http_headers(),
+            &self.dynamic_caps_http_headers(body),
             body,
         )
         .await
@@ -3938,7 +3922,6 @@ async fn install_dynamic_caps_origin_fixture(app: &ControlStateApp) -> tokio::ta
             "router_mesh_addr": "127.0.0.1:39001",
             "router_identity_id": plan.router_identity_id,
             "router_public_key_b64": "dGVzdC1yb3V0ZXIta2V5",
-            "site_controller_pid": 1,
             "site_controller_url": plan.authority_url,
         }),
     )
@@ -4078,6 +4061,7 @@ async fn dynamic_caps_held_list_ignores_unrouted_offered_sites() {
         SiteDefinition {
             kind: SiteKind::Compose,
             context: None,
+            controller_site: None,
         },
     );
     state.placement.offered_sites.insert(
@@ -4085,13 +4069,13 @@ async fn dynamic_caps_held_list_ignores_unrouted_offered_sites() {
         SiteDefinition {
             kind: SiteKind::Vm,
             context: None,
+            controller_site: None,
         },
     );
     let state_path = dir.path().join("control-state.json");
     write_control_state(&state_path, &state).expect("state should write");
     let controller_app = SiteControllerApp {
         control: test_control_state_app(&dir, state, state_path),
-        router_auth_token: Arc::<str>::from("test-router-auth"),
         ready: ready_site_controller_flag(),
     };
 
@@ -4130,6 +4114,7 @@ async fn localize_framework_control_state_tracks_remote_grant_authority_sites() 
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -4137,6 +4122,7 @@ async fn localize_framework_control_state_tracks_remote_grant_authority_sites() 
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
         ]),
@@ -4206,6 +4192,7 @@ async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -4213,6 +4200,7 @@ async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
         ]),
@@ -4309,7 +4297,6 @@ async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
         BTreeMap::from([("direct_a".to_string(), authority_base_url)]);
     let controller_app = SiteControllerApp {
         control: app,
-        router_auth_token: Arc::<str>::from("test-router-auth"),
         ready: ready_site_controller_flag(),
     };
 
@@ -4354,6 +4341,7 @@ async fn held_list_aggregates_remote_grants_via_peer_router() {
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -4361,6 +4349,7 @@ async fn held_list_aggregates_remote_grants_via_peer_router() {
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
         ]),
@@ -4460,7 +4449,6 @@ async fn held_list_aggregates_remote_grants_via_peer_router() {
         BTreeMap::from([("direct_a".to_string(), authority_base_url)]);
     let controller_app = SiteControllerApp {
         control: app,
-        router_auth_token: Arc::<str>::from("test-router-auth"),
         ready: ready_site_controller_flag(),
     };
 
@@ -4950,6 +4938,7 @@ async fn create_snapshot_and_destroy_exact_child() {
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -4957,6 +4946,7 @@ async fn create_snapshot_and_destroy_exact_child() {
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
         ]),
@@ -5813,6 +5803,7 @@ async fn delegated_cross_site_framework_requests_route_to_the_forwarded_authorit
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -5820,6 +5811,7 @@ async fn delegated_cross_site_framework_requests_route_to_the_forwarded_authorit
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
         ]),
@@ -5873,9 +5865,7 @@ async fn delegated_cross_site_framework_requests_route_to_the_forwarded_authorit
         .cloned()
         .expect("delegate should have a forwarded framework capability instance");
     assert_eq!(
-        framework_authority_site_id(&direct_state, &direct_record)
-            .expect("authority site should resolve through composite placement"),
-        "compose_local",
+        direct_record.controller_site_id, "compose_local",
         "delegated root authority should stay anchored at the forwarded realm site",
     );
     let router_public_key_b64 = base64::engine::general_purpose::STANDARD.encode([11u8; 32]);
@@ -5927,12 +5917,8 @@ async fn delegated_cross_site_framework_requests_route_to_the_forwarded_authorit
                 dir.path().join("direct-state.json"),
             )
         },
-        router_auth_token: Arc::<str>::from("test-router-auth"),
         ready: ready_site_controller_flag(),
     };
-    reconcile_local_framework_routes(&direct_controller_app.control)
-        .await
-        .expect("direct-local controller should publish delegated framework routes");
     let stale_err = match super::site_controller::execute_site_controller_framework_mutate(
         &direct_controller_app,
         &direct_record,
@@ -5952,10 +5938,7 @@ async fn delegated_cross_site_framework_requests_route_to_the_forwarded_authorit
     };
     assert_eq!(stale_err.0.code, ProtocolErrorCode::ControlStateUnavailable);
     assert!(
-        stale_err
-            .0
-            .message
-            .contains("router framework route overlays are stale"),
+        stale_err.0.message.contains("bound to controller site"),
         "unexpected stale-delivery error: {}",
         stale_err.0.message
     );
@@ -5988,7 +5971,6 @@ async fn delegated_cross_site_framework_requests_route_to_the_forwarded_authorit
             controller_plan: Arc::new(compose_plan),
             ..test_control_state_app(&dir, compose_state.clone(), compose_state_path)
         },
-        router_auth_token: Arc::<str>::from("test-router-auth"),
         ready: ready_site_controller_flag(),
     };
     let response = super::site_controller::execute_site_controller_framework_mutate(
@@ -6124,6 +6106,7 @@ async fn create_child_publishes_sites_before_resolving_cross_site_link_overlays(
                 SiteDefinition {
                     kind: SiteKind::Compose,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -6131,6 +6114,7 @@ async fn create_child_publishes_sites_before_resolving_cross_site_link_overlays(
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
         ]),
@@ -6359,7 +6343,7 @@ async fn create_child_publishes_sites_before_resolving_cross_site_link_overlays(
 }
 
 #[tokio::test]
-async fn destroy_and_recreate_same_child_name_gets_a_new_capability_instance_id() {
+async fn destroy_and_recreate_same_child_name_revokes_then_restores_stable_framework_route() {
     let dir = TempDir::new().expect("temp dir");
     let root_path = dir.path().join("root.json5");
     let parent_path = dir.path().join("parent.json5");
@@ -6440,6 +6424,13 @@ async fn destroy_and_recreate_same_child_name_gets_a_new_capability_instance_id(
         .map(|(id, _)| id.0)
         .expect("parent component should exist");
 
+    let parent_record = state
+        .capability_instances
+        .values()
+        .find(|record| record.recipient_component_moniker == "/parent")
+        .cloned()
+        .expect("parent should have its own framework capability instance");
+
     create_child(
         &mut state,
         parent_id,
@@ -6454,12 +6445,30 @@ async fn destroy_and_recreate_same_child_name_gets_a_new_capability_instance_id(
     )
     .await
     .expect("first delegate create should succeed");
-    let first_cap_instance_id = state
+    authorize_capability_instance(&state, &parent_record.cap_instance_id, "/parent").expect(
+        "parent authorization should survive when a child receives the same controller route",
+    );
+    let (first_cap_instance_id, first_route_id, first_peer_id) = state
         .capability_instances
         .values()
         .find(|record| record.recipient_component_moniker == "/parent/delegate")
-        .map(|record| record.cap_instance_id.clone())
+        .map(|record| {
+            (
+                record.cap_instance_id.clone(),
+                record.route_id.clone(),
+                record.recipient_peer_id.clone(),
+            )
+        })
         .expect("first delegate capability instance should exist");
+    assert_ne!(
+        first_cap_instance_id, parent_record.cap_instance_id,
+        "distinct recipients must retain distinct framework grant identities even when they share \
+         a controller route",
+    );
+    assert_eq!(
+        first_route_id, parent_record.route_id,
+        "distinct recipients in the same authority should share the same stable controller route",
+    );
 
     destroy_child(&mut state, parent_id, "delegate", &state_path)
         .await
@@ -6471,6 +6480,10 @@ async fn destroy_and_recreate_same_child_name_gets_a_new_capability_instance_id(
             .any(|record| record.recipient_component_moniker == "/parent/delegate"),
         "destroy should revoke the first child lifetime's capability instance",
     );
+    let destroyed = authorize_capability_instance(&state, &first_cap_instance_id, &first_peer_id)
+        .expect_err("destroyed child should no longer authorize");
+    assert_eq!(destroyed.code, ProtocolErrorCode::Unauthorized);
+    assert_eq!(destroyed.message, "unknown framework capability instance");
 
     create_child(
         &mut state,
@@ -6486,40 +6499,127 @@ async fn destroy_and_recreate_same_child_name_gets_a_new_capability_instance_id(
     )
     .await
     .expect("second delegate create should succeed");
-    let second_cap_instance_id = state
+    let (second_cap_instance_id, second_route_id, second_peer_id) = state
         .capability_instances
         .values()
         .find(|record| record.recipient_component_moniker == "/parent/delegate")
-        .map(|record| record.cap_instance_id.clone())
+        .map(|record| {
+            (
+                record.cap_instance_id.clone(),
+                record.route_id.clone(),
+                record.recipient_peer_id.clone(),
+            )
+        })
         .expect("second delegate capability instance should exist");
 
     assert_ne!(
-        first_cap_instance_id, second_cap_instance_id,
-        "recreating the same child name must mint a new framework capability instance id",
+        second_cap_instance_id, first_cap_instance_id,
+        "recreating the same child name must mint a fresh framework grant identity",
     );
+    assert_eq!(
+        second_route_id, first_route_id,
+        "ordinary framework.component bindings should reuse the stable controller route for the \
+         same authority and child path",
+    );
+    assert_eq!(
+        second_peer_id, first_peer_id,
+        "recreating the same child name should restore the same peer identity path",
+    );
+    authorize_capability_instance(&state, &second_cap_instance_id, &second_peer_id)
+        .expect("recreated child should regain framework authorization");
 }
 
 #[test]
-fn framework_auth_header_must_match_expected_token() {
+fn control_state_auth_header_must_match_expected_token() {
     let mut headers = HeaderMap::new();
-    let missing = authorize_framework_auth_header(&headers, "expected")
+    let missing = authorize_control_state_auth_header(&headers, "expected")
         .expect_err("missing auth header should be rejected");
     assert_eq!(missing.0.code, ProtocolErrorCode::Unauthorized);
 
     headers.insert(
-        FRAMEWORK_AUTH_HEADER,
+        CONTROL_STATE_AUTH_HEADER,
         "wrong".parse().expect("header should parse"),
     );
-    let wrong = authorize_framework_auth_header(&headers, "expected")
+    let wrong = authorize_control_state_auth_header(&headers, "expected")
         .expect_err("mismatched auth header should be rejected");
     assert_eq!(wrong.0.code, ProtocolErrorCode::Unauthorized);
 
     headers.insert(
-        FRAMEWORK_AUTH_HEADER,
+        CONTROL_STATE_AUTH_HEADER,
         "expected".parse().expect("header should parse"),
     );
-    authorize_framework_auth_header(&headers, "expected")
+    authorize_control_state_auth_header(&headers, "expected")
         .expect("matching auth header should succeed");
+}
+
+#[tokio::test]
+async fn local_controller_requests_require_internal_route_headers_not_framework_auth() {
+    let (dir, state, state_path, _) = compile_framework_binding_control_state().await;
+    let app = SiteControllerApp {
+        control: test_control_state_app(&dir, state, state_path),
+        ready: ready_site_controller_flag(),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER,
+        "1".parse().expect("header should parse"),
+    );
+    headers.insert(
+        FRAMEWORK_ROUTE_ID_HEADER,
+        site_controller_internal_route_id(&app.control.controller_plan.site_id)
+            .parse()
+            .expect("route header should parse"),
+    );
+    headers.insert(
+        FRAMEWORK_PEER_ID_HEADER,
+        app.control
+            .controller_plan
+            .router_identity_id
+            .parse()
+            .expect("peer header should parse"),
+    );
+
+    super::site_controller::authorize_local_controller_request(&app, &headers).expect(
+        "router-local controller requests should authorize without a control-state auth header",
+    );
+
+    headers.insert(
+        FRAMEWORK_ROUTE_ID_HEADER,
+        "component:/wrong:__amber_internal_site_controller:http"
+            .parse()
+            .expect("header should parse"),
+    );
+    let err = super::site_controller::authorize_local_controller_request(&app, &headers)
+        .expect_err("wrong internal route should be rejected");
+    assert_eq!(err.0.code, ProtocolErrorCode::Unauthorized);
+}
+
+#[tokio::test]
+async fn dynamic_caps_sidecar_requests_reject_ambient_control_state_auth_without_internal_route() {
+    let dir = TempDir::new().expect("temp dir");
+    let state = compile_dynamic_caps_binding_state().await;
+    let state_path = dir.path().join("control-state.json");
+    write_control_state(&state_path, &state).expect("state should write");
+    let app = SiteControllerApp {
+        control: test_control_state_app(&dir, state, state_path),
+        ready: ready_site_controller_flag(),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTROL_STATE_AUTH_HEADER,
+        app.control
+            .control_state_auth_token
+            .parse()
+            .expect("auth header should parse"),
+    );
+
+    let err = super::site_controller::authorize_dynamic_caps_sidecar_request(
+        &app,
+        &headers,
+        "components./alice",
+    )
+    .expect_err("ambient control-state auth must not bypass the controller internal route");
+    assert_eq!(err.0.code, ProtocolErrorCode::Unauthorized);
 }
 
 #[tokio::test]
@@ -7020,6 +7120,7 @@ async fn snapshot_is_stable_across_dynamic_create_order() {
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -7027,6 +7128,7 @@ async fn snapshot_is_stable_across_dynamic_create_order() {
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
         ]),
@@ -7159,6 +7261,7 @@ async fn create_rejects_unoffered_backend_without_committing_child_state() {
             SiteDefinition {
                 kind: SiteKind::Compose,
                 context: None,
+                controller_site: None,
             },
         )]),
         defaults: PlacementDefaults {
@@ -7278,6 +7381,7 @@ async fn concurrent_distinct_creates_commit_both_children() {
             SiteDefinition {
                 kind: SiteKind::Compose,
                 context: None,
+                controller_site: None,
             },
         )]),
         defaults: PlacementDefaults {
@@ -7402,6 +7506,7 @@ async fn prepare_child_record_uses_frozen_dynamic_placement_assignments() {
                 SiteDefinition {
                     kind: SiteKind::Compose,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -7409,6 +7514,7 @@ async fn prepare_child_record_uses_frozen_dynamic_placement_assignments() {
                 SiteDefinition {
                     kind: SiteKind::Kubernetes,
                     context: None,
+                    controller_site: None,
                 },
             ),
         ]),
@@ -7606,6 +7712,7 @@ async fn prepare_child_record_supports_cross_site_dynamic_fragments() {
                 SiteDefinition {
                     kind: SiteKind::Compose,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -7613,6 +7720,7 @@ async fn prepare_child_record_supports_cross_site_dynamic_fragments() {
                 SiteDefinition {
                     kind: SiteKind::Direct,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -7620,6 +7728,7 @@ async fn prepare_child_record_supports_cross_site_dynamic_fragments() {
                 SiteDefinition {
                     kind: SiteKind::Kubernetes,
                     context: None,
+                    controller_site: None,
                 },
             ),
             (
@@ -7627,6 +7736,7 @@ async fn prepare_child_record_supports_cross_site_dynamic_fragments() {
                 SiteDefinition {
                     kind: SiteKind::Vm,
                     context: None,
+                    controller_site: None,
                 },
             ),
         ]),
@@ -8283,6 +8393,7 @@ async fn recover_control_state_surfaces_create_prepared_rollback_failures() {
             SiteDefinition {
                 kind: SiteKind::Direct,
                 context: None,
+                controller_site: None,
             },
         )]),
         defaults: PlacementDefaults {
@@ -8394,6 +8505,7 @@ async fn recover_control_state_does_not_republish_live_children() {
             SiteDefinition {
                 kind: SiteKind::Direct,
                 context: None,
+                controller_site: None,
             },
         )]),
         defaults: PlacementDefaults {
@@ -9112,6 +9224,13 @@ services:
     image: busybox
   amber-provisioner:
     image: ghcr.io/rdi-foundation/amber-provisioner:test
+  amber-site-controller:
+    image: __amber_internal/site-controller
+    command:
+      - --plan
+      - /amber/site/state/site-controller-plan.json
+    environment:
+      - EXISTING_ENV=kept
 networks:
   amber_mesh: {}
 volumes:
@@ -9120,14 +9239,15 @@ volumes:
     )
     .expect("compose yaml should write");
 
+    let controller_port = 32111;
     let plan = write_site_controller_plan(
         &site_controller_plan_path(&site_state_root),
         "test-run",
         "test-mesh",
         "compose-site",
         SiteKind::Compose,
-        SocketAddr::from(([0, 0, 0, 0], SITE_CONTROLLER_PORT)),
-        &format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{SITE_CONTROLLER_PORT}"),
+        SocketAddr::from(([0, 0, 0, 0], controller_port)),
+        &format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{controller_port}"),
         "/site/compose-site/router",
         &BTreeMap::new(),
         &BTreeMap::new(),
@@ -9179,11 +9299,11 @@ volumes:
         .get(serde_yaml::Value::String("command".to_string()))
         .and_then(serde_yaml::Value::as_sequence)
         .expect("controller service should have a command");
-    let plan_path = site_controller_plan_path(&site_state_root)
-        .display()
-        .to_string();
     assert_eq!(command[0].as_str(), Some("--plan"));
-    assert_eq!(command[1].as_str(), Some(plan_path.as_str()));
+    assert_eq!(
+        command[1].as_str(),
+        Some("/amber/site/state/site-controller-plan.json")
+    );
     assert_eq!(
         service
             .get(serde_yaml::Value::String("user".to_string()))
@@ -9212,6 +9332,15 @@ volumes:
                 temp.path().display()
             ))
     }));
+    let environment = service
+        .get(serde_yaml::Value::String("environment".to_string()))
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("controller service should preserve environment");
+    assert!(
+        environment
+            .iter()
+            .any(|value| value.as_str() == Some("EXISTING_ENV=kept"))
+    );
     assert!(
         volumes
             .iter()
@@ -9258,7 +9387,8 @@ fn kubernetes_site_controller_resources_are_injected_into_the_artifact() {
     fs::create_dir_all(site_state_root.clone()).expect("site state root should create");
     fs::write(
         artifact_root.join("kustomization.yaml"),
-        "resources:\n  - 05-networkpolicies/amber-router-netpol.yaml\n",
+        "resources:\n  - 03-deployments/amber-site-controller.yaml\n  - \
+         04-services/amber-site-controller.yaml\n  - 05-networkpolicies/amber-router-netpol.yaml\n",
     )
     .expect("kustomization should write");
     fs::write(
@@ -9308,14 +9438,57 @@ spec:
         "http://amber-router:37046".to_string(),
     )]);
 
+    fs::create_dir_all(artifact_root.join("03-deployments"))
+        .expect("deployments dir should create");
+    fs::write(
+        artifact_root.join("03-deployments/amber-site-controller.yaml"),
+        r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amber-site-controller
+spec:
+  template:
+    spec:
+      containers:
+        - name: main
+          image: __amber_internal/site-controller
+          args:
+            - --plan
+            - /amber/site/state/site-controller-plan.json
+          env:
+            - name: EXISTING_ENV
+              value: kept
+        - name: sidecar
+          image: ghcr.io/rdi-foundation/amber-router:test
+"#,
+    )
+    .expect("controller deployment should write");
+    fs::write(
+        artifact_root.join("04-services/amber-site-controller.yaml"),
+        r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: amber-site-controller
+spec:
+  ports:
+    - name: framework-component
+      port: 32123
+      targetPort: 32123
+      protocol: TCP
+"#,
+    )
+    .expect("controller service should write");
+    let controller_port = 32123;
     let plan = write_site_controller_plan(
         &site_controller_plan_path(&site_state_root),
         "test-run",
         "test-mesh",
         "kube-site",
         SiteKind::Kubernetes,
-        SocketAddr::from(([0, 0, 0, 0], SITE_CONTROLLER_PORT)),
-        &format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{SITE_CONTROLLER_PORT}"),
+        SocketAddr::from(([0, 0, 0, 0], controller_port)),
+        &format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{controller_port}"),
         "/site/kube-site/router",
         &peer_site_router_urls,
         &BTreeMap::new(),
@@ -9375,11 +9548,26 @@ spec:
         "kubernetes site controller seeding should reuse the site-controller image so tests and \
          CI do not depend on an extra public init image pull",
     );
-    let container = deployment["spec"]["template"]["spec"]["containers"]
+    let containers = deployment["spec"]["template"]["spec"]["containers"]
         .as_sequence()
-        .and_then(|containers| containers.first())
+        .expect("deployment should contain site-controller containers");
+    assert_eq!(
+        containers.len(),
+        2,
+        "kubernetes bootstrap should patch the rendered controller deployment instead of \
+         replacing it"
+    );
+    let container = containers
+        .iter()
+        .find(|container| {
+            container
+                .as_mapping()
+                .and_then(|mapping| mapping.get(serde_yaml::Value::String("name".to_string())))
+                .and_then(serde_yaml::Value::as_str)
+                .is_some_and(|name| name == "main")
+        })
         .and_then(serde_yaml::Value::as_mapping)
-        .expect("deployment should contain a site-controller container");
+        .expect("deployment should keep the main site-controller container");
     assert!(
         !container.contains_key(serde_yaml::Value::String("command".to_string())),
         "kubernetes site controller should keep the image entrypoint and pass only args"
@@ -9399,7 +9587,8 @@ spec:
             .expect("seed configmap should read");
     assert!(seed.contains("site-controller-plan.json"));
     assert!(seed.contains("artifact.tar.b64"));
-    assert!(seed.contains("http://amber-site-controller:4100"));
+    assert!(seed.contains(&format!("http://amber-site-controller:{controller_port}")));
+    assert!(deployment_raw.contains("EXISTING_ENV"));
 
     let router_netpol =
         fs::read_to_string(artifact_root.join("05-networkpolicies/amber-router-netpol.yaml"))
@@ -9439,6 +9628,7 @@ fn local_site_manager_state_uses_controller_plan_when_host_state_is_absent() {
                 SiteDefinition {
                     kind: SiteKind::Compose,
                     context: None,
+                    controller_site: None,
                 },
             )]),
             defaults: PlacementDefaults::default(),
@@ -9481,8 +9671,7 @@ fn local_site_manager_state_uses_controller_plan_when_host_state_is_absent() {
     controller_plan.local_router_control =
         Some("unix:///amber/control/router-control.sock".to_string());
     controller_plan.published_router_mesh_addr = Some("127.0.0.1:24000".to_string());
-    controller_plan.authority_url =
-        format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{SITE_CONTROLLER_PORT}");
+    controller_plan.authority_url = "http://amber-site-controller:32111".to_string();
 
     let state = load_site_manager_state(&app, "compose-site")
         .expect("local controller should synthesize site metadata from its own plan");
@@ -9492,7 +9681,7 @@ fn local_site_manager_state_uses_controller_plan_when_host_state_is_absent() {
         Some("unix:///amber/control/router-control.sock")
     );
     assert_eq!(state.router_mesh_addr.as_deref(), Some("127.0.0.1:24000"));
-    let authority_url = format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{SITE_CONTROLLER_PORT}");
+    let authority_url = "http://amber-site-controller:32111".to_string();
     assert_eq!(
         state.site_controller_url.as_deref(),
         Some(authority_url.as_str())
@@ -9525,6 +9714,7 @@ fn load_site_manager_state_prefers_local_controller_view_over_stale_host_state()
                 SiteDefinition {
                     kind: SiteKind::Compose,
                     context: None,
+                    controller_site: None,
                 },
             )]),
             defaults: PlacementDefaults::default(),
@@ -9580,8 +9770,7 @@ fn load_site_manager_state_prefers_local_controller_view_over_stale_host_state()
     controller_plan.local_router_control =
         Some("unix:///amber/control/router-control.sock".to_string());
     controller_plan.published_router_mesh_addr = Some("127.0.0.1:24000".to_string());
-    controller_plan.authority_url =
-        format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{SITE_CONTROLLER_PORT}");
+    controller_plan.authority_url = "http://amber-site-controller:32111".to_string();
 
     let state = load_site_manager_state(&app, "compose-site")
         .expect("local controller should not trust stale host manager state");
@@ -9591,7 +9780,7 @@ fn load_site_manager_state_prefers_local_controller_view_over_stale_host_state()
         Some("unix:///amber/control/router-control.sock")
     );
     assert_eq!(state.router_mesh_addr.as_deref(), Some("127.0.0.1:24000"));
-    let authority_url = format!("http://{SITE_CONTROLLER_SERVICE_NAME}:{SITE_CONTROLLER_PORT}");
+    let authority_url = "http://amber-site-controller:32111".to_string();
     assert_eq!(
         state.site_controller_url.as_deref(),
         Some(authority_url.as_str())

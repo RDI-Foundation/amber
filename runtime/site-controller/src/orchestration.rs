@@ -186,7 +186,6 @@ pub(super) fn site_receipt_from_manager_state(state: &SiteManagerStateView) -> S
         kubernetes_consumer_router_mesh_addr: state.kubernetes_consumer_router_mesh_addr.clone(),
         router_identity_id: state.router_identity_id.clone(),
         router_public_key_b64: state.router_public_key_b64.clone(),
-        site_controller_pid: state.site_controller_pid,
         site_controller_url: state.site_controller_url.clone(),
     }
 }
@@ -291,7 +290,6 @@ fn local_site_manager_state_view(app: &ControlStateApp) -> SiteManagerStateView 
                     .as_ref()
                     .and_then(|state| state.router_public_key_b64.clone())
             }),
-        site_controller_pid: None,
         site_controller_url: Some(app.controller_plan.authority_url.clone()),
     }
 }
@@ -316,34 +314,6 @@ pub(super) fn load_launched_site(
     })
 }
 
-fn framework_route_overlay_id(authority_site_id: &str) -> String {
-    format!("framework-component-routes:{authority_site_id}")
-}
-
-fn framework_component_route(
-    record: &CapabilityInstanceRecord,
-    allowed_issuers: Vec<String>,
-    target: InboundTarget,
-) -> InboundRoute {
-    InboundRoute {
-        route_id: record.route_id.clone(),
-        capability: record.capability.clone(),
-        capability_kind: Some("component".to_string()),
-        capability_profile: None,
-        protocol: MeshProtocol::Http,
-        http_plugins: Vec::new(),
-        target,
-        allowed_issuers,
-    }
-}
-
-fn framework_controller_external_target() -> InboundTarget {
-    InboundTarget::External {
-        url_env: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV.to_string(),
-        optional: false,
-    }
-}
-
 async fn peer_router_identity_for_overlay(
     app: &ControlStateApp,
     site_id: &str,
@@ -356,7 +326,6 @@ async fn peer_router_identity_for_overlay(
     }
     let site_app = SiteControllerApp {
         control: app.clone(),
-        router_auth_token: app.control_state_auth_token.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -376,25 +345,6 @@ async fn peer_router_identity_for_overlay(
         id: identity.id,
         public_key: identity.public_key,
     })
-}
-
-fn peer_router_mesh_addr_for_overlay(
-    app: &ControlStateApp,
-    site_id: &str,
-) -> std::result::Result<String, ProtocolErrorResponse> {
-    app.controller_plan
-        .peer_router_mesh_addrs
-        .get(site_id)
-        .cloned()
-        .ok_or_else(|| {
-            protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
-                &format!(
-                    "site controller `{}` has no mesh address for peer site `{site_id}`",
-                    app.controller_plan.site_id
-                ),
-            )
-        })
 }
 
 fn local_router_control_endpoint(
@@ -684,114 +634,6 @@ pub(super) async fn revoke_dynamic_capability_origin_overlays_local(
                 )
             })?;
     }
-    Ok(())
-}
-
-pub(super) async fn framework_route_overlay_payload(
-    app: &ControlStateApp,
-) -> std::result::Result<Option<DesiredRouteOverlay>, ProtocolErrorResponse> {
-    let state = app.control_state.lock().await.clone();
-    let local_site_id = app.controller_plan.site_id.clone();
-    let mut overlay = DesiredRouteOverlay {
-        peers: Vec::new(),
-        inbound_routes: Vec::new(),
-    };
-
-    for record in state.capability_instances.values() {
-        let authority_site_id = framework_authority_site_id(&state, record)?;
-        let consumer_site_id = record.recipient_site_id.clone();
-
-        if authority_site_id == local_site_id {
-            if consumer_site_id == local_site_id {
-                overlay.inbound_routes.push(framework_component_route(
-                    record,
-                    vec![record.recipient_peer_id.clone()],
-                    framework_controller_external_target(),
-                ));
-                continue;
-            }
-            let consumer_peer = peer_router_identity_for_overlay(app, &consumer_site_id).await?;
-            if !overlay.peers.iter().any(|peer| peer.id == consumer_peer.id) {
-                overlay.peers.push(consumer_peer.clone());
-            }
-            overlay.inbound_routes.push(framework_component_route(
-                record,
-                vec![consumer_peer.id],
-                framework_controller_external_target(),
-            ));
-            continue;
-        }
-
-        if consumer_site_id != local_site_id {
-            continue;
-        }
-
-        let authority_peer = peer_router_identity_for_overlay(app, &authority_site_id).await?;
-        let route = framework_component_route(
-            record,
-            vec![record.recipient_peer_id.clone()],
-            InboundTarget::MeshForward {
-                peer_addr: peer_router_mesh_addr_for_overlay(app, &authority_site_id)?,
-                peer_id: authority_peer.id.clone(),
-                route_id: record.route_id.clone(),
-                capability: record.capability.clone(),
-            },
-        );
-        if !overlay
-            .peers
-            .iter()
-            .any(|peer| peer.id == authority_peer.id)
-        {
-            overlay.peers.push(authority_peer.clone());
-        }
-        overlay.inbound_routes.push(route);
-    }
-
-    if overlay.peers.is_empty() && overlay.inbound_routes.is_empty() {
-        return Ok(None);
-    }
-    overlay.peers.sort_by(|left, right| left.id.cmp(&right.id));
-    overlay
-        .inbound_routes
-        .sort_by(|left, right| left.route_id.cmp(&right.route_id));
-    Ok(Some(overlay))
-}
-
-pub(super) async fn reconcile_local_framework_routes(
-    app: &ControlStateApp,
-) -> std::result::Result<(), ProtocolErrorResponse> {
-    let overlay_id = framework_route_overlay_id(&app.controller_plan.site_id);
-    let endpoint = local_router_control_endpoint(app)?;
-    if let Some(overlay) = framework_route_overlay_payload(app).await? {
-        apply_route_overlay_with_retry(
-            &endpoint,
-            &overlay_id,
-            &overlay.peers,
-            &overlay.inbound_routes,
-            Duration::from_secs(30),
-        )
-        .await
-        .map_err(|err| {
-            controller_protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
-                &app.controller_plan.site_id,
-                "publish framework route overlay",
-                err,
-            )
-        })?;
-    } else {
-        revoke_route_overlay_with_retry(&endpoint, &overlay_id, Duration::from_secs(30))
-            .await
-            .map_err(|err| {
-                controller_protocol_error(
-                    ProtocolErrorCode::ControlStateUnavailable,
-                    &app.controller_plan.site_id,
-                    "retract framework route overlay",
-                    err,
-                )
-            })?;
-    }
-
     Ok(())
 }
 
@@ -2181,12 +2023,11 @@ pub(super) async fn execute_create_child(
         (tx_id, child)
     };
     let (tx_id, child) = child;
-    reconcile_local_framework_routes(app).await?;
 
     let state = app.control_state.lock().await.clone();
     if let Err(err) = prepare_child_on_sites(app, &state, &child).await {
         let rollback_err = rollback_prepared_sites(app, child.child_id).await;
-        let should_reconcile = {
+        {
             let mut state = app.control_state.lock().await;
             if state
                 .pending_creates
@@ -2204,13 +2045,7 @@ pub(super) async fn execute_create_child(
                         Ok(())
                     },
                 )?;
-                true
-            } else {
-                false
             }
-        };
-        if should_reconcile {
-            reconcile_local_framework_routes(app).await?;
         }
         let err = if let Err(rollback_err) = rollback_err {
             protocol_error(
@@ -2265,7 +2100,7 @@ pub(super) async fn execute_destroy_child(
     child_name: &str,
 ) -> std::result::Result<(), ProtocolApiError> {
     let _authority_guard = acquire_authority_lock(app, authority_realm_id).await;
-    let (next, reconcile_routes) = {
+    let next = {
         let mut state = app.control_state.lock().await;
         let Some(child) = state
             .live_children
@@ -2291,10 +2126,10 @@ pub(super) async fn execute_destroy_child(
                         Ok(())
                     },
                 )?;
-                ((child.child_id, ChildState::DestroyRequested), true)
+                (child.child_id, ChildState::DestroyRequested)
             }
-            ChildState::DestroyRequested => ((child.child_id, ChildState::DestroyRequested), false),
-            ChildState::DestroyRetracted => ((child.child_id, ChildState::DestroyRetracted), false),
+            ChildState::DestroyRequested => (child.child_id, ChildState::DestroyRequested),
+            ChildState::DestroyRetracted => (child.child_id, ChildState::DestroyRetracted),
             ChildState::DestroyCommitted | ChildState::CreateAborted => return Ok(()),
             _ => {
                 return Err(protocol_error(
@@ -2305,9 +2140,6 @@ pub(super) async fn execute_destroy_child(
             }
         }
     };
-    if reconcile_routes {
-        reconcile_local_framework_routes(app).await?;
-    }
     match next.1 {
         ChildState::DestroyRequested => continue_destroy_requested(app, next.0).await?,
         ChildState::DestroyRetracted => continue_destroy_retracted(app, next.0).await?,
@@ -2389,9 +2221,6 @@ pub(super) async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
             ChildState::CreateAborted | ChildState::DestroyCommitted => {}
         }
     }
-    reconcile_local_framework_routes(app)
-        .await
-        .map_err(|err| miette::miette!(err.message))?;
     Ok(())
 }
 

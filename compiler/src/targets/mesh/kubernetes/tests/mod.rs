@@ -60,6 +60,79 @@ fn render_artifact(output: &crate::CompileOutput) -> super::KubernetesArtifact {
         .expect("render kubernetes output")
 }
 
+fn compile_framework_component_output(root_path: &Path) -> crate::CompileOutput {
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let url = Url::from_file_path(root_path).expect("file url");
+    rt.block_on(compiler.compile(ManifestRef::from_url(url), opts))
+        .expect("compile scenario")
+}
+
+#[test]
+fn lowered_framework_component_controller_uses_real_internal_image_in_kubernetes_artifacts() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let admin_path = dir.path().join("admin.json5");
+    fs::write(
+        &root_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          components: { admin: "./admin.json5" },
+          bindings: [
+            { to: "#admin.ctl", from: "framework.component" }
+          ]
+        }
+        "##,
+    )
+    .expect("write root manifest");
+    fs::write(
+        &admin_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "sleep 3600"]
+          },
+          slots: { ctl: { kind: "component" } }
+        }
+        "#,
+    )
+    .expect("write admin manifest");
+
+    let output = compile_framework_component_output(&root_path);
+    let artifact = render_artifact(&output);
+    let deployment = artifact
+        .files
+        .get(&PathBuf::from("03-deployments/amber-site-controller.yaml"))
+        .expect("site controller deployment");
+    let service = artifact
+        .files
+        .get(&PathBuf::from("04-services/amber-site-controller.yaml"))
+        .expect("site controller service");
+    let site_controller_image = internal_images().site_controller;
+
+    assert!(
+        deployment.contains(&site_controller_image),
+        "synthetic controller deployment should use the real site-controller image: {deployment}"
+    );
+    assert!(
+        !deployment.contains("__amber_internal/site-controller"),
+        "kubernetes artifacts must not leak the internal site-controller placeholder image: \
+         {deployment}"
+    );
+    assert!(
+        service.contains("name: amber-site-controller"),
+        "the lowered controller should render an ordinary service for the controller workload: \
+         {service}"
+    );
+}
+
 fn parse_rendered_env(content: &str) -> std::collections::BTreeMap<String, String> {
     content
         .lines()

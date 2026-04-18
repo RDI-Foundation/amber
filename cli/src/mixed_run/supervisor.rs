@@ -265,9 +265,6 @@ pub(super) fn build_supervisor_plan(
             None
         },
         observability_endpoint: input.observability_endpoint.map(ToOwned::to_owned),
-        site_controller_plan_path: input
-            .site_controller_plan_path
-            .map(|path| path.display().to_string()),
         site_controller_url: input.site_controller_url.map(ToOwned::to_owned),
         launch_env,
     })
@@ -584,7 +581,6 @@ pub(super) fn launched_site_from_state(
                 .clone(),
             router_identity_id: state.router_identity_id.clone(),
             router_public_key_b64: state.router_public_key_b64.clone(),
-            site_controller_pid: state.site_controller_pid,
             site_controller_url: state.site_controller_url.clone(),
         },
         router_control,
@@ -637,26 +633,6 @@ pub(super) async fn ensure_site_running(
 ) -> Result<()> {
     reap_child(&mut runtime.site_process)?;
     reap_child(&mut runtime.port_forward)?;
-    reap_child(&mut runtime.site_controller)?;
-
-    if matches!(plan.kind, SiteKind::Direct | SiteKind::Vm)
-        && runtime.site_controller.is_none()
-        && let Some(plan_path) = plan.site_controller_plan_path.as_deref()
-    {
-        let controller = super::site_controller_command()?;
-        runtime.site_controller = Some(spawn_runtime_process_with_executable(
-            &controller.executable,
-            &PathBuf::from(&plan.site_state_root),
-            "site-controller.log",
-            &plan.launch_env,
-            |cmd| {
-                for arg in &controller.prefix_args {
-                    cmd.arg(arg);
-                }
-                cmd.arg("--plan").arg(plan_path);
-            },
-        )?);
-    }
 
     match plan.kind {
         SiteKind::Direct => {
@@ -808,6 +784,7 @@ pub(super) async fn try_discover_site(
     }?;
     if discovery.is_none()
         && plan.kind == SiteKind::Compose
+        && compose_site_requires_controller(plan)
         && !compose_site_controller_started(plan)?
     {
         runtime.site_started = false;
@@ -1000,8 +977,12 @@ pub(super) fn local_site_controller_addr(plan: &SiteSupervisorPlan) -> Result<Op
     Ok(Some(SocketAddr::new(ip, port)))
 }
 
+fn compose_site_requires_controller(plan: &SiteSupervisorPlan) -> bool {
+    plan.kind == SiteKind::Compose && plan.site_controller_url.is_some()
+}
+
 pub(super) fn compose_site_controller_container_name(plan: &SiteSupervisorPlan) -> Option<String> {
-    (plan.kind == SiteKind::Compose)
+    compose_site_requires_controller(plan)
         .then_some(plan.compose_project.as_deref()?)
         .map(|project| {
             format!(
@@ -1193,7 +1174,7 @@ pub(super) async fn try_discover_compose_site(
     else {
         return Ok(None);
     };
-    if !compose_site_controller_ready(plan)? {
+    if compose_site_requires_controller(plan) && !compose_site_controller_ready(plan)? {
         return Ok(None);
     }
     Ok(Some(discovery))
@@ -1326,21 +1307,15 @@ pub(super) async fn cleanup_site(
 ) -> Result<()> {
     reap_child(&mut runtime.site_process)?;
     reap_child(&mut runtime.port_forward)?;
-    reap_child(&mut runtime.site_controller)?;
-
     if let Some(child) = runtime.site_process.as_mut() {
         stop_child(child).await?;
     }
     if let Some(child) = runtime.port_forward.as_mut() {
         stop_child(child).await?;
     }
-    if let Some(child) = runtime.site_controller.as_mut() {
-        stop_child(child).await?;
-    }
     runtime.site_process = None;
     runtime.site_started = false;
     runtime.port_forward = None;
-    runtime.site_controller = None;
 
     match plan.kind {
         SiteKind::Compose => {
@@ -1425,7 +1400,6 @@ pub(super) fn build_site_state(
         kubernetes_consumer_router_mesh_addr,
         router_identity_id,
         router_public_key_b64,
-        site_controller_pid: runtime.site_controller.as_ref().map(Child::id),
         site_controller_url: plan.site_controller_url.clone(),
         last_error,
     }
@@ -1471,7 +1445,6 @@ pub(super) fn persist_site_state(
                 .clone(),
             router_identity_id: launched.receipt.router_identity_id.clone(),
             router_public_key_b64: launched.receipt.router_public_key_b64.clone(),
-            site_controller_pid: launched.receipt.site_controller_pid,
             site_controller_url: launched.receipt.site_controller_url.clone(),
             last_error,
         },
@@ -2308,7 +2281,6 @@ mod tests {
                 kubernetes_consumer_router_mesh_addr: Some("192.168.65.254:24000".to_string()),
                 router_identity_id: Some(router_identity.id.clone()),
                 router_public_key_b64: None,
-                site_controller_pid: None,
                 site_controller_url: None,
             },
             router_control: ControlEndpoint::Tcp("127.0.0.1:24100".to_string()),
@@ -2392,7 +2364,6 @@ mod tests {
                 kubernetes_consumer_router_mesh_addr: Some("192.168.65.254:24000".to_string()),
                 router_identity_id: Some(router_identity.id.clone()),
                 router_public_key_b64: None,
-                site_controller_pid: None,
                 site_controller_url: None,
             },
             router_control: ControlEndpoint::Tcp("127.0.0.1:24100".to_string()),

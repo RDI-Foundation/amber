@@ -9,21 +9,21 @@ use miette::{IntoDiagnostic as _, Result, WrapErr as _};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    orchestration::ProtocolApiError, planner::ControlStateApp, state::FRAMEWORK_AUTH_HEADER, *,
+    orchestration::ProtocolApiError, planner::ControlStateApp, state::CONTROL_STATE_AUTH_HEADER, *,
 };
 
 pub(super) async fn cleanup_dynamic_bridge_proxies(app: &ControlStateApp) -> Result<()> {
     app.runtime.cleanup().await
 }
 
-pub(super) fn authorize_framework_auth_header(
+pub(super) fn authorize_control_state_auth_header(
     headers: &HeaderMap,
     expected: &str,
 ) -> std::result::Result<(), ProtocolApiError> {
-    let actual = required_header(headers, FRAMEWORK_AUTH_HEADER)?;
+    let actual = required_header(headers, CONTROL_STATE_AUTH_HEADER)?;
     if actual != expected {
         return Err(ProtocolApiError::unauthorized(
-            "invalid authenticated framework request header",
+            "invalid authenticated control-state request header",
         ));
     }
     Ok(())
@@ -41,7 +41,7 @@ pub(super) fn required_header(
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
             ProtocolApiError::unauthorized(format!(
-                "missing authenticated framework request header `{name}`"
+                "missing authenticated control-state request header `{name}`"
             ))
         })
 }

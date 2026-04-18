@@ -1599,7 +1599,41 @@ mod direct_input_tests {
                 version: amber_mesh::MESH_PROVISION_PLAN_VERSION.to_string(),
                 identity_seed: None,
                 existing_peer_identities: Vec::new(),
-                targets: vec![MeshProvisionTarget {
+                targets: vec![
+                MeshProvisionTarget {
+                    kind: MeshProvisionTargetKind::Component,
+                    config: MeshConfigTemplate {
+                        identity: amber_mesh::MeshIdentityTemplate {
+                            id: "/site/local/controller".to_string(),
+                            mesh_scope: None,
+                        },
+                        mesh_listen: "127.0.0.1:23001".parse().expect("mesh listen"),
+                        control_listen: None,
+                        dynamic_caps_listen: None,
+                        control_allow: None,
+                        peers: Vec::new(),
+                        inbound: vec![InboundRoute {
+                            route_id: amber_mesh::component_route_id(
+                                "/site/local/controller",
+                                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+                                MeshProtocol::Http,
+                            ),
+                            capability: amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME.to_string(),
+                            capability_kind: None,
+                            capability_profile: None,
+                            protocol: MeshProtocol::Http,
+                            http_plugins: Vec::new(),
+                            target: InboundTarget::Local { port: 8080 },
+                            allowed_issuers: vec!["/site/local/router".to_string()],
+                        }],
+                        outbound: Vec::new(),
+                        transport: amber_mesh::TransportConfig::NoiseIk {},
+                    },
+                    output: MeshProvisionOutput::Filesystem {
+                        dir: "mesh/controller".to_string(),
+                    },
+                },
+                MeshProvisionTarget {
                     kind: MeshProvisionTargetKind::Router,
                     config: MeshConfigTemplate {
                         identity: amber_mesh::MeshIdentityTemplate {
@@ -1618,7 +1652,8 @@ mod direct_input_tests {
                     output: MeshProvisionOutput::Filesystem {
                         dir: "mesh/router".to_string(),
                     },
-                }],
+                }
+            ],
             },
         )
         .expect("write mesh plan");
@@ -1642,7 +1677,11 @@ mod direct_input_tests {
         .expect("inject routes");
 
         let plan: MeshProvisionPlan = read_json(&path, "mesh provision plan").expect("plan");
-        let router = &plan.targets[0];
+        let router = plan
+            .targets
+            .iter()
+            .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
+            .expect("router target should remain present");
         assert!(
             router.config.inbound.iter().any(|route| {
                 route.route_id == site_controller_internal_route_id("local")
@@ -1650,9 +1689,26 @@ mod direct_input_tests {
                     && route.allowed_issuers == vec!["/site/peer/router".to_string()]
                     && matches!(
                         route.target,
-                        InboundTarget::External { ref url_env, optional }
-                            if url_env == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV
-                                && !optional
+                        InboundTarget::MeshForward {
+                            ref peer_id,
+                            ref peer_addr,
+                            ref route_id,
+                            ref capability,
+                        } if peer_id == "/site/local/controller"
+                            && peer_addr
+                                == if cfg!(target_os = "linux") {
+                                    "10.0.2.2:23001"
+                                } else {
+                                    "127.0.0.1:23001"
+                                }
+                            && route_id
+                                == &amber_mesh::component_route_id(
+                                    "/site/local/controller",
+                                    amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+                                    MeshProtocol::Http,
+                                )
+                            && capability
+                                == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
                     )
             }),
             "router should expose a local inbound route for peer site-controller traffic",

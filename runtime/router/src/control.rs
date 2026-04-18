@@ -1,3 +1,5 @@
+use std::env;
+
 use super::*;
 
 #[derive(Clone)]
@@ -428,17 +430,11 @@ pub(super) async fn handle_inbound(
             optional,
         } => match route.protocol {
             MeshProtocol::Http => {
-                let framework_route_id = (url_env
-                    == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV)
-                    .then(|| Arc::<str>::from(route.route_id.as_str()));
-                let framework_peer_id = (url_env
-                    == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_URL_ENV)
-                    .then(|| Arc::<str>::from(remote_id.as_str()));
                 proxy_noise_to_external(
                     &mut session,
                     ExternalProxyRequest {
-                        route_id: framework_route_id,
-                        peer_id: framework_peer_id,
+                        route_id: None,
+                        peer_id: None,
                         labels: HttpExchangeLabels::inbound_from_route(
                             config.identity.id.clone().into(),
                             remote_id.clone().into(),

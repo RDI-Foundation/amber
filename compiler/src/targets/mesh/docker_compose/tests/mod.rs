@@ -24,6 +24,7 @@ use url::Url;
 
 use super::{DockerComposeReporter, *};
 use crate::{
+    CompileOptions, Compiler, DigestStore, OptimizeOptions,
     linker::program_lowering::lower_program,
     targets::{mesh::internal_images::resolve_internal_images, storage::StorageIdentity},
 };
@@ -49,6 +50,73 @@ fn render_compose(
     output: &crate::CompileOutput,
 ) -> Result<super::DockerComposeArtifact, crate::reporter::ReporterError> {
     DockerComposeReporter.emit(&compiled_scenario(output))
+}
+
+fn compile_framework_component_output(root_path: &Path) -> crate::CompileOutput {
+    let compiler = Compiler::new(amber_resolver::Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let url = Url::from_file_path(root_path).expect("file url");
+    rt.block_on(compiler.compile(ManifestRef::from_url(url), opts))
+        .expect("compile scenario")
+}
+
+#[test]
+fn lowered_framework_component_controller_uses_real_internal_image_in_compose_artifacts() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let admin_path = dir.path().join("admin.json5");
+    fs::write(
+        &root_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          components: { admin: "./admin.json5" },
+          bindings: [
+            { to: "#admin.ctl", from: "framework.component" }
+          ]
+        }
+        "##,
+    )
+    .expect("write root manifest");
+    fs::write(
+        &admin_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "sleep 3600"]
+          },
+          slots: { ctl: { kind: "component" } }
+        }
+        "#,
+    )
+    .expect("write admin manifest");
+
+    let output = compile_framework_component_output(&root_path);
+    let artifact = render_compose(&output).expect("render compose artifact");
+    let compose_yaml = artifact.compose_yaml();
+    let site_controller_image = internal_images().site_controller;
+
+    assert!(
+        compose_yaml.contains(&format!("image: {site_controller_image}")),
+        "synthetic controller components should use the real site-controller image: {compose_yaml}"
+    );
+    assert!(
+        compose_yaml.contains("amber-site-controller:")
+            && compose_yaml.contains("amber-site-controller-net:"),
+        "the lowered controller should render as an ordinary program+sidecar workload: \
+         {compose_yaml}"
+    );
+    assert!(
+        !compose_yaml.contains("__amber_internal/site-controller"),
+        "compose artifacts must not leak the internal site-controller placeholder image: \
+         {compose_yaml}"
+    );
 }
 
 #[test]

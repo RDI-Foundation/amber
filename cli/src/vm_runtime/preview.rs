@@ -138,14 +138,40 @@ pub(crate) fn build_vm_site_launch_preview(
         mesh_plan,
     } = load_vm_runtime_inputs(&plan_path)?;
 
-    let port_assignments = materialize_vm_runtime(
+    let mut inspectability_warnings = Vec::new();
+    let port_assignments = match materialize_vm_runtime(
         &plan_root,
         runtime_root,
         &vm_plan,
         &mesh_plan,
         router_mesh_port,
         true,
-    )?;
+    ) {
+        Ok(port_assignments) => port_assignments,
+        Err(err) if crate::direct_runtime::missing_existing_peer_identity(&err) => {
+            // Dry-run preview can still show the local VM launch shape before peer-site routers
+            // exist; the missing identities only block full mesh config materialization.
+            inspectability_warnings.push(format!(
+                "preview is missing one or more peer-site router identities, so mesh configs \
+                 remain unresolved until those sites are running: {err}"
+            ));
+            let (preview_peer_identities, preview_peer_ports) =
+                crate::direct_runtime::preview_placeholder_peer_mesh_state(&mesh_plan);
+            materialize_vm_runtime_with_existing(
+                &plan_root,
+                runtime_root,
+                &vm_plan,
+                &mesh_plan,
+                router_mesh_port,
+                VmExistingMeshState {
+                    reuse_existing: false,
+                    peer_ports_by_id: &preview_peer_ports,
+                    peer_identities_by_id: &preview_peer_identities,
+                },
+            )?
+        }
+        Err(err) => return Err(err),
+    };
     let arch = host_arch()?;
     let (qemu_system, qemu_warning) = preview_qemu_system_binary(arch);
     let (amber_cli, amber_warning) = preview_amber_binary();
@@ -169,7 +195,6 @@ pub(crate) fn build_vm_site_launch_preview(
         .transpose()?;
 
     let mut virtual_machines = Vec::new();
-    let mut inspectability_warnings = Vec::new();
     inspectability_warnings.extend(qemu_warning);
     inspectability_warnings.extend(amber_warning);
     for component_id in &vm_plan.startup_order {

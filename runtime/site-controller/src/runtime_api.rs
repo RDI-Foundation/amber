@@ -149,8 +149,6 @@ pub struct SiteReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_public_key_b64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub site_controller_pid: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site_controller_url: Option<String>,
 }
 
