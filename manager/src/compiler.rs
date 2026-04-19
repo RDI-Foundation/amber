@@ -5,7 +5,8 @@ use std::{
 };
 
 use amber_compiler::{
-    CompileOptions, Compiler, DigestStore,
+    CompileOptions, Compiler, DigestStore, GovernanceFuture, GovernanceRuntime,
+    GovernanceRuntimeError, GovernanceSession,
     bundle::BundleBuilder,
     mesh::ProxyMetadata,
     reporter::{
@@ -32,6 +33,23 @@ use crate::{
 };
 
 pub const ENV_FILE_NAME: &str = ".env";
+
+#[derive(Debug)]
+struct ManagerGovernanceRuntime;
+
+impl GovernanceRuntime for ManagerGovernanceRuntime {
+    fn start<'a>(
+        &'a self,
+        _compiled: &'a CompiledScenario,
+    ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>> {
+        Box::pin(async {
+            Err(GovernanceRuntimeError::message(
+                "amber-manager does not yet support governance-enabled compilation; compile this \
+                 scenario through the CLI until the shared governance runtime is extracted",
+            ))
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CompiledMaterialization {
@@ -401,7 +419,8 @@ async fn compile_source_materialization(
     bundle_dir: Option<&Path>,
 ) -> Result<CompiledMaterialization, CompileError> {
     let url = parse_source_url(source_url)?;
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default())
+        .with_governance_runtime(Arc::new(ManagerGovernanceRuntime));
     let output = if store_bundle {
         let tree = compiler
             .resolve_tree(

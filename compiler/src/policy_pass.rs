@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use amber_manifest::{CapabilityDecl, ExperimentalFeature, ExportName};
@@ -7,6 +5,7 @@ use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, ScenarioIr, ScenarioIrError, SlotRef,
 };
+use futures::future;
 use miette::Diagnostic;
 use thiserror::Error;
 
@@ -158,7 +157,7 @@ pub(crate) async fn apply_policies(
     rewrite_scenario(scenario, &collected)
 }
 
-pub(crate) async fn collect_policy_outputs(
+async fn collect_policy_outputs(
     scenario: &Scenario,
     governance: &Governance,
     runtime: &dyn GovernanceRuntime,
@@ -172,44 +171,58 @@ pub(crate) async fn collect_policy_outputs(
         .start(&compiled)
         .await
         .map_err(|source| Error::StartGovernance { source })?;
+    let session_ref = session.as_ref();
     let collected = async {
-        let mut collected = Vec::new();
+        let mut invocations = Vec::new();
 
         for scope in &governance.scopes {
             let ScopeArtifacts { input, targets } = build_scope_artifacts(scenario, scope)?;
-            let scope_depth = scope_depth(&scope.root_moniker);
+            let scope_depth_value = scope_depth(&scope.root_moniker);
 
             for (policy_index, policy) in scope.policies.iter().enumerate() {
+                let scope_root = scope.root_moniker.clone();
+                let policy_index_value = policy_index;
+                let policy_export = policy.export.clone();
                 let request = PolicyRequest {
                     scope: input.clone(),
                     args: policy.args.clone(),
                 };
-                let output = session
-                    .invoke_policy(&policy.export, &request)
-                    .await
-                    .map_err(|source| Error::InvokePolicy {
-                        scope_root: scope.root_moniker.clone(),
-                        policy: policy.export.clone(),
-                        source,
-                    })?;
-                // Generated interposers may not rely on experimental features.
-                validate_policy_output(&output, &input, &BTreeSet::<ExperimentalFeature>::new())
+                let input = input.clone();
+                let targets = targets.clone();
+
+                invocations.push(async move {
+                    let output = session_ref
+                        .invoke_policy(&policy_export, &request)
+                        .await
+                        .map_err(|source| Error::InvokePolicy {
+                            scope_root: scope_root.clone(),
+                            policy: policy_export.clone(),
+                            source,
+                        })?;
+                    // Generated interposers may not rely on experimental features.
+                    validate_policy_output(
+                        &output,
+                        &input,
+                        &BTreeSet::<ExperimentalFeature>::new(),
+                    )
                     .map_err(|source| Error::InvalidPolicyOutput {
-                        scope_root: scope.root_moniker.clone(),
-                        policy: policy.export.clone(),
+                        scope_root: scope_root.clone(),
+                        policy: policy_export.clone(),
                         source: Box::new(source),
                     })?;
-                collected.push(PolicyApplication {
-                    scope_root: scope.root_moniker.clone(),
-                    scope_depth,
-                    policy_index,
-                    input: input.clone(),
-                    targets: targets.clone(),
-                    output,
+                    Ok(PolicyApplication {
+                        scope_root,
+                        scope_depth: scope_depth_value,
+                        policy_index: policy_index_value,
+                        input,
+                        targets,
+                        output,
+                    })
                 });
             }
         }
-        Ok(collected)
+
+        future::try_join_all(invocations).await
     }
     .await;
 
@@ -221,10 +234,8 @@ pub(crate) async fn collect_policy_outputs(
     }
 }
 
-pub(crate) fn build_policy_input(
-    scenario: &Scenario,
-    scope: &GovernedScope,
-) -> Result<PolicyInput, Error> {
+#[cfg(test)]
+fn build_policy_input(scenario: &Scenario, scope: &GovernedScope) -> Result<PolicyInput, Error> {
     Ok(build_scope_artifacts(scenario, scope)?.input)
 }
 

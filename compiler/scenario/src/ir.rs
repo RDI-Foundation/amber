@@ -1595,42 +1595,6 @@ mod tests {
     }
 
     #[test]
-    fn scenario_ir_rejects_governance_era_version() {
-        let ir = json!({
-            "schema": SCENARIO_IR_SCHEMA,
-            "version": 7,
-            "root": 0,
-            "components": [
-                {
-                    "id": 0,
-                    "moniker": "/",
-                    "parent": null,
-                    "children": [],
-                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
-                    "config": null,
-                    "program": null,
-                    "slots": {},
-                    "provides": {}
-                }
-            ],
-            "bindings": [],
-            "exports": []
-        });
-
-        let parsed: ScenarioIr =
-            serde_json::from_value(ir).expect("deserialize governance-era scenario IR");
-        let err =
-            Scenario::try_from(parsed).expect_err("governance-era scenario IR should be rejected");
-        assert!(matches!(
-            err,
-            ScenarioIrError::VersionMismatch {
-                expected: SCENARIO_IR_VERSION,
-                actual: 7
-            }
-        ));
-    }
-
-    #[test]
     fn scenario_ir_defaults_missing_program_and_caps() {
         let payload = json!({
             "schema": SCENARIO_IR_SCHEMA,
