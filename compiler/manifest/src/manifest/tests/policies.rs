@@ -18,10 +18,43 @@ fn use_entries_and_policies_parse() {
 
     assert_eq!(manifest.uses().len(), 2);
     assert_eq!(manifest.policies().len(), 2);
-    assert_eq!(manifest.policies()[0].alias, "wrapper");
-    assert_eq!(manifest.policies()[0].export, "rewrite");
-    assert_eq!(manifest.policies()[1].alias, "membrane");
-    assert_eq!(manifest.policies()[1].export, "apply");
+    assert_eq!(manifest.policies()[0].policy.alias, "wrapper");
+    assert_eq!(manifest.policies()[0].policy.export, "rewrite");
+    assert_eq!(manifest.policies()[0].args, None);
+    assert_eq!(manifest.policies()[1].policy.alias, "membrane");
+    assert_eq!(manifest.policies()[1].policy.export, "apply");
+    assert_eq!(manifest.policies()[1].args, None);
+}
+
+#[test]
+fn policy_object_form_parses_args() {
+    let manifest: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["governance"],
+          use: {
+            wrapper: "https://example.com/wrapper.json5",
+          },
+          policies: [{
+            policy: "#wrapper.rewrite",
+            args: {
+              redact_terms: ["${config.secret}"],
+            },
+          }],
+        }
+        "##
+    .parse()
+    .unwrap();
+
+    assert_eq!(manifest.policies().len(), 1);
+    assert_eq!(manifest.policies()[0].policy.alias, "wrapper");
+    assert_eq!(manifest.policies()[0].policy.export, "rewrite");
+    assert_eq!(
+        manifest.policies()[0].args,
+        Some(serde_json::json!({
+            "redact_terms": ["${config.secret}"],
+        }))
+    );
 }
 
 #[test]

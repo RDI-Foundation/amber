@@ -249,6 +249,115 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
 }
 
 #[test]
+fn flatten_keeps_policy_declaring_nodes() {
+    let root_manifest: Manifest = r##"
+        {
+          manifest_version: "0.3.0",
+          components: { parent: "file:///parent.json5" },
+          exports: { cap: "#parent.cap" },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let parent_manifest: Manifest = r##"
+        {
+          manifest_version: "0.3.0",
+          experimental_features: ["governance"],
+          use: {
+            policy: { manifest: "file:///policy.json5" },
+          },
+          policies: ["#policy.apply"],
+          components: { child: "file:///child.json5" },
+          exports: { cap: "#child.cap" },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let child_manifest: Manifest = r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "child",
+            entrypoint: ["child"],
+            network: { endpoints: [{ name: "cap", port: 80 }] },
+          },
+          provides: { cap: { kind: "http", endpoint: "cap" } },
+          exports: { cap: "cap" },
+        }
+    "#
+    .parse()
+    .unwrap();
+
+    let cap_decl = child_manifest
+        .provides()
+        .get("cap")
+        .expect("child provides cap")
+        .decl
+        .clone();
+
+    let store = DigestStore::new();
+    let root_digest = root_manifest.digest();
+    let parent_digest = parent_manifest.digest();
+    let child_digest = child_manifest.digest();
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/parent")),
+        Some(component(2, "/parent/child")),
+    ];
+    components[0].as_mut().unwrap().digest = root_digest;
+    components[1].as_mut().unwrap().digest = parent_digest;
+    components[2].as_mut().unwrap().digest = child_digest;
+
+    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[2].as_mut().unwrap().parent = Some(ComponentId(1));
+    components[0]
+        .as_mut()
+        .unwrap()
+        .children
+        .push(ComponentId(1));
+    components[1]
+        .as_mut()
+        .unwrap()
+        .children
+        .push(ComponentId(2));
+
+    apply_manifest(components[0].as_mut().unwrap(), &root_manifest);
+    apply_manifest(components[1].as_mut().unwrap(), &parent_manifest);
+    apply_manifest(components[2].as_mut().unwrap(), &child_manifest);
+
+    store.put(root_digest, Arc::new(root_manifest));
+    store.put(parent_digest, Arc::new(parent_manifest));
+    store.put(child_digest, Arc::new(child_manifest));
+
+    let mut scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
+        root: ComponentId(0),
+        components,
+        bindings: Vec::new(),
+        exports: vec![ScenarioExport {
+            name: "cap".to_string(),
+            capability: cap_decl,
+            from: ProvideRef {
+                component: ComponentId(2),
+                name: "cap".to_string(),
+            },
+        }],
+    };
+    scenario.normalize_order();
+
+    let scenario = flatten_routing_only(scenario, &store).unwrap();
+
+    assert_eq!(scenario.components.iter().flatten().count(), 3);
+    assert!(
+        scenario
+            .components_iter()
+            .any(|(_, component)| component.moniker.as_str() == "/parent")
+    );
+}
+
+#[test]
 fn flatten_keeps_resource_owners() {
     let root_manifest: Manifest = r##"
         {

@@ -14,8 +14,8 @@ use crate::{
     Governance, GovernedScope,
     governance_runtime::{GovernanceRuntime, GovernanceRuntimeError},
     policy::{
-        AttachmentId, PolicyInput, PolicyOutput, ScenarioScope, ScopeBinding, ScopeBindingFrom,
-        ScopeExport, ScopeImport, ValidationError, validate_policy_output,
+        AttachmentId, PolicyInput, PolicyOutput, PolicyRequest, ScenarioScope, ScopeBinding,
+        ScopeBindingFrom, ScopeExport, ScopeImport, ValidationError, validate_policy_output,
     },
     reporter::{CompiledScenario, CompiledScenarioError},
 };
@@ -47,7 +47,6 @@ enum AttachmentSide {
 struct TargetDescriptor {
     key: TargetKey,
     side: AttachmentSide,
-    placement_parent: ComponentId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,21 +179,24 @@ pub(crate) async fn collect_policy_outputs(
             let ScopeArtifacts { input, targets } = build_scope_artifacts(scenario, scope)?;
             let scope_depth = scope_depth(&scope.root_moniker);
 
-            for (policy_index, policy_export) in scope.policies.iter().enumerate() {
-                let output =
-                    session
-                        .invoke_policy(policy_export, &input)
-                        .await
-                        .map_err(|source| Error::InvokePolicy {
-                            scope_root: scope.root_moniker.clone(),
-                            policy: policy_export.clone(),
-                            source,
-                        })?;
+            for (policy_index, policy) in scope.policies.iter().enumerate() {
+                let request = PolicyRequest {
+                    scope: input.clone(),
+                    args: policy.args.clone(),
+                };
+                let output = session
+                    .invoke_policy(&policy.export, &request)
+                    .await
+                    .map_err(|source| Error::InvokePolicy {
+                        scope_root: scope.root_moniker.clone(),
+                        policy: policy.export.clone(),
+                        source,
+                    })?;
                 // Generated interposers may not rely on experimental features.
                 validate_policy_output(&output, &input, &BTreeSet::<ExperimentalFeature>::new())
                     .map_err(|source| Error::InvalidPolicyOutput {
                         scope_root: scope.root_moniker.clone(),
-                        policy: policy_export.clone(),
+                        policy: policy.export.clone(),
                         source: Box::new(source),
                     })?;
                 collected.push(PolicyApplication {
@@ -270,7 +272,6 @@ fn build_scope_artifacts(
             TargetDescriptor {
                 key: TargetKey::Binding(binding_index),
                 side,
-                placement_parent: binding_placement_parent(scenario, binding),
             },
         );
 
@@ -320,7 +321,6 @@ fn build_scope_artifacts(
             TargetDescriptor {
                 key: TargetKey::Export(export_index),
                 side: AttachmentSide::Source,
-                placement_parent: export_placement_parent(scenario, export),
             },
         );
         next_attachment += 1;
@@ -360,7 +360,6 @@ fn rewrite_scenario(
                 application_index,
                 interposition_index,
                 interposition,
-                &application.targets,
             )?;
 
             for attachment in &interposition.attachments {
@@ -428,9 +427,8 @@ fn insert_interposer_component(
     application_index: usize,
     interposition_index: usize,
     interposition: &crate::policy::Interposition,
-    target_descriptors: &BTreeMap<AttachmentId, TargetDescriptor>,
 ) -> Result<ComponentId, Error> {
-    let parent = interposition_parent(scenario, application, interposition, target_descriptors)?;
+    let parent = scope_root_component_id(scenario, &application.scope_root);
     let moniker =
         unique_interposer_moniker(scenario, parent, application_index, interposition_index);
     let component_id = ComponentId(scenario.components.len());
@@ -441,8 +439,8 @@ fn insert_interposer_component(
         moniker: Moniker::from(moniker),
         // Synthetic interposers are post-manifest IR components, so reuse an existing digest.
         digest: scenario.component(scenario.root).digest,
-        config: None,
-        config_schema: None,
+        config: interposition.interposer.config.clone(),
+        config_schema: interposition.interposer.config_schema.clone(),
         program: interposition.interposer.program.clone(),
         slots: interposition
             .interposer
@@ -515,75 +513,11 @@ fn unique_interposer_moniker(
     }
 }
 
-fn interposition_parent(
-    scenario: &Scenario,
-    application: &PolicyApplication,
-    interposition: &crate::policy::Interposition,
-    target_descriptors: &BTreeMap<AttachmentId, TargetDescriptor>,
-) -> Result<ComponentId, Error> {
-    let mut parents = interposition
-        .attachments
-        .iter()
-        .map(|attachment| {
-            target_descriptors
-                .get(&attachment.target)
-                .map(|descriptor| descriptor.placement_parent)
-                .ok_or_else(|| Error::MissingAttachmentTarget {
-                    scope_root: application.scope_root.clone(),
-                    target: attachment.target,
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter();
-
-    let mut parent = parents
-        .next()
-        .expect("validated interposition should have at least one attachment");
-    for candidate in parents {
-        parent = lowest_common_ancestor(scenario, parent, candidate);
-    }
-    Ok(parent)
-}
-
-fn binding_placement_parent(scenario: &Scenario, binding: &BindingEdge) -> ComponentId {
-    match binding_source_component_id(&binding.from) {
-        Some(source) => lowest_common_ancestor(scenario, source, binding.to.component),
-        None => component_parent_or_root(scenario, binding.to.component),
-    }
-}
-
-fn export_placement_parent(scenario: &Scenario, export: &ScenarioExport) -> ComponentId {
-    component_parent_or_root(scenario, export.from.component)
-}
-
-fn component_parent_or_root(scenario: &Scenario, component: ComponentId) -> ComponentId {
+fn scope_root_component_id(scenario: &Scenario, root_moniker: &Moniker) -> ComponentId {
     scenario
-        .component(component)
-        .parent
-        .unwrap_or(scenario.root)
-}
-
-fn lowest_common_ancestor(
-    scenario: &Scenario,
-    left: ComponentId,
-    right: ComponentId,
-) -> ComponentId {
-    let mut ancestors = HashSet::new();
-    let mut current = Some(left);
-    while let Some(component) = current {
-        ancestors.insert(component);
-        current = scenario.component(component).parent;
-    }
-
-    let mut current = Some(right);
-    while let Some(component) = current {
-        if ancestors.contains(&component) {
-            return component;
-        }
-        current = scenario.component(component).parent;
-    }
-
-    scenario.root
+        .components_iter()
+        .find_map(|(id, component)| (component.moniker == *root_moniker).then_some(id))
+        .expect("governed scope root should exist in the scenario")
 }
 
 fn sort_attachments_for_target(attachments: &mut [PendingAttachment]) {
@@ -769,7 +703,7 @@ mod tests {
         fn invoke_policy<'a>(
             &'a self,
             policy_export: &'a ExportName,
-            _input: &'a PolicyInput,
+            _request: &'a PolicyRequest,
         ) -> GovernanceFuture<'a, Result<PolicyOutput, GovernanceRuntimeError>> {
             Box::pin(async move {
                 Ok(self
@@ -880,7 +814,7 @@ mod tests {
             && binding.to.name == "in"));
         assert_eq!(
             rewritten.component(ComponentId(5)).parent,
-            Some(ComponentId(0))
+            Some(ComponentId(1))
         );
     }
 
@@ -911,6 +845,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_policies_preserves_interposer_config() {
+        let scenario = fixture_scenario();
+        let governance = fixture_governance();
+
+        let runner = MockRunner {
+            outputs: BTreeMap::from([(
+                "policy_0_0".to_string(),
+                PolicyOutput {
+                    interpositions: vec![Interposition {
+                        interposer: InterposerComponent {
+                            config: Some(serde_json::json!({
+                                "redaction_terms": ["${config.secret}"],
+                            })),
+                            config_schema: Some(serde_json::json!({
+                                "type": "object",
+                                "properties": {
+                                    "redaction_terms": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                    },
+                                },
+                                "required": ["redaction_terms"],
+                            })),
+                            program: Some(Program::Path(ProgramPath {
+                                path: "./interposer".to_string(),
+                                args: amber_manifest::ProgramEntrypoint::default(),
+                                common: ProgramCommon::default(),
+                            })),
+                            slots: BTreeMap::from([(
+                                SlotName::try_from("in").expect("valid slot name"),
+                                SlotDecl::builder()
+                                    .decl(http_capability())
+                                    .optional(false)
+                                    .multiple(false)
+                                    .build(),
+                            )]),
+                            provides: BTreeMap::from([(
+                                ProvideName::try_from("out").expect("valid provide name"),
+                                ProvideDecl::builder().decl(http_capability()).build(),
+                            )]),
+                            resources: BTreeMap::new(),
+                            metadata: None,
+                        },
+                        attachments: vec![Attachment {
+                            target: AttachmentId(0),
+                            interposer_slot: SlotName::try_from("in").expect("valid slot name"),
+                            interposer_provide: ProvideName::try_from("out")
+                                .expect("valid provide name"),
+                        }],
+                    }],
+                },
+            )]),
+        };
+
+        let rewritten = apply_policies(scenario, Some(&governance), Some(&runner))
+            .await
+            .expect("config-bearing interposer should rewrite successfully");
+
+        let interposer = rewritten.component(ComponentId(5));
+        assert_eq!(
+            interposer.config,
+            Some(serde_json::json!({
+                "redaction_terms": ["${config.secret}"],
+            }))
+        );
+        assert_eq!(
+            interposer.config_schema,
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "redaction_terms": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                    },
+                },
+                "required": ["redaction_terms"],
+            }))
+        );
+    }
+
+    #[tokio::test]
     async fn apply_policies_orders_cross_scope_interposers_by_side_and_depth() {
         let scenario = cross_scope_fixture_scenario();
         let governance = Governance {
@@ -919,17 +934,15 @@ mod tests {
             scopes: vec![
                 GovernedScope {
                     root_moniker: moniker("/"),
-                    policies: vec![ExportName::try_from("root_policy").expect("valid export name")],
+                    policies: vec![governed_policy("root_policy")],
                 },
                 GovernedScope {
                     root_moniker: moniker("/right"),
-                    policies: vec![
-                        ExportName::try_from("right_policy").expect("valid export name"),
-                    ],
+                    policies: vec![governed_policy("right_policy")],
                 },
                 GovernedScope {
                     root_moniker: moniker("/left"),
-                    policies: vec![ExportName::try_from("left_policy").expect("valid export name")],
+                    policies: vec![governed_policy("left_policy")],
                 },
             ],
         };
@@ -973,10 +986,7 @@ mod tests {
             provenance: Default::default(),
             scopes: vec![GovernedScope {
                 root_moniker: moniker("/left"),
-                policies: vec![
-                    ExportName::try_from("policy_a").expect("valid export name"),
-                    ExportName::try_from("policy_b").expect("valid export name"),
-                ],
+                policies: vec![governed_policy("policy_a"), governed_policy("policy_b")],
             }],
         };
         let runner = MockRunner {
@@ -1012,7 +1022,7 @@ mod tests {
             provenance: Default::default(),
             scopes: vec![GovernedScope {
                 root_moniker: moniker("/left"),
-                policies: vec![ExportName::try_from("policy_0_0").expect("valid export name")],
+                policies: vec![governed_policy("policy_0_0")],
             }],
         }
     }
@@ -1171,6 +1181,8 @@ mod tests {
         PolicyOutput {
             interpositions: vec![Interposition {
                 interposer: InterposerComponent {
+                    config: None,
+                    config_schema: None,
                     program: Some(Program::Path(ProgramPath {
                         path: "./interposer".to_string(),
                         args: amber_manifest::ProgramEntrypoint::default(),
@@ -1248,6 +1260,13 @@ mod tests {
 
     fn http_capability() -> CapabilityDecl {
         CapabilityDecl::builder().kind(CapabilityKind::Http).build()
+    }
+
+    fn governed_policy(name: &str) -> crate::governance::GovernedPolicy {
+        crate::governance::GovernedPolicy {
+            export: ExportName::try_from(name).expect("valid export name"),
+            args: None,
+        }
     }
 
     fn moniker(path: &str) -> Moniker {

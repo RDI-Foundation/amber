@@ -24,9 +24,9 @@ use crate::{
     schema::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ChildTemplateDecl,
         ChildTemplateManifestDecl, ComponentDecl, ConfigSchema, EnvironmentDecl, ExportTarget,
-        LocalCapabilityRefKind, LocalComponentRef, ManifestBinding, MountSource, PolicyRef,
-        Program, ProvideDecl, RawBinding, RawExportTarget, RawProgram, ResourceDecl, SlotDecl,
-        VmScalarU32,
+        LocalCapabilityRefKind, LocalComponentRef, ManifestBinding, MountSource, PolicyDecl,
+        PolicyRef, Program, ProvideDecl, RawBinding, RawExportTarget, RawPolicyDecl,
+        RawPolicyDeclObject, RawProgram, ResourceDecl, SlotDecl, VmScalarU32,
     },
 };
 
@@ -70,7 +70,7 @@ pub struct RawManifest {
     #[serde(default)]
     pub bindings: Vec<RawBinding>,
     #[serde(default)]
-    pub policies: Vec<PolicyRef>,
+    pub policies: Vec<RawPolicyDecl>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub exports: BTreeMap<String, RawExportTarget>,
@@ -193,12 +193,12 @@ fn validate_component_manifest_refs(
 
 fn validate_policy_refs(
     uses: &BTreeMap<String, ComponentDecl>,
-    policies: &[PolicyRef],
+    policies: &[PolicyDecl],
 ) -> Result<(), Error> {
     for policy in policies {
-        if !uses.contains_key(policy.alias.as_str()) {
+        if !uses.contains_key(policy.policy.alias.as_str()) {
             return Err(Error::UnknownPolicyUse {
-                alias: policy.alias.clone(),
+                alias: policy.policy.alias.clone(),
             });
         }
     }
@@ -935,6 +935,21 @@ impl RawManifest {
         validate_component_manifest_refs(&r#use)?;
         validate_use_names(&r#use)?;
         validate_environment_names(&environments)?;
+        let policies = policies
+            .into_iter()
+            .map(|policy| -> Result<PolicyDecl, Error> {
+                match policy {
+                    RawPolicyDecl::Ref(policy) => Ok(PolicyDecl {
+                        policy: PolicyRef::from_str(&policy)?,
+                        args: None,
+                    }),
+                    RawPolicyDecl::Object(policy) => Ok(PolicyDecl {
+                        policy: PolicyRef::from_str(&policy.policy)?,
+                        args: policy.args,
+                    }),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         validate_policy_refs(&r#use, &policies)?;
 
         let components = convert_components(components)?;
@@ -1028,7 +1043,7 @@ pub struct Manifest {
     resources: BTreeMap<ResourceName, ResourceDecl>,
     child_templates: BTreeMap<TemplateName, ChildTemplateDecl>,
     bindings: Vec<ManifestBinding>,
-    policies: Vec<PolicyRef>,
+    policies: Vec<PolicyDecl>,
     exports: BTreeMap<ExportName, ExportTarget>,
     metadata: Option<Value>,
     digest: ManifestDigest,
@@ -1087,7 +1102,7 @@ impl Manifest {
         &self.bindings
     }
 
-    pub fn policies(&self) -> &[PolicyRef] {
+    pub fn policies(&self) -> &[PolicyDecl] {
         &self.policies
     }
 
@@ -1142,7 +1157,7 @@ impl Manifest {
         #[builder(default)] resources: BTreeMap<String, ResourceDecl>,
         #[builder(default)] child_templates: BTreeMap<String, ChildTemplateDecl>,
         #[builder(default)] bindings: Vec<RawBinding>,
-        #[builder(default)] policies: Vec<PolicyRef>,
+        #[builder(default)] policies: Vec<PolicyDecl>,
         #[builder(default)] exports: BTreeMap<String, RawExportTarget>,
         metadata: Option<Value>,
     ) -> Result<Self, Error> {
@@ -1161,7 +1176,15 @@ impl Manifest {
             resources,
             child_templates,
             bindings,
-            policies,
+            policies: policies
+                .into_iter()
+                .map(|policy| {
+                    RawPolicyDecl::Object(RawPolicyDeclObject {
+                        policy: policy.policy.to_string(),
+                        args: policy.args,
+                    })
+                })
+                .collect(),
             exports,
             metadata,
         }
@@ -1298,7 +1321,16 @@ impl From<&Manifest> for RawManifest {
             resources,
             child_templates,
             bindings,
-            policies: manifest.policies.clone(),
+            policies: manifest
+                .policies
+                .iter()
+                .map(|policy| {
+                    RawPolicyDecl::Object(RawPolicyDeclObject {
+                        policy: policy.policy.to_string(),
+                        args: policy.args.clone(),
+                    })
+                })
+                .collect(),
             exports,
             metadata: manifest.metadata.clone(),
         }

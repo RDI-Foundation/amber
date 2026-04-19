@@ -4,7 +4,6 @@ import os
 import socketserver
 
 PORT = int(os.environ["PORT"])
-REDACTION_TERMS = json.loads(os.environ["REDACTION_TERMS"])
 REDACTOR_RUNTIME = r"""
 import json
 import os
@@ -62,17 +61,31 @@ with socketserver.TCPServer(("0.0.0.0", PORT), Handler) as httpd:
 """
 
 
-def interposition_for(target_id):
+def interposition_for(target_id, redaction_terms):
     upstream_url_template = "$" + "{slots.upstream.url}"
+    redaction_terms_template = "$" + "{config.redaction_terms}"
     return {
         "interposer": {
+            "config": {
+                "redaction_terms": redaction_terms,
+            },
+            "config_schema": {
+                "type": "object",
+                "properties": {
+                    "redaction_terms": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["redaction_terms"],
+            },
             "program": {
                 "path": "/usr/bin/env",
                 "args": ["python3", "-u", "-c", REDACTOR_RUNTIME],
                 "env": {
                     "PORT": "8130",
                     "UPSTREAM_URL": upstream_url_template,
-                    "REDACTION_TERMS": json.dumps(REDACTION_TERMS), # TODO: leaks the secret
+                    "REDACTION_TERMS": redaction_terms_template,
                 },
                 "network": {
                     "endpoints": [
@@ -105,14 +118,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length) if length else b"{}"
-        scope = json.loads(raw.decode("utf-8"))
+        request = json.loads(raw.decode("utf-8"))
+        scope = request.get("scope", {})
+        args = request.get("args", {}) or {}
+        redaction_terms = args.get("redaction_terms", [])
 
         interpositions = []
         for section in ("imports", "bindings", "exports"):
             for edge in scope.get(section, []):
                 capability = edge.get("capability", {})
                 if capability.get("kind") == "a2a":
-                    interpositions.append(interposition_for(edge["id"]))
+                    interpositions.append(interposition_for(edge["id"], redaction_terms))
 
         body = json.dumps({"interpositions": interpositions}).encode("utf-8")
         self.send_response(200)

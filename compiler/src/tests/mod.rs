@@ -28,7 +28,7 @@ use crate::{
         BUNDLE_INDEX_NAME, BUNDLE_SCHEMA, BUNDLE_VERSION, BundleBuilder, BundleIndex, BundleLoader,
         BundleRequest,
     },
-    policy::{PolicyInput, PolicyOutput},
+    policy::{PolicyOutput, PolicyRequest},
     reporter::{Reporter as _, scenario_ir::ScenarioIrReporter},
 };
 
@@ -144,7 +144,7 @@ impl GovernanceSession for TestGovernanceSession {
     fn invoke_policy<'a>(
         &'a self,
         _policy_export: &'a amber_manifest::ExportName,
-        _input: &'a PolicyInput,
+        _request: &'a PolicyRequest,
     ) -> GovernanceFuture<'a, Result<PolicyOutput, GovernanceRuntimeError>> {
         Box::pin(async { Ok(PolicyOutput::default()) })
     }

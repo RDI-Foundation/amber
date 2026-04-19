@@ -4,7 +4,7 @@ use amber_manifest::ExportName;
 use thiserror::Error;
 
 use crate::{
-    policy::{PolicyInput, PolicyOutput},
+    policy::{PolicyOutput, PolicyRequest},
     reporter::CompiledScenario,
 };
 
@@ -35,7 +35,7 @@ pub trait GovernanceSession: Send + Sync {
     fn invoke_policy<'a>(
         &'a self,
         policy_export: &'a ExportName,
-        input: &'a PolicyInput,
+        request: &'a PolicyRequest,
     ) -> GovernanceFuture<'a, Result<PolicyOutput, GovernanceRuntimeError>>;
 
     fn finish(self: Box<Self>) -> GovernanceFuture<'static, Result<(), GovernanceRuntimeError>>;

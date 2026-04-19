@@ -724,6 +724,32 @@ impl FromStr for PolicyRef {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum RawPolicyDecl {
+    Ref(String),
+    Object(RawPolicyDeclObject),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct RawPolicyDeclObject {
+    pub policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct PolicyDecl {
+    pub policy: PolicyRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
+}
+
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
 )]

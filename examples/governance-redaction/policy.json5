@@ -1,14 +1,6 @@
 {
   manifest_version: "0.1.0",
 
-  config_schema: {
-    type: "object",
-    properties: {
-      secrets: { type: "array", items: { type: "string" } },
-    },
-    required: ["secrets"],
-  },
-
   program: {
     path: "/usr/bin/env",
     args: [
@@ -19,7 +11,6 @@
     ],
     env: {
       PORT: "8120",
-      REDACTION_TERMS: "${config.secrets}",
     },
     network: {
       endpoints: [

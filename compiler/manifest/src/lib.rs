@@ -38,11 +38,12 @@ pub use schema::{
     CapabilityTransport, ChildTemplateDecl, ChildTemplateLimitsDecl, ChildTemplateManifestDecl,
     ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EndpointPort, EnvironmentDecl,
     ExportTarget, LocalComponentRef, ManifestBinding, MountSource, Network, NetworkProtocol,
-    PolicyRef, Program, ProgramCommandKind, ProgramCommon, ProgramConfigUseSite, ProgramImage,
-    ProgramMount, ProgramNetworkRef, ProgramPath, ProgramVmField, ProvideDecl, RawBinding,
-    RawExportTarget, RawProgram, RawProgramCommon, RawProgramImage, RawProgramPath,
-    RawProgramVmField, RawVmCloudInit, RawVmProgram, RealmSelector, ResourceDecl, RuntimeBackend,
-    SlotDecl, VmCloudInit, VmEgress, VmNetwork, VmProgram, VmScalarU32,
+    PolicyDecl, PolicyRef, Program, ProgramCommandKind, ProgramCommon, ProgramConfigUseSite,
+    ProgramImage, ProgramMount, ProgramNetworkRef, ProgramPath, ProgramVmField, ProvideDecl,
+    RawBinding, RawExportTarget, RawPolicyDecl, RawPolicyDeclObject, RawProgram, RawProgramCommon,
+    RawProgramImage, RawProgramPath, RawProgramVmField, RawVmCloudInit, RawVmProgram,
+    RealmSelector, ResourceDecl, RuntimeBackend, SlotDecl, VmCloudInit, VmEgress, VmNetwork,
+    VmProgram, VmScalarU32,
 };
 pub use slot_query::{
     SlotQuery, SlotQueryError, SlotQueryValidation, SlotTarget, parse_slot_query,

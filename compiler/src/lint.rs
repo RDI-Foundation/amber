@@ -677,7 +677,7 @@ pub fn lint_manifest(
     let policy_referenced_uses: BTreeSet<_> = manifest
         .policies()
         .iter()
-        .map(|policy| policy.alias.as_str())
+        .map(|policy| policy.policy.alias.as_str())
         .collect();
 
     for use_name in manifest.uses().keys() {

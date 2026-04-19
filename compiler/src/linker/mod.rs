@@ -17,8 +17,8 @@ use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
     ComponentDecl, ComponentRef, ConfigSchema, ExportName, ExportTarget, InterpolatedPart,
-    InterpolatedString, InterpolationSource, Manifest, ManifestDigest, ManifestRef, PolicyRef,
-    ProgramConfigUseSite, RawManifest, framework_capability, span_for_json_pointer,
+    InterpolatedString, InterpolationSource, Manifest, ManifestDigest, ManifestRef, PolicyDecl,
+    PolicyRef, ProgramConfigUseSite, RawManifest, framework_capability, span_for_json_pointer,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
@@ -46,7 +46,7 @@ use crate::{
     DigestStore,
     config::analysis::ScenarioConfigAnalysis,
     frontend::{ResolvedNode, ResolvedTree, store::display_url},
-    governance::{Governance, GovernedScope},
+    governance::{Governance, GovernedPolicy, GovernedScope},
 };
 
 #[allow(unused_assignments)]
@@ -98,7 +98,7 @@ struct ScopeBuild {
     root_moniker: amber_scenario::Moniker,
     manifest_url: Url,
     uses: BTreeMap<String, ResolvedNode>,
-    policies: Vec<PolicyRef>,
+    policies: Vec<PolicyDecl>,
 }
 
 #[derive(Clone, Debug)]
@@ -430,6 +430,18 @@ pub enum Error {
         #[source_code]
         src: Option<NamedSource<Arc<str>>>,
         #[label(primary, "config declared here")]
+        span: Option<SourceSpan>,
+    },
+
+    #[error("invalid args for policy `{policy}` in {component_path}: {message}")]
+    #[diagnostic(code(compiler::invalid_policy_args))]
+    InvalidPolicyArgs {
+        component_path: String,
+        policy: String,
+        message: String,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "args declared here")]
         span: Option<SourceSpan>,
     },
 
@@ -879,6 +891,15 @@ fn compose_use_config(
     rc::compose_config_template(parsed, scope_template)
 }
 
+fn compose_policy_args(
+    args: &Value,
+    scope_template: &rc::RootConfigTemplate,
+    scope_schema: Option<&serde_json::Value>,
+) -> Result<rc::ConfigNode, rc::ConfigError> {
+    let parsed = crate::config::template::parse_instance_config_template(Some(args), scope_schema)?;
+    rc::compose_config_template(parsed, scope_template)
+}
+
 fn collect_config_ref_paths(node: &rc::ConfigNode) -> BTreeSet<String> {
     fn go(node: &rc::ConfigNode, out: &mut BTreeSet<String>) {
         use amber_template::TemplatePart;
@@ -913,9 +934,9 @@ fn governance_root_schema_for_paths(path_schemas: &BTreeMap<String, (Value, bool
     ) {
         match path.split_once('.') {
             Some((head, tail)) => {
-                let entry = props.entry(head.to_string()).or_insert_with(|| {
-                    serde_json::json!({ "type": "object", "properties": {} })
-                });
+                let entry = props
+                    .entry(head.to_string())
+                    .or_insert_with(|| serde_json::json!({ "type": "object", "properties": {} }));
                 if let Value::Object(obj) = entry {
                     obj.entry("properties")
                         .or_insert_with(|| Value::Object(serde_json::Map::new()));
@@ -924,7 +945,13 @@ fn governance_root_schema_for_paths(path_schemas: &BTreeMap<String, (Value, bool
                         _ => Vec::new(),
                     };
                     if let Some(Value::Object(nested_props)) = obj.get_mut("properties") {
-                        insert_path(nested_props, &mut nested_required, tail, leaf_schema, is_required);
+                        insert_path(
+                            nested_props,
+                            &mut nested_required,
+                            tail,
+                            leaf_schema,
+                            is_required,
+                        );
                     }
                     if !nested_required.is_empty() {
                         obj.insert("required".to_string(), Value::Array(nested_required));
@@ -948,7 +975,13 @@ fn governance_root_schema_for_paths(path_schemas: &BTreeMap<String, (Value, bool
     let mut properties = serde_json::Map::new();
     let mut required: Vec<Value> = Vec::new();
     for (path, (leaf_schema, is_required)) in path_schemas {
-        insert_path(&mut properties, &mut required, path, leaf_schema, *is_required);
+        insert_path(
+            &mut properties,
+            &mut required,
+            path,
+            leaf_schema,
+            *is_required,
+        );
     }
     let mut schema = serde_json::json!({ "type": "object", "properties": properties });
     if !required.is_empty() {
@@ -986,17 +1019,15 @@ fn build_governance(
                     let composed =
                         compose_use_config(raw_config, sa.template(), sa.component_schema())
                             .map_err(|err| {
-                                let (src, span) =
-                                    store.diagnostic_source(&scope.manifest_url).map_or(
-                                        (None, None),
-                                        |(src, spans)| {
-                                            let span = spans
-                                                .uses
-                                                .get(use_name.as_str())
-                                                .and_then(|s| s.config);
-                                            (Some(src), span)
-                                        },
-                                    );
+                                let (src, span) = store
+                                    .diagnostic_source(&scope.manifest_url)
+                                    .map_or((None, None), |(src, spans)| {
+                                        let span = spans
+                                            .uses
+                                            .get(use_name.as_str())
+                                            .and_then(|s| s.config);
+                                        (Some(src), span)
+                                    });
                                 Error::InvalidUseConfig {
                                     component_path: scope.root_moniker.to_string(),
                                     use_name: use_name.clone(),
@@ -1006,16 +1037,18 @@ fn build_governance(
                                 }
                             })?;
                     for path in collect_config_ref_paths(&composed) {
-                        governance_root_path_schemas.entry(path.clone()).or_insert_with(|| {
-                            let root_schema = sa.root_schema();
-                            let leaf = root_schema
-                                .and_then(|s| rc::schema_lookup_ref(s, &path).ok().cloned())
-                                .unwrap_or(Value::Bool(true));
-                            let is_required = root_schema
-                                .and_then(|s| rc::schema_path_is_required(s, &path).ok())
-                                .unwrap_or(false);
-                            (leaf, is_required)
-                        });
+                        governance_root_path_schemas
+                            .entry(path.clone())
+                            .or_insert_with(|| {
+                                let root_schema = sa.root_schema();
+                                let leaf = root_schema
+                                    .and_then(|s| rc::schema_lookup_ref(s, &path).ok().cloned())
+                                    .unwrap_or(Value::Bool(true));
+                                let is_required = root_schema
+                                    .and_then(|s| rc::schema_path_is_required(s, &path).ok())
+                                    .unwrap_or(false);
+                                (leaf, is_required)
+                            });
                     }
                     Some(composed.to_manifest_value())
                 }
@@ -1043,18 +1076,19 @@ fn build_governance(
 
         let mut policies = Vec::with_capacity(scope.policies.len());
         for (policy_index, policy) in scope.policies.iter().enumerate() {
+            let policy_ref = &policy.policy;
             let use_node = scope
                 .uses
-                .get(policy.alias.as_str())
+                .get(policy_ref.alias.as_str())
                 .expect("policy aliases are validated before resolution");
-            let endpoint =
-                resolve_policy_export(store, use_node, policy.export.as_str()).map_err(|()| {
+            let endpoint = resolve_policy_export(store, use_node, policy_ref.export.as_str())
+                .map_err(|()| {
                     let (src, span) =
                         policy_ref_decl_site(store, &scope.manifest_url, policy_index);
                     Error::PolicyExportUnresolved {
-                        policy: policy.to_string().into(),
-                        use_name: policy.alias.clone().into(),
-                        export: policy.export.clone().into(),
+                        policy: policy_ref.to_string().into(),
+                        use_name: policy_ref.alias.clone().into(),
+                        export: policy_ref.export.clone().into(),
                         src,
                         span,
                     }
@@ -1067,41 +1101,72 @@ fn build_governance(
                     let (src, span) =
                         policy_ref_decl_site(store, &scope.manifest_url, policy_index);
                     return Err(Error::InvalidPolicyExport {
-                        policy: policy.to_string().into(),
+                        policy: policy_ref.to_string().into(),
                         message: format!(
                             "must resolve to an `http` provide with profile `policy`, got `{decl}`"
                         )
                         .into(),
                         src,
                         span,
-                        related: policy_endpoint_related_spans(store, policy, &endpoint),
+                        related: policy_endpoint_related_spans(store, policy_ref, &endpoint),
                     });
                 }
                 ResolvedPolicyEndpoint::Slot { .. } => {
                     let (src, span) =
                         policy_ref_decl_site(store, &scope.manifest_url, policy_index);
                     return Err(Error::InvalidPolicyExport {
-                        policy: policy.to_string().into(),
+                        policy: policy_ref.to_string().into(),
                         message: "must resolve to a provide, not a slot".into(),
                         src,
                         span,
-                        related: policy_endpoint_related_spans(store, policy, &endpoint),
+                        related: policy_endpoint_related_spans(store, policy_ref, &endpoint),
                     });
                 }
             }
 
+            let args = match (policy.args.as_ref(), scope_ca) {
+                (Some(raw_args), Some(sa)) => Some(
+                    compose_policy_args(raw_args, sa.template(), sa.component_schema())
+                        .map_err(|err| {
+                            let (src, span) = store.diagnostic_source(&scope.manifest_url).map_or(
+                                (None, None),
+                                |(src, spans)| {
+                                    let span = spans
+                                        .policies
+                                        .get(policy_index)
+                                        .and_then(|s| s.args.or(s.policy).or(Some(s.whole)));
+                                    (Some(src), span)
+                                },
+                            );
+                            Error::InvalidPolicyArgs {
+                                component_path: scope.root_moniker.to_string(),
+                                policy: policy_ref.to_string(),
+                                message: err.to_string(),
+                                src,
+                                span,
+                            }
+                        })?
+                        .to_manifest_value(),
+                ),
+                (Some(raw_args), None) => Some(raw_args.clone()),
+                (None, _) => None,
+            };
+
             let child_name = use_child_names
-                .get(policy.alias.as_str())
+                .get(policy_ref.alias.as_str())
                 .expect("resolved policy alias should match a resolved use");
             let export_name = ExportName::try_from(format!("policy_{scope_index}_{policy_index}"))
                 .expect("synthetic governance export names are valid");
             governance_root_exports.insert(
                 export_name.to_string(),
-                format!("#{child_name}.{}", policy.export)
+                format!("#{child_name}.{}", policy_ref.export)
                     .parse()
                     .expect("synthetic governance exports should be valid"),
             );
-            policies.push(export_name);
+            policies.push(GovernedPolicy {
+                export: export_name,
+                args,
+            });
         }
 
         scopes.push(GovernedScope {

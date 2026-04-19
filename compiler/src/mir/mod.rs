@@ -366,6 +366,9 @@ fn is_realm_significant(
     manifests: &[Option<Arc<Manifest>>],
     child_index: &[BTreeMap<String, ComponentId>],
 ) -> bool {
+    if !manifest.policies().is_empty() {
+        return true;
+    }
     if !component.child_templates.is_empty() {
         return true;
     }

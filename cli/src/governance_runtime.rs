@@ -9,7 +9,7 @@ use std::{
 
 use amber_compiler::{
     GovernanceFuture, GovernanceRuntime, GovernanceRuntimeError, GovernanceSession,
-    policy::{PolicyInput, PolicyOutput},
+    policy::{PolicyOutput, PolicyRequest},
     reporter::CompiledScenario,
     run_plan::build_run_plan,
 };
@@ -22,7 +22,10 @@ use tokio::{
 };
 use url::Url;
 
-use crate::{mixed_run, run_inputs::{collect_run_interface, missing_required_root_inputs}};
+use crate::{
+    mixed_run,
+    run_inputs::{collect_run_interface, missing_required_root_inputs},
+};
 
 pub(crate) struct CliGovernanceRuntime {
     client: Client,
@@ -163,7 +166,7 @@ impl GovernanceSession for CliGovernanceSession {
     fn invoke_policy<'a>(
         &'a self,
         policy_export: &'a ExportName,
-        input: &'a PolicyInput,
+        request: &'a PolicyRequest,
     ) -> GovernanceFuture<'a, Result<PolicyOutput, GovernanceRuntimeError>> {
         Box::pin(async move {
             let url = self
@@ -177,7 +180,7 @@ impl GovernanceSession for CliGovernanceSession {
             let response = self
                 .client
                 .post(url.clone())
-                .json(input)
+                .json(request)
                 .send()
                 .await
                 .map_err(|err| {

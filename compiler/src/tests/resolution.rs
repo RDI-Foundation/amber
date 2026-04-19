@@ -860,19 +860,35 @@ async fn use_config_with_config_interpolation_compiles() {
 
     let compiler = compiler_with_noop_governance();
     let output = compiler
-        .compile(manifest_ref_for_path(&root_path), standard_compile_options())
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
         .await
         .expect("use config with config interpolation should compile");
 
-    let governance = output.governance.as_ref().expect("governance should be present");
+    let governance = output
+        .governance
+        .as_ref()
+        .expect("governance should be present");
     let root_id = governance.scenario.root;
     let root_digest = governance.scenario.component(root_id).digest;
-    let root_manifest = output.store.get(&root_digest).expect("governance root manifest in store");
-    let config_schema = root_manifest.config_schema().expect("governance root should have config schema");
+    let root_manifest = output
+        .store
+        .get(&root_digest)
+        .expect("governance root manifest in store");
+    let config_schema = root_manifest
+        .config_schema()
+        .expect("governance root should have config schema");
     // The governance root schema should expose the api_key path from the outer scenario
     let schema_value = &config_schema.0;
-    let props = schema_value.get("properties").expect("schema should have properties");
-    assert!(props.get("api_key").is_some(), "api_key should appear in governance root schema properties");
+    let props = schema_value
+        .get("properties")
+        .expect("schema should have properties");
+    assert!(
+        props.get("api_key").is_some(),
+        "api_key should appear in governance root schema properties"
+    );
 }
 
 #[tokio::test]
@@ -949,21 +965,131 @@ async fn use_config_with_config_interpolation_in_child_scope_compiles() {
 
     let compiler = compiler_with_noop_governance();
     let output = compiler
-        .compile(manifest_ref_for_path(&root_path), standard_compile_options())
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
         .await
         .expect("use config interpolation through child scope template should compile");
 
-    let governance = output.governance.as_ref().expect("governance should be present");
+    let governance = output
+        .governance
+        .as_ref()
+        .expect("governance should be present");
     let root_id = governance.scenario.root;
     let root_digest = governance.scenario.component(root_id).digest;
-    let root_manifest = output.store.get(&root_digest).expect("governance root manifest in store");
-    let config_schema = root_manifest.config_schema().expect("governance root should have config schema");
+    let root_manifest = output
+        .store
+        .get(&root_digest)
+        .expect("governance root manifest in store");
+    let config_schema = root_manifest
+        .config_schema()
+        .expect("governance root should have config schema");
     // The child scope's api_key config is threaded through the outer root_api_key config ref,
     // so the governance root schema should expose root_api_key (not api_key).
     let schema_value = &config_schema.0;
-    let props = schema_value.get("properties").expect("schema should have properties");
-    assert!(props.get("root_api_key").is_some(), "root_api_key should appear in governance root schema properties");
-    assert!(props.get("api_key").is_none(), "api_key is scoped to the child and should not appear directly in governance root schema");
+    let props = schema_value
+        .get("properties")
+        .expect("schema should have properties");
+    assert!(
+        props.get("root_api_key").is_some(),
+        "root_api_key should appear in governance root schema properties"
+    );
+    assert!(
+        props.get("api_key").is_none(),
+        "api_key is scoped to the child and should not appear directly in governance root schema"
+    );
+}
+
+#[tokio::test]
+async fn policy_args_are_composed_against_scope_config() {
+    let dir = tmp_dir("scenario-policy-args-compose");
+    let root_path = dir.path().join("root.json5");
+    let scope_path = dir.path().join("scope.json5");
+    let policy_path = dir.path().join("policy.json5");
+
+    write_file(
+        &policy_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "policy",
+            entrypoint: ["policy"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          exports: { apply: "apply" },
+        }
+        "#,
+    );
+    write_file(
+        &scope_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              config_schema: {{
+                type: "object",
+                properties: {{ hidden_secret: {{ type: "string" }} }},
+              }},
+              use: {{
+                policy_comp: {{
+                  manifest: "{policy}",
+                }},
+              }},
+              policies: [{{
+                policy: "#policy_comp.apply",
+                args: {{ secret: "${{config.hidden_secret}}" }},
+              }}],
+            }}
+            "##,
+            policy = file_url(&policy_path),
+        ),
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              config_schema: {{
+                type: "object",
+                properties: {{ root_secret: {{ type: "string" }} }},
+              }},
+              components: {{
+                scope: {{
+                  manifest: "{scope}",
+                  config: {{ hidden_secret: "${{config.root_secret}}" }},
+                }},
+              }},
+            }}
+            "##,
+            scope = file_url(&scope_path),
+        ),
+    );
+
+    let compiler = compiler_with_noop_governance();
+    let output = compiler
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect("policy args composition should compile");
+
+    let governance = output
+        .governance
+        .as_ref()
+        .expect("governance should be present");
+    assert_eq!(
+        governance.scopes[0].policies[0].args,
+        Some(serde_json::json!({
+            "secret": "${config.root_secret}",
+        }))
+    );
 }
 
 #[tokio::test]
@@ -1074,7 +1200,10 @@ async fn compile_resolves_policy_exports_from_use_entries() {
 
     let governance = output.governance.expect("governance should exist");
     assert_eq!(governance.scopes.len(), 1);
-    assert_eq!(governance.scopes[0].policies[0].as_str(), "policy_0_0");
+    assert_eq!(
+        governance.scopes[0].policies[0].export.as_str(),
+        "policy_0_0"
+    );
     assert_eq!(governance.scenario.exports.len(), 1);
     assert_eq!(
         governance.scenario.exports[0].capability.kind,
@@ -1149,7 +1278,10 @@ async fn compile_follows_child_exports_for_policies() {
         .unwrap();
 
     let governance = output.governance.expect("governance should exist");
-    assert_eq!(governance.scopes[0].policies[0].as_str(), "policy_0_0");
+    assert_eq!(
+        governance.scopes[0].policies[0].export.as_str(),
+        "policy_0_0"
+    );
     assert_eq!(governance.scenario.exports.len(), 1);
     assert_eq!(
         governance.scenario.exports[0].capability.kind,
@@ -1379,7 +1511,10 @@ async fn compile_attaches_governance_artifact_for_policy_uses() {
     assert_eq!(governance.scopes.len(), 1);
     assert_eq!(governance.scopes[0].root_moniker.as_str(), "/");
     assert_eq!(governance.scopes[0].policies.len(), 1);
-    assert_eq!(governance.scopes[0].policies[0].as_str(), "policy_0_0");
+    assert_eq!(
+        governance.scopes[0].policies[0].export.as_str(),
+        "policy_0_0"
+    );
     assert_eq!(governance.scenario.exports[0].name, "policy_0_0");
     assert_eq!(governance.scenario.components.iter().flatten().count(), 2);
 }

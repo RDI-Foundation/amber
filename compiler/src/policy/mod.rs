@@ -3,6 +3,7 @@ use std::{
     fmt,
 };
 
+use amber_config as rc;
 use amber_manifest::{
     CapabilityDecl, ExperimentalFeature, ProvideDecl, ProvideName, ResourceDecl, ResourceName,
     SlotDecl, SlotName,
@@ -15,6 +16,14 @@ use thiserror::Error;
 use crate::linker::program_lowering::validate_lowered_program_mounts;
 
 pub type PolicyInput = ScenarioScope;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyRequest {
+    pub scope: PolicyInput,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AttachmentId(pub u64);
@@ -88,6 +97,12 @@ pub struct Attachment {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterposerComponent {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_schema: Option<Value>,
     pub program: Option<Program>,
     #[serde(default)]
     pub slots: BTreeMap<SlotName, SlotDecl>,
@@ -148,6 +163,12 @@ pub enum ValidationError {
 
     #[error("interposer must declare a program")]
     MissingInterposerProgram,
+
+    #[error("interposer config requires config_schema")]
+    MissingInterposerConfigSchema,
+
+    #[error("interposer config_schema is invalid: {message}")]
+    InvalidInterposerConfigSchema { message: String },
 }
 
 pub fn validate_policy_output(
@@ -240,6 +261,17 @@ fn validate_interposer_component(
     component: &InterposerComponent,
     enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<(), ValidationError> {
+    if component.config.is_some() && component.config_schema.is_none() {
+        return Err(ValidationError::MissingInterposerConfigSchema);
+    }
+    if let Some(schema) = component.config_schema.as_ref() {
+        rc::validate_config_schema(schema).map_err(|err| {
+            ValidationError::InvalidInterposerConfigSchema {
+                message: err.to_string(),
+            }
+        })?;
+    }
+
     let Some(program) = component.program.as_ref() else {
         return Err(ValidationError::MissingInterposerProgram);
     };
@@ -342,6 +374,8 @@ mod tests {
         PolicyOutput {
             interpositions: vec![Interposition {
                 interposer: InterposerComponent {
+                    config: None,
+                    config_schema: None,
                     program: Some(Program::Path(ProgramPath {
                         path: "./interposer".to_string(),
                         args: amber_manifest::ProgramEntrypoint::default(),
@@ -509,6 +543,23 @@ mod tests {
         )
         .expect_err("missing interposer program must be rejected");
         assert_eq!(err, ValidationError::MissingInterposerProgram);
+    }
+
+    #[test]
+    fn validation_rejects_interposer_config_without_schema() {
+        let mut output = valid_output();
+        output.interpositions[0].interposer.config = Some(serde_json::json!({
+            "secret": "${config.secret}",
+        }));
+
+        let err = validate_policy_output(
+            &output,
+            &scope_with_binding(http_capability()),
+            &BTreeSet::new(),
+        )
+        .expect_err("interposer config without schema must be rejected");
+
+        assert_eq!(err, ValidationError::MissingInterposerConfigSchema);
     }
 
     #[test]
