@@ -1855,6 +1855,75 @@ async fn compile_attaches_governance_artifact_for_policy_uses() {
 }
 
 #[tokio::test]
+async fn compile_governance_artifact_ignores_unreferenced_use_entries() {
+    let dir = tmp_dir("compile-governance-referenced-uses-only");
+    let root_path = dir.path().join("root.json5");
+    let wrapper_path = dir.path().join("wrapper.json5");
+    let unused_path = dir.path().join("unused.json5");
+
+    write_file(
+        &wrapper_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "wrapper",
+            entrypoint: ["wrapper"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { rewrite: { kind: "http", profile: "policy", endpoint: "api" } },
+          exports: { rewrite: "rewrite" },
+        }
+        "#,
+    );
+    write_file(&unused_path, r#"{ manifest_version: "0.1.0" }"#);
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              use: {{
+                wrapper: "{wrapper}",
+                unused: {{
+                  manifest: "{unused}",
+                  config: {{ broken: "${{config.missing}}" }},
+                }},
+              }},
+              policies: ["#wrapper.rewrite"],
+            }}
+            "##,
+            wrapper = file_url(&wrapper_path),
+            unused = file_url(&unused_path),
+        ),
+    );
+
+    let output = compiler_with_noop_governance()
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect("unreferenced governance uses should not block compilation");
+
+    let governance = output
+        .governance
+        .as_ref()
+        .expect("governance artifact should be attached");
+    assert_eq!(governance.scenario.components.iter().flatten().count(), 2);
+
+    let root_id = governance.scenario.root;
+    let root_digest = governance.scenario.component(root_id).digest;
+    let root_manifest = output
+        .store
+        .get(&root_digest)
+        .expect("governance root manifest in store");
+    assert!(root_manifest.components().contains_key("use_0_0"));
+    assert!(!root_manifest.components().contains_key("use_0_1"));
+}
+
+#[tokio::test]
 async fn used_manifest_rejects_nested_governance() {
     let dir = tmp_dir("scenario-use-nested-governance");
     let root_path = dir.path().join("root.json5");

@@ -1032,9 +1032,19 @@ fn build_governance(
 
     for (scope_index, scope) in scope_builds.iter().enumerate() {
         let scope_ca = config_analysis.component(scope.root_id);
+        let referenced_uses: BTreeSet<&str> = scope
+            .policies
+            .iter()
+            .map(|policy| policy.policy.alias.as_str())
+            .collect();
 
         let mut use_child_names = BTreeMap::new();
-        for (use_index, (use_name, use_node)) in scope.uses.iter().enumerate() {
+        for (use_index, (use_name, use_node)) in scope
+            .uses
+            .iter()
+            .filter(|(use_name, _)| referenced_uses.contains(use_name.as_str()))
+            .enumerate()
+        {
             let child_name = format!("use_{scope_index}_{use_index}");
             let composed_config = match (use_node.config.as_ref(), scope_ca) {
                 (Some(raw_config), Some(sa)) => {
