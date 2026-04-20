@@ -940,6 +940,12 @@ fn governance_policy_display_name(scope_root: &Moniker, alias: &str) -> String {
 }
 
 fn governance_root_schema_for_paths(root_schema: &Value, paths: &BTreeSet<String>) -> Value {
+    // An empty path is the internal sentinel for `${config}` / `$${config}`, meaning the policy
+    // needs the whole root object rather than a property literally named `""`.
+    if paths.contains("") {
+        return root_schema.clone();
+    }
+
     fn insert_path(
         props: &mut serde_json::Map<String, Value>,
         required: &mut Vec<Value>,

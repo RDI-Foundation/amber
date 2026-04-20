@@ -1111,6 +1111,149 @@ async fn policy_symbolic_config_is_composed_against_scope_config() {
 }
 
 #[tokio::test]
+async fn governance_root_schema_uses_full_root_schema_for_whole_config_ref() {
+    assert_governance_root_schema_for_whole_config_ref("${config}").await;
+}
+
+#[tokio::test]
+async fn governance_root_schema_uses_full_root_schema_for_symbolic_whole_config_ref() {
+    assert_governance_root_schema_for_whole_config_ref("$${config}").await;
+}
+
+async fn assert_governance_root_schema_for_whole_config_ref(policy_config_ref: &str) {
+    let dir = tmp_dir("scenario-governance-whole-root-config");
+    let root_path = dir.path().join("root.json5");
+    let scope_path = dir.path().join("scope.json5");
+    let policy_path = dir.path().join("policy.json5");
+
+    write_file(
+        &policy_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              snapshot: {
+                type: "object",
+                properties: {
+                  key: { type: "string" },
+                  nested: {
+                    type: "object",
+                    properties: {
+                      flag: { type: "boolean" },
+                    },
+                    required: ["flag"],
+                  },
+                },
+                required: ["key", "nested"],
+              },
+            },
+            required: ["snapshot"],
+          },
+          program: {
+            image: "policy",
+            entrypoint: ["policy"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          exports: { apply: "apply" },
+        }
+        "#,
+    );
+    write_file(
+        &scope_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              use: {{
+                policy_comp: {{
+                  manifest: "{policy}",
+                  config: {{ snapshot: "{policy_config_ref}" }},
+                }},
+              }},
+              policies: ["#policy_comp.apply"],
+            }}
+            "##,
+            policy = file_url(&policy_path),
+        ),
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r#"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              config_schema: {{
+                type: "object",
+                properties: {{
+                  key: {{ type: "string" }},
+                  nested: {{
+                    type: "object",
+                    properties: {{
+                      flag: {{ type: "boolean" }},
+                    }},
+                    required: ["flag"],
+                  }},
+                }},
+                required: ["key", "nested"],
+              }},
+              components: {{
+                scope: {{ manifest: "{scope}" }},
+              }},
+            }}
+            "#,
+            scope = file_url(&scope_path),
+        ),
+    );
+
+    let compiler = compiler_with_noop_governance();
+    let output = compiler
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect("whole-root governance config should compile");
+
+    let governance = output
+        .governance
+        .as_ref()
+        .expect("governance should be present");
+    let root_id = governance.scenario.root;
+    let root_digest = governance.scenario.component(root_id).digest;
+    let root_manifest = output
+        .store
+        .get(&root_digest)
+        .expect("governance root manifest in store");
+    let config_schema = root_manifest
+        .config_schema()
+        .expect("governance root should have config schema");
+
+    assert_eq!(
+        config_schema.0,
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "key": { "type": "string" },
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "flag": { "type": "boolean" },
+                    },
+                    "required": ["flag"],
+                },
+            },
+            "required": ["key", "nested"],
+        }),
+        "whole-root config ref should reuse the full root schema",
+    );
+}
+
+#[tokio::test]
 async fn governance_root_schema_handles_overlapping_config_paths() {
     let dir = tmp_dir("scenario-governance-overlapping-paths");
     let root_path = dir.path().join("root.json5");
