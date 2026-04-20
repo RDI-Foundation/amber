@@ -13,17 +13,13 @@
   use: {
     redaction: {
       manifest: "./policy.json5",
+      config: {
+        redaction_term: "$${config.secret}",
+      },
     },
   },
 
-  policies: [
-    {
-      policy: "#redaction.apply",
-      args: {
-        redaction_terms: ["${config.secret}"],
-      },
-    },
-  ],
+  policies: ["#redaction.apply"],
 
   components: {
     responder: "./a2a-responder.json5",

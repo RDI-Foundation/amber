@@ -253,6 +253,10 @@ fn eval_config_node_with_behavior(
                 "config.{path} not found (missing key in runtime config)"
             ))),
         },
+        ConfigTemplate::SymbolicConfigRef { path } => {
+            Ok(Some(Value::String(format!("${{config.{path}}}"))))
+        }
+        ConfigTemplate::SymbolicString { value } => Ok(Some(Value::String(value.clone()))),
         ConfigTemplate::TemplateString { parts } => render_template_string_with_behavior(
             parts,
             root_config,

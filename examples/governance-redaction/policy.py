@@ -4,6 +4,7 @@ import os
 import socketserver
 
 PORT = int(os.environ["PORT"])
+REDACTION_TERM = os.environ["REDACTION_TERM"]
 REDACTOR_RUNTIME = r"""
 import json
 import os
@@ -13,13 +14,12 @@ from http.server import BaseHTTPRequestHandler
 
 PORT = int(os.environ["PORT"])
 UPSTREAM_URL = os.environ["UPSTREAM_URL"]
-REDACTION_TERMS = json.loads(os.environ.get("REDACTION_TERMS", "[]"))
+REDACTION_TERM = os.environ["REDACTION_TERM"]
 
 
 def redact(payload):
     text = payload.decode("utf-8")
-    for term in REDACTION_TERMS:
-        text = text.replace(term, "[REDACTED]")
+    text = text.replace(REDACTION_TERM, "[REDACTED]")
     return text.encode("utf-8")
 
 
@@ -61,23 +61,20 @@ with socketserver.TCPServer(("0.0.0.0", PORT), Handler) as httpd:
 """
 
 
-def interposition_for(target_id, redaction_terms):
+def interposition_for(target_id, redaction_term):
     upstream_url_template = "$" + "{slots.upstream.url}"
-    redaction_terms_template = "$" + "{config.redaction_terms}"
+    redaction_term_template = "$" + "{config.redaction_term}"
     return {
         "interposer": {
             "config": {
-                "redaction_terms": redaction_terms,
+                "redaction_term": redaction_term,
             },
             "config_schema": {
                 "type": "object",
                 "properties": {
-                    "redaction_terms": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
+                    "redaction_term": {"type": "string"},
                 },
-                "required": ["redaction_terms"],
+                "required": ["redaction_term"],
             },
             "program": {
                 "path": "/usr/bin/env",
@@ -85,7 +82,7 @@ def interposition_for(target_id, redaction_terms):
                 "env": {
                     "PORT": "8130",
                     "UPSTREAM_URL": upstream_url_template,
-                    "REDACTION_TERMS": redaction_terms_template,
+                    "REDACTION_TERM": redaction_term_template,
                 },
                 "network": {
                     "endpoints": [
@@ -120,15 +117,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b"{}"
         request = json.loads(raw.decode("utf-8"))
         scope = request.get("scope", {})
-        args = request.get("args", {}) or {}
-        redaction_terms = args.get("redaction_terms", [])
 
         interpositions = []
         for section in ("imports", "bindings", "exports"):
             for edge in scope.get(section, []):
                 capability = edge.get("capability", {})
                 if capability.get("kind") == "a2a":
-                    interpositions.append(interposition_for(edge["id"], redaction_terms))
+                    interpositions.append(interposition_for(edge["id"], REDACTION_TERM))
 
         body = json.dumps({"interpositions": interpositions}).encode("utf-8")
         self.send_response(200)

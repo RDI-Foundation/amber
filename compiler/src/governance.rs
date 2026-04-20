@@ -1,6 +1,5 @@
 use amber_manifest::ExportName;
 use amber_scenario::{Moniker, Scenario};
-use serde_json::Value;
 
 use crate::Provenance;
 
@@ -20,5 +19,4 @@ pub struct GovernedScope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GovernedPolicy {
     pub export: ExportName,
-    pub args: Option<Value>,
 }

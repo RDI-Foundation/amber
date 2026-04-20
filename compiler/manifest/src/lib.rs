@@ -40,10 +40,9 @@ pub use schema::{
     ExportTarget, LocalComponentRef, ManifestBinding, MountSource, Network, NetworkProtocol,
     PolicyDecl, PolicyRef, Program, ProgramCommandKind, ProgramCommon, ProgramConfigUseSite,
     ProgramImage, ProgramMount, ProgramNetworkRef, ProgramPath, ProgramVmField, ProvideDecl,
-    RawBinding, RawExportTarget, RawPolicyDecl, RawPolicyDeclObject, RawProgram, RawProgramCommon,
-    RawProgramImage, RawProgramPath, RawProgramVmField, RawVmCloudInit, RawVmProgram,
-    RealmSelector, ResourceDecl, RuntimeBackend, SlotDecl, VmCloudInit, VmEgress, VmNetwork,
-    VmProgram, VmScalarU32,
+    RawBinding, RawExportTarget, RawPolicyDecl, RawProgram, RawProgramCommon, RawProgramImage,
+    RawProgramPath, RawProgramVmField, RawVmCloudInit, RawVmProgram, RealmSelector, ResourceDecl,
+    RuntimeBackend, SlotDecl, VmCloudInit, VmEgress, VmNetwork, VmProgram, VmScalarU32,
 };
 pub use slot_query::{
     SlotQuery, SlotQueryError, SlotQueryValidation, SlotTarget, parse_slot_query,

@@ -227,6 +227,8 @@ impl ConfigTemplatePayload {
 pub enum ConfigTemplate {
     Literal(Value),
     ConfigRef { path: String },
+    SymbolicConfigRef { path: String },
+    SymbolicString { value: String },
     TemplateString { parts: TemplateString },
     Object(BTreeMap<String, ConfigTemplate>),
     Array(Vec<ConfigTemplate>),
@@ -239,6 +241,16 @@ impl ConfigTemplate {
             Self::ConfigRef { path } => {
                 let mut map = Map::new();
                 map.insert("$config".to_string(), Value::String(path.clone()));
+                Value::Object(map)
+            }
+            Self::SymbolicConfigRef { path } => {
+                let mut map = Map::new();
+                map.insert("$symbolic_config".to_string(), Value::String(path.clone()));
+                Value::Object(map)
+            }
+            Self::SymbolicString { value } => {
+                let mut map = Map::new();
+                map.insert("$symbolic_string".to_string(), Value::String(value.clone()));
                 Value::Object(map)
             }
             Self::TemplateString { parts } => {
@@ -279,6 +291,18 @@ impl ConfigTemplate {
                     return Err("$config value must be a string".to_string());
                 };
                 return Ok(Self::ConfigRef { path });
+            }
+            if let Some(value) = map.remove("$symbolic_config") {
+                let Value::String(path) = value else {
+                    return Err("$symbolic_config value must be a string".to_string());
+                };
+                return Ok(Self::SymbolicConfigRef { path });
+            }
+            if let Some(value) = map.remove("$symbolic_string") {
+                let Value::String(value) = value else {
+                    return Err("$symbolic_string value must be a string".to_string());
+                };
+                return Ok(Self::SymbolicString { value });
             }
             if let Some(value) = map.remove("$template") {
                 let parts: TemplateString =

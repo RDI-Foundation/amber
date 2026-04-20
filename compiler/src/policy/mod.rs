@@ -20,9 +20,6 @@ pub type PolicyInput = ScenarioScope;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyRequest {
     pub scope: PolicyInput,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub args: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

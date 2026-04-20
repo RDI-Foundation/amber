@@ -433,18 +433,6 @@ pub enum Error {
         span: Option<SourceSpan>,
     },
 
-    #[error("invalid args for policy `{policy}` in {component_path}: {message}")]
-    #[diagnostic(code(compiler::invalid_policy_args))]
-    InvalidPolicyArgs {
-        component_path: String,
-        policy: String,
-        message: String,
-        #[source_code]
-        src: Option<NamedSource<Arc<str>>>,
-        #[label(primary, "args declared here")]
-        span: Option<SourceSpan>,
-    },
-
     #[error("unsupported manifest feature `{feature}` in {component_path}")]
     #[diagnostic(code(linker::unsupported_feature))]
     UnsupportedManifestFeature {
@@ -891,21 +879,23 @@ fn compose_use_config(
     rc::compose_config_template(parsed, scope_template)
 }
 
-fn compose_policy_args(
-    args: &Value,
-    scope_template: &rc::RootConfigTemplate,
-    scope_schema: Option<&serde_json::Value>,
-) -> Result<rc::ConfigNode, rc::ConfigError> {
-    let parsed = crate::config::template::parse_instance_config_template(Some(args), scope_schema)?;
-    rc::compose_config_template(parsed, scope_template)
-}
-
 fn collect_config_ref_paths(node: &rc::ConfigNode) -> BTreeSet<String> {
     fn go(node: &rc::ConfigNode, out: &mut BTreeSet<String>) {
         use amber_template::TemplatePart;
         match node {
             rc::ConfigNode::ConfigRef(path) => {
                 out.insert(path.clone());
+            }
+            rc::ConfigNode::SymbolicConfigRef(path) => {
+                out.insert(path.clone());
+            }
+            rc::ConfigNode::SymbolicString(value) => {
+                let parsed = value.parse::<amber_manifest::InterpolatedString>().ok();
+                if let Some(parsed) = parsed {
+                    parsed.visit_config_uses(|path| {
+                        out.insert(path.to_string());
+                    });
+                }
             }
             rc::ConfigNode::StringTemplate(parts) => {
                 for part in parts {
@@ -1124,34 +1114,6 @@ fn build_governance(
                 }
             }
 
-            let args = match (policy.args.as_ref(), scope_ca) {
-                (Some(raw_args), Some(sa)) => Some(
-                    compose_policy_args(raw_args, sa.template(), sa.component_schema())
-                        .map_err(|err| {
-                            let (src, span) = store.diagnostic_source(&scope.manifest_url).map_or(
-                                (None, None),
-                                |(src, spans)| {
-                                    let span = spans
-                                        .policies
-                                        .get(policy_index)
-                                        .and_then(|s| s.args.or(s.policy).or(Some(s.whole)));
-                                    (Some(src), span)
-                                },
-                            );
-                            Error::InvalidPolicyArgs {
-                                component_path: scope.root_moniker.to_string(),
-                                policy: policy_ref.to_string(),
-                                message: err.to_string(),
-                                src,
-                                span,
-                            }
-                        })?
-                        .to_manifest_value(),
-                ),
-                (Some(raw_args), None) => Some(raw_args.clone()),
-                (None, _) => None,
-            };
-
             let child_name = use_child_names
                 .get(policy_ref.alias.as_str())
                 .expect("resolved policy alias should match a resolved use");
@@ -1165,7 +1127,6 @@ fn build_governance(
             );
             policies.push(GovernedPolicy {
                 export: export_name,
-                args,
             });
         }
 

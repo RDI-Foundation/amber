@@ -1002,8 +1002,8 @@ async fn use_config_with_config_interpolation_in_child_scope_compiles() {
 }
 
 #[tokio::test]
-async fn policy_args_are_composed_against_scope_config() {
-    let dir = tmp_dir("scenario-policy-args-compose");
+async fn policy_symbolic_config_is_composed_against_scope_config() {
+    let dir = tmp_dir("scenario-policy-symbolic-config-compose");
     let root_path = dir.path().join("root.json5");
     let scope_path = dir.path().join("scope.json5");
     let policy_path = dir.path().join("policy.json5");
@@ -1013,6 +1013,11 @@ async fn policy_args_are_composed_against_scope_config() {
         r#"
         {
           manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { redaction_term: { type: "string" } },
+            required: ["redaction_term"],
+          },
           program: {
             image: "policy",
             entrypoint: ["policy"],
@@ -1037,12 +1042,10 @@ async fn policy_args_are_composed_against_scope_config() {
               use: {{
                 policy_comp: {{
                   manifest: "{policy}",
+                  config: {{ redaction_term: "$${{config.hidden_secret}}" }},
                 }},
               }},
-              policies: [{{
-                policy: "#policy_comp.apply",
-                args: {{ secret: "${{config.hidden_secret}}" }},
-              }}],
+              policies: ["#policy_comp.apply"],
             }}
             "##,
             policy = file_url(&policy_path),
@@ -1078,16 +1081,31 @@ async fn policy_args_are_composed_against_scope_config() {
             standard_compile_options(),
         )
         .await
-        .expect("policy args composition should compile");
+        .expect("policy symbolic config composition should compile");
 
     let governance = output
         .governance
         .as_ref()
         .expect("governance should be present");
+    let root_id = governance.scenario.root;
+    let root_digest = governance.scenario.component(root_id).digest;
+    let root_manifest = output
+        .store
+        .get(&root_digest)
+        .expect("governance root manifest in store");
+    let policy_component = root_manifest
+        .components()
+        .get("use_0_0")
+        .expect("policy component should be present in governance root");
+    let amber_manifest::ComponentDecl::Object(policy_component) = policy_component else {
+        panic!("policy component should be in object form");
+    };
     assert_eq!(
-        governance.scopes[0].policies[0].args,
-        Some(serde_json::json!({
-            "secret": "${config.root_secret}",
+        policy_component.config.as_ref(),
+        Some(&serde_json::json!({
+            "redaction_term": {
+                "$symbolic_config": "root_secret",
+            },
         }))
     );
 }

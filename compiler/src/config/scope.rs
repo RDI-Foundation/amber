@@ -99,6 +99,16 @@ fn collect_config_refs(template: &rc::RootConfigTemplate) -> Option<BTreeSet<Str
             rc::ConfigNode::ConfigRef(path) => {
                 acc.insert(path.clone());
             }
+            rc::ConfigNode::SymbolicConfigRef(path) => {
+                acc.insert(path.clone());
+            }
+            rc::ConfigNode::SymbolicString(value) => {
+                if let Ok(parsed) = value.parse::<amber_manifest::InterpolatedString>() {
+                    parsed.visit_config_uses(|path| {
+                        acc.insert(path.to_string());
+                    });
+                }
+            }
             rc::ConfigNode::StringTemplate(parts) => {
                 for part in parts {
                     if let amber_template::TemplatePart::Config { config } = part {
@@ -258,6 +268,13 @@ fn prune_config_node(
                     allowed_leaf_paths,
                 )?));
             }
+            rc::ConfigNode::SymbolicConfigRef(root_path) => {
+                return Ok(Some(project_symbolic_config_ref(
+                    root_path,
+                    path,
+                    allowed_leaf_paths,
+                )?));
+            }
             rc::ConfigNode::Object(_) => {}
             _ => return Ok(Some(node.clone())),
         }
@@ -292,6 +309,11 @@ fn prune_config_node(
             }
         }
         rc::ConfigNode::ConfigRef(root_path) => Ok(Some(project_config_ref(
+            root_path,
+            path,
+            allowed_leaf_paths,
+        )?)),
+        rc::ConfigNode::SymbolicConfigRef(root_path) => Ok(Some(project_symbolic_config_ref(
             root_path,
             path,
             allowed_leaf_paths,
@@ -337,6 +359,29 @@ fn project_config_ref(
     }
 
     Ok(rc::ConfigNode::Object(out))
+}
+
+fn project_symbolic_config_ref(
+    root_path: &str,
+    prefix: &str,
+    allowed_leaf_paths: &BTreeSet<String>,
+) -> Result<rc::ConfigNode, String> {
+    let projected = project_config_ref(root_path, prefix, allowed_leaf_paths)?;
+    symbolic_projected_node(projected)
+}
+
+fn symbolic_projected_node(node: rc::ConfigNode) -> Result<rc::ConfigNode, String> {
+    match node {
+        rc::ConfigNode::ConfigRef(path) => Ok(rc::ConfigNode::SymbolicConfigRef(path)),
+        rc::ConfigNode::Object(map) => Ok(rc::ConfigNode::Object(
+            map.into_iter()
+                .map(|(key, value)| symbolic_projected_node(value).map(|value| (key, value)))
+                .collect::<Result<_, _>>()?,
+        )),
+        other => Err(format!(
+            "cannot project symbolic config ref through non-config node {other:?}"
+        )),
+    }
 }
 
 fn insert_config_node(

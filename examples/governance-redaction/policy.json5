@@ -1,6 +1,14 @@
 {
   manifest_version: "0.1.0",
 
+  config_schema: {
+    type: "object",
+    properties: {
+      redaction_term: { type: "string" },
+    },
+    required: ["redaction_term"],
+  },
+
   program: {
     path: "/usr/bin/env",
     args: [
@@ -11,6 +19,7 @@
     ],
     env: {
       PORT: "8120",
+      REDACTION_TERM: "${config.redaction_term}",
     },
     network: {
       endpoints: [

@@ -806,7 +806,7 @@ fn labels_for_policy_ref(spans: &ManifestSpans, input: &str) -> Vec<LabeledSpan>
         .policies
         .iter()
         .find(|policy| policy.value.as_deref() == Some(input))
-        .and_then(|policy| policy.policy.or(Some(policy.whole)));
+        .map(|policy| policy.whole);
     vec![primary(
         span_or_default(span),
         Some("policy ref here".to_string()),
@@ -824,7 +824,7 @@ fn labels_for_policy_use(spans: &ManifestSpans, alias: &str) -> Vec<LabeledSpan>
                 .as_deref()
                 .is_some_and(|value| value.starts_with(prefix.as_str()))
         })
-        .and_then(|policy| policy.policy.or(Some(policy.whole)));
+        .map(|policy| policy.whole);
     vec![primary(
         span_or_default(span),
         Some("unknown use referenced here".to_string()),

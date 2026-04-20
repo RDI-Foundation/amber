@@ -25,8 +25,8 @@ use crate::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ChildTemplateDecl,
         ChildTemplateManifestDecl, ComponentDecl, ConfigSchema, EnvironmentDecl, ExportTarget,
         LocalCapabilityRefKind, LocalComponentRef, ManifestBinding, MountSource, PolicyDecl,
-        PolicyRef, Program, ProvideDecl, RawBinding, RawExportTarget, RawPolicyDecl,
-        RawPolicyDeclObject, RawProgram, ResourceDecl, SlotDecl, VmScalarU32,
+        PolicyRef, Program, ProvideDecl, RawBinding, RawExportTarget, RawPolicyDecl, RawProgram,
+        ResourceDecl, SlotDecl, VmScalarU32,
     },
 };
 
@@ -938,16 +938,9 @@ impl RawManifest {
         let policies = policies
             .into_iter()
             .map(|policy| -> Result<PolicyDecl, Error> {
-                match policy {
-                    RawPolicyDecl::Ref(policy) => Ok(PolicyDecl {
-                        policy: PolicyRef::from_str(&policy)?,
-                        args: None,
-                    }),
-                    RawPolicyDecl::Object(policy) => Ok(PolicyDecl {
-                        policy: PolicyRef::from_str(&policy.policy)?,
-                        args: policy.args,
-                    }),
-                }
+                Ok(PolicyDecl {
+                    policy: PolicyRef::from_str(&policy.0)?,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         validate_policy_refs(&r#use, &policies)?;
@@ -1178,12 +1171,7 @@ impl Manifest {
             bindings,
             policies: policies
                 .into_iter()
-                .map(|policy| {
-                    RawPolicyDecl::Object(RawPolicyDeclObject {
-                        policy: policy.policy.to_string(),
-                        args: policy.args,
-                    })
-                })
+                .map(|policy| RawPolicyDecl(policy.policy.to_string()))
                 .collect(),
             exports,
             metadata,
@@ -1324,12 +1312,7 @@ impl From<&Manifest> for RawManifest {
             policies: manifest
                 .policies
                 .iter()
-                .map(|policy| {
-                    RawPolicyDecl::Object(RawPolicyDeclObject {
-                        policy: policy.policy.to_string(),
-                        args: policy.args.clone(),
-                    })
-                })
+                .map(|policy| RawPolicyDecl(policy.policy.to_string()))
                 .collect(),
             exports,
             metadata: manifest.metadata.clone(),

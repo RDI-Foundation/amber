@@ -15,6 +15,8 @@ pub enum ConfigNode {
     Object(BTreeMap<String, ConfigNode>),
 
     ConfigRef(String),
+    SymbolicConfigRef(String),
+    SymbolicString(String),
     StringTemplate(TemplateString),
 }
 
@@ -30,6 +32,7 @@ impl ConfigNode {
     pub fn contains_runtime(&self) -> bool {
         match self {
             Self::ConfigRef(_) => true,
+            Self::SymbolicConfigRef(_) => true,
             Self::StringTemplate(parts) => template_string_is_runtime(parts),
             Self::Array(items) => items.iter().any(|n| n.contains_runtime()),
             Self::Object(map) => map.values().any(|n| n.contains_runtime()),
@@ -52,6 +55,12 @@ impl ConfigNode {
                     .collect(),
             ),
             Self::ConfigRef(path) => ConfigTemplate::ConfigRef { path: path.clone() },
+            Self::SymbolicConfigRef(path) => {
+                ConfigTemplate::SymbolicConfigRef { path: path.clone() }
+            }
+            Self::SymbolicString(value) => ConfigTemplate::SymbolicString {
+                value: value.clone(),
+            },
             Self::StringTemplate(parts) => ConfigTemplate::TemplateString {
                 parts: parts.clone(),
             },
@@ -82,6 +91,8 @@ impl ConfigNode {
                 "cannot evaluate runtime config reference {:?} at compile time",
                 path
             ))),
+            Self::SymbolicConfigRef(path) => Ok(Value::String(format!("${{config.{path}}}"))),
+            Self::SymbolicString(value) => Ok(Value::String(value.clone())),
             Self::StringTemplate(parts) => {
                 if template_string_is_runtime(parts) {
                     return Err(ConfigError::interp(
@@ -103,6 +114,8 @@ impl ConfigNode {
     pub fn static_subset(&self) -> Option<Value> {
         match self {
             Self::ConfigRef(_) => None,
+            Self::SymbolicConfigRef(path) => Some(Value::String(format!("${{config.{path}}}"))),
+            Self::SymbolicString(value) => Some(Value::String(value.clone())),
             Self::StringTemplate(parts) => {
                 if template_string_is_runtime(parts) {
                     None
@@ -166,6 +179,13 @@ impl ConfigNode {
                         path, seg
                     )));
                 }
+                Self::SymbolicConfigRef(_) | Self::SymbolicString(_) => {
+                    return Err(ConfigError::interp(format!(
+                        "config path {:?} is string-valued; cannot descend into {:?} at compile \
+                         time",
+                        path, seg
+                    )));
+                }
                 _ => {
                     return Err(ConfigError::interp(format!(
                         "config path {:?} not found (encountered non-object before segment {:?})",
@@ -187,6 +207,11 @@ impl ConfigNode {
             Self::Bool(b) => Value::Bool(*b),
             Self::Number(n) => Value::Number(n.clone()),
             Self::String(s) => Value::String(s.clone()),
+            Self::SymbolicString(value) => Value::Object(
+                [("$symbolic_string".to_string(), Value::String(value.clone()))]
+                    .into_iter()
+                    .collect(),
+            ),
             Self::Array(items) => {
                 Value::Array(items.iter().map(|n| n.to_manifest_value()).collect())
             }
@@ -196,6 +221,11 @@ impl ConfigNode {
                     .collect(),
             ),
             Self::ConfigRef(path) => Value::String(format!("${{config.{path}}}")),
+            Self::SymbolicConfigRef(path) => Value::Object(
+                [("$symbolic_config".to_string(), Value::String(path.clone()))]
+                    .into_iter()
+                    .collect(),
+            ),
             Self::StringTemplate(parts) => {
                 let mut s = String::new();
                 for part in parts {
@@ -277,6 +307,10 @@ fn resolve_against_parent(parent: &RootConfigTemplate, parent_path: &str) -> Res
 fn inline_as_template_parts(node: &ConfigNode) -> Result<TemplateString> {
     match node {
         ConfigNode::ConfigRef(path) => Ok(vec![TemplatePart::config(path.clone())]),
+        ConfigNode::SymbolicConfigRef(path) => {
+            Ok(vec![TemplatePart::lit(format!("${{config.{path}}}"))])
+        }
+        ConfigNode::SymbolicString(value) => Ok(vec![TemplatePart::lit(value.clone())]),
         ConfigNode::StringTemplate(parts) => Ok(parts.clone()),
         _ if !node.contains_runtime() => {
             let value = node.evaluate_static()?;
@@ -299,6 +333,11 @@ pub fn compose_config_template(
     fn go(node: ConfigNode, parent: &RootConfigTemplate) -> Result<ConfigNode> {
         match node {
             ConfigNode::ConfigRef(parent_path) => resolve_against_parent(parent, &parent_path),
+            ConfigNode::SymbolicConfigRef(parent_path) => {
+                let resolved = resolve_against_parent(parent, &parent_path)?;
+                symbolic_literalize(resolved)
+            }
+            ConfigNode::SymbolicString(value) => Ok(ConfigNode::SymbolicString(value)),
             ConfigNode::StringTemplate(parts) => {
                 let mut out: TemplateString = Vec::new();
                 for part in parts {
@@ -348,4 +387,34 @@ pub fn compose_config_template(
     }
 
     go(child, parent)
+}
+
+fn symbolic_literalize(node: ConfigNode) -> Result<ConfigNode> {
+    match node {
+        ConfigNode::ConfigRef(path) => Ok(ConfigNode::SymbolicConfigRef(path)),
+        ConfigNode::SymbolicConfigRef(path) => Ok(ConfigNode::SymbolicConfigRef(path)),
+        ConfigNode::SymbolicString(value) => Ok(ConfigNode::SymbolicString(value)),
+        ConfigNode::StringTemplate(parts) => {
+            let mut value = String::new();
+            for part in parts {
+                match part {
+                    TemplatePart::Lit { lit } => value.push_str(&lit),
+                    TemplatePart::Config { config } => {
+                        value.push_str(&format!("${{config.{config}}}"));
+                    }
+                    TemplatePart::Slot { .. }
+                    | TemplatePart::Item { .. }
+                    | TemplatePart::CurrentItem { .. } => {
+                        return Err(ConfigError::interp(
+                            "symbolic config interpolation cannot include slot/item template parts",
+                        ));
+                    }
+                }
+            }
+            Ok(ConfigNode::SymbolicString(value))
+        }
+        other => Ok(ConfigNode::String(stringify_for_interpolation(
+            &other.evaluate_static()?,
+        )?)),
+    }
 }

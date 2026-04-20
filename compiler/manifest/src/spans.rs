@@ -67,8 +67,6 @@ pub struct ComponentDeclSpans {
 pub struct PolicyRefSpans {
     pub whole: SourceSpan,
     pub value: Option<Arc<str>>,
-    pub policy: Option<SourceSpan>,
-    pub args: Option<SourceSpan>,
 }
 
 #[derive(Clone, Debug)]
@@ -589,22 +587,9 @@ fn collect_policies(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &
 
     for (idx, policy_value) in policy_values.iter().enumerate() {
         let whole = span_or_default(policies.index_span(idx));
-        let policy = policies
-            .index_cursor(idx)
-            .and_then(|cursor| cursor.child_span("policy"));
-        let args = policies
-            .index_cursor(idx)
-            .and_then(|cursor| cursor.child_span("args"));
         out.policies.push(PolicyRefSpans {
             whole,
-            value: policy_value.as_str().map(Into::into).or_else(|| {
-                policy_value
-                    .get("policy")
-                    .and_then(Value::as_str)
-                    .map(Into::into)
-            }),
-            policy,
-            args,
+            value: policy_value.as_str().map(Into::into),
         });
     }
 }

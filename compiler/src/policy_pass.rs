@@ -185,7 +185,6 @@ async fn collect_policy_outputs(
                 let policy_export = policy.export.clone();
                 let request = PolicyRequest {
                     scope: input.clone(),
-                    args: policy.args.clone(),
                 };
                 let input = input.clone();
                 let targets = targets.clone();
@@ -1276,7 +1275,6 @@ mod tests {
     fn governed_policy(name: &str) -> crate::governance::GovernedPolicy {
         crate::governance::GovernedPolicy {
             export: ExportName::try_from(name).expect("valid export name"),
-            args: None,
         }
     }
 
