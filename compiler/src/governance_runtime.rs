@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{collections::BTreeMap, future::Future, pin::Pin};
 
 use amber_manifest::ExportName;
 use thiserror::Error;
@@ -28,6 +28,7 @@ pub trait GovernanceRuntime: Send + Sync {
     fn start<'a>(
         &'a self,
         compiled: &'a CompiledScenario,
+        policy_display_names: &'a BTreeMap<String, String>,
     ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>>;
 }
 

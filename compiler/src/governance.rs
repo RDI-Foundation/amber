@@ -19,4 +19,5 @@ pub struct GovernedScope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GovernedPolicy {
     pub export: ExportName,
+    pub display_name: String,
 }

@@ -41,6 +41,7 @@ impl GovernanceRuntime for ManagerGovernanceRuntime {
     fn start<'a>(
         &'a self,
         _compiled: &'a CompiledScenario,
+        _policy_display_names: &'a BTreeMap<String, String>,
     ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>> {
         Box::pin(async {
             Err(GovernanceRuntimeError::message(

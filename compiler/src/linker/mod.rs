@@ -22,7 +22,7 @@ use amber_manifest::{
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
-    FrameworkRef, ManifestCatalogEntry, ProgramMount, ProvideRef,
+    FrameworkRef, ManifestCatalogEntry, Moniker, ProgramMount, ProvideRef,
     ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
     StorageResourceParams as ScenarioStorageResourceParams, TemplateBinding, TemplateConfigField,
     graph::component_path_for,
@@ -914,7 +914,32 @@ fn collect_config_ref_paths(node: &rc::ConfigNode) -> BTreeSet<String> {
     paths
 }
 
-fn governance_root_schema_for_paths(path_schemas: &BTreeMap<String, (Value, bool)>) -> Value {
+/// Drop paths subsumed by a shorter prefix (e.g. "api.key" when "api" is present).
+fn normalize_config_paths(paths: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut result = BTreeSet::new();
+    let mut last_prefix: Option<&str> = None;
+    for path in paths {
+        if let Some(prefix) = last_prefix
+            && path.starts_with(prefix)
+            && path.as_bytes().get(prefix.len()) == Some(&b'.')
+        {
+            continue;
+        }
+        last_prefix = Some(path.as_str());
+        result.insert(path.clone());
+    }
+    result
+}
+
+fn governance_policy_display_name(scope_root: &Moniker, alias: &str) -> String {
+    if scope_root.as_str() == "/" {
+        format!("/{alias}")
+    } else {
+        format!("{}/{alias}", scope_root.as_str())
+    }
+}
+
+fn governance_root_schema_for_paths(root_schema: &Value, paths: &BTreeSet<String>) -> Value {
     fn insert_path(
         props: &mut serde_json::Map<String, Value>,
         required: &mut Vec<Value>,
@@ -964,14 +989,15 @@ fn governance_root_schema_for_paths(path_schemas: &BTreeMap<String, (Value, bool
 
     let mut properties = serde_json::Map::new();
     let mut required: Vec<Value> = Vec::new();
-    for (path, (leaf_schema, is_required)) in path_schemas {
-        insert_path(
-            &mut properties,
-            &mut required,
-            path,
-            leaf_schema,
-            *is_required,
-        );
+    for path in paths {
+        let leaf = rc::schema_lookup_ref(root_schema, path)
+            .ok()
+            .cloned()
+            .unwrap_or(Value::Bool(true));
+        let is_required = rc::schema_path_is_required(root_schema, path)
+            .ok()
+            .unwrap_or(false);
+        insert_path(&mut properties, &mut required, path, &leaf, is_required);
     }
     let mut schema = serde_json::json!({ "type": "object", "properties": properties });
     if !required.is_empty() {
@@ -995,7 +1021,7 @@ fn build_governance(
     let mut governance_children = BTreeMap::new();
     let mut governance_root_components = BTreeMap::new();
     let mut governance_root_exports = BTreeMap::new();
-    let mut governance_root_path_schemas: BTreeMap<String, (Value, bool)> = BTreeMap::new();
+    let mut governance_root_config_paths: BTreeSet<String> = BTreeSet::new();
     let mut scopes = Vec::with_capacity(scope_builds.len());
 
     for (scope_index, scope) in scope_builds.iter().enumerate() {
@@ -1026,20 +1052,7 @@ fn build_governance(
                                     span,
                                 }
                             })?;
-                    for path in collect_config_ref_paths(&composed) {
-                        governance_root_path_schemas
-                            .entry(path.clone())
-                            .or_insert_with(|| {
-                                let root_schema = sa.root_schema();
-                                let leaf = root_schema
-                                    .and_then(|s| rc::schema_lookup_ref(s, &path).ok().cloned())
-                                    .unwrap_or(Value::Bool(true));
-                                let is_required = root_schema
-                                    .and_then(|s| rc::schema_path_is_required(s, &path).ok())
-                                    .unwrap_or(false);
-                                (leaf, is_required)
-                            });
-                    }
+                    governance_root_config_paths.extend(collect_config_ref_paths(&composed));
                     Some(composed.to_manifest_value())
                 }
                 _ => use_node.config.clone(),
@@ -1127,6 +1140,10 @@ fn build_governance(
             );
             policies.push(GovernedPolicy {
                 export: export_name,
+                display_name: governance_policy_display_name(
+                    &scope.root_moniker,
+                    &policy_ref.alias,
+                ),
             });
         }
 
@@ -1139,8 +1156,13 @@ fn build_governance(
     let mut raw_manifest = RawManifest::from(&Manifest::empty());
     raw_manifest.components = governance_root_components;
     raw_manifest.exports = governance_root_exports;
-    if !governance_root_path_schemas.is_empty() {
-        let schema = governance_root_schema_for_paths(&governance_root_path_schemas);
+    if !governance_root_config_paths.is_empty() {
+        let normalized = normalize_config_paths(&governance_root_config_paths);
+        let root_schema = config_analysis
+            .root_schema()
+            .cloned()
+            .unwrap_or(Value::Bool(true));
+        let schema = governance_root_schema_for_paths(&root_schema, &normalized);
         raw_manifest.config_schema = Some(
             ConfigSchema::new(schema)
                 .expect("synthetic governance root config schema should be valid"),

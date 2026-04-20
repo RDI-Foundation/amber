@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use amber_manifest::{CapabilityDecl, ExperimentalFeature, ExportName};
+use amber_manifest::{CapabilityDecl, ExperimentalFeature};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, ScenarioIr, ScenarioIrError, SlotRef,
@@ -110,7 +110,7 @@ pub enum Error {
     #[diagnostic(code(compiler::policy_pass_invoke_policy))]
     InvokePolicy {
         scope_root: Moniker,
-        policy: ExportName,
+        policy: String,
         #[source]
         source: GovernanceRuntimeError,
     },
@@ -119,7 +119,7 @@ pub enum Error {
     #[diagnostic(code(compiler::policy_pass_invalid_output))]
     InvalidPolicyOutput {
         scope_root: Moniker,
-        policy: ExportName,
+        policy: String,
         #[source]
         source: Box<ValidationError>,
     },
@@ -167,8 +167,14 @@ async fn collect_policy_outputs(
         &governance.provenance,
     )
     .map_err(|source| Error::CompileGovernance { source })?;
+    let policy_display_names = governance
+        .scopes
+        .iter()
+        .flat_map(|scope| scope.policies.iter())
+        .map(|policy| (policy.export.to_string(), policy.display_name.clone()))
+        .collect::<BTreeMap<_, _>>();
     let session = runtime
-        .start(&compiled)
+        .start(&compiled, &policy_display_names)
         .await
         .map_err(|source| Error::StartGovernance { source })?;
     let session_ref = session.as_ref();
@@ -183,6 +189,7 @@ async fn collect_policy_outputs(
                 let scope_root = scope.root_moniker.clone();
                 let policy_index_value = policy_index;
                 let policy_export = policy.export.clone();
+                let policy_display_name = policy.display_name.clone();
                 let request = PolicyRequest {
                     scope: input.clone(),
                 };
@@ -195,7 +202,7 @@ async fn collect_policy_outputs(
                         .await
                         .map_err(|source| Error::InvokePolicy {
                             scope_root: scope_root.clone(),
-                            policy: policy_export.clone(),
+                            policy: policy_display_name.clone(),
                             source,
                         })?;
                     // Generated interposers may not rely on experimental features.
@@ -206,7 +213,7 @@ async fn collect_policy_outputs(
                     )
                     .map_err(|source| Error::InvalidPolicyOutput {
                         scope_root: scope_root.clone(),
-                        policy: policy_export.clone(),
+                        policy: policy_display_name.clone(),
                         source: Box::new(source),
                     })?;
                     Ok(PolicyApplication {
@@ -695,6 +702,7 @@ mod tests {
         fn start<'a>(
             &'a self,
             _compiled: &'a CompiledScenario,
+            _policy_display_names: &'a BTreeMap<String, String>,
         ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>>
         {
             Box::pin(async move {
@@ -1275,6 +1283,7 @@ mod tests {
     fn governed_policy(name: &str) -> crate::governance::GovernedPolicy {
         crate::governance::GovernedPolicy {
             export: ExportName::try_from(name).expect("valid export name"),
+            display_name: name.to_string(),
         }
     }
 

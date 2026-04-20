@@ -1111,6 +1111,177 @@ async fn policy_symbolic_config_is_composed_against_scope_config() {
 }
 
 #[tokio::test]
+async fn governance_root_schema_handles_overlapping_config_paths() {
+    let dir = tmp_dir("scenario-governance-overlapping-paths");
+    let root_path = dir.path().join("root.json5");
+    let scope_path = dir.path().join("scope.json5");
+    let policy_a_path = dir.path().join("policy_a.json5");
+    let policy_b_path = dir.path().join("policy_b.json5");
+
+    // policy_a takes a whole "creds" object
+    write_file(
+        &policy_a_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { creds: { type: "object", properties: { key: { type: "string" }, url: { type: "string" } } } },
+          },
+          program: {
+            image: "policy",
+            entrypoint: ["policy"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          exports: { apply: "apply" },
+        }
+        "#,
+    );
+    // policy_b takes only a single key
+    write_file(
+        &policy_b_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { token: { type: "string" } },
+          },
+          program: {
+            image: "policy",
+            entrypoint: ["policy"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          exports: { apply: "apply" },
+        }
+        "#,
+    );
+    // The scope exposes two separate config keys that the root maps to overlapping
+    // root paths: whole_creds → creds (object) and just_key → creds.key (leaf).
+    write_file(
+        &scope_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              config_schema: {{
+                type: "object",
+                properties: {{
+                  whole_creds: {{ type: "object", properties: {{ key: {{ type: "string" }}, url: {{ type: "string" }} }} }},
+                  just_key: {{ type: "string" }},
+                }},
+              }},
+              use: {{
+                audit: {{
+                  manifest: "{policy_a}",
+                  config: {{ creds: "${{config.whole_creds}}" }},
+                }},
+                redaction: {{
+                  manifest: "{policy_b}",
+                  config: {{ token: "$${{config.just_key}}" }},
+                }},
+              }},
+              policies: ["#audit.apply", "#redaction.apply"],
+            }}
+            "##,
+            policy_a = file_url(&policy_a_path),
+            policy_b = file_url(&policy_b_path),
+        ),
+    );
+    // The root maps scope's whole_creds → creds and just_key → creds.key,
+    // producing overlapping root paths "creds" and "creds.key".
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["governance"],
+              config_schema: {{
+                type: "object",
+                properties: {{
+                  creds: {{
+                    type: "object",
+                    properties: {{
+                      key: {{ type: "string" }},
+                      url: {{ type: "string" }},
+                    }},
+                    required: ["key"],
+                  }},
+                }},
+                required: ["creds"],
+              }},
+              components: {{
+                scope: {{
+                  manifest: "{scope}",
+                  config: {{
+                    whole_creds: "${{config.creds}}",
+                    just_key: "${{config.creds.key}}",
+                  }},
+                }},
+              }},
+            }}
+            "##,
+            scope = file_url(&scope_path),
+        ),
+    );
+
+    let compiler = compiler_with_noop_governance();
+    let output = compiler
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect("overlapping config paths should compile");
+
+    let governance = output
+        .governance
+        .as_ref()
+        .expect("governance should be present");
+    let root_id = governance.scenario.root;
+    let root_digest = governance.scenario.component(root_id).digest;
+    let root_manifest = output
+        .store
+        .get(&root_digest)
+        .expect("governance root manifest in store");
+    let config_schema = root_manifest
+        .config_schema()
+        .expect("governance root should have config schema");
+    let schema_value = &config_schema.0;
+    let creds_schema = schema_value
+        .get("properties")
+        .and_then(|p| p.get("creds"))
+        .expect("creds should appear in governance root schema");
+
+    // "creds" subsumes "creds.key", so the full creds object schema should be used
+    assert_eq!(
+        creds_schema,
+        &serde_json::json!({
+            "type": "object",
+            "properties": {
+                "key": { "type": "string" },
+                "url": { "type": "string" },
+            },
+            "required": ["key"],
+        })
+    );
+
+    // "creds" should be required since it is required in the root schema
+    let required = schema_value
+        .get("required")
+        .and_then(|r| r.as_array())
+        .expect("schema should have required");
+    assert!(
+        required.iter().any(|r| r == "creds"),
+        "creds should be required in governance root schema"
+    );
+}
+
+#[tokio::test]
 async fn used_manifest_must_not_require_root_slots() {
     let dir = tmp_dir("scenario-use-required-slot");
     let root_path = dir.path().join("root.json5");
@@ -1222,6 +1393,7 @@ async fn compile_resolves_policy_exports_from_use_entries() {
         governance.scopes[0].policies[0].export.as_str(),
         "policy_0_0"
     );
+    assert_eq!(governance.scopes[0].policies[0].display_name, "/wrapper");
     assert_eq!(governance.scenario.exports.len(), 1);
     assert_eq!(
         governance.scenario.exports[0].capability.kind,
@@ -1300,6 +1472,7 @@ async fn compile_follows_child_exports_for_policies() {
         governance.scopes[0].policies[0].export.as_str(),
         "policy_0_0"
     );
+    assert_eq!(governance.scopes[0].policies[0].display_name, "/wrapper");
     assert_eq!(governance.scenario.exports.len(), 1);
     assert_eq!(
         governance.scenario.exports[0].capability.kind,
@@ -1533,6 +1706,7 @@ async fn compile_attaches_governance_artifact_for_policy_uses() {
         governance.scopes[0].policies[0].export.as_str(),
         "policy_0_0"
     );
+    assert_eq!(governance.scopes[0].policies[0].display_name, "/wrapper");
     assert_eq!(governance.scenario.exports[0].name, "policy_0_0");
     assert_eq!(governance.scenario.components.iter().flatten().count(), 2);
 }

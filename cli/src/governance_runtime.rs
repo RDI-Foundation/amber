@@ -44,6 +44,7 @@ impl Default for CliGovernanceRuntime {
 struct CliGovernanceSession {
     client: Client,
     export_urls: BTreeMap<String, Url>,
+    policy_display_names: BTreeMap<String, String>,
     // finish(self) needs to take ownership of the temp run state while the session itself stays
     // Sync for the compiler's async pipeline.
     cleanup: Mutex<Option<GovernanceCleanup>>,
@@ -59,6 +60,7 @@ impl GovernanceRuntime for CliGovernanceRuntime {
     fn start<'a>(
         &'a self,
         compiled: &'a CompiledScenario,
+        policy_display_names: &'a BTreeMap<String, String>,
     ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>> {
         Box::pin(async move {
             let storage_root = TempDir::new().map_err(|err| {
@@ -140,8 +142,13 @@ impl GovernanceRuntime for CliGovernanceRuntime {
                     "failed to expose governance exports: {err}"
                 )));
             }
-            if let Err(err) =
-                wait_for_governance_exports_ready(&self.client, &export_urls, &run_root).await
+            if let Err(err) = wait_for_governance_exports_ready(
+                &self.client,
+                &export_urls,
+                policy_display_names,
+                &run_root,
+            )
+            .await
             {
                 proxy_task.abort();
                 let _ = proxy_task.await;
@@ -152,6 +159,7 @@ impl GovernanceRuntime for CliGovernanceRuntime {
             Ok(Box::new(CliGovernanceSession {
                 client: self.client.clone(),
                 export_urls,
+                policy_display_names: policy_display_names.clone(),
                 cleanup: Mutex::new(Some(GovernanceCleanup {
                     storage_root,
                     run_id: receipt.run_id,
@@ -169,12 +177,13 @@ impl GovernanceSession for CliGovernanceSession {
         request: &'a PolicyRequest,
     ) -> GovernanceFuture<'a, Result<PolicyOutput, GovernanceRuntimeError>> {
         Box::pin(async move {
+            let policy_name = display_name_for(&self.policy_display_names, policy_export.as_str());
             let url = self
                 .export_urls
                 .get(policy_export.as_str())
                 .ok_or_else(|| {
                     GovernanceRuntimeError::message(format!(
-                        "governance export `{policy_export}` is not running"
+                        "governance export `{policy_name}` is not running"
                     ))
                 })?;
             let response = self
@@ -185,7 +194,7 @@ impl GovernanceSession for CliGovernanceSession {
                 .await
                 .map_err(|err| {
                     GovernanceRuntimeError::message(format!(
-                        "request to `{policy_export}` failed: {err}"
+                        "request to `{policy_name}` failed: {err}"
                     ))
                 })?;
             let status = response.status();
@@ -301,6 +310,7 @@ fn build_export_urls(
 async fn wait_for_governance_exports_ready(
     client: &Client,
     export_urls: &BTreeMap<String, Url>,
+    policy_display_names: &BTreeMap<String, String>,
     run_root: &Path,
 ) -> Result<(), GovernanceRuntimeError> {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -313,30 +323,78 @@ async fn wait_for_governance_exports_ready(
                 Err(_) => false,
             };
             if !ready {
-                pending.push(name.as_str());
+                pending.push(display_name_for(policy_display_names, name));
             }
         }
 
         if pending.is_empty() {
             return Ok(());
         }
+        if let Some(failure) = mixed_run::startup_failure_for_run(run_root)
+            .map_err(|err| GovernanceRuntimeError::message(err.to_string()))?
+        {
+            return Err(GovernanceRuntimeError::message(
+                format_governance_startup_error(
+                    &pending,
+                    Some(&failure),
+                    &collect_governance_logs(run_root),
+                ),
+            ));
+        }
         if Instant::now() >= deadline {
-            print_governance_logs(run_root);
-            return Err(GovernanceRuntimeError::message(format!(
-                "governance exports did not become ready in time: {}",
-                pending.join(", "),
-            )));
+            return Err(GovernanceRuntimeError::message(
+                format_governance_startup_error(&pending, None, &collect_governance_logs(run_root)),
+            ));
         }
 
         sleep(Duration::from_millis(100)).await;
     }
 }
 
-fn print_governance_logs(run_root: &Path) {
+fn format_governance_startup_error(
+    pending: &[&str],
+    failure: Option<&str>,
+    logs: &[String],
+) -> String {
+    let mut message = if let Some(failure) = failure {
+        format!(
+            "governance policy failed to start: {}\n\n{}",
+            pending.join(", "),
+            failure
+        )
+    } else {
+        format!(
+            "governance exports did not become ready in time: {}",
+            pending.join(", "),
+        )
+    };
+    if !logs.is_empty() {
+        message.push_str("\n\npolicy process output:\n");
+        for line in logs {
+            message.push_str("  ");
+            message.push_str(line);
+            message.push('\n');
+        }
+    }
+    message
+}
+
+fn display_name_for<'a>(
+    policy_display_names: &'a BTreeMap<String, String>,
+    export_name: &'a str,
+) -> &'a str {
+    policy_display_names
+        .get(export_name)
+        .map(String::as_str)
+        .unwrap_or(export_name)
+}
+
+fn collect_governance_logs(run_root: &Path) -> Vec<String> {
     let state_root = run_root.join("state");
     let Ok(entries) = fs::read_dir(&state_root) else {
-        return;
+        return Vec::new();
     };
+    let mut out = Vec::new();
     for entry in entries.flatten() {
         let site_root = entry.path();
         if !site_root.is_dir() {
@@ -345,26 +403,37 @@ fn print_governance_logs(run_root: &Path) {
         let Ok(raw) = fs::read_to_string(site_root.join("site.log")) else {
             continue;
         };
-        let stderr_lines: Vec<&str> = raw
-            .lines()
-            .filter(|l| l.contains("amber.node.logs") && l.contains("amber_stream=\"stderr\""))
-            .filter_map(policy_log_message)
-            .collect();
-        if !stderr_lines.is_empty() {
-            eprintln!("\npolicy process stderr:");
-            for line in stderr_lines {
-                eprintln!("  {line}");
+        for line in raw.lines() {
+            if let Some(msg) = extract_log_message(line) {
+                out.push(msg.to_string());
             }
         }
     }
+    out
 }
 
-fn policy_log_message(line: &str) -> Option<&str> {
-    let msg_start = line.find("}: ")?.saturating_add(3);
-    let msg_end = line[msg_start..]
-        .find(" amber_stream=")
-        .map(|i| msg_start + i)
-        .unwrap_or(line.len());
-    let msg = line[msg_start..msg_end].trim();
-    if msg.is_empty() { None } else { Some(msg) }
+fn extract_log_message(line: &str) -> Option<&str> {
+    // Process stderr forwarded through the tracing span
+    if line.contains("amber.node.logs") && line.contains("amber_stream=\"stderr\"") {
+        let msg_start = line.find("}: ")?.saturating_add(3);
+        let msg_end = line[msg_start..]
+            .find(" amber_stream=")
+            .map(|i| msg_start + i)
+            .unwrap_or(line.len());
+        let msg = line[msg_start..msg_end].trim();
+        if !msg.is_empty() {
+            return Some(msg);
+        }
+    }
+    // Error-level logs from the runtime helper itself
+    if line.contains(" ERROR ") {
+        let msg = line
+            .find(" ERROR ")
+            .map(|i| line[i + 7..].trim())
+            .unwrap_or(line);
+        if !msg.is_empty() {
+            return Some(msg);
+        }
+    }
+    None
 }

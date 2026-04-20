@@ -451,7 +451,11 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
         program.visit_config_uses(|_, query| uses.add_query(query));
     }
 
-    for decl in manifest.components().values() {
+    for decl in manifest
+        .components()
+        .values()
+        .chain(manifest.uses().values())
+    {
         let ComponentDecl::Object(obj) = decl else {
             continue;
         };
@@ -944,6 +948,36 @@ mod tests {
         assert!(!lints.iter().any(|lint| matches!(
             lint,
             crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "token"
+        )));
+    }
+
+    #[test]
+    fn config_used_in_use_config_is_not_linted() {
+        let input = r##"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["governance"],
+          config_schema: {
+            type: "object",
+            properties: {
+              secret: { type: "string" },
+            },
+          },
+          use: {
+            policy: {
+              manifest: "https://example.com/policy",
+              config: { token: "${config.secret}" },
+            },
+          },
+          policies: ["#policy.apply"],
+        }
+        "##;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "secret"
         )));
     }
 

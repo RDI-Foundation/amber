@@ -133,6 +133,7 @@ impl GovernanceRuntime for TestGovernanceRuntime {
     fn start<'a>(
         &'a self,
         _compiled: &'a crate::reporter::CompiledScenario,
+        _policy_display_names: &'a std::collections::BTreeMap<String, String>,
     ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>> {
         Box::pin(async { Ok(Box::new(TestGovernanceSession) as Box<dyn GovernanceSession>) })
     }
