@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import socketserver
 from http.server import BaseHTTPRequestHandler

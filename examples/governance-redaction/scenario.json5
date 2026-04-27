@@ -5,16 +5,17 @@
   config_schema: {
     type: "object",
     properties: {
-      secret: { type: "string", default: "swordfish" },
+      launch_code: { type: "string", default: "swordfish" },
+      api_key: { type: "string", default: "hunter2" },
     },
-    required: ["secret"],
+    required: ["launch_code", "api_key"],
   },
 
   use: {
     redaction: {
       manifest: "./policy.json5",
       config: {
-        redaction_term: "$${config.secret}",
+        redaction_terms: ["$${config.launch_code}", "$${config.api_key}"],
       },
     },
   },
@@ -26,7 +27,8 @@
     caller: {
       manifest: "./a2a-caller.json5",
       config: {
-        secret: "${config.secret}",
+        launch_code: "${config.launch_code}",
+        api_key: "${config.api_key}",
       },
     },
   },

@@ -4,22 +4,19 @@
   config_schema: {
     type: "object",
     properties: {
-      redaction_term: { type: "string" },
+      redaction_terms: {
+        type: "array",
+        items: { type: "string" },
+      },
     },
-    required: ["redaction_term"],
+    required: ["redaction_terms"],
   },
 
   program: {
-    path: "/usr/bin/env",
-    args: [
-      "python3",
-      "-u",
-      "-c",
-      { file: "./policy.py" },
-    ],
+    path: "./policy.py",
     env: {
       PORT: "8120",
-      REDACTION_TERM: "${config.redaction_term}",
+      REDACTION_TERMS: "${config.redaction_terms}",
     },
     network: {
       endpoints: [

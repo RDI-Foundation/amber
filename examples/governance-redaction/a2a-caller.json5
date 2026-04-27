@@ -4,9 +4,10 @@
   config_schema: {
     type: "object",
     properties: {
-      secret: { type: "string" },
+      launch_code: { type: "string" },
+      api_key: { type: "string" },
     },
-    required: ["secret"],
+    required: ["launch_code", "api_key"],
   },
 
   slots: {
@@ -24,7 +25,8 @@
     env: {
       AGENT_URL: "${slots.agent.url}",
       PORT: "8112",
-      SECRET: "${config.secret}",
+      LAUNCH_CODE: "${config.launch_code}",
+      API_KEY: "${config.api_key}",
     },
     network: {
       endpoints: [
