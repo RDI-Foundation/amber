@@ -1115,15 +1115,9 @@ async fn governance_root_schema_uses_full_root_schema_for_whole_config_ref() {
     assert_governance_root_schema_for_whole_config_ref("${config}").await;
 }
 
-#[tokio::test]
-async fn governance_root_schema_uses_full_root_schema_for_symbolic_whole_config_ref() {
-    assert_governance_root_schema_for_whole_config_ref("$${config}").await;
-}
-
 async fn assert_governance_root_schema_for_whole_config_ref(policy_config_ref: &str) {
     let dir = tmp_dir("scenario-governance-whole-root-config");
     let root_path = dir.path().join("root.json5");
-    let scope_path = dir.path().join("scope.json5");
     let policy_path = dir.path().join("policy.json5");
 
     write_file(
@@ -1162,28 +1156,9 @@ async fn assert_governance_root_schema_for_whole_config_ref(policy_config_ref: &
         "#,
     );
     write_file(
-        &scope_path,
-        &format!(
-            r##"
-            {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
-              use: {{
-                policy_comp: {{
-                  manifest: "{policy}",
-                  config: {{ snapshot: "{policy_config_ref}" }},
-                }},
-              }},
-              policies: ["#policy_comp.apply"],
-            }}
-            "##,
-            policy = file_url(&policy_path),
-        ),
-    );
-    write_file(
         &root_path,
         &format!(
-            r#"
+            r##"
             {{
               manifest_version: "0.1.0",
               experimental_features: ["governance"],
@@ -1201,12 +1176,16 @@ async fn assert_governance_root_schema_for_whole_config_ref(policy_config_ref: &
                 }},
                 required: ["key", "nested"],
               }},
-              components: {{
-                scope: {{ manifest: "{scope}" }},
+              use: {{
+                policy_comp: {{
+                  manifest: "{policy}",
+                  config: {{ snapshot: "{policy_config_ref}" }},
+                }},
               }},
+              policies: ["#policy_comp.apply"],
             }}
-            "#,
-            scope = file_url(&scope_path),
+            "##,
+            policy = file_url(&policy_path),
         ),
     );
 

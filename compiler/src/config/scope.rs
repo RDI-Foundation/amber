@@ -99,16 +99,6 @@ fn collect_config_refs(template: &rc::RootConfigTemplate) -> Option<BTreeSet<Str
             rc::ConfigNode::ConfigRef(path) => {
                 acc.insert(path.clone());
             }
-            rc::ConfigNode::SymbolicConfigRef(path) => {
-                acc.insert(path.clone());
-            }
-            rc::ConfigNode::SymbolicString(value) => {
-                if let Ok(parsed) = value.parse::<amber_manifest::InterpolatedString>() {
-                    parsed.visit_config_uses(|path| {
-                        acc.insert(path.to_string());
-                    });
-                }
-            }
             rc::ConfigNode::StringTemplate(parts) => {
                 for part in parts {
                     if let amber_template::TemplatePart::Config { config } = part {
@@ -707,5 +697,55 @@ mod tests {
         assert!(template_json.contains("repo"));
         assert!(template_json.contains("tag"));
         assert!(!template_json.contains("token"));
+    }
+
+    #[test]
+    fn build_runtime_config_view_ignores_symbolic_refs_for_runtime_inputs() {
+        let root_schema = json!({
+            "type": "object",
+            "properties": {
+                "launch_code": { "type": "string" },
+                "api_key": { "type": "string", "secret": true }
+            }
+        });
+        let root_leaves = rc::collect_leaf_paths(&root_schema).expect("collect root leaves");
+
+        let component_schema = json!({
+            "type": "object",
+            "properties": {
+                "redaction_terms": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
+            }
+        });
+        let component_template =
+            rc::RootConfigTemplate::Node(rc::ConfigNode::Object(BTreeMap::from([(
+                "redaction_terms".to_string(),
+                rc::ConfigNode::Array(vec![
+                    rc::ConfigNode::SymbolicConfigRef("launch_code".to_string()),
+                    rc::ConfigNode::SymbolicConfigRef("api_key".to_string()),
+                ]),
+            )])));
+        let used_component_paths = BTreeSet::from(["redaction_terms".to_string()]);
+
+        let view = build_runtime_config_view(
+            "/policy",
+            &root_schema,
+            &root_leaves,
+            &component_template,
+            &component_schema,
+            &used_component_paths,
+        )
+        .expect("build view");
+
+        assert!(
+            view.allowed_root_leaf_paths.is_empty(),
+            "symbolic refs should not require runtime root inputs"
+        );
+        assert_eq!(
+            view.pruned_root_schema,
+            serde_json::json!({ "type": "object" })
+        );
     }
 }
