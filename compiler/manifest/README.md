@@ -137,6 +137,9 @@ Current values:
 * `"kvm"`
 * `"governance"` - required for the `use` and `policies` top-level sections
 
+For governance policy request/response semantics and interposer behavior, see
+[`../GOVERNANCE.md`](../GOVERNANCE.md).
+
 Rules:
 
 * Unknown feature names are rejected at parse time.
@@ -487,6 +490,27 @@ Notes:
 
 * `config` accepts any non-null JSON value; `null` is treated as omitted.
 * This crate does not validate `config` against `config_schema` (link-time concern).
+
+---
+
+## `use` (governance helper components)
+
+`use` is a map: **instance name → component declaration**.
+
+It uses the same declaration forms as [`components`](#components-child-components), but is only
+available with `experimental_features: ["governance"]`.
+
+`use` entries declare governance-only helper manifests. They are referenced by `policies` and are
+kept out of the main compiled scenario.
+
+---
+
+## `policies`
+
+`policies` is an ordered list of policy capability refs in `#use_name.export` form.
+
+Each entry refers to an exported capability from the local `use` set. Link-time validation of
+those refs is handled by the compiler rather than this crate.
 
 ---
 

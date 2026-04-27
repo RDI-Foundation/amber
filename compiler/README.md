@@ -24,3 +24,6 @@ Compiles a root component manifest into a linked `Scenario` plus provenance and 
 - `targets`: target-family planners and reporters (mesh-family planning + Docker Compose/Kubernetes directory artifacts, plus direct/native and VM artifact planning).
 - `reporter`: transforms `CompileOutput` into artifacts (scenario IR JSON, DOT, metadata JSON, Docker Compose directories, Kubernetes directories, direct/native output directories, and VM output directories); re-exports target reporters.
 - `bundle`: bundle index parsing, manifest packing, and bundle-only resolver wiring.
+
+## Feature docs
+- [`GOVERNANCE.md`](./GOVERNANCE.md): governance overview and policy authoring guide.
