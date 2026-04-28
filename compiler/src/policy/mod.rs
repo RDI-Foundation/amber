@@ -166,6 +166,9 @@ pub enum ValidationError {
 
     #[error("interposer config_schema is invalid: {message}")]
     InvalidInterposerConfigSchema { message: String },
+
+    #[error("interposer config is invalid: {message}")]
+    InvalidInterposerConfig { message: String },
 }
 
 pub fn validate_policy_output(
@@ -267,6 +270,9 @@ fn validate_interposer_component(
                 message: err.to_string(),
             }
         })?;
+        if let Some(config) = component.config.as_ref() {
+            validate_interposer_config(schema, config)?;
+        }
     }
 
     let Some(program) = component.program.as_ref() else {
@@ -288,6 +294,15 @@ fn validate_interposer_component(
             .next()
             .expect("program validation returned at least one error")
             .message,
+    })
+}
+
+fn validate_interposer_config(schema: &Value, config: &Value) -> Result<(), ValidationError> {
+    let mut config = config.clone();
+    rc::validate_config_value(schema, &mut config).map_err(|err| {
+        ValidationError::InvalidInterposerConfig {
+            message: err.to_string(),
+        }
     })
 }
 
@@ -557,6 +572,36 @@ mod tests {
         .expect_err("interposer config without schema must be rejected");
 
         assert_eq!(err, ValidationError::MissingInterposerConfigSchema);
+    }
+
+    #[test]
+    fn validation_rejects_interposer_config_that_does_not_match_schema() {
+        let mut output = valid_output();
+        output.interpositions[0].interposer.config = Some(serde_json::json!({
+            "redaction_terms": "not an array",
+        }));
+        output.interpositions[0].interposer.config_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "redaction_terms": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                },
+            },
+            "required": ["redaction_terms"],
+        }));
+
+        let err = validate_policy_output(
+            &output,
+            &scope_with_binding(http_capability()),
+            &BTreeSet::new(),
+        )
+        .expect_err("invalid interposer config must be rejected");
+
+        assert!(matches!(
+            err,
+            ValidationError::InvalidInterposerConfig { .. }
+        ));
     }
 
     #[test]
