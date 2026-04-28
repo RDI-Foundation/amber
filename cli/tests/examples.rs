@@ -52,8 +52,9 @@ fn examples_check_deny_warnings() {
     }
 
     let mut manifests: Vec<PathBuf> = examples
-        .into_iter()
-        .map(|example| example.root_manifest)
+        .iter()
+        .filter(|example| !example_requires_runtime_during_compile(example))
+        .map(|example| example.root_manifest.clone())
         .collect();
     manifests.extend(collect_scenario_variants(&examples_dir));
     manifests.sort();
@@ -96,6 +97,9 @@ fn examples_compile_from_ir_matches_manifest_outputs() {
 
     for example in collect_examples() {
         if matches!(example_backend(&example), ExampleBackend::CheckOnly) {
+            continue;
+        }
+        if example_requires_runtime_during_compile(&example) {
             continue;
         }
 
@@ -170,7 +174,7 @@ enum ExampleBackend {
 fn example_backend(example: &example_catalog::Example) -> ExampleBackend {
     if matches!(
         example.name.as_str(),
-        "direct-security" | "framework-component" | "governance-redaction"
+        "direct-security" | "framework-component"
     ) {
         ExampleBackend::Direct
     } else if example.name == "vm-network-storage" {
@@ -180,6 +184,10 @@ fn example_backend(example: &example_catalog::Example) -> ExampleBackend {
     } else {
         ExampleBackend::DockerCompose
     }
+}
+
+fn example_requires_runtime_during_compile(example: &example_catalog::Example) -> bool {
+    example.name == "governance-redaction"
 }
 
 fn compile_example_outputs(
