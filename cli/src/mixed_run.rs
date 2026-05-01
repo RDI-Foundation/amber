@@ -130,6 +130,13 @@ fn site_controller_command_from(current: &Path) -> Result<SiteControllerCommand>
             prefix_args: Vec::new(),
         });
     }
+    let amber_executable_name = format!("amber{}", std::env::consts::EXE_SUFFIX);
+    if current.file_name().and_then(|name| name.to_str()) == Some(amber_executable_name.as_str()) {
+        return Ok(SiteControllerCommand {
+            executable: current.to_path_buf(),
+            prefix_args: vec!["run-site-controller"],
+        });
+    }
     if launched_from_cargo_test_binary(current) {
         return Ok(SiteControllerCommand {
             executable: amber_cli_executable_from(current)?,

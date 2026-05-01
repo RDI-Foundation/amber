@@ -27,7 +27,6 @@ use super::{api::*, http::*, orchestration::*, planner::*, state::*, *};
 use crate::{
     ccs_api::FrameworkComponentInspectRequest,
     runtime_api::{SharedSiteControllerRuntime, SiteControllerRuntime},
-    site_controller::RouterIdentityResponse,
 };
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -81,6 +80,7 @@ impl SiteControllerRuntime for TestSiteControllerRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -90,6 +90,7 @@ impl SiteControllerRuntime for TestSiteControllerRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -98,6 +99,7 @@ impl SiteControllerRuntime for TestSiteControllerRuntime {
         &'a self,
         _plan: &'a SiteControllerPlan,
         _child_id: u64,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -107,6 +109,7 @@ impl SiteControllerRuntime for TestSiteControllerRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -275,6 +278,7 @@ impl SiteControllerRuntime for FailingPublishRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -284,6 +288,7 @@ impl SiteControllerRuntime for FailingPublishRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Err(miette::miette!("publish exploded")) })
     }
@@ -292,6 +297,7 @@ impl SiteControllerRuntime for FailingPublishRuntime {
         &'a self,
         _plan: &'a SiteControllerPlan,
         _child_id: u64,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -301,6 +307,7 @@ impl SiteControllerRuntime for FailingPublishRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         let destroy_calls = self.destroy_calls.clone();
         Box::pin(async move {
@@ -405,6 +412,7 @@ impl SiteControllerRuntime for RecordingPublishRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -414,6 +422,7 @@ impl SiteControllerRuntime for RecordingPublishRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         let publish_calls = self.publish_calls.clone();
         Box::pin(async move {
@@ -430,6 +439,7 @@ impl SiteControllerRuntime for RecordingPublishRuntime {
         &'a self,
         _plan: &'a SiteControllerPlan,
         _child_id: u64,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -439,6 +449,7 @@ impl SiteControllerRuntime for RecordingPublishRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -565,6 +576,7 @@ impl SiteControllerRuntime for PublishBeforeResolveRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -574,6 +586,7 @@ impl SiteControllerRuntime for PublishBeforeResolveRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         let publish_calls = self.publish_calls.clone();
         Box::pin(async move {
@@ -591,6 +604,7 @@ impl SiteControllerRuntime for PublishBeforeResolveRuntime {
         &'a self,
         _plan: &'a SiteControllerPlan,
         _child_id: u64,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -600,6 +614,7 @@ impl SiteControllerRuntime for PublishBeforeResolveRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -704,6 +719,7 @@ impl SiteControllerRuntime for FailingRollbackRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -713,6 +729,7 @@ impl SiteControllerRuntime for FailingRollbackRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -721,6 +738,7 @@ impl SiteControllerRuntime for FailingRollbackRuntime {
         &'a self,
         _plan: &'a SiteControllerPlan,
         _child_id: u64,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Err(miette::miette!("rollback exploded")) })
     }
@@ -730,6 +748,7 @@ impl SiteControllerRuntime for FailingRollbackRuntime {
         _plan: &'a SiteControllerPlan,
         _state: FrameworkControlState,
         _child: LiveChildRecord,
+        _site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -1061,7 +1080,7 @@ fn delegated_entry_for(
     .expect("delegated held entry should resolve")
 }
 
-async fn compile_dynamic_caps_binding_state() -> FrameworkControlState {
+fn dynamic_caps_binding_scenario_ir() -> ScenarioIr {
     fn path_program() -> amber_scenario::Program {
         serde_json::from_value(serde_json::json!({
             "path": "/usr/bin/env",
@@ -1121,7 +1140,7 @@ async fn compile_dynamic_caps_binding_state() -> FrameworkControlState {
         }
     }
 
-    let scenario = ScenarioIr {
+    ScenarioIr {
         schema: amber_scenario::SCENARIO_IR_SCHEMA.to_string(),
         version: amber_scenario::SCENARIO_IR_VERSION,
         root: 0,
@@ -1218,7 +1237,11 @@ async fn compile_dynamic_caps_binding_state() -> FrameworkControlState {
         ],
         exports: Vec::new(),
         manifest_catalog: BTreeMap::new(),
-    };
+    }
+}
+
+async fn compile_dynamic_caps_binding_state() -> FrameworkControlState {
+    let scenario = dynamic_caps_binding_scenario_ir();
     let placement = PlacementFile {
         schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
         version: amber_compiler::run_plan::PLACEMENT_VERSION,
@@ -1830,7 +1853,6 @@ async fn same_site_dynamic_child_output_bindings_reuse_provider_component_routes
     let runtime_spec =
         build_local_child_runtime_spec(&state, consumer, &site_id).expect("runtime spec");
     assert_eq!(runtime_spec.direct_inputs.len(), 1);
-    assert!(runtime_spec.routed_inputs.is_empty());
     assert_eq!(runtime_spec.direct_inputs[0].component, "/consumer");
     assert_eq!(runtime_spec.direct_inputs[0].slot, "required_api");
     assert_eq!(
@@ -1976,7 +1998,6 @@ async fn same_site_static_child_export_bindings_reuse_provider_component_routes(
     let runtime_spec =
         build_local_child_runtime_spec(&state, consumer, &site_id).expect("runtime spec");
     assert_eq!(runtime_spec.direct_inputs.len(), 1);
-    assert!(runtime_spec.routed_inputs.is_empty());
     assert_eq!(runtime_spec.direct_inputs[0].component, "/consumer");
     assert_eq!(runtime_spec.direct_inputs[0].slot, "upstream");
     assert_eq!(
@@ -2050,9 +2071,9 @@ async fn dynamic_grant_routes_to_holder_site_not_offered_site_order() {
 }
 
 #[tokio::test]
-async fn dynamic_caps_cross_site_share_syncs_holder_authority_through_site_router() {
+async fn dynamic_caps_cross_site_share_syncs_holder_authority_through_remote_controller_capability()
+{
     let dir = TempDir::new().expect("temp dir");
-    let base = compile_dynamic_caps_binding_state().await;
     let placement = PlacementFile {
         schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
         version: amber_compiler::run_plan::PLACEMENT_VERSION,
@@ -2087,7 +2108,7 @@ async fn dynamic_caps_cross_site_share_syncs_holder_authority_through_site_route
         framework_children: None,
     };
     let mut authority_state = compile_control_state_from_ir_with_run_id(
-        base.base_scenario.clone(),
+        dynamic_caps_binding_scenario_ir(),
         Some(&placement),
         "test-run",
     )
@@ -2115,17 +2136,10 @@ async fn dynamic_caps_cross_site_share_syncs_holder_authority_through_site_route
         "/v1/controller/dynamic-caps/grant-authorities/sync",
         axum::routing::post({
             let sync_requests = sync_requests.clone();
-            move |headers: HeaderMap,
+            move |_headers: HeaderMap,
                   Json(request): Json<dynamic_caps::ControlDynamicGrantAuthoritySyncRequest>| {
                 let sync_requests = sync_requests.clone();
                 async move {
-                    assert_eq!(
-                        headers
-                            .get(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER)
-                            .and_then(|value| value.to_str().ok()),
-                        Some("1"),
-                        "cross-site share sync should stay local on the destination controller",
-                    );
                     sync_requests
                         .lock()
                         .expect("sync request log poisoned")
@@ -2143,8 +2157,10 @@ async fn dynamic_caps_cross_site_share_syncs_holder_authority_through_site_route
     let controller_plan = Arc::make_mut(&mut app.controller_plan);
     controller_plan.site_id = "direct_a".to_string();
     controller_plan.router_identity_id = "/site/direct_a/router".to_string();
-    controller_plan.peer_site_router_urls =
-        BTreeMap::from([("direct_b".to_string(), holder_base_url)]);
+    install_remote_controller_peer_url_fixture(
+        &mut app,
+        &BTreeMap::from([("direct_b".to_string(), holder_base_url)]),
+    );
     let controller_app = SiteControllerApp {
         control: app,
         ready: ready_site_controller_flag(),
@@ -2452,6 +2468,77 @@ async fn compile_framework_binding_control_state() -> (
     (dir, state, state_path, record)
 }
 
+async fn compile_cross_site_framework_authority_control_state()
+-> (TempDir, FrameworkControlState, PathBuf) {
+    let dir = TempDir::new().expect("temp dir");
+    let admin_path = dir.path().join("admin.json5");
+    let authority_path = dir.path().join("authority.json5");
+    let root_path = dir.path().join("root.json5");
+    write_file(
+        &admin_path,
+        r#"
+            {
+              manifest_version: "0.3.0",
+              slots: { ctl: { kind: "component" } },
+              program: {
+                path: "/usr/bin/env",
+                args: ["sh", "-c", "sleep 30"],
+                env: { CTL_URL: "${slots.ctl.url}" },
+                network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+              },
+              provides: { api: { kind: "http", endpoint: "http" } },
+              exports: { api: "api" },
+            }
+            "#,
+    );
+    write_file(
+        &authority_path,
+        &format!(
+            r##"
+                {{
+                  manifest_version: "0.3.0",
+                  components: {{ admin: "{admin}" }},
+                  bindings: [
+                    {{ to: "#admin.ctl", from: "framework.component" }}
+                  ],
+                  program: {{
+                    image: "busybox:1.36.1",
+                    entrypoint: ["sh", "-c", "sleep 30"],
+                    network: {{ endpoints: [{{ name: "http", port: 8081, protocol: "http" }}] }}
+                  }},
+                  provides: {{ api: {{ kind: "http", endpoint: "http" }} }},
+                  exports: {{
+                    api: "api",
+                    admin_api: "#admin.api"
+                  }},
+                }}
+                "##,
+            admin = file_url(&admin_path),
+        ),
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+                {{
+                  manifest_version: "0.3.0",
+                  components: {{ authority: "{authority}" }},
+                  exports: {{
+                    authority_api: "#authority.api",
+                    authority_admin_api: "#authority.admin_api"
+                  }},
+                }}
+                "##,
+            authority = file_url(&authority_path),
+        ),
+    );
+
+    let state = compile_control_state(&root_path).await;
+    let state_path = dir.path().join("control-state.json");
+    write_control_state(&state_path, &state).expect("state should write");
+    (dir, state, state_path)
+}
+
 fn empty_live_child(
     authority_realm_id: usize,
     name: &str,
@@ -2587,10 +2674,13 @@ fn test_control_state_app(
     };
     let router_control = test_router_control_addr();
     let router_public_key_b64 = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
-    let site_id = offered_sites
-        .keys()
-        .next()
+    let site_id = state
+        .placement
+        .assignments
+        .get("/")
         .cloned()
+        .or_else(|| state.placement.defaults.path.clone())
+        .or_else(|| offered_sites.keys().next().cloned())
         .expect("offered sites should contain at least one site");
     for (site_id, site_definition) in &offered_sites {
         let site_state_root = state_root.join(site_id);
@@ -2936,6 +3026,14 @@ async fn install_framework_site_controller_fixture(
         .expect("router mesh config should write");
 
     vec![overlay_handle]
+}
+
+fn install_remote_controller_peer_url_fixture(
+    app: &mut ControlStateApp,
+    remote_base_urls: &BTreeMap<String, String>,
+) {
+    let plan = Arc::make_mut(&mut app.controller_plan);
+    plan.peer_site_router_urls.extend(remote_base_urls.clone());
 }
 
 struct TestMcpClient {
@@ -3518,7 +3616,7 @@ async fn refresh_capability_instances_rejects_unlowered_framework_component_bind
     );
 }
 #[tokio::test]
-async fn recover_control_state_reconciles_framework_routes_without_live_peer_controllers() {
+async fn recover_control_state_reconciles_framework_routes_without_live_remote_controllers() {
     let (dir, mut state, state_path, _) = compile_framework_binding_control_state().await;
     state.placement.offered_sites = BTreeMap::from([
         (
@@ -3568,7 +3666,7 @@ async fn recover_control_state_reconciles_framework_routes_without_live_peer_con
     };
 
     recover_control_state(&authority_app).await.expect(
-        "recovery should not require a live peer controller when peer router identities were \
+        "recovery should not require a live remote controller when peer router identities were \
          already planned",
     );
 }
@@ -3713,71 +3811,19 @@ fn inject_site_controller_peer_router_routes_records_peer_router_identities() {
     assert!(
         router
             .config
+            .peers
+            .iter()
+            .any(|peer| peer.id == "/site/local/controller"),
+        "the router plan should trust the lowered local controller peer it forwards to",
+    );
+    assert!(
+        router
+            .config
             .outbound
             .iter()
             .any(|route| route.route_id == "site-controller:peer"
                 && route.peer_id == "/site/peer/router"),
         "the router plan should include the site-controller forwarding route for the peer site",
-    );
-}
-
-#[tokio::test]
-async fn prepare_child_on_site_rejects_nonlocal_site_plan() {
-    let dir = TempDir::new().expect("temp dir");
-    let root_path = dir.path().join("root.json5");
-    let worker_path = dir.path().join("worker.json5");
-    write_file(
-        &worker_path,
-        r#"
-            {
-              manifest_version: "0.3.0",
-              program: {
-                path: "/bin/echo",
-                args: ["worker"],
-                network: { endpoints: [{ name: "http", port: 8080 }] }
-              }
-            }
-        "#,
-    );
-    write_file(
-        &root_path,
-        &format!(
-            r#"
-                {{
-                  manifest_version: "0.3.0",
-                  program: {{ path: "/bin/echo", args: ["root"] }},
-                  slots: {{
-                    realm: {{ kind: "component", optional: true }}
-                  }},
-                  child_templates: {{
-                    worker: {{
-                      manifest: "{worker}"
-                    }}
-                  }}
-                }}
-            "#,
-            worker = file_url(&worker_path),
-        ),
-    );
-    let state = compile_control_state(&root_path).await;
-    let state_path = dir.path().join("control-state.json");
-    write_control_state(&state_path, &state).expect("state should write");
-    let app = test_control_state_app(&dir, state, state_path);
-    let mut child = empty_live_child(1, "remote", 1, ChildState::CreatePrepared);
-    child.assignments = BTreeMap::from([("/remote".to_string(), "other-site".to_string())]);
-    let err = prepare_child_on_site(
-        &app,
-        &app.control_state.lock().await.clone(),
-        &child,
-        "other-site",
-    )
-    .await
-    .expect_err("nonlocal children without a router path should fail");
-    assert_eq!(err.code, ProtocolErrorCode::OriginUnavailable);
-    assert!(
-        err.message.contains("has no router forward path"),
-        "unexpected error: {}",
-        err.message
     );
 }
 
@@ -4089,7 +4135,7 @@ async fn dynamic_caps_held_list_ignores_unrouted_offered_sites() {
         false,
     )
     .await
-    .expect("held list should stay local when no peer controller routes exist");
+    .expect("held list should stay local when no remote controller routes exist");
 
     let super::control_state_api::DynamicCapsInspectResponse::HeldList(held) = response else {
         panic!("held list request should return a held list response");
@@ -4104,7 +4150,6 @@ async fn dynamic_caps_held_list_ignores_unrouted_offered_sites() {
 
 #[tokio::test]
 async fn localize_framework_control_state_tracks_remote_grant_authority_sites() {
-    let base = compile_dynamic_caps_binding_state().await;
     let placement = PlacementFile {
         schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
         version: amber_compiler::run_plan::PLACEMENT_VERSION,
@@ -4139,7 +4184,7 @@ async fn localize_framework_control_state_tracks_remote_grant_authority_sites() 
         framework_children: None,
     };
     let mut state = compile_control_state_from_ir_with_run_id(
-        base.base_scenario.clone(),
+        dynamic_caps_binding_scenario_ir(),
         Some(&placement),
         "test-run",
     )
@@ -4182,7 +4227,6 @@ async fn localize_framework_control_state_tracks_remote_grant_authority_sites() 
 #[tokio::test]
 async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
     let dir = TempDir::new().expect("temp dir");
-    let base = compile_dynamic_caps_binding_state().await;
     let placement = PlacementFile {
         schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
         version: amber_compiler::run_plan::PLACEMENT_VERSION,
@@ -4217,7 +4261,7 @@ async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
         framework_children: None,
     };
     let mut authoritative = compile_control_state_from_ir_with_run_id(
-        base.base_scenario.clone(),
+        dynamic_caps_binding_scenario_ir(),
         Some(&placement),
         "test-run",
     )
@@ -4257,18 +4301,11 @@ async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
         axum::routing::post({
             let hits = hits.clone();
             let remote_grant_id = remote_grant_id.clone();
-            move |headers: HeaderMap,
+            move |_headers: HeaderMap,
                   Json(request): Json<dynamic_caps::ControlDynamicInspectRefRequest>| {
                 let hits = hits.clone();
                 let remote_grant_id = remote_grant_id.clone();
                 async move {
-                    assert_eq!(
-                        headers
-                            .get(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER)
-                            .and_then(|value| value.to_str().ok()),
-                        Some("1"),
-                        "peer-routed inspect_ref should stay local on the destination controller",
-                    );
                     hits.lock()
                         .expect("inspect-ref hit log poisoned")
                         .push(request.r#ref.clone());
@@ -4293,8 +4330,10 @@ async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
     let controller_plan = Arc::make_mut(&mut app.controller_plan);
     controller_plan.site_id = "direct_b".to_string();
     controller_plan.router_identity_id = "/site/direct_b/router".to_string();
-    controller_plan.peer_site_router_urls =
-        BTreeMap::from([("direct_a".to_string(), authority_base_url)]);
+    install_remote_controller_peer_url_fixture(
+        &mut app,
+        &BTreeMap::from([("direct_a".to_string(), authority_base_url)]),
+    );
     let controller_app = SiteControllerApp {
         control: app,
         ready: ready_site_controller_flag(),
@@ -4329,9 +4368,8 @@ async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
 }
 
 #[tokio::test]
-async fn held_list_aggregates_remote_grants_via_peer_router() {
+async fn held_list_aggregates_remote_grants_via_remote_controller_capability() {
     let dir = TempDir::new().expect("temp dir");
-    let base = compile_dynamic_caps_binding_state().await;
     let placement = PlacementFile {
         schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
         version: amber_compiler::run_plan::PLACEMENT_VERSION,
@@ -4366,7 +4404,7 @@ async fn held_list_aggregates_remote_grants_via_peer_router() {
         framework_children: None,
     };
     let mut authoritative = compile_control_state_from_ir_with_run_id(
-        base.base_scenario.clone(),
+        dynamic_caps_binding_scenario_ir(),
         Some(&placement),
         "test-run",
     )
@@ -4404,18 +4442,11 @@ async fn held_list_aggregates_remote_grants_via_peer_router() {
         axum::routing::post({
             let hits = hits.clone();
             let remote_grant_id = remote_grant_id.clone();
-            move |headers: HeaderMap,
+            move |_headers: HeaderMap,
                   Json(request): Json<dynamic_caps::ControlDynamicHeldListRequest>| {
                 let hits = hits.clone();
                 let remote_grant_id = remote_grant_id.clone();
                 async move {
-                    assert_eq!(
-                        headers
-                            .get(super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER)
-                            .and_then(|value| value.to_str().ok()),
-                        Some("1"),
-                        "peer-routed held_list should stay local on the destination controller",
-                    );
                     hits.lock()
                         .expect("held-list hit log poisoned")
                         .push(request.holder_component_id.clone());
@@ -4445,8 +4476,10 @@ async fn held_list_aggregates_remote_grants_via_peer_router() {
     let controller_plan = Arc::make_mut(&mut app.controller_plan);
     controller_plan.site_id = "direct_b".to_string();
     controller_plan.router_identity_id = "/site/direct_b/router".to_string();
-    controller_plan.peer_site_router_urls =
-        BTreeMap::from([("direct_a".to_string(), authority_base_url)]);
+    install_remote_controller_peer_url_fixture(
+        &mut app,
+        &BTreeMap::from([("direct_a".to_string(), authority_base_url)]),
+    );
     let controller_app = SiteControllerApp {
         control: app,
         ready: ready_site_controller_flag(),
@@ -5871,14 +5904,15 @@ async fn delegated_cross_site_framework_requests_route_to_the_forwarded_authorit
     let router_public_key_b64 = base64::engine::general_purpose::STANDARD.encode([11u8; 32]);
     let peer_router_attempts = std::sync::Arc::new(std::sync::Mutex::new(0usize));
     let peer_router = Router::new().route(
-        "/v1/controller/router-identity",
-        axum::routing::get({
+        "/v1/internal/router-identity",
+        axum::routing::post({
             let router_public_key_b64 = router_public_key_b64.clone();
             let peer_router_attempts = peer_router_attempts.clone();
-            move || {
+            move |Json(request): Json<RouterIdentityRequest>| {
                 let router_public_key_b64 = router_public_key_b64.clone();
                 let peer_router_attempts = peer_router_attempts.clone();
                 async move {
+                    assert_eq!(request.site_id, "direct_local");
                     let mut attempts = peer_router_attempts
                         .lock()
                         .expect("peer router attempt log poisoned");
@@ -6087,14 +6121,32 @@ async fn capability_instance_auth_and_snapshot_scope_are_enforced() {
 async fn create_child_publishes_sites_before_resolving_cross_site_link_overlays() {
     let dir = TempDir::new().expect("temp dir");
     let root_path = dir.path().join("root.json5");
+    let admin_path = dir.path().join("admin.json5");
     write_file(
-        &root_path,
+        &admin_path,
         r#"
             {
               manifest_version: "0.3.0",
-              program: { path: "/bin/echo", args: ["root"] }
+              slots: { ctl: { kind: "component" } },
+              program: { path: "/bin/echo", args: ["admin", "${slots.ctl.url}"] }
             }
             "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+                {{
+                  manifest_version: "0.3.0",
+                  program: {{ path: "/bin/echo", args: ["root"] }},
+                  components: {{ admin: "{admin}" }},
+                  bindings: [
+                    {{ to: "#admin.ctl", from: "framework.component" }}
+                  ],
+                }}
+                "##,
+            admin = file_url(&admin_path),
+        ),
     );
 
     let placement = PlacementFile {
@@ -6127,6 +6179,48 @@ async fn create_child_publishes_sites_before_resolving_cross_site_link_overlays(
         framework_children: None,
     };
     let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+    for execution_site in ["direct_local", "compose_local"] {
+        if state.base_scenario.components.iter().any(|component| {
+            amber_compiler::run_plan::framework_component_controller_metadata(
+                component.metadata.as_ref(),
+            )
+            .is_some_and(|metadata| metadata.execution_site == execution_site)
+        }) {
+            continue;
+        }
+        let mut scenario = Scenario::try_from(state.base_scenario.clone()).expect("base scenario");
+        let root_id = scenario.root;
+        let controller_id = amber_scenario::ComponentId(scenario.components.len());
+        scenario.components.push(Some(amber_scenario::Component {
+            id: controller_id,
+            parent: Some(root_id),
+            moniker: format!("/__amber_internal_framework_component_controller/{execution_site}")
+                .into(),
+            digest: scenario.component(root_id).digest,
+            config: None,
+            config_schema: None,
+            program: None,
+            slots: BTreeMap::new(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: Some(
+                serde_json::to_value(
+                    amber_compiler::run_plan::FrameworkComponentControllerMetadata {
+                        kind: "amber.framework_component.controller".to_string(),
+                        execution_site: execution_site.to_string(),
+                        grants: BTreeMap::new(),
+                    },
+                )
+                .expect("controller metadata should serialize"),
+            ),
+            child_templates: BTreeMap::new(),
+            children: Vec::new(),
+        }));
+        scenario.component_mut(root_id).children.push(controller_id);
+        scenario.normalize_order();
+        scenario.assert_invariants();
+        state.base_scenario = amber_scenario::ScenarioIr::from(&scenario);
+    }
     let state_path = dir.path().join("control-state.json");
     let root_authority = state.base_scenario.root;
     let child_root_id = 10_001usize;
@@ -6237,8 +6331,9 @@ async fn create_child_publishes_sites_before_resolving_cross_site_link_overlays(
 
     let peer_router = Router::new()
         .route(
-            "/v1/controller/router-identity",
-            axum::routing::get(|| async {
+            "/v1/internal/router-identity",
+            axum::routing::post(|Json(request): Json<RouterIdentityRequest>| async move {
+                assert_eq!(request.site_id, "compose_local");
                 Json(RouterIdentityResponse {
                     id: "/site/compose_local/router".to_string(),
                     public_key_b64: base64::engine::general_purpose::STANDARD.encode([13u8; 32]),
@@ -6282,7 +6377,6 @@ async fn create_child_publishes_sites_before_resolving_cross_site_link_overlays(
     plan.site_id = "direct_local".to_string();
     plan.kind = SiteKind::Direct;
     plan.router_identity_id = "/site/direct_local/router".to_string();
-    plan.peer_site_router_urls = BTreeMap::from([("compose_local".to_string(), peer_router_url)]);
     plan.site_state_root = dir
         .path()
         .join("state")
@@ -6309,11 +6403,24 @@ async fn create_child_publishes_sites_before_resolving_cross_site_link_overlays(
             .display()
             .to_string(),
     );
-    let app = ControlStateApp {
+    let mut app = ControlStateApp {
         controller_plan: Arc::new(plan),
         runtime,
         ..base_app
     };
+    install_remote_controller_peer_url_fixture(
+        &mut app,
+        &BTreeMap::from([("compose_local".to_string(), peer_router_url.clone())]),
+    );
+    assert_eq!(
+        app.controller_plan
+            .peer_site_router_urls
+            .get("compose_local")
+            .map(String::as_str),
+        Some(peer_router_url.as_str()),
+        "controller runtime should use the router-local peer URL for compose-local controller \
+         traffic",
+    );
     continue_create_committed_hidden(&app, child.child_id)
         .await
         .expect("create should publish the child before resolving cross-site overlays");
@@ -6559,6 +6666,25 @@ async fn local_controller_requests_require_internal_route_headers_not_framework_
         control: test_control_state_app(&dir, state, state_path),
         ready: ready_site_controller_flag(),
     };
+    let controller_route_id = {
+        let state = app.control.control_state.lock().await.clone();
+        let scenario = Scenario::try_from(state.base_scenario.clone()).expect("base scenario");
+        let controller = scenario
+            .components_iter()
+            .find(|(_, component)| {
+                amber_compiler::run_plan::framework_component_controller_metadata(
+                    component.metadata.as_ref(),
+                )
+                .is_some()
+            })
+            .map(|(_, component)| component)
+            .expect("site controller component should be injected");
+        amber_mesh::component_route_id(
+            controller.moniker.as_str(),
+            amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+            amber_mesh::MeshProtocol::Http,
+        )
+    };
     let mut headers = HeaderMap::new();
     headers.insert(
         super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER,
@@ -6566,7 +6692,7 @@ async fn local_controller_requests_require_internal_route_headers_not_framework_
     );
     headers.insert(
         FRAMEWORK_ROUTE_ID_HEADER,
-        site_controller_internal_route_id(&app.control.controller_plan.site_id)
+        controller_route_id
             .parse()
             .expect("route header should parse"),
     );
@@ -6579,9 +6705,11 @@ async fn local_controller_requests_require_internal_route_headers_not_framework_
             .expect("peer header should parse"),
     );
 
-    super::site_controller::authorize_local_controller_request(&app, &headers).expect(
-        "router-local controller requests should authorize without a control-state auth header",
-    );
+    super::site_controller::authorize_local_controller_request(&app, &headers)
+        .await
+        .expect(
+            "router-local controller requests should authorize without a control-state auth header",
+        );
 
     headers.insert(
         FRAMEWORK_ROUTE_ID_HEADER,
@@ -6590,7 +6718,111 @@ async fn local_controller_requests_require_internal_route_headers_not_framework_
             .expect("header should parse"),
     );
     let err = super::site_controller::authorize_local_controller_request(&app, &headers)
+        .await
         .expect_err("wrong internal route should be rejected");
+    assert_eq!(err.0.code, ProtocolErrorCode::Unauthorized);
+}
+
+#[tokio::test]
+async fn local_controller_requests_select_the_controller_for_the_current_site() {
+    let (dir, mut state, state_path, _) = compile_framework_binding_control_state().await;
+    let mut scenario = Scenario::try_from(state.base_scenario.clone()).expect("base scenario");
+    let root_id = scenario.root;
+    let compose_controller_id = amber_scenario::ComponentId(scenario.components.len());
+    scenario.components.push(Some(amber_scenario::Component {
+        id: compose_controller_id,
+        parent: Some(root_id),
+        moniker: "/__amber_internal_framework_component_controller/compose_local"
+            .to_string()
+            .into(),
+        digest: scenario.component(root_id).digest,
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        metadata: Some(
+            serde_json::to_value(
+                amber_compiler::run_plan::FrameworkComponentControllerMetadata {
+                    kind: "amber.framework_component.controller".to_string(),
+                    execution_site: "compose_local".to_string(),
+                    grants: BTreeMap::new(),
+                },
+            )
+            .expect("controller metadata should serialize"),
+        ),
+        child_templates: BTreeMap::new(),
+        children: Vec::new(),
+    }));
+    scenario
+        .component_mut(root_id)
+        .children
+        .push(compose_controller_id);
+    scenario.normalize_order();
+    scenario.assert_invariants();
+    state.base_scenario = amber_scenario::ScenarioIr::from(&scenario);
+
+    let route_id_for_site = |scenario: &Scenario, execution_site: &str| {
+        let controller = scenario
+            .components_iter()
+            .find(|(_, component)| {
+                amber_compiler::run_plan::framework_component_controller_metadata(
+                    component.metadata.as_ref(),
+                )
+                .is_some_and(|metadata| metadata.execution_site == execution_site)
+            })
+            .map(|(_, component)| component)
+            .expect("site controller component should be injected for the site");
+        amber_mesh::component_route_id(
+            controller.moniker.as_str(),
+            amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+            amber_mesh::MeshProtocol::Http,
+        )
+    };
+
+    let direct_route_id = route_id_for_site(&scenario, "direct_local");
+    let compose_route_id = route_id_for_site(&scenario, "compose_local");
+
+    let control = test_control_state_app(&dir, state, state_path.clone());
+    let mut controller_plan = control.controller_plan.as_ref().clone();
+    controller_plan.site_id = "direct_local".to_string();
+    controller_plan.kind = SiteKind::Direct;
+    controller_plan.router_identity_id = "/site/direct_local/router".to_string();
+    let app = SiteControllerApp {
+        control: ControlStateApp {
+            controller_plan: Arc::new(controller_plan),
+            ..control
+        },
+        ready: ready_site_controller_flag(),
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        super::site_controller::CONTROLLER_LOCAL_ONLY_HEADER,
+        "1".parse().expect("header should parse"),
+    );
+    headers.insert(
+        FRAMEWORK_ROUTE_ID_HEADER,
+        direct_route_id.parse().expect("route header should parse"),
+    );
+    headers.insert(
+        FRAMEWORK_PEER_ID_HEADER,
+        "/site/direct_local/router"
+            .parse()
+            .expect("peer header should parse"),
+    );
+    super::site_controller::authorize_local_controller_request(&app, &headers)
+        .await
+        .expect("the direct-local controller should accept its own lowered internal route");
+
+    headers.insert(
+        FRAMEWORK_ROUTE_ID_HEADER,
+        compose_route_id.parse().expect("route header should parse"),
+    );
+    let err = super::site_controller::authorize_local_controller_request(&app, &headers)
+        .await
+        .expect_err("a different site's controller route should be rejected");
     assert_eq!(err.0.code, ProtocolErrorCode::Unauthorized);
 }
 
@@ -6614,12 +6846,223 @@ async fn dynamic_caps_sidecar_requests_reject_ambient_control_state_auth_without
     );
 
     let err = super::site_controller::authorize_dynamic_caps_sidecar_request(
-        &app,
         &headers,
         "components./alice",
     )
     .expect_err("ambient control-state auth must not bypass the controller internal route");
     assert_eq!(err.0.code, ProtocolErrorCode::Unauthorized);
+}
+
+#[tokio::test]
+async fn cross_site_framework_capability_records_bind_to_provider_router_peers() {
+    let (_dir, state, _state_path) = compile_cross_site_framework_authority_control_state().await;
+    let expected_provider_router = "/site/compose_local/router";
+
+    let admin_record = state
+        .capability_instances
+        .values()
+        .find(|record| record.recipient_component_moniker == "/authority/admin")
+        .cloned()
+        .expect("cross-site admin should receive a framework capability record");
+    assert_eq!(admin_record.controller_site_id, "compose_local");
+    assert_eq!(admin_record.recipient_site_id, "direct_local");
+    assert_eq!(admin_record.recipient_peer_id, expected_provider_router);
+    authorize_capability_instance(
+        &state,
+        &admin_record.cap_instance_id,
+        expected_provider_router,
+    )
+    .expect("cross-site framework grants should authorize through the provider site router");
+    let admin_err =
+        authorize_capability_instance(&state, &admin_record.cap_instance_id, "/authority/admin")
+            .expect_err(
+                "cross-site framework grants must not authorize the remote component directly",
+            );
+    assert_eq!(admin_err.code, ProtocolErrorCode::Unauthorized);
+
+    let remote_record = state
+        .capability_instances
+        .values()
+        .find(|record| {
+            record.capability == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+                && record.controller_site_id == "compose_local"
+                && record.recipient_site_id == "direct_local"
+        })
+        .cloned()
+        .expect("compose-local controller should expose the remote controller internal capability");
+    assert_eq!(remote_record.recipient_peer_id, expected_provider_router);
+    authorize_capability_instance(
+        &state,
+        &remote_record.cap_instance_id,
+        expected_provider_router,
+    )
+    .expect(
+        "cross-site remote controller capabilities should authorize through the provider site \
+         router",
+    );
+    let peer_err = authorize_capability_instance(
+        &state,
+        &remote_record.cap_instance_id,
+        remote_record.recipient_component_moniker.as_str(),
+    )
+    .expect_err(
+        "cross-site remote controller capabilities must not authorize the remote controller \
+         component directly",
+    );
+    assert_eq!(peer_err.code, ProtocolErrorCode::Unauthorized);
+}
+
+#[tokio::test]
+async fn dynamic_caps_remote_controller_requests_authorize_over_public_remote_controller_capability()
+ {
+    let (dir, state, state_path) = compile_cross_site_framework_authority_control_state().await;
+    let app = SiteControllerApp {
+        control: test_control_state_app(&dir, state.clone(), state_path),
+        ready: ready_site_controller_flag(),
+    };
+    let remote_record = state
+        .capability_instances
+        .values()
+        .find(|record| {
+            record.capability == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+                && record.controller_site_id == "compose_local"
+                && record.recipient_site_id == "direct_local"
+        })
+        .cloned()
+        .expect("compose-local controller should expose the remote controller internal capability");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        FRAMEWORK_ROUTE_ID_HEADER,
+        remote_record
+            .route_id
+            .parse()
+            .expect("route header should parse"),
+    );
+    headers.insert(
+        FRAMEWORK_PEER_ID_HEADER,
+        remote_record
+            .recipient_peer_id
+            .parse()
+            .expect("peer header should parse"),
+    );
+
+    let auth = super::site_controller::authorize_dynamic_caps_request(
+        &app,
+        &headers,
+        "components./remote-holder",
+    )
+    .await
+    .expect(
+        "remote dynamic capability requests should authorize through the router-local controller \
+         route",
+    );
+    assert_eq!(
+        auth,
+        super::site_controller::DynamicCapsRequestAuth::RemoteController
+    );
+}
+
+#[tokio::test]
+async fn router_identity_lookup_requests_target_site_from_remote_controller_site() {
+    let dir = TempDir::new().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    write_file(
+        &root_path,
+        r#"
+            {
+              manifest_version: "0.3.0",
+              program: { path: "/bin/echo", args: ["root"] },
+            }
+            "#,
+    );
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([
+            (
+                "compose_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Compose,
+                    context: None,
+                    controller_site: None,
+                },
+            ),
+            (
+                "direct_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                    controller_site: None,
+                },
+            ),
+            (
+                "vm_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Vm,
+                    context: None,
+                    controller_site: Some("direct_local".to_string()),
+                },
+            ),
+        ]),
+        defaults: PlacementDefaults {
+            path: Some("compose_local".to_string()),
+            vm: Some("vm_local".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::new(),
+        dynamic_capabilities: None,
+        framework_children: None,
+    };
+    let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+    let state_path = dir.path().join("state.json");
+    write_control_state(&state_path, &state).expect("state should write");
+
+    let requested_sites = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let vm_public_key = [23u8; 32];
+    let peer_router = Router::new().route(
+        "/v1/internal/router-identity",
+        axum::routing::post({
+            let requested_sites = requested_sites.clone();
+            move |Json(request): Json<RouterIdentityRequest>| {
+                let requested_sites = requested_sites.clone();
+                async move {
+                    requested_sites
+                        .lock()
+                        .expect("requested site log should lock")
+                        .push(request.site_id.clone());
+                    Json(RouterIdentityResponse {
+                        id: format!("/site/{}/router", request.site_id),
+                        public_key_b64: base64::engine::general_purpose::STANDARD
+                            .encode(vm_public_key),
+                    })
+                }
+            }
+        }),
+    );
+    let (direct_controller_url, _direct_controller_handle) = spawn_test_router(peer_router).await;
+
+    let mut app = test_control_state_app(&dir, state, state_path);
+    let plan = Arc::make_mut(&mut app.controller_plan);
+    plan.site_id = "compose_local".to_string();
+    plan.kind = SiteKind::Compose;
+    plan.peer_site_router_urls = BTreeMap::from([(
+        "direct_local".to_string(),
+        direct_controller_url.to_string(),
+    )]);
+
+    let identity = router_identity_for_overlay(&app, "vm_local")
+        .await
+        .expect("remote controller site should return the target VM router identity");
+    assert_eq!(identity.id, "/site/vm_local/router");
+    assert_eq!(identity.public_key, vm_public_key);
+    assert_eq!(
+        requested_sites
+            .lock()
+            .expect("requested site log should lock")
+            .clone(),
+        vec!["vm_local".to_string()],
+        "the remote controller request must name the target site, not the controller site",
+    );
 }
 
 #[tokio::test]
@@ -7551,6 +7994,43 @@ async fn prepare_child_record_uses_frozen_dynamic_placement_assignments() {
 }
 
 #[tokio::test]
+async fn prepare_child_record_grants_internal_controller_route_only_to_dynamic_child() {
+    let (_dir, mut state, _state_path, _admin_record) =
+        compile_framework_binding_control_state().await;
+    let root_authority = state.base_scenario.root;
+    let child = prepare_child_record(
+        &mut state,
+        root_authority,
+        &CreateChildRequest {
+            template: "worker".to_string(),
+            name: "job".to_string(),
+            manifest: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        },
+    )
+    .await
+    .expect("dynamic child should plan successfully");
+    let spec = build_local_child_runtime_spec(&state, &child, "direct_local")
+        .expect("dynamic child should build a direct runtime spec");
+    let internal_routes = spec
+        .controller_routes
+        .iter()
+        .filter(|route| {
+            route.capability == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(internal_routes.len(), 1);
+    assert_eq!(
+        internal_routes[0].allowed_issuers,
+        vec!["/job".to_string()],
+        "dynamic child sidecars need the local controller route for dynamic-capability control, \
+         but the overlay must not grant access to pre-existing components or unrelated children",
+    );
+}
+
+#[tokio::test]
 async fn prepare_child_record_supports_cross_site_dynamic_fragments() {
     let dir = TempDir::new().expect("temp dir");
     let root_path = dir.path().join("root.json5");
@@ -7788,11 +8268,19 @@ async fn prepare_child_record_supports_cross_site_dynamic_fragments() {
     let compose_spec =
         build_local_child_runtime_spec(&state, &child, "compose_local").expect("compose spec");
     assert_eq!(compose_spec.assigned_components, vec!["/job-compose/root"]);
+    assert!(
+        compose_spec.direct_inputs.is_empty(),
+        "cross-site child bindings should not be modeled as same-site direct inputs"
+    );
     let direct_spec =
         build_local_child_runtime_spec(&state, &child, "direct_local").expect("direct spec");
     assert_eq!(
         direct_spec.assigned_components,
         vec!["/job-compose/direct_helper"]
+    );
+    assert!(
+        direct_spec.direct_inputs.is_empty(),
+        "provider-only sites should not receive synthetic direct inputs for cross-site links"
     );
     let kind_spec =
         build_local_child_runtime_spec(&state, &child, "kind_local").expect("kind spec");
@@ -7800,10 +8288,47 @@ async fn prepare_child_record_supports_cross_site_dynamic_fragments() {
         kind_spec.assigned_components,
         vec!["/job-compose/kind_helper"]
     );
+    assert!(
+        kind_spec.direct_inputs.is_empty(),
+        "provider-only sites should not receive synthetic direct inputs for cross-site links"
+    );
     let vm_spec = build_local_child_runtime_spec(&state, &child, "vm_local").expect("vm spec");
     assert_eq!(
         vm_spec.assigned_components,
         vec!["/job-compose/vm_helper/root"]
+    );
+    assert!(
+        vm_spec.direct_inputs.is_empty(),
+        "provider-only sites should not receive synthetic direct inputs for cross-site links"
+    );
+    assert_eq!(
+        child.overlays.len(),
+        6,
+        "three cross-site child bindings should lower to three consumer external-slot overlays          and three provider export-peer overlays"
+    );
+    assert_eq!(
+        child
+            .overlays
+            .iter()
+            .filter(|overlay| {
+                overlay.site_id == "compose_local"
+                    && matches!(overlay.action, DynamicOverlayAction::ExternalSlot { .. })
+            })
+            .count(),
+        3,
+        "the child root site should receive one external-slot overlay per cross-site binding"
+    );
+    assert_eq!(
+        child
+            .overlays
+            .iter()
+            .filter(|overlay| {
+                overlay.site_id != "compose_local"
+                    && matches!(overlay.action, DynamicOverlayAction::ExportPeer { .. })
+            })
+            .count(),
+        3,
+        "each remote provider site should expose one export-peer overlay for the child binding"
     );
 }
 
@@ -9351,12 +9876,16 @@ volumes:
             .iter()
             .any(|value| { value.as_str() == Some("/var/run/docker.sock:/var/run/docker.sock") })
     );
+    let group_add = service
+        .get(serde_yaml::Value::String("group_add".to_string()))
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("controller service should join the router runtime group");
     assert!(
-        service
-            .get(serde_yaml::Value::String("group_add".to_string()))
-            .is_none(),
-        "compose site controller should not override its supplemental groups; it runs as root to \
-         preserve access to both the Docker socket and the router-control volume"
+        group_add
+            .iter()
+            .any(|value| value.as_str() == Some("65532")),
+        "compose site controller runs with dropped capabilities, so it needs the router runtime \
+         group to access the router-control socket"
     );
     assert!(
         extra_hosts
@@ -9388,7 +9917,9 @@ fn kubernetes_site_controller_resources_are_injected_into_the_artifact() {
     fs::write(
         artifact_root.join("kustomization.yaml"),
         "resources:\n  - 03-deployments/amber-site-controller.yaml\n  - \
-         04-services/amber-site-controller.yaml\n  - 05-networkpolicies/amber-router-netpol.yaml\n",
+         04-services/amber-site-controller.yaml\n  - \
+         05-networkpolicies/amber-router-netpol.yaml\n  - \
+         05-networkpolicies/amber-site-controller-netpol.yaml\n",
     )
     .expect("kustomization should write");
     fs::write(
@@ -9423,6 +9954,27 @@ spec:
 "#,
     )
     .expect("router netpol should write");
+    fs::write(
+        artifact_root.join("05-networkpolicies/amber-site-controller-netpol.yaml"),
+        r#"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amber-site-controller-netpol
+spec:
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          amber.io/component: amber-router
+    ports:
+    - protocol: TCP
+      port: 24000
+    - protocol: TCP
+      port: 24100
+"#,
+    )
+    .expect("site controller netpol should write");
     fs::write(
         site_state_root.join("site-controller-state.json"),
         "{\"schema\":\"amber.test\",\"version\":1}",
@@ -9586,7 +10138,14 @@ spec:
         fs::read_to_string(artifact_root.join("01-configmaps/amber-site-controller-seed.yaml"))
             .expect("seed configmap should read");
     assert!(seed.contains("site-controller-plan.json"));
-    assert!(seed.contains("artifact.tar.b64"));
+    assert!(
+        !seed.contains("artifact.tar.b64"),
+        "kubernetes controller bootstrap should seed ordinary files instead of a tarball"
+    );
+    assert!(
+        deployment_raw.contains("cp -R /amber/seed/artifact/. /amber/site/artifact"),
+        "kubernetes controller bootstrap should copy seeded artifact files directly"
+    );
     assert!(seed.contains(&format!("http://amber-site-controller:{controller_port}")));
     assert!(deployment_raw.contains("EXISTING_ENV"));
 
@@ -9600,6 +10159,11 @@ spec:
         .expect("router service should read");
     assert!(router_service.contains("controller-route-37046"));
     assert!(router_service.contains("port: 37046"));
+    let controller_netpol = fs::read_to_string(
+        artifact_root.join("05-networkpolicies/amber-site-controller-netpol.yaml"),
+    )
+    .expect("site controller netpol should read");
+    assert!(controller_netpol.contains("37046"));
 }
 
 #[test]
@@ -9685,6 +10249,81 @@ fn local_site_manager_state_uses_controller_plan_when_host_state_is_absent() {
     assert_eq!(
         state.site_controller_url.as_deref(),
         Some(authority_url.as_str())
+    );
+}
+
+#[test]
+fn site_execution_site_routes_vm_sites_to_their_direct_controller() {
+    let state = FrameworkControlState {
+        schema: CONTROL_STATE_SCHEMA.to_string(),
+        version: CONTROL_STATE_VERSION,
+        run_id: "test-run".to_string(),
+        base_scenario: ScenarioIr {
+            schema: amber_scenario::SCENARIO_IR_SCHEMA.to_string(),
+            version: amber_scenario::SCENARIO_IR_VERSION,
+            root: 0,
+            components: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
+        },
+        run_links: Vec::new(),
+        placement: FrozenPlacementState {
+            offered_sites: BTreeMap::from([
+                (
+                    "direct_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                        controller_site: None,
+                    },
+                ),
+                (
+                    "vm_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Vm,
+                        context: None,
+                        controller_site: Some("direct_local".to_string()),
+                    },
+                ),
+            ]),
+            defaults: PlacementDefaults::default(),
+            standby_sites: Vec::new(),
+            initial_active_sites: vec!["direct_local".to_string(), "vm_local".to_string()],
+            dynamic_enabled_sites: vec!["direct_local".to_string(), "vm_local".to_string()],
+            control_only_sites: Vec::new(),
+            active_site_capabilities: BTreeMap::new(),
+            placement_components: BTreeMap::new(),
+            assignments: BTreeMap::new(),
+        },
+        generation: 0,
+        next_child_id: 1,
+        next_tx_id: 0,
+        id_stride: 1,
+        next_component_id: 0,
+        capability_instances: BTreeMap::new(),
+        journal: Vec::new(),
+        dynamic_capability_signing_seed_b64: mesh_dynamic_caps::signing_seed_b64(
+            &mesh_dynamic_caps::signing_key_from_seed(
+                mesh_dynamic_caps::generate_dynamic_capability_signing_seed(),
+            ),
+        ),
+        next_dynamic_capability_grant_id: 0,
+        dynamic_capability_grants: BTreeMap::new(),
+        dynamic_capability_grant_authority_sites: BTreeMap::new(),
+        dynamic_capability_journal: Vec::new(),
+        live_children: Vec::new(),
+        pending_creates: Vec::new(),
+        pending_destroys: Vec::new(),
+    };
+
+    assert_eq!(
+        site_execution_site_from_state(&state, "direct_local").expect("direct site execution"),
+        "direct_local"
+    );
+    assert_eq!(
+        site_execution_site_from_state(&state, "vm_local").expect("vm site execution"),
+        "direct_local"
     );
 }
 

@@ -9,6 +9,7 @@ const COMPOSE_ROUTER_SERVICE_NAME: &str = "amber-router";
 const COMPOSE_ROUTER_CONTROL_INIT_SERVICE_NAME: &str = "amber-router-control-init";
 const COMPOSE_ROUTER_CONTROL_SOCKET_DIR: &str = "/amber/control";
 const COMPOSE_ROUTER_CONTROL_VOLUME_NAME: &str = "amber-router-control";
+const COMPOSE_ROUTER_RUNTIME_GID: &str = "65532";
 const DOCKER_SOCK_PATH: &str = "/var/run/docker.sock";
 const COMPOSE_CONTROLLER_PLAN_PATH: &str = "/amber/site/state/site-controller-plan.json";
 
@@ -20,6 +21,13 @@ fn ensure_string_sequence_contains(sequence: &mut serde_yaml::Sequence, value: &
         return;
     }
     sequence.push(yaml_string(value));
+}
+
+fn uses_service_network_mode(service: &serde_yaml::Mapping) -> bool {
+    service
+        .get(yaml_string("network_mode"))
+        .and_then(serde_yaml::Value::as_str)
+        .is_some_and(|mode| mode.starts_with("service:"))
 }
 
 fn ensure_controller_environment(
@@ -151,6 +159,10 @@ pub fn inject_compose_site_controller(
     service.insert(yaml_string("image"), yaml_string(controller_image));
     service.insert(yaml_string("user"), yaml_string("0:0"));
     service.insert(
+        yaml_string("group_add"),
+        serde_yaml::Value::Sequence(vec![yaml_string(COMPOSE_ROUTER_RUNTIME_GID)]),
+    );
+    service.insert(
         yaml_string("healthcheck"),
         serde_yaml::to_value(json!({
             "test": [
@@ -170,14 +182,20 @@ pub fn inject_compose_site_controller(
     );
     service.insert(yaml_string("restart"), yaml_string("unless-stopped"));
 
-    let extra_hosts = service
-        .entry(yaml_string("extra_hosts"))
-        .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
-        .as_sequence_mut()
-        .ok_or_else(|| {
-            miette::miette!("compose site controller service has a non-sequence extra_hosts field")
-        })?;
-    ensure_string_sequence_contains(extra_hosts, "host.docker.internal:host-gateway");
+    if uses_service_network_mode(service) {
+        service.remove(yaml_string("extra_hosts"));
+    } else {
+        let extra_hosts = service
+            .entry(yaml_string("extra_hosts"))
+            .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
+            .as_sequence_mut()
+            .ok_or_else(|| {
+                miette::miette!(
+                    "compose site controller service has a non-sequence extra_hosts field"
+                )
+            })?;
+        ensure_string_sequence_contains(extra_hosts, "host.docker.internal:host-gateway");
+    }
 
     let volumes = service
         .entry(yaml_string("volumes"))
@@ -251,6 +269,55 @@ mod tests {
                 "router=dev-tag,helper=dev-tag".to_string(),
             )]),
         }
+    }
+
+    #[test]
+    fn inject_compose_site_controller_keeps_service_network_mode_compatible() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let compose_path = temp.path().join("compose.yaml");
+        fs::write(
+            &compose_path,
+            "services:
+  amber-site-controller:
+    image: __amber_internal/site-controller
+    network_mode: service:amber-site-controller-net
+    extra_hosts:
+      - host.docker.internal:host-gateway
+",
+        )
+        .expect("compose file should write");
+
+        let plan = test_plan(temp.path());
+        let plan_path = temp.path().join("site-controller-plan.json");
+        fs::write(&plan_path, "{}").expect("plan file should write");
+
+        inject_compose_site_controller(
+            temp.path(),
+            &plan,
+            &plan_path,
+            "ghcr.io/rdi-foundation/amber-site-controller:test",
+        )
+        .expect("compose site controller injection should succeed");
+
+        let document = read_compose_document(&compose_path).expect("compose should parse");
+        let service = document
+            .as_mapping()
+            .and_then(|root| root.get(yaml_string("services")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|services| services.get(yaml_string(SITE_CONTROLLER_SERVICE_NAME)))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("site controller service should exist");
+        assert_eq!(
+            service
+                .get(yaml_string("network_mode"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("service:amber-site-controller-net"),
+            "late bootstrap must preserve the lowered sidecar sharing topology",
+        );
+        assert!(
+            service.get(yaml_string("extra_hosts")).is_none(),
+            "late bootstrap must not add host mappings to service-networked controller workloads",
+        );
     }
 
     #[test]

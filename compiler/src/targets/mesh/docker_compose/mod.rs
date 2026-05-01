@@ -113,7 +113,7 @@ fn build_control_socket_init_service(volume_name: &str) -> Service {
         format!(
             "mkdir -p {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} && chown \
              {ROUTER_RUNTIME_UID}:{ROUTER_RUNTIME_GID} {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} \
-             && chmod 0700 {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
+             && chmod 0770 {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
         ),
     ]);
     service.volumes.push(format!(

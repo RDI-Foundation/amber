@@ -935,7 +935,7 @@ pub(super) fn local_site_controller_ready(
     timeout: Duration,
 ) -> Result<bool> {
     let Some(addr) = local_site_controller_addr(plan)? else {
-        return Ok(false);
+        return Ok(true);
     };
     Ok(wait_for_http_response(addr, timeout).is_ok())
 }

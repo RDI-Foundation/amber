@@ -140,6 +140,7 @@ ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 const TEST_APP_SOURCE_IMAGE: &str = "python:3.13-alpine";
 const TEST_APP_LOCAL_IMAGE_REPOSITORY: &str = "amber-mixed-run-test-app";
+const KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER: &str = "main";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DockerImageMeta {
@@ -1433,6 +1434,10 @@ pub(crate) fn framework_control_state_snapshot(control_state_root: &Path) -> Val
         let Some(site_id) = entry.file_name().into_string().ok() else {
             continue;
         };
+        let manager_state = site_manager_state_from_state_root(control_state_root, &site_id);
+        if !site_hosts_local_framework_controller(control_state_root, &site_id, &manager_state) {
+            continue;
+        }
         let state = framework_site_control_state(control_state_root, &site_id);
         if let Some(children) = state["live_children"].as_array() {
             live_children.extend(children.iter().cloned());
@@ -1470,6 +1475,20 @@ fn framework_site_control_state(control_state_root: &Path, site_id: &str) -> Val
         materialize_kubernetes_control_state(&manager_state, &state_path);
     }
     read_json(&state_path)
+}
+
+fn site_hosts_local_framework_controller(
+    control_state_root: &Path,
+    site_id: &str,
+    manager_state: &Value,
+) -> bool {
+    if manager_state["kind"].as_str() == Some("kubernetes") {
+        return control_state_root
+            .join(site_id)
+            .join("site-controller-plan.json")
+            .is_file();
+    }
+    framework_site_control_state_path(control_state_root, site_id, manager_state).is_file()
 }
 
 fn site_manager_state(run_root: &Path, site_id: &str) -> Value {
@@ -1560,6 +1579,8 @@ fn kubernetes_child_runtime_root_exists(manager_state: &Value, child_id: u64) ->
         .arg(namespace)
         .arg("exec")
         .arg(&pod)
+        .arg("-c")
+        .arg(KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER)
         .arg("--")
         .arg("sh")
         .arg("-lc")
@@ -1622,6 +1643,8 @@ fn materialize_kubernetes_child_artifact(
         .arg("-n")
         .arg(namespace)
         .arg("cp")
+        .arg("-c")
+        .arg(KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER)
         .arg(format!("{pod}:{remote_artifact_dir}"))
         .arg(&target)
         .status()
@@ -1668,6 +1691,8 @@ fn materialize_kubernetes_control_state(manager_state: &Value, state_path: &Path
         .arg(namespace)
         .arg("exec")
         .arg(&pod)
+        .arg("-c")
+        .arg(KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER)
         .arg("--")
         .arg("cat")
         .arg("/amber/site/state/site-controller-state.json")
@@ -3196,6 +3221,47 @@ mod tests {
             "kubernetes framework control state should use the dedicated cache path, got {}",
             state_path.display()
         );
+    }
+
+    #[test]
+    fn framework_control_state_snapshot_skips_sites_without_local_controller() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let state_root = temp.path().join("state");
+        let direct_root = state_root.join("direct_local");
+        let vm_root = state_root.join("vm_local");
+        fs::create_dir_all(&direct_root).expect("direct state root should create");
+        fs::create_dir_all(&vm_root).expect("vm state root should create");
+        write_json(
+            &direct_root.join("manager-state.json"),
+            &json!({
+                "kind": "direct",
+                "site_id": "direct_local",
+            }),
+        );
+        write_json(
+            &direct_root.join("site-controller-state.json"),
+            &json!({
+                "live_children": [
+                    {
+                        "name": "local-child",
+                        "state": "live",
+                        "child_id": 7,
+                    }
+                ],
+            }),
+        );
+        write_json(
+            &vm_root.join("manager-state.json"),
+            &json!({
+                "kind": "vm",
+                "site_id": "vm_local",
+            }),
+        );
+
+        let snapshot = framework_control_state_snapshot(&state_root);
+
+        assert_eq!(snapshot["live_children"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["live_children"][0]["name"], "local-child");
     }
 
     #[cfg(unix)]

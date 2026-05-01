@@ -9,7 +9,8 @@ pub(super) const SITE_CONTROLLER_STATE_PATH: &str = "/v1/controller/state";
 pub(super) const FRAMEWORK_ROUTE_ID_HEADER: &str = "x-amber-route-id";
 pub(super) const FRAMEWORK_PEER_ID_HEADER: &str = "x-amber-peer-id";
 pub(super) const CONTROL_STATE_AUTH_HEADER: &str = "x-amber-control-state-auth";
-pub const SITE_CONTROLLER_INTERNAL_CAPABILITY: &str = "amber.internal.site_controller";
+pub const SITE_CONTROLLER_INTERNAL_CAPABILITY: &str =
+    amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME;
 pub const SITE_CONTROLLER_SERVICE_NAME: &str = "amber-site-controller";
 
 pub fn site_controller_internal_route_id(site_id: &str) -> String {
@@ -114,19 +115,6 @@ pub struct DynamicProxyExportRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_profile: Option<String>,
     pub target_port: u16,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DynamicInputRouteRecord {
-    pub component: String,
-    pub slot: String,
-    pub provider_component: String,
-    pub protocol: String,
-    pub capability_kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capability_profile: Option<String>,
-    #[serde(flatten)]
-    pub target: DynamicInputRouteTarget,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

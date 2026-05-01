@@ -39,7 +39,7 @@ use amber_compiler::{
         dot::DotReporter,
         metadata::MetadataReporter,
         scenario_ir::ScenarioIrReporter,
-        vm::VM_PLAN_FILENAME,
+        vm::{VM_PLAN_FILENAME, VM_RUN_SCRIPT_FILENAME, VmReporter},
     },
     run_plan::{
         PlacementFile, RUN_PLAN_SCHEMA, RunPlan, SiteKind, build_homogeneous_export_run_plan,
@@ -1154,10 +1154,16 @@ async fn compile(args: CompileArgs) -> Result<()> {
     }
 
     if let Some(vm_dest) = outputs.vm {
-        let run_plan = build_homogeneous_export_run_plan(&compiled, SiteKind::Vm)
-            .into_diagnostic()
-            .wrap_err("failed to build homogeneous vm export plan")?;
-        write_unmanaged_export_output(&vm_dest, &run_plan, SiteKind::Vm)?;
+        let artifact = VmReporter
+            .emit(&compiled)
+            .map_err(miette::Report::new)
+            .wrap_err("failed to build vm artifact")?;
+        write_directory_output(
+            &vm_dest,
+            "vm output directory",
+            &artifact.files,
+            Some(Path::new(VM_RUN_SCRIPT_FILENAME)),
+        )?;
     }
 
     if let Some(metadata_dest) = outputs.metadata {

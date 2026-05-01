@@ -812,11 +812,43 @@ fn framework_site_controller_state_path(run: &RunHandle) -> PathBuf {
         .expect("run should materialize at least one site controller state file")
 }
 
+fn framework_controller_internal_route_id(run: &RunHandle, site_id: &str) -> String {
+    let state = read_json(&framework_site_controller_state_path(run));
+    let controller_moniker = state["base_scenario"]["components"]
+        .as_array()
+        .expect("site controller state should include base scenario components")
+        .iter()
+        .find(|component| {
+            component["metadata"]["kind"]
+                == amber_compiler::run_plan::FRAMEWORK_COMPONENT_CONTROLLER_METADATA_KIND
+                && component["metadata"]["execution_site"] == site_id
+        })
+        .and_then(|component| component["moniker"].as_str())
+        .expect("base scenario should include the local synthetic site controller component");
+    amber_mesh::component_route_id(
+        controller_moniker,
+        amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+        amber_mesh::MeshProtocol::Http,
+    )
+}
+
 fn framework_controller_post(run: &RunHandle, path: &str, payload: &Value) -> (u16, String) {
     let plan = read_json(&framework_site_controller_plan_path(run));
     let authority_url = plan["authority_url"]
         .as_str()
         .expect("site controller plan should publish authority_url");
+    let site_id = plan["site_id"]
+        .as_str()
+        .expect("site controller plan should publish site_id");
+    let route_id = framework_controller_internal_route_id(run, site_id);
+    let logical_component_id = payload["holder_component_id"]
+        .as_str()
+        .or_else(|| payload["caller_component_id"].as_str())
+        .expect("dynamic capability controller request should identify the calling component");
+    let peer_id = logical_component_id
+        .strip_prefix("components.")
+        .filter(|moniker| moniker.starts_with('/'))
+        .expect("dynamic capability logical component id should be a component moniker");
     let body = serde_json::to_string(payload).expect("request body should serialize");
     let output = command_output_via_tempfiles(
         std::process::Command::new("curl")
@@ -828,22 +860,11 @@ fn framework_controller_post(run: &RunHandle, path: &str, payload: &Value) -> (u
             .arg("-H")
             .arg("content-type: application/json")
             .arg("-H")
-            .arg("-H")
             .arg("x-amber-site-controller-local-only: 1")
             .arg("-H")
-            .arg(format!(
-                "x-amber-route-id: site-controller:{}",
-                plan["site_id"]
-                    .as_str()
-                    .expect("site controller plan should publish site_id")
-            ))
+            .arg(format!("x-amber-route-id: {route_id}"))
             .arg("-H")
-            .arg(format!(
-                "x-amber-peer-id: {}",
-                plan["router_identity_id"]
-                    .as_str()
-                    .expect("site controller plan should publish router identity")
-            ))
+            .arg(format!("x-amber-peer-id: {peer_id}"))
             .arg("--data")
             .arg(body)
             .arg("-o")
@@ -1708,7 +1729,10 @@ fn framework_component_direct_create_destroy_live() {
             }
         }),
     );
-    assert_eq!(create_status, 200, "create request should succeed");
+    assert_eq!(
+        create_status, 200,
+        "create request should succeed: {create_response}"
+    );
     let create_json: Value =
         serde_json::from_str(&create_response).expect("create response should be valid json");
     assert_eq!(create_json["child"]["name"], "job-1");
@@ -3179,7 +3203,10 @@ fn framework_component_compose_parent_standby_direct_live() {
         "/create/worker/job-1",
         "create request should return an HTTP response",
     );
-    assert_eq!(create_status, 200, "create request should succeed");
+    assert_eq!(
+        create_status, 200,
+        "create request should succeed: {create_response}"
+    );
     let create_json: Value =
         serde_json::from_str(&create_response).expect("create response should be valid json");
     assert_eq!(create_json["child"]["name"], "job-1");
@@ -3317,7 +3344,10 @@ fn framework_component_direct_parent_compose_child_live() {
         "/create/job-1",
         "create request should return an HTTP response",
     );
-    assert_eq!(create_status, 200, "create request should succeed");
+    assert_eq!(
+        create_status, 200,
+        "create request should succeed: {create_response}"
+    );
     let create_json: Value =
         serde_json::from_str(&create_response).expect("create response should be valid json");
     assert_eq!(create_json["child"]["name"], "job-1");

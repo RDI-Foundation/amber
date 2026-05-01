@@ -758,7 +758,7 @@ pub(super) fn bind_unix_listener(path: &str) -> Result<UnixListener, RouterError
             path: path.clone(),
             source,
         })?;
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660)).map_err(
         |source| RouterError::BindUnixFailed {
             path: path.clone(),
             source,

@@ -6,9 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use base64::Engine as _;
 use serde_json::json;
-use tar::Builder;
 
 use super::*;
 
@@ -17,8 +15,13 @@ const KUBERNETES_ROUTER_MESH_PORT: u16 = 24000;
 const KUBERNETES_ROUTER_CONTROL_PORT: u16 = 24100;
 const KUBERNETES_ROUTER_SERVICE_PATH: &str = "04-services/amber-router.yaml";
 const KUBERNETES_ROUTER_NETPOL_PATH: &str = "05-networkpolicies/amber-router-netpol.yaml";
+const KUBERNETES_CONTROLLER_NETPOL_PATH: &str =
+    "05-networkpolicies/amber-site-controller-netpol.yaml";
 const KUBERNETES_CONTROLLER_SEED_CONFIGMAP_PATH: &str =
     "01-configmaps/amber-site-controller-seed.yaml";
+const KUBERNETES_CONTROLLER_SEED_CONFIGMAP_PATH_PREFIX: &str =
+    "01-configmaps/amber-site-controller-seed";
+const KUBERNETES_CONTROLLER_SEED_CONFIGMAP_DATA_LIMIT: usize = 64 * 1024;
 const KUBERNETES_CONTROLLER_SERVICE_ACCOUNT_PATH: &str = "02-rbac/amber-site-controller-sa.yaml";
 const KUBERNETES_CONTROLLER_ROLE_PATH: &str = "02-rbac/amber-site-controller-role.yaml";
 const KUBERNETES_CONTROLLER_ROLE_BINDING_PATH: &str =
@@ -36,20 +39,27 @@ const KUBERNETES_CONTROLLER_STATE_PATH: &str = "/amber/site/state/site-controlle
 const KUBERNETES_CONTROLLER_DESIRED_LINKS_PATH: &str = "/amber/site/state/desired-links.json";
 const KUBERNETES_CONTROLLER_SEED_ROOT: &str = "/amber/seed";
 
+#[derive(Clone, Debug)]
+struct KubernetesControllerSeedConfigMap {
+    path: String,
+    name: String,
+    items: Vec<serde_json::Value>,
+    document: serde_json::Value,
+}
+
 pub fn inject_kubernetes_site_controller(
     artifact_root: &Path,
     plan: &SiteControllerPlan,
     controller_image: &str,
 ) -> Result<()> {
     let embedded_plan = build_embedded_kubernetes_controller_plan(plan);
-    let seed_configmap =
-        build_kubernetes_controller_seed_configmap(artifact_root, plan, &embedded_plan)?;
+    let seed_configmaps =
+        build_kubernetes_controller_seed_configmaps(artifact_root, plan, &embedded_plan)?;
     let labels = kubernetes_controller_labels();
 
-    write_yaml_artifact(
-        artifact_root.join(KUBERNETES_CONTROLLER_SEED_CONFIGMAP_PATH),
-        &seed_configmap,
-    )?;
+    for configmap in &seed_configmaps {
+        write_yaml_artifact(artifact_root.join(&configmap.path), &configmap.document)?;
+    }
     write_yaml_artifact(
         artifact_root.join(KUBERNETES_CONTROLLER_SERVICE_ACCOUNT_PATH),
         &json!({
@@ -129,20 +139,24 @@ pub fn inject_kubernetes_site_controller(
         artifact_root.join(KUBERNETES_CONTROLLER_DEPLOYMENT_PATH),
         plan,
         controller_image,
+        &seed_configmaps,
     )?;
-    add_kubernetes_resource_paths(
-        artifact_root,
-        &[
-            KUBERNETES_CONTROLLER_SEED_CONFIGMAP_PATH,
-            KUBERNETES_CONTROLLER_SERVICE_ACCOUNT_PATH,
-            KUBERNETES_CONTROLLER_ROLE_PATH,
-            KUBERNETES_CONTROLLER_ROLE_BINDING_PATH,
-        ],
-    )?;
+    let mut resource_paths = seed_configmaps
+        .iter()
+        .map(|configmap| configmap.path.as_str())
+        .collect::<Vec<_>>();
+    resource_paths.extend([
+        KUBERNETES_CONTROLLER_SERVICE_ACCOUNT_PATH,
+        KUBERNETES_CONTROLLER_ROLE_PATH,
+        KUBERNETES_CONTROLLER_ROLE_BINDING_PATH,
+    ]);
+    add_kubernetes_resource_paths(artifact_root, &resource_paths)?;
+    let peer_router_route_ports = peer_router_route_ports(&embedded_plan)?;
     ensure_kubernetes_router_allows_site_controller_ingress(
         artifact_root,
-        &peer_router_route_ports(&embedded_plan)?,
-    )
+        &peer_router_route_ports,
+    )?;
+    ensure_kubernetes_site_controller_allows_router_egress(artifact_root, &peer_router_route_ports)
 }
 
 fn upsert_named_sequence_entry(
@@ -219,6 +233,7 @@ fn patch_kubernetes_controller_deployment(
     path: PathBuf,
     plan: &SiteControllerPlan,
     controller_image: &str,
+    seed_configmaps: &[KubernetesControllerSeedConfigMap],
 ) -> Result<()> {
     let raw = fs::read_to_string(&path)
         .into_diagnostic()
@@ -278,9 +293,10 @@ cp \
 cp \
                      {KUBERNETES_CONTROLLER_SEED_ROOT}/desired-links.json \
                      {KUBERNETES_CONTROLLER_DESIRED_LINKS_PATH}
-base64 -d \
-                     {KUBERNETES_CONTROLLER_SEED_ROOT}/artifact.tar.b64 | tar \
-                     -xf - -C {KUBERNETES_CONTROLLER_ARTIFACT_ROOT}
+if [ -d {KUBERNETES_CONTROLLER_SEED_ROOT}/artifact ]; then
+  cp -R {KUBERNETES_CONTROLLER_SEED_ROOT}/artifact/. \
+    {KUBERNETES_CONTROLLER_ARTIFACT_ROOT}
+fi
 "
                 )
             ],
@@ -334,13 +350,24 @@ base64 -d \
         .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
         .as_sequence_mut()
         .ok_or_else(|| miette::miette!("controller deployment volumes must be a sequence"))?;
+    let seed_sources = seed_configmaps
+        .iter()
+        .map(|configmap| {
+            json!({
+                "configMap": {
+                    "name": configmap.name.clone(),
+                    "items": configmap.items.clone(),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
     upsert_named_sequence_entry(
         volumes,
         KUBERNETES_CONTROLLER_SEED_VOLUME,
         serde_yaml::to_value(json!({
             "name": KUBERNETES_CONTROLLER_SEED_VOLUME,
-            "configMap": {
-                "name": format!("{SITE_CONTROLLER_SERVICE_NAME}-seed"),
+            "projected": {
+                "sources": seed_sources,
             }
         }))
         .into_diagnostic()
@@ -382,11 +409,42 @@ fn build_embedded_kubernetes_controller_plan(plan: &SiteControllerPlan) -> SiteC
     embedded
 }
 
-fn build_kubernetes_controller_seed_configmap(
+fn build_kubernetes_controller_seed_configmaps(
     artifact_root: &Path,
     plan: &SiteControllerPlan,
     embedded_plan: &SiteControllerPlan,
-) -> Result<serde_json::Value> {
+) -> Result<Vec<KubernetesControllerSeedConfigMap>> {
+    let seed_files = build_kubernetes_controller_seed_files(artifact_root, plan, embedded_plan)?;
+    let mut chunks = Vec::<Vec<(String, String)>>::new();
+    let mut current = Vec::<(String, String)>::new();
+    let mut current_size = 0usize;
+    for (path, contents) in seed_files {
+        let entry_size = path.len() + contents.len();
+        if !current.is_empty()
+            && current_size + entry_size > KUBERNETES_CONTROLLER_SEED_CONFIGMAP_DATA_LIMIT
+        {
+            chunks.push(current);
+            current = Vec::new();
+            current_size = 0;
+        }
+        current.push((path, contents));
+        current_size += entry_size;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, files)| render_kubernetes_controller_seed_configmap(index, files))
+        .collect()
+}
+
+fn build_kubernetes_controller_seed_files(
+    artifact_root: &Path,
+    plan: &SiteControllerPlan,
+    embedded_plan: &SiteControllerPlan,
+) -> Result<Vec<(String, String)>> {
     let state_json = fs::read_to_string(&plan.state_path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read {}", plan.state_path))?;
@@ -397,32 +455,67 @@ fn build_kubernetes_controller_seed_configmap(
     let embedded_plan_json = serde_json::to_string_pretty(embedded_plan)
         .into_diagnostic()
         .wrap_err("failed to serialize embedded kubernetes site controller plan")?;
-    Ok(json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {
-            "name": format!("{SITE_CONTROLLER_SERVICE_NAME}-seed"),
-            "labels": kubernetes_controller_labels(),
-        },
-        "data": {
-            "site-controller-plan.json": embedded_plan_json,
-            "site-controller-state.json": state_json,
-            "desired-links.json": desired_links_json,
-            "artifact.tar.b64": tar_directory_base64(artifact_root)?,
-        }
-    }))
+    let mut files = BTreeMap::from([
+        ("site-controller-plan.json".to_string(), embedded_plan_json),
+        ("site-controller-state.json".to_string(), state_json),
+        ("desired-links.json".to_string(), desired_links_json),
+    ]);
+    for path in walk_files(artifact_root)? {
+        let relative = path
+            .strip_prefix(artifact_root)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to relativize {}", path.display()))?;
+        let relative = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let contents = fs::read_to_string(&path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+        files.insert(format!("artifact/{relative}"), contents);
+    }
+    Ok(files.into_iter().collect())
 }
 
-fn tar_directory_base64(root: &Path) -> Result<String> {
-    let mut tar = Builder::new(Vec::new());
-    tar.append_dir_all(".", root)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to archive {}", root.display()))?;
-    let bytes = tar
-        .into_inner()
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to finalize archive {}", root.display()))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+fn render_kubernetes_controller_seed_configmap(
+    index: usize,
+    files: Vec<(String, String)>,
+) -> Result<KubernetesControllerSeedConfigMap> {
+    let name = if index == 0 {
+        format!("{SITE_CONTROLLER_SERVICE_NAME}-seed")
+    } else {
+        format!("{SITE_CONTROLLER_SERVICE_NAME}-seed-{index}")
+    };
+    let path = if index == 0 {
+        KUBERNETES_CONTROLLER_SEED_CONFIGMAP_PATH.to_string()
+    } else {
+        format!("{KUBERNETES_CONTROLLER_SEED_CONFIGMAP_PATH_PREFIX}-{index}.yaml")
+    };
+    let mut data = serde_json::Map::new();
+    let mut items = Vec::with_capacity(files.len());
+    for (entry_index, (relative_path, contents)) in files.into_iter().enumerate() {
+        let key = format!("seed-{entry_index:04}");
+        data.insert(key.clone(), serde_json::Value::String(contents));
+        items.push(json!({
+            "key": key,
+            "path": relative_path,
+        }));
+    }
+    Ok(KubernetesControllerSeedConfigMap {
+        path,
+        name: name.clone(),
+        items,
+        document: json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": name,
+                "labels": kubernetes_controller_labels(),
+            },
+            "data": data,
+        }),
+    })
 }
 
 fn add_kubernetes_resource_paths(artifact_root: &Path, paths: &[&str]) -> Result<()> {
@@ -635,6 +728,111 @@ fn ensure_kubernetes_router_allows_site_controller_ingress(
         .wrap_err_with(|| format!("failed to write {}", path.display()))
 }
 
+fn ensure_kubernetes_site_controller_allows_router_egress(
+    artifact_root: &Path,
+    route_ports: &BTreeSet<u16>,
+) -> Result<()> {
+    if route_ports.is_empty() {
+        return Ok(());
+    }
+    let path = artifact_root.join(KUBERNETES_CONTROLLER_NETPOL_PATH);
+    let raw = fs::read_to_string(&path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    let mut document: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid {}", path.display()))?;
+    let egress = document
+        .as_mapping_mut()
+        .and_then(|root| root.get_mut(yaml_string("spec")))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .and_then(|spec| spec.get_mut(yaml_string("egress")))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or_else(|| {
+            miette::miette!(
+                "site controller network policy {} is missing spec.egress",
+                path.display()
+            )
+        })?;
+    let router_selector = BTreeMap::from([(
+        "amber.io/component".to_string(),
+        KUBERNETES_ROUTER_NAME.to_string(),
+    )]);
+    if let Some(rule) = egress.iter_mut().find(|rule| {
+        rule.as_mapping()
+            .and_then(|mapping| mapping.get(yaml_string("to")))
+            .and_then(serde_yaml::Value::as_sequence)
+            .is_some_and(|to| {
+                to.iter().any(|peer| {
+                    peer.as_mapping()
+                        .and_then(|mapping| mapping.get(yaml_string("podSelector")))
+                        .and_then(serde_yaml::Value::as_mapping)
+                        .and_then(|selector_value| selector_value.get(yaml_string("matchLabels")))
+                        .and_then(serde_yaml::Value::as_mapping)
+                        .is_some_and(|labels| {
+                            labels.get(yaml_string("amber.io/component"))
+                                == Some(&yaml_string(KUBERNETES_ROUTER_NAME))
+                        })
+                })
+            })
+    }) {
+        let ports = rule
+            .as_mapping_mut()
+            .and_then(|mapping| mapping.get_mut(yaml_string("ports")))
+            .and_then(serde_yaml::Value::as_sequence_mut)
+            .ok_or_else(|| {
+                miette::miette!(
+                    "site controller network policy {} router egress rule is missing ports",
+                    path.display()
+                )
+            })?;
+        let existing_ports = ports
+            .iter()
+            .filter_map(|port| {
+                port.as_mapping()
+                    .and_then(|entry| entry.get(yaml_string("port")))
+                    .and_then(serde_yaml::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+            })
+            .collect::<BTreeSet<_>>();
+        for port in route_ports {
+            if existing_ports.contains(port) {
+                continue;
+            }
+            ports.push(
+                serde_yaml::to_value(json!({
+                    "protocol": "TCP",
+                    "port": port,
+                }))
+                .into_diagnostic()
+                .wrap_err("failed to serialize site controller router egress port")?,
+            );
+        }
+    } else {
+        egress.push(
+            serde_yaml::to_value(json!({
+                "to": [{
+                    "podSelector": {
+                        "matchLabels": router_selector,
+                    }
+                }],
+                "ports": route_ports.iter().map(|port| json!({
+                    "protocol": "TCP",
+                    "port": port,
+                })).collect::<Vec<_>>()
+            }))
+            .into_diagnostic()
+            .wrap_err("failed to serialize site controller router egress rule")?,
+        );
+    }
+    let rendered = serde_yaml::to_string(&document)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to serialize {}", path.display()))?;
+    fs::write(&path, rendered)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))
+}
+
 fn kubernetes_controller_labels() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -676,7 +874,7 @@ fn write_yaml_artifact(path: PathBuf, value: &impl serde::Serialize) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, net::SocketAddr};
+    use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
 
     use amber_compiler::run_plan::SiteKind;
 
@@ -722,17 +920,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn inject_kubernetes_site_controller_propagates_launch_env() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let artifact_root = temp.path();
+    fn write_kubernetes_controller_fixture(artifact_root: &Path) {
         fs::create_dir_all(artifact_root.join("04-services")).expect("services dir");
         fs::create_dir_all(artifact_root.join("05-networkpolicies")).expect("netpol dir");
+        fs::create_dir_all(artifact_root.join("03-deployments")).expect("deployments dir");
         fs::write(
             artifact_root.join("kustomization.yaml"),
             "resources:\n  - 03-deployments/amber-site-controller.yaml\n  - \
              04-services/amber-site-controller.yaml\n  - 04-services/amber-router.yaml\n  - \
-             05-networkpolicies/amber-router-netpol.yaml\n",
+             05-networkpolicies/amber-router-netpol.yaml\n  - \
+             05-networkpolicies/amber-site-controller-netpol.yaml\n",
         )
         .expect("kustomization should write");
         fs::write(
@@ -747,7 +944,27 @@ mod tests {
              amber-router-netpol\nspec:\n  ingress: []\n",
         )
         .expect("router netpol should write");
-        fs::create_dir_all(artifact_root.join("03-deployments")).expect("deployments dir");
+        fs::write(
+            artifact_root.join(KUBERNETES_CONTROLLER_NETPOL_PATH),
+            r#"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amber-site-controller-netpol
+spec:
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          amber.io/component: amber-router
+    ports:
+    - protocol: TCP
+      port: 24000
+    - protocol: TCP
+      port: 24100
+"#,
+        )
+        .expect("site controller netpol should write");
         fs::write(
             artifact_root.join(KUBERNETES_CONTROLLER_DEPLOYMENT_PATH),
             r#"
@@ -788,8 +1005,9 @@ spec:
 "#,
         )
         .expect("controller service should write");
+    }
 
-        let plan = test_plan(artifact_root);
+    fn write_controller_state(plan: &SiteControllerPlan) {
         fs::write(&plan.state_path, "{}").expect("state should write");
         fs::create_dir_all(&plan.site_state_root).expect("site state dir");
         fs::write(
@@ -797,6 +1015,35 @@ spec:
             "{}",
         )
         .expect("desired links should write");
+    }
+
+    fn seed_configmap_paths(artifact_root: &Path) -> Vec<PathBuf> {
+        let mut paths =
+            walk_files(&artifact_root.join("01-configmaps")).expect("seed configmaps should list");
+        paths.sort();
+        paths
+    }
+
+    fn controller_pod_spec(deployment: &serde_yaml::Value) -> &serde_yaml::Mapping {
+        deployment
+            .as_mapping()
+            .and_then(|root| root.get(yaml_string("spec")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|spec| spec.get(yaml_string("template")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|template| template.get(yaml_string("spec")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("controller deployment should include a pod spec")
+    }
+
+    #[test]
+    fn inject_kubernetes_site_controller_propagates_launch_env() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let artifact_root = temp.path();
+        write_kubernetes_controller_fixture(artifact_root);
+
+        let plan = test_plan(artifact_root);
+        write_controller_state(&plan);
 
         inject_kubernetes_site_controller(
             artifact_root,
@@ -808,17 +1055,23 @@ spec:
         let deployment_raw =
             fs::read_to_string(artifact_root.join(KUBERNETES_CONTROLLER_DEPLOYMENT_PATH))
                 .expect("controller deployment should exist");
+        assert!(
+            !deployment_raw.contains("artifact.tar.b64"),
+            "kubernetes controller bootstrap should seed ordinary files instead of a tarball"
+        );
+        assert!(
+            !deployment_raw.contains("base64 -d"),
+            "kubernetes controller bootstrap should not decode a tarball at startup"
+        );
+        assert!(
+            deployment_raw.contains("cp -R /amber/seed/artifact/."),
+            "kubernetes controller bootstrap should copy seeded artifact files directly"
+        );
         let deployment: serde_yaml::Value =
             serde_yaml::from_str(&deployment_raw).expect("deployment yaml should parse");
-        let containers = deployment
-            .as_mapping()
-            .and_then(|root| root.get(yaml_string("spec")))
-            .and_then(serde_yaml::Value::as_mapping)
-            .and_then(|spec| spec.get(yaml_string("template")))
-            .and_then(serde_yaml::Value::as_mapping)
-            .and_then(|template| template.get(yaml_string("spec")))
-            .and_then(serde_yaml::Value::as_mapping)
-            .and_then(|spec| spec.get(yaml_string("containers")))
+        let pod_spec = controller_pod_spec(&deployment);
+        let containers = pod_spec
+            .get(yaml_string("containers"))
             .and_then(serde_yaml::Value::as_sequence)
             .expect("controller deployment should include containers");
         assert_eq!(
@@ -854,5 +1107,159 @@ spec:
                     && mapping.get(yaml_string("value")) == Some(&yaml_string("kept"))
             })
         }));
+
+        let volumes = pod_spec
+            .get(yaml_string("volumes"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("controller deployment should include volumes");
+        let seed_volume = volumes
+            .iter()
+            .find(|volume| {
+                volume
+                    .as_mapping()
+                    .and_then(|mapping| mapping.get(yaml_string("name")))
+                    .and_then(serde_yaml::Value::as_str)
+                    .is_some_and(|name| name == KUBERNETES_CONTROLLER_SEED_VOLUME)
+            })
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("controller deployment should include the seed volume");
+        let projected_sources = seed_volume
+            .get(yaml_string("projected"))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|projected| projected.get(yaml_string("sources")))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("controller seed volume should project configmaps");
+        let projected_paths = projected_sources
+            .iter()
+            .flat_map(|source| {
+                source
+                    .as_mapping()
+                    .and_then(|mapping| mapping.get(yaml_string("configMap")))
+                    .and_then(serde_yaml::Value::as_mapping)
+                    .and_then(|config_map| config_map.get(yaml_string("items")))
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| {
+                        item.as_mapping()
+                            .and_then(|mapping| mapping.get(yaml_string("path")))
+                            .and_then(serde_yaml::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            projected_paths
+                .iter()
+                .any(|path| path == "site-controller-plan.json")
+        );
+        assert!(
+            projected_paths
+                .iter()
+                .any(|path| path == "site-controller-state.json")
+        );
+        assert!(
+            projected_paths
+                .iter()
+                .any(|path| path == "desired-links.json")
+        );
+        assert!(
+            projected_paths
+                .iter()
+                .any(|path| path == "artifact/kustomization.yaml")
+        );
+        assert!(
+            seed_configmap_paths(artifact_root)
+                .iter()
+                .any(|path| path.file_name().and_then(|name| name.to_str())
+                    == Some("amber-site-controller-seed.yaml")),
+            "kustomization should still include the primary controller seed configmap"
+        );
+    }
+
+    #[test]
+    fn inject_kubernetes_site_controller_chunks_seed_configmaps_to_avoid_annotation_limits() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let artifact_root = temp.path();
+        write_kubernetes_controller_fixture(artifact_root);
+        fs::create_dir_all(artifact_root.join("seed-data")).expect("seed data dir");
+        fs::write(
+            artifact_root.join("seed-data/large-a.txt"),
+            "a".repeat(KUBERNETES_CONTROLLER_SEED_CONFIGMAP_DATA_LIMIT / 2),
+        )
+        .expect("large artifact A should write");
+        fs::write(
+            artifact_root.join("seed-data/large-b.txt"),
+            "b".repeat(KUBERNETES_CONTROLLER_SEED_CONFIGMAP_DATA_LIMIT / 2),
+        )
+        .expect("large artifact B should write");
+
+        let plan = test_plan(artifact_root);
+        write_controller_state(&plan);
+
+        inject_kubernetes_site_controller(
+            artifact_root,
+            &plan,
+            "ghcr.io/rdi-foundation/amber-site-controller:test",
+        )
+        .expect("kubernetes site controller injection should succeed");
+
+        let seed_paths = seed_configmap_paths(artifact_root);
+        assert!(
+            seed_paths.len() > 1,
+            "large controller seeds should be split across multiple configmaps"
+        );
+        for seed_path in &seed_paths {
+            let raw = fs::read_to_string(seed_path).expect("seed configmap should read");
+            let document: serde_yaml::Value =
+                serde_yaml::from_str(&raw).expect("seed configmap should parse");
+            let data_size = document
+                .as_mapping()
+                .and_then(|root| root.get(yaml_string("data")))
+                .and_then(serde_yaml::Value::as_mapping)
+                .expect("seed configmap should have data")
+                .iter()
+                .map(|(key, value)| {
+                    key.as_str().unwrap_or_default().len()
+                        + value.as_str().unwrap_or_default().len()
+                })
+                .sum::<usize>();
+            assert!(
+                data_size <= KUBERNETES_CONTROLLER_SEED_CONFIGMAP_DATA_LIMIT,
+                "seed configmap {} should stay under the chunk limit",
+                seed_path.display()
+            );
+        }
+
+        let deployment_raw =
+            fs::read_to_string(artifact_root.join(KUBERNETES_CONTROLLER_DEPLOYMENT_PATH))
+                .expect("controller deployment should exist");
+        let deployment: serde_yaml::Value =
+            serde_yaml::from_str(&deployment_raw).expect("deployment yaml should parse");
+        let pod_spec = controller_pod_spec(&deployment);
+        let projected_sources = pod_spec
+            .get(yaml_string("volumes"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(|volumes| {
+                volumes.iter().find(|volume| {
+                    volume
+                        .as_mapping()
+                        .and_then(|mapping| mapping.get(yaml_string("name")))
+                        .and_then(serde_yaml::Value::as_str)
+                        .is_some_and(|name| name == KUBERNETES_CONTROLLER_SEED_VOLUME)
+                })
+            })
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|mapping| mapping.get(yaml_string("projected")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|projected| projected.get(yaml_string("sources")))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("controller deployment should project seed configmaps");
+        assert_eq!(
+            projected_sources.len(),
+            seed_paths.len(),
+            "deployment should project every generated seed configmap"
+        );
     }
 }

@@ -44,6 +44,7 @@ pub(crate) trait SiteControllerRuntime: Send + Sync {
         plan: &'a SiteControllerPlan,
         state: FrameworkControlState,
         child: LiveChildRecord,
+        site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()>;
 
     fn publish_child<'a>(
@@ -51,12 +52,14 @@ pub(crate) trait SiteControllerRuntime: Send + Sync {
         plan: &'a SiteControllerPlan,
         state: FrameworkControlState,
         child: LiveChildRecord,
+        site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()>;
 
     fn rollback_child<'a>(
         &'a self,
         plan: &'a SiteControllerPlan,
         child_id: u64,
+        site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()>;
 
     fn destroy_child<'a>(
@@ -64,6 +67,7 @@ pub(crate) trait SiteControllerRuntime: Send + Sync {
         plan: &'a SiteControllerPlan,
         state: FrameworkControlState,
         child: LiveChildRecord,
+        site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()>;
 
     fn collect_live_component_runtime_metadata(

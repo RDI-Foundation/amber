@@ -48,7 +48,9 @@ mod kubernetes_controller;
 mod site_artifacts;
 mod site_runtime_support;
 
-pub(crate) use self::child_runtime::default_site_controller_runtime;
+pub(crate) use self::child_runtime::{
+    default_site_controller_runtime, runtime_plan_for_site_from_controller_plan,
+};
 pub(super) use self::site_artifacts::*;
 pub use self::{
     child_runtime::cleanup_dynamic_site_children,
@@ -1153,7 +1155,7 @@ async fn wait_for_kubernetes_site_router_ready(
             kubernetes_router_ready_targets(plan, manager_state.as_ref())?
             && probe_kubernetes_router_control_ready(&control_target, Duration::from_millis(250))
                 .await?
-            && router_mesh_listener_ready_target(&mesh_target).await
+            && router_mesh_listener_ready_target(&mesh_target, Duration::from_millis(250)).await
         {
             return Ok(());
         }
@@ -1223,8 +1225,11 @@ fn kubernetes_local_router_mesh_target(plan: &SiteControllerRuntimePlan) -> Resu
     Ok(format!("{host}:{mesh_port}"))
 }
 
-async fn router_mesh_listener_ready_target(target: &str) -> bool {
-    tokio::net::TcpStream::connect(target).await.is_ok()
+async fn router_mesh_listener_ready_target(target: &str, timeout: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(target)).await,
+        Ok(Ok(_))
+    )
 }
 
 async fn probe_kubernetes_router_control_ready(target: &str, timeout: Duration) -> Result<bool> {

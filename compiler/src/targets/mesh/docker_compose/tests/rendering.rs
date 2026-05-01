@@ -1303,6 +1303,13 @@ fn compose_emits_export_metadata_and_labels() {
     assert_eq!(control_init_service.user.as_deref(), Some("0:0"));
     assert!(
         control_init_service
+            .command
+            .as_ref()
+            .is_some_and(|command| command.iter().any(|arg| arg.contains("chmod 0770"))),
+        "router control dir should be group-accessible to the injected site controller"
+    );
+    assert!(
+        control_init_service
             .volumes
             .iter()
             .any(|v| v == "amber-router-control:/amber/control")

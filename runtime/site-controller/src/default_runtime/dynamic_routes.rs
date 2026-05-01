@@ -58,16 +58,6 @@ pub(super) fn dynamic_proxy_export_route_id(
     ))
 }
 
-pub(super) fn dynamic_input_route_mesh_protocol(
-    input: &DynamicInputRouteRecord,
-) -> Result<MeshProtocol> {
-    let protocol = input
-        .protocol
-        .parse::<NetworkProtocol>()
-        .map_err(|err| miette::miette!("invalid dynamic routed-input protocol: {err}"))?;
-    mesh_protocol(protocol)
-}
-
 pub(super) fn dynamic_input_direct_mesh_protocol(
     input: &DynamicInputDirectRecord,
 ) -> Result<MeshProtocol> {
@@ -76,23 +66,6 @@ pub(super) fn dynamic_input_direct_mesh_protocol(
         .parse::<NetworkProtocol>()
         .map_err(|err| miette::miette!("invalid dynamic direct-input protocol: {err}"))?;
     mesh_protocol(protocol)
-}
-
-pub(super) fn dynamic_input_route_route_id(
-    input: &DynamicInputRouteRecord,
-    protocol: MeshProtocol,
-) -> String {
-    match &input.target {
-        DynamicInputRouteTarget::ComponentProvide { provide } => {
-            component_route_id(&input.provider_component, provide, protocol)
-        }
-    }
-}
-
-pub(super) fn dynamic_input_route_capability(input: &DynamicInputRouteRecord) -> String {
-    match &input.target {
-        DynamicInputRouteTarget::ComponentProvide { provide } => provide.clone(),
-    }
 }
 
 pub(super) fn dynamic_input_direct_route_id(
@@ -114,24 +87,6 @@ pub(super) fn dynamic_input_direct_capability(input: &DynamicInputDirectRecord) 
 
 pub(super) fn is_compose_component_sidecar_service(service_name: &str) -> bool {
     service_name.ends_with("-net")
-}
-
-pub(super) fn dynamic_input_route_http_plugins(
-    input: &DynamicInputRouteRecord,
-    protocol: MeshProtocol,
-) -> Vec<HttpRoutePlugin> {
-    dynamic_proxy_export_http_plugins(
-        &DynamicProxyExportRecord {
-            component_id: 0,
-            component: input.provider_component.clone(),
-            provide: dynamic_input_route_capability(input),
-            protocol: input.protocol.clone(),
-            capability_kind: input.capability_kind.clone(),
-            capability_profile: input.capability_profile.clone(),
-            target_port: 0,
-        },
-        protocol,
-    )
 }
 
 pub(super) fn dynamic_input_direct_http_plugins(
@@ -161,21 +116,6 @@ pub(super) fn overlay_peer_addr_map_from_ports(
         .collect()
 }
 
-pub(super) fn overlay_issuer_sets(
-    routed_inputs: &[DynamicInputRouteRecord],
-) -> Result<BTreeMap<String, BTreeSet<String>>> {
-    dynamic_route_issuer_grants(&[SiteControllerRuntimeChildRecord {
-        child_id: 0,
-        artifact_root: String::new(),
-        assigned_components: Vec::new(),
-        proxy_exports: BTreeMap::new(),
-        direct_inputs: Vec::new(),
-        routed_inputs: routed_inputs.to_vec(),
-        process_pid: None,
-        published: false,
-    }])
-}
-
 pub(super) fn overlay_upsert_peer(
     peers: &mut Vec<MeshPeer>,
     peer_identities: &BTreeMap<String, MeshIdentityPublic>,
@@ -194,54 +134,11 @@ pub(super) fn overlay_upsert_peer(
     Ok(())
 }
 
-pub(super) fn overlay_upsert_route(routes: &mut Vec<InboundRoute>, route: InboundRoute) {
-    if let Some(existing) = routes
-        .iter_mut()
-        .find(|existing| existing.route_id == route.route_id)
-    {
-        *existing = route;
-    } else {
-        routes.push(route);
-    }
-}
-
-pub(super) fn routed_input_overlay_route(
-    input: &DynamicInputRouteRecord,
-    provider_peer_addr: &str,
-    allowed_issuers: Vec<String>,
-) -> Result<InboundRoute> {
-    let protocol = dynamic_input_route_mesh_protocol(input)?;
-    let (target_route_id, capability) = match &input.target {
-        DynamicInputRouteTarget::ComponentProvide { provide } => (
-            component_route_id(&input.provider_component, provide, protocol),
-            provide.clone(),
-        ),
-    };
-    Ok(InboundRoute {
-        route_id: dynamic_input_route_route_id(input, protocol),
-        capability: dynamic_input_route_capability(input),
-        capability_kind: Some(input.capability_kind.clone()),
-        capability_profile: input.capability_profile.clone(),
-        protocol,
-        http_plugins: dynamic_input_route_http_plugins(input, protocol),
-        target: InboundTarget::MeshForward {
-            peer_addr: provider_peer_addr.to_string(),
-            peer_id: input.provider_component.clone(),
-            route_id: target_route_id,
-            capability,
-        },
-        allowed_issuers,
-    })
-}
-
 pub(super) fn augment_route_overlay_payload(
     payload: &mut StoredRouteOverlayPayload,
     proxy_exports: &BTreeMap<String, DynamicProxyExportRecord>,
-    routed_inputs: &[DynamicInputRouteRecord],
     provider_peer_addrs: &BTreeMap<String, String>,
     peer_identities: &BTreeMap<String, MeshIdentityPublic>,
-    allowed_issuers_by_route: Option<&BTreeMap<String, BTreeSet<String>>>,
-    skip_missing_providers: bool,
 ) -> Result<()> {
     for export in proxy_exports.values() {
         overlay_upsert_peer(&mut payload.peers, peer_identities, &export.component)?;
@@ -261,138 +158,6 @@ pub(super) fn augment_route_overlay_payload(
                 })
         },
     )?;
-
-    for input in routed_inputs {
-        let Some(provider_peer_addr) = provider_peer_addrs.get(&input.provider_component) else {
-            if skip_missing_providers {
-                continue;
-            }
-            return Err(miette::miette!(
-                "dynamic route overlay is missing a live peer address for {}",
-                input.provider_component
-            ));
-        };
-        overlay_upsert_peer(
-            &mut payload.peers,
-            peer_identities,
-            &input.provider_component,
-        )?;
-        let route_id =
-            dynamic_input_route_route_id(input, dynamic_input_route_mesh_protocol(input)?);
-        let allowed_issuers = allowed_issuers_by_route
-            .and_then(|issuers| issuers.get(&route_id))
-            .map(|issuers| issuers.iter().cloned().collect())
-            .unwrap_or_default();
-        overlay_upsert_route(
-            &mut payload.inbound_routes,
-            routed_input_overlay_route(input, provider_peer_addr, allowed_issuers)?,
-        );
-    }
-
-    Ok(())
-}
-
-pub(super) fn routed_input_router_peer_addr(
-    kind: SiteKind,
-    router_mesh_port: Option<u16>,
-) -> Result<String> {
-    let router_mesh_port = router_mesh_port.ok_or_else(|| {
-        miette::miette!("site {kind:?} is missing its router mesh port for routed child inputs")
-    })?;
-    Ok(match kind {
-        SiteKind::Direct | SiteKind::Vm => format!("127.0.0.1:{router_mesh_port}"),
-        SiteKind::Compose => format!("{COMPOSE_ROUTER_SERVICE_NAME}:{router_mesh_port}"),
-        SiteKind::Kubernetes => {
-            format!("{KUBERNETES_ROUTER_COMPONENT_NAME}:{router_mesh_port}")
-        }
-    })
-}
-
-pub(super) fn router_mesh_port_from_plan(
-    mesh_plan: &MeshProvisionPlan,
-    artifact_kind: &str,
-) -> Result<u16> {
-    mesh_plan
-        .targets
-        .iter()
-        .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
-        .map(|target| target.config.mesh_listen.port())
-        .ok_or_else(|| {
-            miette::miette!("{artifact_kind} mesh provision plan is missing its router mesh target")
-        })
-}
-
-pub(super) fn rewrite_dynamic_routed_inputs(
-    mesh_plan: &mut MeshProvisionPlan,
-    routed_inputs: &[DynamicInputRouteRecord],
-    kind: SiteKind,
-    router_identity_id: &str,
-    router_mesh_port: Option<u16>,
-) -> Result<()> {
-    if routed_inputs.is_empty() {
-        return Ok(());
-    }
-
-    let router_peer_addr = routed_input_router_peer_addr(kind, router_mesh_port)?;
-    for input in routed_inputs {
-        let protocol = dynamic_input_route_mesh_protocol(input)?;
-        let component_target = mesh_plan
-            .targets
-            .iter_mut()
-            .find(|target| {
-                matches!(target.kind, MeshProvisionTargetKind::Component)
-                    && target.config.identity.id == input.component
-            })
-            .ok_or_else(|| {
-                miette::miette!(
-                    "dynamic routed input {}.{} is missing component {} in the mesh provision plan",
-                    input.component,
-                    input.slot,
-                    input.component
-                )
-            })?;
-        if !component_target
-            .config
-            .peers
-            .iter()
-            .any(|peer| peer.id == router_identity_id)
-        {
-            component_target
-                .config
-                .peers
-                .push(amber_mesh::MeshPeerTemplate {
-                    id: router_identity_id.to_string(),
-                });
-        }
-
-        let route_id = dynamic_input_route_route_id(input, protocol);
-        let capability = dynamic_input_route_capability(input);
-        let mut matched = false;
-        for route in component_target
-            .config
-            .outbound
-            .iter_mut()
-            .filter(|route| route.slot == input.slot)
-        {
-            matched = true;
-            route.route_id = route_id.clone();
-            route.protocol = protocol;
-            route.peer_addr = router_peer_addr.clone();
-            route.peer_id = router_identity_id.to_string();
-            route.capability = capability.clone();
-            route.capability_kind = Some(input.capability_kind.clone());
-            route.capability_profile = input.capability_profile.clone();
-            route.http_plugins = dynamic_input_route_http_plugins(input, protocol);
-        }
-        if !matched {
-            return Err(miette::miette!(
-                "dynamic routed input {}.{} is missing an outbound route in the mesh provision \
-                 plan",
-                input.component,
-                input.slot
-            ));
-        }
-    }
 
     Ok(())
 }
@@ -479,28 +244,6 @@ pub(super) fn rewrite_dynamic_direct_inputs(
     Ok(())
 }
 
-pub(super) fn rewrite_dynamic_routed_inputs_in_artifact(
-    artifact_root: &Path,
-    routed_inputs: &[DynamicInputRouteRecord],
-    kind: SiteKind,
-    router_identity_id: &str,
-    router_mesh_port: Option<u16>,
-) -> Result<()> {
-    if routed_inputs.is_empty() {
-        return Ok(());
-    }
-    let path = artifact_root.join("mesh-provision-plan.json");
-    let mut mesh_plan: MeshProvisionPlan = read_json(&path, "mesh provision plan")?;
-    rewrite_dynamic_routed_inputs(
-        &mut mesh_plan,
-        routed_inputs,
-        kind,
-        router_identity_id,
-        router_mesh_port,
-    )?;
-    write_json(&path, &mesh_plan)
-}
-
 pub(super) fn rewrite_dynamic_direct_inputs_in_artifact(
     artifact_root: &Path,
     direct_inputs: &[DynamicInputDirectRecord],
@@ -570,41 +313,10 @@ pub(super) fn build_filesystem_route_overlay_base(
     })
 }
 
-pub(super) fn write_direct_vm_startup_route_overlay_payload(
-    artifact_root: &Path,
-    _artifact_kind: &str,
-    routed_inputs: &[DynamicInputRouteRecord],
-    provider_peer_addrs: &BTreeMap<String, String>,
-    existing_site_peer_identities: &BTreeMap<String, MeshIdentityPublic>,
-) -> Result<()> {
-    if routed_inputs.is_empty() {
-        return Ok(());
-    }
-    let allowed_issuers = overlay_issuer_sets(routed_inputs)?;
-    let mut payload = StoredRouteOverlayPayload {
-        peers: Vec::new(),
-        inbound_routes: Vec::new(),
-    };
-    augment_route_overlay_payload(
-        &mut payload,
-        &BTreeMap::new(),
-        routed_inputs,
-        provider_peer_addrs,
-        existing_site_peer_identities,
-        Some(&allowed_issuers),
-        true,
-    )?;
-    if payload.inbound_routes.is_empty() {
-        return Ok(());
-    }
-    write_dynamic_route_overlay_payload(artifact_root, &payload)
-}
-
 pub(super) fn write_direct_vm_live_route_overlay_payload(
     artifact_root: &Path,
     assigned_components: &[String],
     proxy_exports: &BTreeMap<String, DynamicProxyExportRecord>,
-    routed_inputs: &[DynamicInputRouteRecord],
     provider_peer_addrs: &BTreeMap<String, String>,
     peer_identities: &BTreeMap<String, MeshIdentityPublic>,
 ) -> Result<()> {
@@ -617,11 +329,8 @@ pub(super) fn write_direct_vm_live_route_overlay_payload(
     augment_route_overlay_payload(
         &mut payload,
         proxy_exports,
-        routed_inputs,
         provider_peer_addrs,
         peer_identities,
-        None,
-        false,
     )?;
     write_dynamic_route_overlay_payload(artifact_root, &payload)
 }
@@ -947,15 +656,17 @@ pub(super) fn dynamic_child_route_overlay_id(
 pub(super) fn site_router_control_endpoint(
     plan: &SiteControllerRuntimePlan,
 ) -> Result<ControlEndpoint> {
+    if plan.kind == SiteKind::Kubernetes
+        && let Some(raw) = plan.local_router_control.as_deref()
+    {
+        return parse_control_endpoint(raw);
+    }
     let state_path = Path::new(&plan.site_state_root).join("manager-state.json");
     if state_path.is_file() {
         let state: SiteManagerState = read_json(&state_path, "site manager state")?;
         if let Some(raw) = state.router_control {
             return parse_control_endpoint(&raw);
         }
-    }
-    if let Some(raw) = plan.local_router_control.as_deref() {
-        return parse_control_endpoint(raw);
     }
 
     match plan.kind {
@@ -970,6 +681,23 @@ pub(super) fn site_router_control_endpoint(
             plan.site_id
         )),
     }
+}
+
+async fn site_router_overlay_control_endpoint_with_timeout(
+    plan: &SiteControllerRuntimePlan,
+    timeout: Duration,
+) -> Result<ControlEndpoint> {
+    if plan.kind == SiteKind::Kubernetes {
+        wait_for_kubernetes_site_router_ready(plan, timeout).await?;
+    }
+    site_router_control_endpoint(plan)
+}
+
+async fn site_router_overlay_control_endpoint(
+    plan: &SiteControllerRuntimePlan,
+) -> Result<ControlEndpoint> {
+    site_router_overlay_control_endpoint_with_timeout(plan, site_ready_timeout_for_kind(plan.kind))
+        .await
 }
 
 pub(super) fn child_router_overlay_payload(
@@ -1094,105 +822,120 @@ pub(super) fn child_overlay_runtime_root(
     }
 }
 
-pub(super) fn dynamic_route_issuer_grants(
-    children: &[SiteControllerRuntimeChildRecord],
-) -> Result<BTreeMap<String, BTreeSet<String>>> {
-    let mut issuers_by_route_id = BTreeMap::<String, BTreeSet<String>>::new();
-    for child in children {
-        for input in &child.routed_inputs {
-            let route_id =
-                dynamic_input_route_route_id(input, dynamic_input_route_mesh_protocol(input)?);
-            issuers_by_route_id
-                .entry(route_id)
-                .or_default()
-                .insert(input.component.clone());
-        }
+pub(super) const SITE_CONTROLLER_INTERNAL_OVERLAY_ID: &str = "framework-site-controller";
+
+fn local_site_controller_runtime(
+    live_components: &BTreeMap<String, LiveComponentRuntimeMetadata>,
+) -> Result<Option<&LiveComponentRuntimeMetadata>> {
+    let mut controllers = live_components.values().filter(|runtime| {
+        runtime.mesh_config.inbound.iter().any(|route| {
+            route.capability == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+        })
+    });
+    let Some(controller) = controllers.next() else {
+        return Ok(None);
+    };
+    if controllers.next().is_some() {
+        return Err(miette::miette!(
+            "dynamic site controller overlay found multiple local framework.component controller \
+             runtimes"
+        ));
     }
-    Ok(issuers_by_route_id)
+    Ok(Some(controller))
 }
 
-pub(super) fn load_published_component_peers(
-    plan: &SiteControllerRuntimePlan,
+fn dynamic_site_controller_overlay_payload(
     published_children: &[SiteControllerRuntimeChildRecord],
-) -> Result<BTreeMap<String, MeshPeer>> {
-    let mut component_peers = BTreeMap::new();
-    for child in published_children {
-        if child.assigned_components.is_empty() {
-            continue;
-        }
-        let artifact_root = Path::new(&child.artifact_root);
-        let runtime_root = child_overlay_runtime_root(plan, child);
-        let provision: MeshProvisionPlan = read_json(
-            &artifact_root.join("mesh-provision-plan.json"),
-            "mesh provision plan",
-        )?;
-        for component in &child.assigned_components {
-            let target = provision
-                .targets
-                .iter()
-                .find(|target| {
-                    matches!(target.kind, MeshProvisionTargetKind::Component)
-                        && target.config.identity.id == *component
-                })
-                .ok_or_else(|| {
-                    miette::miette!(
-                        "published child {} is missing component {} in its mesh provision plan",
-                        child.child_id,
-                        component
-                    )
-                })?;
-            let identity = match &target.output {
-                MeshProvisionOutput::Filesystem { dir } => read_json(
-                    &runtime_root.join(dir).join(MESH_IDENTITY_FILENAME),
-                    "mesh identity",
-                )?,
-                MeshProvisionOutput::KubernetesSecret { name, namespace } => {
-                    load_kubernetes_mesh_identity_secret(plan, name, namespace.as_deref())?
-                }
-            };
-            component_peers.insert(
-                component.clone(),
-                MeshPeer {
-                    id: identity.id.clone(),
-                    public_key: identity.public_key().into_diagnostic()?,
-                },
-            );
-        }
-    }
-    Ok(component_peers)
-}
+    live_components: &BTreeMap<String, LiveComponentRuntimeMetadata>,
+) -> Result<Option<StoredRouteOverlayPayload>> {
+    let Some(controller_runtime) = local_site_controller_runtime(live_components)? else {
+        return Ok(None);
+    };
 
-pub(super) fn apply_dynamic_route_issuer_grants(
-    peers: &mut Vec<MeshPeer>,
-    inbound_routes: &mut [InboundRoute],
-    issuers_by_route_id: &BTreeMap<String, BTreeSet<String>>,
-    component_peers: &BTreeMap<String, MeshPeer>,
-) -> Result<()> {
-    let mut known_peer_ids = peers
-        .iter()
-        .map(|peer| peer.id.clone())
-        .collect::<BTreeSet<_>>();
-    for route in inbound_routes {
-        let Some(issuers) = issuers_by_route_id.get(&route.route_id) else {
-            continue;
-        };
-        route.allowed_issuers = issuers.iter().cloned().collect();
-        for issuer in issuers {
-            if known_peer_ids.contains(issuer) {
+    let mut routes_by_id = BTreeMap::<String, InboundRoute>::new();
+    let mut issuer_ids = BTreeSet::<String>::new();
+    for child in published_children {
+        for route in &child.controller_routes {
+            if route.allowed_issuers.is_empty() {
                 continue;
             }
-            let peer = component_peers.get(issuer).ok_or_else(|| {
-                miette::miette!(
-                    "dynamic route {} references published issuer {} with no live mesh peer",
-                    route.route_id,
-                    issuer
-                )
-            })?;
-            peers.push(peer.clone());
-            known_peer_ids.insert(issuer.clone());
+            issuer_ids.extend(route.allowed_issuers.iter().cloned());
+            if let Some(existing) = routes_by_id.get_mut(&route.route_id) {
+                if !controller_overlay_routes_compatible(existing, route) {
+                    return Err(miette::miette!(
+                        "dynamic controller overlay route {} is defined with incompatible route \
+                         metadata",
+                        route.route_id
+                    ));
+                }
+                existing
+                    .allowed_issuers
+                    .extend(route.allowed_issuers.iter().cloned());
+                existing.allowed_issuers.sort();
+                existing.allowed_issuers.dedup();
+            } else {
+                let mut route = route.clone();
+                route.allowed_issuers.sort();
+                route.allowed_issuers.dedup();
+                routes_by_id.insert(route.route_id.clone(), route);
+            }
         }
     }
-    Ok(())
+    if routes_by_id.is_empty() {
+        return Ok(None);
+    }
+
+    let static_peer_ids = controller_runtime
+        .mesh_config
+        .peers
+        .iter()
+        .map(|peer| peer.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut peers = Vec::new();
+    for issuer_id in issuer_ids {
+        if issuer_id == controller_runtime.mesh_config.identity.id
+            || static_peer_ids.contains(issuer_id.as_str())
+        {
+            continue;
+        }
+        let runtime = live_components.get(&issuer_id).ok_or_else(|| {
+            miette::miette!(
+                "dynamic controller overlay route grants issuer {} but that peer is not live on \
+                 site {}",
+                issuer_id,
+                controller_runtime.moniker
+            )
+        })?;
+        peers.push(MeshPeer {
+            id: runtime.mesh_config.identity.id.clone(),
+            public_key: runtime.mesh_config.identity.public_key,
+        });
+    }
+
+    Ok(Some(StoredRouteOverlayPayload {
+        peers,
+        inbound_routes: routes_by_id.into_values().collect(),
+    }))
+}
+
+fn dynamic_site_controller_overlay_required(
+    published_children: &[SiteControllerRuntimeChildRecord],
+) -> bool {
+    published_children.iter().any(|child| {
+        child
+            .controller_routes
+            .iter()
+            .any(|route| !route.allowed_issuers.is_empty())
+    })
+}
+
+fn controller_overlay_routes_compatible(left: &InboundRoute, right: &InboundRoute) -> bool {
+    left.capability == right.capability
+        && left.capability_kind == right.capability_kind
+        && left.capability_profile == right.capability_profile
+        && left.protocol == right.protocol
+        && left.http_plugins == right.http_plugins
+        && left.target == right.target
 }
 
 pub(super) fn dynamic_direct_input_overlay_id(component: &str) -> String {
@@ -1221,7 +964,7 @@ pub(super) fn dynamic_direct_input_grants(
     Ok(grants)
 }
 
-pub(super) async fn reconcile_dynamic_direct_input_overlays(
+pub(super) async fn reconcile_dynamic_site_controller_overlay(
     app: &SiteControllerRuntimeApp,
 ) -> Result<()> {
     let published_children = {
@@ -1234,8 +977,66 @@ pub(super) async fn reconcile_dynamic_direct_input_overlays(
             .collect::<Vec<_>>()
     };
     let live_components = collect_live_component_runtime_metadata(&app.plan)?;
+    let Some(controller_runtime) = local_site_controller_runtime(&live_components)? else {
+        if !dynamic_site_controller_overlay_required(&published_children) {
+            return Ok(());
+        }
+        return Err(miette::miette!(
+            "site {} has published dynamic children but no live framework.component controller \
+             component",
+            app.plan.site_id
+        ));
+    };
+    let Some(control_endpoint) = controller_runtime.control_endpoint.as_ref() else {
+        return Ok(());
+    };
+    let Some(overlay) =
+        dynamic_site_controller_overlay_payload(&published_children, &live_components)?
+    else {
+        revoke_route_overlay_with_retry(
+            control_endpoint,
+            SITE_CONTROLLER_INTERNAL_OVERLAY_ID,
+            Duration::from_secs(30),
+        )
+        .await?;
+        return Ok(());
+    };
+    apply_route_overlay_with_retry(
+        control_endpoint,
+        SITE_CONTROLLER_INTERNAL_OVERLAY_ID,
+        &overlay.peers,
+        &overlay.inbound_routes,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+pub(super) async fn reconcile_dynamic_direct_input_overlays(
+    app: &SiteControllerRuntimeApp,
+) -> Result<()> {
+    let (published_children, previous_overlay_providers) = {
+        let state = app.state.lock().await;
+        (
+            state
+                .children
+                .values()
+                .filter(|child| child.published)
+                .cloned()
+                .collect::<Vec<_>>(),
+            state.direct_input_overlay_providers.clone(),
+        )
+    };
+    let live_components = collect_live_component_runtime_metadata(&app.plan)?;
     let grants = dynamic_direct_input_grants(&published_children)?;
-    for (component, runtime) in &live_components {
+    let current_overlay_providers = grants.keys().cloned().collect::<BTreeSet<_>>();
+    let overlay_providers = current_overlay_providers
+        .union(&previous_overlay_providers)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for component in &overlay_providers {
+        let Some(runtime) = live_components.get(component) else {
+            continue;
+        };
         let Some(control_endpoint) = runtime.control_endpoint.as_ref() else {
             continue;
         };
@@ -1292,6 +1093,11 @@ pub(super) async fn reconcile_dynamic_direct_input_overlays(
         )
         .await?;
     }
+    let mut state = app.state.lock().await;
+    if state.direct_input_overlay_providers != current_overlay_providers {
+        state.direct_input_overlay_providers = current_overlay_providers;
+        write_json(&app.state_path, &*state)?;
+    }
     Ok(())
 }
 
@@ -1323,24 +1129,16 @@ pub(super) async fn reconcile_dynamic_site_router_overlays_for_children(
     if overlay_children.is_empty() {
         return Ok(());
     }
-
-    let issuers_by_route_id = dynamic_route_issuer_grants(issuer_children)?;
-    let component_peers = load_published_component_peers(&app.plan, issuer_children)?;
+    let endpoint = site_router_overlay_control_endpoint(&app.plan).await?;
+    let _ = issuer_children;
     for child in overlay_children {
         let artifact_root = Path::new(&child.artifact_root);
         let runtime_root = child_overlay_runtime_root(&app.plan, child);
-        let (mut peers, mut inbound_routes) =
+        let (peers, inbound_routes) =
             child_router_overlay_payload(&app.plan, artifact_root, &runtime_root)?;
-        apply_dynamic_route_issuer_grants(
-            &mut peers,
-            &mut inbound_routes,
-            &issuers_by_route_id,
-            &component_peers,
-        )?;
         if inbound_routes.is_empty() {
             continue;
         }
-        let endpoint = site_router_control_endpoint(&app.plan)?;
         apply_route_overlay_with_retry(
             &endpoint,
             &dynamic_child_route_overlay_id(&app.plan, child.child_id),
@@ -1358,13 +1156,13 @@ pub(super) async fn apply_dynamic_site_router_overlay(
     plan: &SiteControllerRuntimePlan,
     child: &SiteControllerRuntimeChildRecord,
 ) -> Result<()> {
+    let endpoint = site_router_overlay_control_endpoint(plan).await?;
     let artifact_root = Path::new(&child.artifact_root);
     let runtime_root = child_overlay_runtime_root(plan, child);
     let (peers, inbound_routes) = child_router_overlay_payload(plan, artifact_root, &runtime_root)?;
     if inbound_routes.is_empty() {
         return Ok(());
     }
-    let endpoint = site_router_control_endpoint(plan)?;
     apply_route_overlay_with_retry(
         &endpoint,
         &dynamic_child_route_overlay_id(plan, child.child_id),
@@ -1379,7 +1177,7 @@ pub(super) async fn revoke_dynamic_site_router_overlay(
     plan: &SiteControllerRuntimePlan,
     child: &SiteControllerRuntimeChildRecord,
 ) -> Result<()> {
-    let endpoint = site_router_control_endpoint(plan)?;
+    let endpoint = site_router_overlay_control_endpoint(plan).await?;
     revoke_route_overlay_with_retry(
         &endpoint,
         &dynamic_child_route_overlay_id(plan, child.child_id),
@@ -1390,11 +1188,317 @@ pub(super) async fn revoke_dynamic_site_router_overlay(
 
 #[cfg(test)]
 mod direct_input_tests {
-    use std::fs;
+    use std::{
+        fs,
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration as StdDuration, Instant as StdInstant},
+    };
 
     use amber_mesh::MeshConfigTemplate;
+    use axum::response::IntoResponse;
 
     use super::*;
+
+    async fn spawn_mock_router_mesh_listener() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("mock router mesh listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock router mesh listener addr should resolve");
+        let handle = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        (addr, handle)
+    }
+
+    async fn spawn_gated_router_control_listener(
+        ready: Arc<AtomicBool>,
+        saw_mutation: Arc<AtomicBool>,
+        mutated_before_ready: Arc<AtomicBool>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("mock router control listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock router control listener addr should resolve");
+        let router = axum::Router::new()
+            .route(
+                "/identity",
+                axum::routing::get({
+                    let ready = ready.clone();
+                    move || {
+                        let ready = ready.clone();
+                        async move {
+                            if ready.load(Ordering::SeqCst) {
+                                axum::Json(MeshIdentityPublic {
+                                    id: "/site/kind_local/router".to_string(),
+                                    public_key: [9u8; 32],
+                                    mesh_scope: Some("test-mesh".to_string()),
+                                })
+                                .into_response()
+                            } else {
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/overlays/{overlay_id}",
+                axum::routing::put({
+                    let ready = ready.clone();
+                    let saw_mutation = saw_mutation.clone();
+                    let mutated_before_ready = mutated_before_ready.clone();
+                    move || {
+                        let ready = ready.clone();
+                        let saw_mutation = saw_mutation.clone();
+                        let mutated_before_ready = mutated_before_ready.clone();
+                        async move {
+                            saw_mutation.store(true, Ordering::SeqCst);
+                            if !ready.load(Ordering::SeqCst) {
+                                mutated_before_ready.store(true, Ordering::SeqCst);
+                            }
+                            axum::http::StatusCode::NO_CONTENT
+                        }
+                    }
+                })
+                .delete({
+                    let ready = ready.clone();
+                    let saw_mutation = saw_mutation.clone();
+                    let mutated_before_ready = mutated_before_ready.clone();
+                    move || {
+                        let ready = ready.clone();
+                        let saw_mutation = saw_mutation.clone();
+                        let mutated_before_ready = mutated_before_ready.clone();
+                        async move {
+                            saw_mutation.store(true, Ordering::SeqCst);
+                            if !ready.load(Ordering::SeqCst) {
+                                mutated_before_ready.store(true, Ordering::SeqCst);
+                            }
+                            axum::http::StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service())
+                .await
+                .expect("mock router control server should run");
+        });
+        (addr, handle)
+    }
+
+    fn kubernetes_overlay_test_plan(
+        temp: &tempfile::TempDir,
+        control_addr: SocketAddr,
+        mesh_addr: SocketAddr,
+    ) -> SiteControllerRuntimePlan {
+        let artifact_dir = temp.path().join("artifact");
+        let site_state_root = temp.path().join("state").join("kind_local");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir should exist");
+        fs::create_dir_all(&site_state_root).expect("site state root should exist");
+        SiteControllerRuntimePlan {
+            schema: "amber.run.site_controller_runtime_plan".to_string(),
+            version: 1,
+            run_id: "test-run".to_string(),
+            mesh_scope: "test-mesh".to_string(),
+            run_root: temp.path().display().to_string(),
+            site_id: "kind_local".to_string(),
+            kind: SiteKind::Kubernetes,
+            router_identity_id: "/site/kind_local/router".to_string(),
+            local_router_control: Some(control_addr.to_string()),
+            artifact_dir: artifact_dir.display().to_string(),
+            site_state_root: site_state_root.display().to_string(),
+            listen_addr: "127.0.0.1:32000".parse().expect("listen addr"),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: Some(mesh_addr.port()),
+            compose_project: None,
+            kubernetes_namespace: Some("amber-test-kind-local".to_string()),
+            context: None,
+            observability_endpoint: None,
+            launch_env: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn compose_site_router_control_endpoint_prefers_manager_state_volume_socket() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let site_state_root = temp.path().join("state").join("compose_local");
+        fs::create_dir_all(&site_state_root).expect("site state root should exist");
+        write_json(
+            &site_state_root.join("manager-state.json"),
+            &serde_json::json!({
+                "schema": "amber.run.site_manager_state",
+                "version": 1,
+                "run_id": "test-run",
+                "site_id": "compose_local",
+                "kind": "compose",
+                "status": "running",
+                "artifact_dir": temp.path().join("artifact").display().to_string(),
+                "supervisor_pid": 1u32,
+                "router_control": "volume://demo_amber-router-control/router-control.sock",
+                "router_mesh_addr": "127.0.0.1:24000",
+            }),
+        )
+        .expect("manager state should write");
+        let plan = SiteControllerRuntimePlan {
+            schema: "amber.run.site_controller_runtime_plan".to_string(),
+            version: 1,
+            run_id: "test-run".to_string(),
+            mesh_scope: "test-mesh".to_string(),
+            run_root: temp.path().display().to_string(),
+            site_id: "compose_local".to_string(),
+            kind: SiteKind::Compose,
+            router_identity_id: "/site/compose_local/router".to_string(),
+            local_router_control: Some("unix:///amber/control/router-control.sock".to_string()),
+            artifact_dir: temp.path().join("artifact").display().to_string(),
+            site_state_root: site_state_root.display().to_string(),
+            listen_addr: "127.0.0.1:32000".parse().expect("listen addr"),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: Some(24000),
+            compose_project: Some("demo".to_string()),
+            kubernetes_namespace: None,
+            context: None,
+            observability_endpoint: None,
+            launch_env: BTreeMap::new(),
+        };
+
+        assert!(matches!(
+            site_router_control_endpoint(&plan).expect("router control endpoint should resolve"),
+            ControlEndpoint::VolumeSocket { volume, socket_path }
+                if volume == "demo_amber-router-control" && socket_path == "/router-control.sock"
+        ));
+    }
+
+    #[test]
+    fn site_router_control_endpoint_prefers_local_embedded_target_over_manager_state() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let site_state_root = temp.path().join("state").join("kind_local");
+        fs::create_dir_all(&site_state_root).expect("site state root should exist");
+        write_json(
+            &site_state_root.join("manager-state.json"),
+            &serde_json::json!({
+                "schema": "amber.run.site_manager_state",
+                "version": 1,
+                "run_id": "test-run",
+                "site_id": "kind_local",
+                "kind": "kubernetes",
+                "status": "running",
+                "artifact_dir": temp.path().join("artifact").display().to_string(),
+                "supervisor_pid": 1u32,
+                "router_control": "127.0.0.1:9",
+                "router_mesh_addr": "127.0.0.1:9",
+            }),
+        )
+        .expect("manager state should write");
+        let plan = SiteControllerRuntimePlan {
+            schema: "amber.run.site_controller_runtime_plan".to_string(),
+            version: 1,
+            run_id: "test-run".to_string(),
+            mesh_scope: "test-mesh".to_string(),
+            run_root: temp.path().display().to_string(),
+            site_id: "kind_local".to_string(),
+            kind: SiteKind::Kubernetes,
+            router_identity_id: "/site/kind_local/router".to_string(),
+            local_router_control: Some("amber-router:24100".to_string()),
+            artifact_dir: temp.path().join("artifact").display().to_string(),
+            site_state_root: site_state_root.display().to_string(),
+            listen_addr: "127.0.0.1:32000".parse().expect("listen addr"),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: Some(24000),
+            compose_project: None,
+            kubernetes_namespace: Some("amber-test-kind-local".to_string()),
+            context: None,
+            observability_endpoint: None,
+            launch_env: BTreeMap::new(),
+        };
+
+        assert!(matches!(
+            site_router_control_endpoint(&plan).expect("router control endpoint should resolve"),
+            ControlEndpoint::Tcp(addr) if addr == "amber-router:24100"
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_kubernetes_router_control_ready_accepts_mock_identity_response() {
+        let ready = Arc::new(AtomicBool::new(true));
+        let (control_addr, control_handle) = spawn_gated_router_control_listener(
+            ready,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        assert!(
+            probe_kubernetes_router_control_ready(
+                &control_addr.to_string(),
+                StdDuration::from_secs(1)
+            )
+            .await
+            .expect("router control probe should succeed"),
+            "the mock router control server should satisfy the readiness probe",
+        );
+        control_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn router_mesh_listener_ready_target_accepts_mock_listener() {
+        let (mesh_addr, mesh_handle) = spawn_mock_router_mesh_listener().await;
+        assert!(
+            router_mesh_listener_ready_target(&mesh_addr.to_string(), StdDuration::from_secs(1))
+                .await,
+            "the mock mesh listener should satisfy the mesh readiness probe",
+        );
+        mesh_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn site_router_overlay_control_endpoint_waits_for_kubernetes_router_readiness() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let ready = Arc::new(AtomicBool::new(false));
+        let saw_mutation = Arc::new(AtomicBool::new(false));
+        let mutated_before_ready = Arc::new(AtomicBool::new(false));
+        let (mesh_addr, mesh_handle) = spawn_mock_router_mesh_listener().await;
+        let (control_addr, control_handle) =
+            spawn_gated_router_control_listener(ready.clone(), saw_mutation, mutated_before_ready)
+                .await;
+        let plan = kubernetes_overlay_test_plan(&temp, control_addr, mesh_addr);
+
+        let gate = ready.clone();
+        let gate_handle = tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(350)).await;
+            gate.store(true, Ordering::SeqCst);
+        });
+
+        let start = StdInstant::now();
+        let endpoint =
+            site_router_overlay_control_endpoint_with_timeout(&plan, StdDuration::from_secs(6))
+                .await
+                .expect("overlay endpoint should wait for router readiness and then resolve");
+
+        assert!(
+            start.elapsed() >= StdDuration::from_millis(300),
+            "overlay endpoint resolution should wait until the Kubernetes router is ready",
+        );
+        assert!(matches!(
+            endpoint,
+            ControlEndpoint::Tcp(addr) if addr == control_addr.to_string()
+        ));
+        gate_handle.abort();
+        control_handle.abort();
+        mesh_handle.abort();
+    }
 
     #[test]
     fn rewrite_dynamic_direct_inputs_points_child_at_provider_sidecar() {
@@ -1500,36 +1604,6 @@ mod direct_input_tests {
     }
 
     #[test]
-    fn dynamic_route_issuer_grants_include_component_provide_inputs() {
-        let issuers = dynamic_route_issuer_grants(&[SiteControllerRuntimeChildRecord {
-            child_id: 7,
-            artifact_root: "/tmp/child".to_string(),
-            assigned_components: vec!["/sibling".to_string()],
-            proxy_exports: BTreeMap::new(),
-            direct_inputs: Vec::new(),
-            routed_inputs: vec![DynamicInputRouteRecord {
-                component: "/sibling".to_string(),
-                slot: "upstream".to_string(),
-                provider_component: "/provider".to_string(),
-                protocol: "http".to_string(),
-                capability_kind: "http".to_string(),
-                capability_profile: None,
-                target: DynamicInputRouteTarget::ComponentProvide {
-                    provide: "http".to_string(),
-                },
-            }],
-            process_pid: None,
-            published: true,
-        }])
-        .expect("component-provide routed inputs should produce issuer grants");
-
-        assert_eq!(
-            issuers.get("component:/provider:http:http"),
-            Some(&BTreeSet::from(["/sibling".to_string()]))
-        );
-    }
-
-    #[test]
     fn dynamic_direct_input_overlay_id_is_path_safe_for_component_monikers() {
         let overlay_id = dynamic_direct_input_overlay_id("/source");
         assert_eq!(
@@ -1540,6 +1614,293 @@ mod direct_input_tests {
         assert!(
             !overlay_id.contains('/'),
             "overlay ids must not contain path separators: {overlay_id}",
+        );
+    }
+
+    #[test]
+    fn dynamic_direct_input_overlay_targets_only_current_and_previous_providers() {
+        let current = BTreeSet::from(["/provider".to_string()]);
+        let previous = BTreeSet::from(["/provider".to_string(), "/stale".to_string()]);
+
+        let overlay_providers = current.union(&previous).cloned().collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            overlay_providers,
+            BTreeSet::from(["/provider".to_string(), "/stale".to_string()]),
+            "reconciliation should only touch providers with current grants or previously applied \
+             overlays",
+        );
+    }
+
+    #[test]
+    fn dynamic_site_controller_overlay_uses_child_controller_route_grants() {
+        let internal_route_id = component_route_id(
+            "/__amber_internal_framework_component_controller/site-a",
+            amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+            MeshProtocol::Http,
+        );
+        let grant_route_id = component_route_id(
+            "/__amber_internal_framework_component_controller/site-a",
+            "__amber_internal_framework_component__site_site-a__authority_root",
+            MeshProtocol::Http,
+        );
+        let live_components = BTreeMap::from([
+            (
+                "/__amber_internal_framework_component_controller/site-a".to_string(),
+                LiveComponentRuntimeMetadata {
+                    moniker: "/__amber_internal_framework_component_controller/site-a".to_string(),
+                    router_reachable_mesh_addr: "127.0.0.1:24000".to_string(),
+                    component_reachable_mesh_addr: "127.0.0.1:24000".to_string(),
+                    control_endpoint: Some(ControlEndpoint::Unix("/tmp/controller.sock".into())),
+                    mesh_config: MeshConfigPublic {
+                        identity: MeshIdentityPublic {
+                            id: "/__amber_internal_framework_component_controller/site-a"
+                                .to_string(),
+                            public_key: [1; 32],
+                            mesh_scope: None,
+                        },
+                        mesh_listen: "127.0.0.1:23000".parse().expect("mesh listen"),
+                        control_listen: None,
+                        dynamic_caps_listen: None,
+                        control_allow: None,
+                        peers: vec![MeshPeer {
+                            id: "/static".to_string(),
+                            public_key: [2; 32],
+                        }],
+                        inbound: vec![InboundRoute {
+                            route_id: internal_route_id.clone(),
+                            capability:
+                                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+                                    .to_string(),
+                            capability_kind: None,
+                            capability_profile: None,
+                            protocol: MeshProtocol::Http,
+                            http_plugins: Vec::new(),
+                            target: InboundTarget::Local { port: 8080 },
+                            allowed_issuers: vec![
+                                "/site/router".to_string(),
+                                "/static".to_string(),
+                            ],
+                        }],
+                        outbound: Vec::new(),
+                        transport: amber_mesh::TransportConfig::NoiseIk {},
+                    },
+                },
+            ),
+            (
+                "/job-dynamic".to_string(),
+                LiveComponentRuntimeMetadata {
+                    moniker: "/job-dynamic".to_string(),
+                    router_reachable_mesh_addr: "127.0.0.1:24001".to_string(),
+                    component_reachable_mesh_addr: "127.0.0.1:24001".to_string(),
+                    control_endpoint: Some(ControlEndpoint::Unix("/tmp/job.sock".into())),
+                    mesh_config: MeshConfigPublic {
+                        identity: MeshIdentityPublic {
+                            id: "/job-dynamic".to_string(),
+                            public_key: [3; 32],
+                            mesh_scope: None,
+                        },
+                        mesh_listen: "127.0.0.1:23001".parse().expect("mesh listen"),
+                        control_listen: None,
+                        dynamic_caps_listen: Some(
+                            "127.0.0.1:19001".parse().expect("dynamic caps listen"),
+                        ),
+                        control_allow: None,
+                        peers: Vec::new(),
+                        inbound: Vec::new(),
+                        outbound: Vec::new(),
+                        transport: amber_mesh::TransportConfig::NoiseIk {},
+                    },
+                },
+            ),
+        ]);
+
+        let overlay = dynamic_site_controller_overlay_payload(
+            &[SiteControllerRuntimeChildRecord {
+                child_id: 7,
+                artifact_root: "/tmp/child".to_string(),
+                assigned_components: vec!["/job-dynamic".to_string()],
+                controller_routes: vec![InboundRoute {
+                    route_id: grant_route_id.clone(),
+                    capability: "__amber_internal_framework_component__site_site-a__authority_root"
+                        .to_string(),
+                    capability_kind: Some("framework.component".to_string()),
+                    capability_profile: None,
+                    protocol: MeshProtocol::Http,
+                    http_plugins: Vec::new(),
+                    target: InboundTarget::Local { port: 8080 },
+                    allowed_issuers: vec!["/job-dynamic".to_string()],
+                }],
+                proxy_exports: BTreeMap::new(),
+                direct_inputs: Vec::new(),
+                process_pid: None,
+                published: true,
+            }],
+            &live_components,
+        )
+        .expect("overlay payload should build")
+        .expect("dynamic child should require an overlay");
+
+        assert_eq!(overlay.peers.len(), 1);
+        assert_eq!(overlay.peers[0].id, "/job-dynamic");
+        assert_eq!(overlay.peers[0].public_key, [3; 32]);
+        assert_eq!(overlay.inbound_routes.len(), 1);
+        assert_eq!(overlay.inbound_routes[0].route_id, grant_route_id);
+        assert_eq!(
+            overlay.inbound_routes[0].allowed_issuers,
+            vec!["/job-dynamic".to_string()],
+            "the overlay should contribute only the dynamic child issuer recorded for this \
+             grant-specific controller route",
+        );
+    }
+
+    #[test]
+    fn dynamic_site_controller_overlay_is_required_only_for_granted_controller_routes() {
+        let child = |controller_routes| SiteControllerRuntimeChildRecord {
+            child_id: 7,
+            artifact_root: "/tmp/child".to_string(),
+            assigned_components: vec!["/job-dynamic".to_string()],
+            controller_routes,
+            proxy_exports: BTreeMap::new(),
+            direct_inputs: Vec::new(),
+            process_pid: None,
+            published: true,
+        };
+
+        assert!(
+            !dynamic_site_controller_overlay_required(&[child(Vec::new())]),
+            "VM sites controlled from a direct site can publish ordinary dynamic children without \
+             a local site-controller component"
+        );
+        assert!(
+            !dynamic_site_controller_overlay_required(&[child(vec![InboundRoute {
+                route_id: "empty".to_string(),
+                capability: "component".to_string(),
+                capability_kind: Some("framework.component".to_string()),
+                capability_profile: None,
+                protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
+                target: InboundTarget::Local { port: 8080 },
+                allowed_issuers: Vec::new(),
+            }])]),
+            "routes with no dynamic issuers do not require a controller overlay"
+        );
+        assert!(
+            dynamic_site_controller_overlay_required(&[child(vec![InboundRoute {
+                route_id: "granted".to_string(),
+                capability: "component".to_string(),
+                capability_kind: Some("framework.component".to_string()),
+                capability_profile: None,
+                protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
+                target: InboundTarget::Local { port: 8080 },
+                allowed_issuers: vec!["/job-dynamic".to_string()],
+            }])]),
+            "controller overlays are still required when a dynamic child receives a granted \
+             framework.component route"
+        );
+    }
+
+    #[test]
+    fn project_dynamic_direct_router_surface_creates_child_control_aliases() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let site_artifact = temp.path().join("site-artifact");
+        let site_state_root = temp.path().join("state").join("direct_local");
+        let child_artifact = site_state_root
+            .join("framework-component")
+            .join("children")
+            .join("1")
+            .join("artifact");
+        fs::create_dir_all(site_artifact.join(".amber").join("control"))
+            .expect("site artifact control dir should exist");
+        fs::create_dir_all(child_artifact.join(".amber")).expect("child artifact dir should exist");
+
+        let site_current = super::super::direct_current_control_socket_path(&site_artifact);
+        if let Some(parent) = site_current.parent() {
+            fs::create_dir_all(parent).expect("site current control dir should exist");
+        }
+        let site_runtime = temp.path().join("router-runtime.sock");
+        fs::write(&site_runtime, []).expect("fake router runtime socket placeholder should exist");
+        super::super::ensure_direct_control_socket_link(
+            &site_current,
+            &site_runtime,
+            "site current control symlink",
+        )
+        .expect("site current control symlink should be created");
+        super::super::ensure_direct_control_socket_link(
+            &site_artifact
+                .join(".amber")
+                .join("control")
+                .join("router-control.sock"),
+            &site_current,
+            "site artifact control symlink",
+        )
+        .expect("site artifact control symlink should be created");
+        write_json(
+            &super::super::direct_runtime_state_path(&child_artifact),
+            &super::super::DirectRuntimeState::default(),
+        )
+        .expect("child direct runtime state should be written");
+
+        let plan = runtime_api::SiteControllerRuntimePlan {
+            schema: "test".to_string(),
+            version: 1,
+            run_id: "run-123".to_string(),
+            mesh_scope: "mesh".to_string(),
+            run_root: temp.path().display().to_string(),
+            site_id: "direct_local".to_string(),
+            kind: SiteKind::Direct,
+            router_identity_id: "/site/direct_local/router".to_string(),
+            local_router_control: None,
+            artifact_dir: site_artifact.display().to_string(),
+            site_state_root: site_state_root.display().to_string(),
+            listen_addr: "127.0.0.1:32000".parse().expect("listen addr"),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: Some(24000),
+            compose_project: None,
+            kubernetes_namespace: None,
+            context: None,
+            observability_endpoint: None,
+            launch_env: BTreeMap::new(),
+        };
+        let child = SiteControllerRuntimeChildRecord {
+            child_id: 1,
+            artifact_root: child_artifact.display().to_string(),
+            assigned_components: vec!["/job-1".to_string()],
+            controller_routes: Vec::new(),
+            proxy_exports: BTreeMap::new(),
+            direct_inputs: Vec::new(),
+            process_pid: None,
+            published: true,
+        };
+
+        project_dynamic_direct_router_surface(&plan, &child)
+            .expect("direct child router surface should project");
+
+        let state: super::super::DirectRuntimeState = read_json(
+            &super::super::direct_runtime_state_path(&child_artifact),
+            "direct runtime state",
+        )
+        .expect("projected direct runtime state should be readable");
+        assert_eq!(state.router_mesh_port, Some(24000));
+
+        let child_current = super::super::direct_current_control_socket_path(&child_artifact);
+        assert_eq!(
+            fs::read_link(&child_current).expect("child current control alias should exist"),
+            site_current,
+            "child current alias should point at the site current control alias",
+        );
+        assert_eq!(
+            fs::read_link(
+                child_artifact
+                    .join(".amber")
+                    .join("control")
+                    .join("router-control.sock")
+            )
+            .expect("child artifact control alias should exist"),
+            child_current,
+            "child artifact control alias should point at the child current alias",
         );
     }
 
@@ -1560,15 +1921,16 @@ mod direct_input_tests {
                 run_id: "run-123".to_string(),
                 site_id: "direct_local".to_string(),
                 kind: SiteKind::Direct,
+                direct_input_overlay_providers: BTreeSet::new(),
                 children: BTreeMap::from([(
                     7,
                     SiteControllerRuntimeChildRecord {
                         child_id: 7,
                         artifact_root: child_root.join("artifact").display().to_string(),
                         assigned_components: Vec::new(),
+                        controller_routes: Vec::new(),
                         proxy_exports: BTreeMap::new(),
                         direct_inputs: Vec::new(),
-                        routed_inputs: Vec::new(),
                         process_pid: None,
                         published: true,
                     },

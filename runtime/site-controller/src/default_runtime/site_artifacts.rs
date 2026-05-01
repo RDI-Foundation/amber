@@ -117,7 +117,6 @@ fn build_dynamic_compose_route_overlay_payload(
     assigned_components: &[String],
     component_mesh_dirs: &BTreeMap<String, String>,
     proxy_exports: &BTreeMap<String, DynamicProxyExportRecord>,
-    routed_inputs: &[DynamicInputRouteRecord],
     existing_site_peer_identities: &BTreeMap<String, MeshIdentityPublic>,
 ) -> Result<StoredRouteOverlayPayload> {
     let plan = read_embedded_compose_mesh_provision_plan(artifact_root)?;
@@ -218,7 +217,6 @@ fn build_dynamic_compose_route_overlay_payload(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let allowed_issuers = overlay_issuer_sets(routed_inputs)?;
     let mut payload = StoredRouteOverlayPayload {
         peers,
         inbound_routes: router_target.config.inbound,
@@ -226,11 +224,8 @@ fn build_dynamic_compose_route_overlay_payload(
     augment_route_overlay_payload(
         &mut payload,
         proxy_exports,
-        routed_inputs,
         &component_peer_addrs,
         &peer_identities,
-        Some(&allowed_issuers),
-        false,
     )?;
     Ok(payload)
 }
@@ -1311,23 +1306,12 @@ pub(super) fn prepare_dynamic_compose_child_artifact(
         component_mesh_dirs,
     } = build_dynamic_compose_mesh_plan(artifact_root, &runtime_spec.assigned_components)?;
     let mut mesh_plan = mesh_plan;
-    let router_mesh_port = router_mesh_port_from_plan(
-        &read_embedded_compose_mesh_provision_plan(artifact_root)?,
-        "compose",
-    )?;
     ensure_dynamic_proxy_export_component_routes(
         &mut mesh_plan,
         &runtime_spec.proxy_exports,
         &plan.router_identity_id,
     )?;
     rewrite_dynamic_direct_inputs(&mut mesh_plan, &runtime_spec.direct_inputs, live_components)?;
-    rewrite_dynamic_routed_inputs(
-        &mut mesh_plan,
-        &runtime_spec.routed_inputs,
-        SiteKind::Compose,
-        &plan.router_identity_id,
-        Some(router_mesh_port),
-    )?;
     let existing_peer_identities =
         required_existing_mesh_peer_identities(&mesh_plan, existing_site_peer_identities)?;
     mesh_plan.existing_peer_identities = existing_peer_identities.values().cloned().collect();
@@ -1349,7 +1333,6 @@ pub(super) fn prepare_dynamic_compose_child_artifact(
         &runtime_spec.assigned_components,
         &component_mesh_dirs,
         &runtime_spec.proxy_exports,
-        &runtime_spec.routed_inputs,
         existing_site_peer_identities,
     )?;
     write_json(&dynamic_route_overlay_path(artifact_root), &overlay_payload)?;
@@ -1665,6 +1648,10 @@ fn inject_site_controller_peer_router_routes_into_plan(
         .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
         .ok_or_else(|| miette::miette!("mesh provision plan is missing a router target"))?;
     let inbound_route_id = site_controller_internal_route_id(local_site_id);
+    let local_target_peer_id = match &local_inbound_target {
+        InboundTarget::MeshForward { peer_id, .. } => Some(peer_id.clone()),
+        _ => None,
+    };
     router
         .config
         .inbound
@@ -1693,6 +1680,11 @@ fn inject_site_controller_peer_router_routes_into_plan(
         .cloned()
         .map(|identity| (identity.id.clone(), identity))
         .collect::<BTreeMap<_, _>>();
+    if let Some(peer_id) = local_target_peer_id
+        && !router.config.peers.iter().any(|peer| peer.id == peer_id)
+    {
+        router.config.peers.push(MeshPeerTemplate { id: peer_id });
+    }
     for route in routes {
         existing_peer_identities.insert(route.peer_router.id.clone(), route.peer_router.clone());
         if !router
@@ -2026,7 +2018,6 @@ pub(super) fn prepare_dynamic_kubernetes_child_artifact(
     project_dynamic_child_mesh_scope(artifact_root, Some(&plan.mesh_scope))?;
     let plan_path = artifact_root.join("mesh-provision-plan.json");
     let mesh_plan = read_embedded_kubernetes_mesh_provision_plan(artifact_root)?;
-    let router_mesh_port = router_mesh_port_from_plan(&mesh_plan, "kubernetes")?;
     let assigned = runtime_spec
         .assigned_components
         .iter()
@@ -2085,13 +2076,6 @@ pub(super) fn prepare_dynamic_kubernetes_child_artifact(
         &mut provision_plan,
         &runtime_spec.direct_inputs,
         live_components,
-    )?;
-    rewrite_dynamic_routed_inputs(
-        &mut provision_plan,
-        &runtime_spec.routed_inputs,
-        SiteKind::Kubernetes,
-        &plan.router_identity_id,
-        Some(router_mesh_port),
     )?;
     let provision_existing_peer_identities =
         required_existing_mesh_peer_identities(&provision_plan, existing_site_peer_identities)?;
@@ -2184,7 +2168,6 @@ pub(super) fn write_kubernetes_live_route_overlay_payload(
     artifact_root: &Path,
     assigned_components: &[String],
     proxy_exports: &BTreeMap<String, DynamicProxyExportRecord>,
-    routed_inputs: &[DynamicInputRouteRecord],
     peer_identities: &BTreeMap<String, MeshIdentityPublic>,
 ) -> Result<()> {
     let provider_peer_addrs = kubernetes_peer_addrs_for_artifact(artifact_root)?;
@@ -2197,11 +2180,8 @@ pub(super) fn write_kubernetes_live_route_overlay_payload(
     augment_route_overlay_payload(
         &mut payload,
         proxy_exports,
-        routed_inputs,
         &provider_peer_addrs,
         peer_identities,
-        None,
-        false,
     )?;
     write_dynamic_route_overlay_payload(artifact_root, &payload)
 }

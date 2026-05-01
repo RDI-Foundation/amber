@@ -94,11 +94,6 @@ fn site_controller_local_router_control_uses_backend_local_control_targets() {
             .starts_with("unix://"),
         "direct site controllers should know their local router control socket up front"
     );
-    assert!(
-        launch_bundle::site_controller_local_router_control(SiteKind::Vm, artifact_dir)
-            .starts_with("unix://"),
-        "vm site controllers should know their local router control socket up front"
-    );
 }
 
 #[test]
@@ -192,6 +187,28 @@ fn provisioner_image_supports_debug_builds() {
 }
 
 #[test]
+fn site_controller_command_prefers_current_amber_binary_over_stale_sibling() {
+    let temp = TempDir::new().expect("temp dir");
+    let debug_dir = temp.path().join("target").join("debug");
+    fs::create_dir_all(&debug_dir).expect("debug dir should exist");
+    let amber = debug_dir.join(format!("amber{}", std::env::consts::EXE_SUFFIX));
+    let site_controller = debug_dir.join(format!(
+        "amber-site-controller{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&amber, "").expect("amber binary should exist");
+    fs::write(&site_controller, "").expect("stale site controller binary should exist");
+
+    let command = site_controller_command_from(&amber).expect("site controller command");
+    assert_eq!(
+        command.executable, amber,
+        "the running amber binary should launch its own run-site-controller subcommand instead of \
+         a stale sibling amber-site-controller executable"
+    );
+    assert_eq!(command.prefix_args, vec!["run-site-controller"]);
+}
+
+#[test]
 fn site_controller_command_prefers_fresh_amber_binary_under_cargo_tests() {
     let temp = TempDir::new().expect("temp dir");
     let debug_dir = temp.path().join("target").join("debug");
@@ -214,6 +231,39 @@ fn site_controller_command_prefers_fresh_amber_binary_under_cargo_tests() {
          sibling amber-site-controller executable"
     );
     assert_eq!(command.prefix_args, vec!["run-site-controller"]);
+}
+
+#[test]
+fn local_site_controller_ready_treats_absent_controller_as_optional() {
+    let plan = SiteSupervisorPlan {
+        schema: "amber.run.site_supervisor_plan".to_string(),
+        version: 2,
+        run_id: "run".to_string(),
+        mesh_scope: "scope".to_string(),
+        run_root: "/tmp/run".to_string(),
+        coordinator_pid: 1,
+        site_id: "vm-local".to_string(),
+        kind: SiteKind::Vm,
+        artifact_dir: "/tmp/artifact".to_string(),
+        site_state_root: "/tmp/state".to_string(),
+        storage_root: None,
+        runtime_root: None,
+        router_mesh_port: None,
+        compose_project: None,
+        kubernetes_namespace: None,
+        context: None,
+        port_forward_mesh_port: None,
+        port_forward_control_port: None,
+        observability_endpoint: None,
+        site_controller_url: None,
+        launch_env: BTreeMap::new(),
+    };
+
+    assert!(
+        supervisor::local_site_controller_ready(&plan, Duration::from_millis(10))
+            .expect("sites without a local controller should still be considered ready"),
+        "managed vm sites should not block startup on a non-existent local controller"
+    );
 }
 
 #[test]

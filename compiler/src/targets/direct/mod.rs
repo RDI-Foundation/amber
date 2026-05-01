@@ -489,17 +489,6 @@ fn build_component_plans(
                 component.moniker.as_str()
             ))
         })?;
-        let dynamic_caps_port = mesh_config_plan
-            .component_configs
-            .get(id)
-            .and_then(|config| config.dynamic_caps_listen)
-            .map(|addr| addr.port())
-            .ok_or_else(|| {
-                MeshError::new(format!(
-                    "internal error: missing dynamic caps listen port for {}",
-                    component.moniker.as_str()
-                ))
-            })?;
         let depends_on = mesh_plan
             .strong_deps()
             .get(id)
@@ -514,6 +503,14 @@ fn build_component_plans(
                 source_dir.as_deref(),
                 component.moniker.as_str(),
             )?
+        };
+        let dynamic_caps_port = match execution {
+            DirectProgramExecutionPlan::InternalSiteController => None,
+            _ => mesh_config_plan
+                .component_configs
+                .get(id)
+                .and_then(|config| config.dynamic_caps_listen)
+                .map(|addr| addr.port()),
         };
 
         out.push(DirectComponentPlan {
@@ -553,17 +550,19 @@ fn direct_internal_execution_plan(
 
 fn inject_direct_dynamic_caps_env(
     execution: DirectProgramExecutionPlan,
-    dynamic_caps_port: u16,
+    dynamic_caps_port: Option<u16>,
 ) -> DirectProgramExecutionPlan {
     match execution {
         DirectProgramExecutionPlan::Direct {
             entrypoint,
             mut env,
         } => {
-            env.insert(
-                DYNAMIC_CAPS_API_URL_ENV.to_string(),
-                format!("http://127.0.0.1:{dynamic_caps_port}"),
-            );
+            if let Some(dynamic_caps_port) = dynamic_caps_port {
+                env.insert(
+                    DYNAMIC_CAPS_API_URL_ENV.to_string(),
+                    format!("http://127.0.0.1:{dynamic_caps_port}"),
+                );
+            }
             DirectProgramExecutionPlan::Direct { entrypoint, env }
         }
         DirectProgramExecutionPlan::HelperRunner {

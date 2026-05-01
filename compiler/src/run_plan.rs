@@ -7,7 +7,7 @@ use amber_json5 as json5;
 use amber_manifest::{
     BindingSource as ManifestBindingSource, BindingTarget as ManifestBindingTarget, CapabilityKind,
     ChildTemplateDecl, ChildTemplateManifestDecl, ComponentDecl, Manifest, ManifestRef,
-    MountSource, NetworkProtocol, Program as ManifestProgram, SlotDecl,
+    MountSource, NetworkProtocol, Program as ManifestProgram, RuntimeBackend, SlotDecl,
 };
 use amber_mesh::dynamic_caps::DynamicCapabilitiesSnapshotIr;
 use amber_scenario::{
@@ -230,6 +230,11 @@ pub(crate) fn lower_framework_component_bindings_for_single_site(
         scenario,
         &offered_sites,
         &assignments_by_component,
+        &PlacementDefaults {
+            path: Some(site_id.to_string()),
+            image: Some(site_id.to_string()),
+            vm: Some(site_id.to_string()),
+        },
         &controller_sites,
     )?;
     compiled
@@ -258,6 +263,7 @@ pub fn lower_framework_component_bindings_for_placement(
         scenario,
         &offered_sites,
         &assignments_by_component,
+        &placement.defaults,
         &BTreeSet::new(),
     )?;
     compiled
@@ -411,6 +417,12 @@ pub fn build_run_plan_with_activation(
             .filter(|site_id| !control_only_site_set.contains(*site_id))
             .cloned()
             .collect::<Vec<_>>();
+        let privileged_control_sites = initial_privileged_control_sites(
+            compiled.scenario(),
+            &offered_sites,
+            &assignments_by_component,
+            &standby_sites,
+        )?;
         let active_site_capabilities: BTreeMap<String, ActiveSiteCapabilities> =
             initial_active_sites
                 .iter()
@@ -420,7 +432,7 @@ pub fn build_run_plan_with_activation(
                         ActiveSiteCapabilities {
                             cross_site_routing: true,
                             dynamic_workloads: dynamic_enabled_sites.contains(site_id),
-                            privileged_control: true,
+                            privileged_control: privileged_control_sites.contains(site_id),
                         },
                     )
                 })
@@ -434,21 +446,13 @@ pub fn build_run_plan_with_activation(
         )
     };
 
-    let controller_sites = if has_public_framework_component_bindings(compiled.scenario()) {
-        active_site_capabilities
-            .keys()
-            .map(|site_id| framework_controller_execution_site_id(&offered_sites, site_id))
-            .collect::<Result<BTreeSet<_>, _>>()?
-            .into_iter()
-            .map(str::to_string)
-            .collect::<BTreeSet<_>>()
-    } else {
-        BTreeSet::new()
-    };
+    let controller_sites =
+        controller_execution_sites_for_active_sites(&offered_sites, &active_site_capabilities)?;
     let lowered = inject_site_controller_components(
         compiled.scenario(),
         &offered_sites,
         &assignments_by_component,
+        &defaults,
         &controller_sites,
     )?;
     assignments_by_component.extend(lowered.synthetic_assignments.clone());
@@ -655,6 +659,13 @@ pub fn build_homogeneous_export_run_plan(
     compiled: &CompiledScenario,
     requested_kind: SiteKind,
 ) -> Result<RunPlan, RunPlanError> {
+    if requested_kind == SiteKind::Vm {
+        return Err(RunPlanError::Other(
+            "homogeneous vm exports are unsupported; vm workloads require an explicit controlling \
+             direct site via placement.sites.<vm>.controller_site"
+                .to_string(),
+        ));
+    }
     let site_id = homogeneous_export_site_id(requested_kind).to_string();
     let placement = PlacementFile {
         schema: PLACEMENT_SCHEMA.to_string(),
@@ -868,22 +879,15 @@ fn resolve_dynamic_planning_state(
         explicit_components,
     )?;
     validate_storage_locality(scenario, &assignments_by_component)?;
-    let controller_sites = if has_public_framework_component_bindings(scenario) {
-        activation
-            .active_site_capabilities
-            .keys()
-            .map(|site_id| framework_controller_execution_site_id(&offered_sites, site_id))
-            .collect::<Result<BTreeSet<_>, _>>()?
-            .into_iter()
-            .map(str::to_string)
-            .collect::<BTreeSet<_>>()
-    } else {
-        BTreeSet::new()
-    };
+    let controller_sites = controller_execution_sites_for_active_sites(
+        &offered_sites,
+        &activation.active_site_capabilities,
+    )?;
     let lowered = inject_site_controller_components(
         scenario,
         &offered_sites,
         &assignments_by_component,
+        &placement.defaults,
         &controller_sites,
     )?;
     assignments_by_component.extend(lowered.synthetic_assignments.clone());
@@ -1239,6 +1243,60 @@ fn framework_controller_execution_site_id<'a>(
     }
 }
 
+fn controller_execution_sites_for_active_sites(
+    site_definitions: &BTreeMap<String, SiteDefinition>,
+    active_site_capabilities: &BTreeMap<String, ActiveSiteCapabilities>,
+) -> Result<BTreeSet<String>, RunPlanError> {
+    active_site_capabilities
+        .iter()
+        .filter(|(_, capabilities)| capabilities.privileged_control)
+        .map(|(site_id, _)| framework_controller_execution_site_id(site_definitions, site_id))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(|sites| sites.into_iter().map(str::to_string).collect())
+}
+
+fn initial_privileged_control_sites(
+    scenario: &Scenario,
+    _offered_sites: &BTreeMap<String, SiteDefinition>,
+    assignments_by_component: &BTreeMap<ComponentId, String>,
+    standby_sites: &[String],
+) -> Result<BTreeSet<String>, RunPlanError> {
+    let moniker_to_site = assignments_by_component
+        .iter()
+        .map(|(component_id, site_id)| {
+            (
+                graph::component_path(scenario, *component_id),
+                site_id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut privileged_control_sites = standby_sites.iter().cloned().collect::<BTreeSet<_>>();
+    privileged_control_sites.extend(assignments_by_component.values().cloned());
+    for (component_id, component) in scenario.components_iter() {
+        if component.child_templates.is_empty() {
+            continue;
+        }
+        if let Some(site_id) = assignments_by_component.get(&component_id) {
+            privileged_control_sites.insert(site_id.clone());
+        }
+    }
+    for binding in &scenario.bindings {
+        let BindingFrom::Framework(framework) = &binding.from else {
+            continue;
+        };
+        if framework.capability.as_str() != "component" {
+            continue;
+        }
+        privileged_control_sites.insert(framework_component_managed_site_id(
+            scenario,
+            &moniker_to_site,
+            framework.authority,
+            binding.to.component,
+        )?);
+    }
+    Ok(privileged_control_sites)
+}
+
 fn expand_sites_to_execution_sites(
     site_ids: &BTreeSet<String>,
     site_definitions: &BTreeMap<String, SiteDefinition>,
@@ -1254,6 +1312,7 @@ fn expand_sites_to_execution_sites(
 #[derive(Clone, Debug)]
 struct FrozenChildTemplateSpec {
     manifests: Option<Vec<String>>,
+    possible_backends: Vec<RuntimeBackend>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1283,16 +1342,20 @@ fn analyze_standby_sites(
     let mut requested_sites = BTreeSet::new();
 
     for template in collect_frozen_child_templates(scenario)? {
-        let Some(keys) = template.manifests.as_ref() else {
-            continue;
-        };
-        for key in keys {
-            requested_sites.extend(analyze_manifest_root_sites(
-                &scenario.manifest_catalog,
+        if let Some(keys) = template.manifests.as_ref() {
+            for key in keys {
+                requested_sites.extend(analyze_manifest_root_sites(
+                    &scenario.manifest_catalog,
+                    site_definitions,
+                    defaults,
+                    key,
+                )?);
+            }
+        } else {
+            requested_sites.extend(site_ids_for_possible_backends(
                 site_definitions,
-                defaults,
-                key,
-            )?);
+                &template.possible_backends,
+            ));
         }
     }
 
@@ -1308,6 +1371,7 @@ fn collect_frozen_child_templates(
         templates.extend(component.child_templates.values().map(|template| {
             FrozenChildTemplateSpec {
                 manifests: template.manifests.clone(),
+                possible_backends: template.possible_backends.clone(),
             }
         }));
     }
@@ -1351,7 +1415,10 @@ fn freeze_manifest_child_template(
         }
     };
 
-    Ok(FrozenChildTemplateSpec { manifests })
+    Ok(FrozenChildTemplateSpec {
+        manifests,
+        possible_backends: template.possible_backends.clone(),
+    })
 }
 
 fn resolve_catalog_key(
@@ -1406,6 +1473,80 @@ fn analyze_manifest_root_sites(
     }
 
     Ok(analyzer.required_sites)
+}
+
+fn framework_component_authority_child_execution_sites(
+    scenario: &Scenario,
+    site_definitions: &BTreeMap<String, SiteDefinition>,
+    defaults: &PlacementDefaults,
+    authority_realm: ComponentId,
+) -> Result<BTreeSet<String>, RunPlanError> {
+    let mut sites = BTreeSet::new();
+    for template in scenario.component(authority_realm).child_templates.values() {
+        sites.extend(child_template_execution_sites(
+            scenario,
+            site_definitions,
+            defaults,
+            template,
+        )?);
+    }
+    Ok(sites)
+}
+
+fn child_template_execution_sites(
+    scenario: &Scenario,
+    site_definitions: &BTreeMap<String, SiteDefinition>,
+    defaults: &PlacementDefaults,
+    template: &amber_scenario::ChildTemplate,
+) -> Result<BTreeSet<String>, RunPlanError> {
+    let mut requested_sites = BTreeSet::new();
+    if let Some(keys) = template.manifests.as_ref() {
+        for key in keys {
+            requested_sites.extend(analyze_manifest_root_sites(
+                &scenario.manifest_catalog,
+                site_definitions,
+                defaults,
+                key,
+            )?);
+        }
+    } else {
+        requested_sites.extend(site_ids_for_possible_backends(
+            site_definitions,
+            &template.possible_backends,
+        ));
+    }
+    requested_sites
+        .iter()
+        .map(|site_id| framework_controller_execution_site_id(site_definitions, site_id))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(|sites| sites.into_iter().map(str::to_string).collect())
+}
+
+fn site_ids_for_possible_backends(
+    site_definitions: &BTreeMap<String, SiteDefinition>,
+    possible_backends: &[RuntimeBackend],
+) -> BTreeSet<String> {
+    if possible_backends.is_empty() {
+        return BTreeSet::new();
+    }
+    let possible_backends = possible_backends.iter().copied().collect::<BTreeSet<_>>();
+    site_definitions
+        .iter()
+        .filter_map(|(site_id, site)| {
+            possible_backends
+                .contains(&runtime_backend_for_site_kind(site.kind))
+                .then_some(site_id.clone())
+        })
+        .collect()
+}
+
+fn runtime_backend_for_site_kind(kind: SiteKind) -> RuntimeBackend {
+    match kind {
+        SiteKind::Direct => RuntimeBackend::Direct,
+        SiteKind::Vm => RuntimeBackend::Vm,
+        SiteKind::Compose => RuntimeBackend::Compose,
+        SiteKind::Kubernetes => RuntimeBackend::Kubernetes,
+    }
 }
 
 impl FragmentAnalyzer<'_> {
@@ -2173,6 +2314,8 @@ const FRAMEWORK_COMPONENT_CONTROLLER_ENDPOINT_NAME: &str = "framework_component"
 const FRAMEWORK_COMPONENT_CONTROLLER_MONIKER_PREFIX: &str =
     "/__amber_internal_framework_component_controller";
 const FRAMEWORK_COMPONENT_CONTROLLER_PROVIDE_PREFIX: &str = "__amber_internal_framework_component";
+const FRAMEWORK_COMPONENT_CONTROLLER_REMOTE_SLOT_PREFIX: &str =
+    "__amber_internal_framework_component_controller_remote";
 const FRAMEWORK_COMPONENT_CONTROLLER_PORT_BASE: u16 = 32000;
 const FRAMEWORK_COMPONENT_CONTROLLER_CONTAINER_PATH: &str = "/usr/local/bin/amber-site-controller";
 const FRAMEWORK_COMPONENT_CONTROLLER_PLAN_PATH: &str =
@@ -2191,6 +2334,7 @@ fn inject_site_controller_components(
     scenario: &Scenario,
     offered_sites: &BTreeMap<String, SiteDefinition>,
     assignments_by_component: &BTreeMap<ComponentId, String>,
+    defaults: &PlacementDefaults,
     controller_sites: &BTreeSet<String>,
 ) -> Result<LoweredFrameworkComponentScenario, RunPlanError> {
     let framework_bindings = scenario
@@ -2203,7 +2347,7 @@ fn inject_site_controller_components(
             _ => None,
         })
         .collect::<Vec<_>>();
-    if framework_bindings.is_empty() {
+    if framework_bindings.is_empty() && controller_sites.is_empty() {
         return Ok(LoweredFrameworkComponentScenario {
             scenario: scenario.clone(),
             synthetic_assignments: BTreeMap::new(),
@@ -2221,6 +2365,32 @@ fn inject_site_controller_components(
         .collect::<BTreeMap<_, _>>();
     let mut grants_by_execution_site =
         BTreeMap::<String, BTreeSet<FrameworkComponentGrantKey>>::new();
+    let mut remote_controller_edges = BTreeSet::<(String, String)>::new();
+    let dynamic_capability_execution_sites = scenario
+        .components_iter()
+        .filter(|(_, component)| component.program.is_some())
+        .map(|(component_id, _)| {
+            assignments_by_component
+                .get(&component_id)
+                .ok_or_else(|| {
+                    RunPlanError::Other(format!(
+                        "program component `{}` has no site assignment",
+                        graph::component_path(scenario, component_id)
+                    ))
+                })
+                .and_then(|site_id| {
+                    framework_controller_execution_site_id(offered_sites, site_id)
+                        .map(str::to_string)
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    for local_site_id in &dynamic_capability_execution_sites {
+        for remote_site_id in &dynamic_capability_execution_sites {
+            if local_site_id != remote_site_id {
+                remote_controller_edges.insert((local_site_id.clone(), remote_site_id.clone()));
+            }
+        }
+    }
     for (binding, framework) in &framework_bindings {
         let managed_site = framework_component_managed_site_id(
             scenario,
@@ -2230,6 +2400,32 @@ fn inject_site_controller_components(
         )?;
         let execution_site =
             framework_controller_execution_site_id(offered_sites, &managed_site)?.to_string();
+        let recipient_moniker = graph::component_path(scenario, binding.to.component);
+        let recipient_site = moniker_to_site
+            .get(&recipient_moniker)
+            .ok_or_else(|| {
+                RunPlanError::Other(format!(
+                    "framework.component recipient `{recipient_moniker}` has no site assignment"
+                ))
+            })?
+            .clone();
+        let recipient_execution_site =
+            framework_controller_execution_site_id(offered_sites, &recipient_site)?.to_string();
+        if recipient_execution_site != execution_site {
+            remote_controller_edges
+                .insert((recipient_execution_site.clone(), execution_site.clone()));
+        }
+        for target_execution_site in framework_component_authority_child_execution_sites(
+            scenario,
+            offered_sites,
+            defaults,
+            framework.authority,
+        )? {
+            if target_execution_site != recipient_execution_site {
+                remote_controller_edges
+                    .insert((recipient_execution_site.clone(), target_execution_site));
+            }
+        }
         grants_by_execution_site
             .entry(execution_site)
             .or_default()
@@ -2254,6 +2450,49 @@ fn inject_site_controller_components(
     let mut rewritten = scenario.clone();
     let mut synthetic_assignments = BTreeMap::new();
     let mut controller_rewrites = BTreeMap::<String, ControllerComponentRewrite>::new();
+    for (component_id, component) in rewritten.components_iter() {
+        let Some(metadata) = framework_component_controller_metadata(component.metadata.as_ref())
+        else {
+            continue;
+        };
+        if !offered_sites.contains_key(&metadata.execution_site) {
+            return Err(RunPlanError::UnknownSite {
+                site_id: metadata.execution_site,
+            });
+        }
+        let provide_by_grant = metadata
+            .grants
+            .into_iter()
+            .map(|(provide, grant)| {
+                (
+                    FrameworkComponentGrantKey {
+                        managed_site: grant.managed_site,
+                        authority_realm: ComponentId(grant.authority_realm_id),
+                        authority_realm_moniker: grant.authority_realm_moniker,
+                    },
+                    provide,
+                )
+            })
+            .collect();
+        synthetic_assignments
+            .entry(component_id)
+            .or_insert_with(|| metadata.execution_site.clone());
+        if controller_rewrites
+            .insert(
+                metadata.execution_site.clone(),
+                ControllerComponentRewrite {
+                    component_id,
+                    provide_by_grant,
+                },
+            )
+            .is_some()
+        {
+            return Err(RunPlanError::Other(format!(
+                "site `{}` already has multiple synthetic framework.component controllers",
+                metadata.execution_site
+            )));
+        }
+    }
 
     let execution_sites = controller_sites
         .iter()
@@ -2264,6 +2503,20 @@ fn inject_site_controller_components(
         let grants = grants_by_execution_site
             .remove(&execution_site)
             .unwrap_or_default();
+        if let Some(rewrite) = controller_rewrites.get(&execution_site) {
+            let missing_grants = grants
+                .iter()
+                .filter(|grant| !rewrite.provide_by_grant.contains_key(*grant))
+                .collect::<Vec<_>>();
+            if !missing_grants.is_empty() {
+                return Err(RunPlanError::Other(format!(
+                    "site `{execution_site}` already has a synthetic framework.component \
+                     controller, but it is missing {} lowered framework.component grant(s)",
+                    missing_grants.len()
+                )));
+            }
+            continue;
+        }
         let controller_id = ComponentId(rewritten.components.len());
         let port = next_framework_component_controller_port(&mut used_ports)?;
         let site = offered_sites
@@ -2329,6 +2582,44 @@ fn inject_site_controller_components(
                 provide_by_grant,
             },
         );
+    }
+
+    for (local_site_id, remote_site_id) in remote_controller_edges {
+        let local_controller_id = controller_rewrites
+            .get(&local_site_id)
+            .ok_or_else(|| {
+                RunPlanError::Other(format!(
+                    "site `{local_site_id}` needs a remote-controller route to `{remote_site_id}` \
+                     but has no synthetic framework.component controller"
+                ))
+            })?
+            .component_id;
+        let remote_controller_id = controller_rewrites
+            .get(&remote_site_id)
+            .ok_or_else(|| {
+                RunPlanError::Other(format!(
+                    "site `{local_site_id}` needs a remote-controller route to `{remote_site_id}` \
+                     but the remote site has no synthetic framework.component controller"
+                ))
+            })?
+            .component_id;
+        let slot_name = framework_component_controller_remote_slot_name(&remote_site_id);
+        rewritten.component_mut(local_controller_id).slots.insert(
+            slot_name.clone(),
+            framework_component_controller_remote_slot_decl()?,
+        );
+        rewritten.bindings.push(BindingEdge {
+            from: BindingFrom::Component(ProvideRef {
+                component: remote_controller_id,
+                name: FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE.to_string(),
+            }),
+            to: SlotRef {
+                component: local_controller_id,
+                name: slot_name,
+            },
+            // Remote controller routes must exist without introducing a cross-site startup cycle.
+            weak: true,
+        });
     }
 
     for binding in &mut rewritten.bindings {
@@ -2425,6 +2716,13 @@ fn framework_component_controller_provide_name(grant: &FrameworkComponentGrantKe
         "{FRAMEWORK_COMPONENT_CONTROLLER_PROVIDE_PREFIX}__site_{}__authority_{}",
         sanitize_framework_component_identifier(grant.managed_site.as_str()),
         grant.authority_realm.0,
+    )
+}
+
+pub fn framework_component_controller_remote_slot_name(site_id: &str) -> String {
+    format!(
+        "{FRAMEWORK_COMPONENT_CONTROLLER_REMOTE_SLOT_PREFIX}__{}",
+        sanitize_framework_component_identifier(site_id),
     )
 }
 
@@ -2552,6 +2850,14 @@ fn framework_component_controller_internal_provide_decl()
     .map_err(|err| {
         RunPlanError::Other(format!(
             "failed to build synthetic site controller internal provide: {err}"
+        ))
+    })
+}
+
+fn framework_component_controller_remote_slot_decl() -> Result<SlotDecl, RunPlanError> {
+    serde_json::from_value(serde_json::json!({ "kind": "http" })).map_err(|err| {
+        RunPlanError::Other(format!(
+            "failed to build synthetic remote site controller slot: {err}"
         ))
     })
 }
@@ -2897,6 +3203,28 @@ mod tests {
         CompiledScenario::from_compile_output(&output).expect("compiled scenario")
     }
 
+    fn direct_mesh_config_for_component(
+        site_plan: &RunSitePlan,
+        moniker: &str,
+    ) -> amber_mesh::MeshConfigTemplate {
+        let mesh_provision_plan: amber_mesh::MeshProvisionPlan = serde_json::from_str(
+            site_plan
+                .artifact_files
+                .get(crate::targets::direct::MESH_PROVISION_PLAN_FILENAME)
+                .expect("mesh provision plan should be present in site artifacts"),
+        )
+        .expect("mesh provision plan should deserialize");
+        mesh_provision_plan
+            .targets
+            .into_iter()
+            .find_map(|target| {
+                (matches!(target.kind, amber_mesh::MeshProvisionTargetKind::Component)
+                    && target.config.identity.id == moniker)
+                    .then_some(target.config)
+            })
+            .unwrap_or_else(|| panic!("mesh provision plan should include component {moniker}"))
+    }
+
     #[tokio::test]
     async fn vm_site_defaults_controller_site_to_sole_direct_site() {
         let dir = tmp_dir("run-plan-vm-controller-default-");
@@ -3102,7 +3430,7 @@ mod tests {
         assert!(plan.sites.contains_key("guest_vm"));
         assert_eq!(
             plan.sites["host_direct"].assigned_components,
-            Vec::<String>::new()
+            vec!["/__amber_internal_framework_component_controller/host_direct".to_string()]
         );
         assert_eq!(
             plan.sites["guest_vm"].assigned_components,
@@ -3137,7 +3465,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sites_without_public_framework_bindings_do_not_inject_site_controller_components() {
+    async fn compile_only_lowering_without_framework_bindings_does_not_inject_site_controller_components()
+     {
+        let dir = tmp_dir("compile-framework-lowering-no-controller-");
+        let worker = dir.path().join("worker.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&worker, path_server_manifest());
+        write(
+            &root,
+            r##"{
+  manifest_version: "0.3.0",
+  components: { worker: "./worker.json5" },
+  exports: { worker_api: "#worker.api" }
+}"##,
+        );
+
+        let compiled = compile(&root).await;
+        let lowered = lower_framework_component_bindings_for_single_site(
+            &compiled,
+            "direct_local",
+            SiteDefinition {
+                kind: SiteKind::Direct,
+                context: None,
+                controller_site: None,
+            },
+        )
+        .expect("compile-time framework lowering should succeed");
+        let scenario = lowered.scenario();
+
+        assert!(
+            scenario.components_iter().all(|(_, component)| {
+                framework_component_controller_metadata(component.metadata.as_ref()).is_none()
+            }),
+            "compile-time lowering should stay inert when no framework.component bindings exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_run_plan_injects_site_controller_components_for_component_hosting_sites() {
         let dir = tmp_dir("run-plan-controller-injection-");
         let worker = dir.path().join("worker.json5");
         let root = dir.path().join("root.json5");
@@ -3160,12 +3526,81 @@ mod tests {
             .expect("direct site should be present");
         let scenario = Scenario::try_from(site_plan.scenario_ir.clone())
             .expect("site scenario should round-trip from IR");
+        let worker_config = direct_mesh_config_for_component(site_plan, "/worker");
+
+        framework_controller_component_for_site(&scenario, "direct_local");
+        assert!(
+            plan.active_site_capabilities["direct_local"].privileged_control,
+            "component-hosting sites should advertise privileged control because dynamic \
+             capability control is site-local",
+        );
+        assert!(
+            worker_config.dynamic_caps_listen.is_some(),
+            "components on populated sites should expose dynamic caps listeners once a local \
+             controller exists",
+        );
+        assert!(
+            worker_config.outbound.iter().any(|route| {
+                route.capability == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+            }),
+            "components on populated sites should get the synthetic local controller route",
+        );
+    }
+
+    #[tokio::test]
+    async fn build_run_plan_direct_artifacts_keep_local_controller_routes_for_framework_sites() {
+        let dir = tmp_dir("run-plan-direct-artifact-controller-route-");
+        let admin = dir.path().join("admin.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&admin, framework_admin_path_manifest());
+        write(
+            &root,
+            r###"{
+  manifest_version: "0.3.0",
+  components: { admin: "./admin.json5" },
+  bindings: [
+    { to: "#admin.ctl", from: "framework.component" }
+  ],
+  exports: { admin_api: "#admin.api" }
+}"###,
+        );
+
+        let compiled = compile(&root).await;
+        let run_plan = build_run_plan(&compiled, None).expect("run plan should build");
+        let site_plan = run_plan
+            .sites
+            .get("direct_local")
+            .expect("direct site should be present");
+        let site_scenario = Scenario::try_from(site_plan.scenario_ir.clone())
+            .expect("site scenario should round-trip from IR");
+        let (_, controller_component, _) =
+            framework_controller_component_for_site(&site_scenario, "direct_local");
+        let admin_config = direct_mesh_config_for_component(site_plan, "/admin");
+        let controller_config =
+            direct_mesh_config_for_component(site_plan, controller_component.moniker.as_str());
 
         assert!(
-            scenario.components_iter().all(|(_, component)| {
-                framework_component_controller_metadata(component.metadata.as_ref()).is_none()
+            run_plan.active_site_capabilities["direct_local"].privileged_control,
+            "sites that provide framework.component should advertise privileged control",
+        );
+        assert!(
+            admin_config.dynamic_caps_listen.is_some(),
+            "ordinary direct-site components should expose dynamic caps listeners when a local \
+             framework controller exists",
+        );
+        assert!(
+            admin_config.outbound.iter().any(|route| {
+                route.protocol == amber_mesh::MeshProtocol::Http
+                    && route.capability
+                        == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
             }),
-            "sites without public framework.component bindings should not inject a controller"
+            "framework-enabled direct-site components must keep their local framework.component \
+             controller route",
+        );
+        assert!(
+            controller_config.dynamic_caps_listen.is_none(),
+            "synthetic controller sidecars must not expose the dynamic caps listener",
         );
     }
 
@@ -3222,6 +3657,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn framework_component_lowering_reuses_existing_synthetic_controller_on_replay() {
+        let dir = tmp_dir("run-plan-framework-component-replay-");
+        let admin = dir.path().join("admin.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&admin, framework_admin_path_manifest());
+        write(
+            &root,
+            r###"{
+  manifest_version: "0.3.0",
+  components: { admin: "./admin.json5" },
+  bindings: [
+    { to: "#admin.ctl", from: "framework.component" }
+  ],
+  exports: { admin_api: "#admin.api" }
+}"###,
+        );
+
+        let compiled = compile(&root).await;
+        let plan = build_run_plan(&compiled, None).expect("run plan should build");
+        let replay_compiled = CompiledScenario::from_ir(plan.base_scenario.clone())
+            .expect("lowered scenario should round-trip through scenario IR");
+        let replay_plan =
+            build_run_plan(&replay_compiled, None).expect("replay run plan should build");
+        let replay = CompiledScenario::from_ir(replay_plan.base_scenario)
+            .expect("replay scenario should deserialize");
+        let controllers = replay
+            .scenario()
+            .components_iter()
+            .filter(|(_, component)| {
+                framework_component_controller_metadata(component.metadata.as_ref()).is_some()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            controllers.len(),
+            1,
+            "replaying a snapshot must reuse the existing synthetic controller instead of \
+             injecting a second controller for the same site",
+        );
+    }
+
+    #[tokio::test]
     async fn framework_component_lowering_routes_cross_site_authorities_to_their_managed_site_controller()
      {
         let dir = tmp_dir("run-plan-framework-component-cross-site-");
@@ -3250,6 +3728,8 @@ mod tests {
         let scenario = lowered.scenario();
         let (controller_id, controller, metadata) =
             framework_controller_component_for_site(scenario, "compose_local");
+        let (direct_controller_id, direct_controller, _) =
+            framework_controller_component_for_site(scenario, "direct_local");
         let binding = scenario
             .bindings
             .iter()
@@ -3276,6 +3756,321 @@ mod tests {
         assert_eq!(ctl_link.provider_site, "compose_local");
         assert_eq!(ctl_link.consumer_site, "direct_local");
         assert_eq!(ctl_link.provider_component, controller.moniker.as_str());
+        let remote_controller_binding = scenario
+            .bindings
+            .iter()
+            .find(|binding| {
+                binding.to.component == direct_controller_id
+                    && binding.to.name
+                        == framework_component_controller_remote_slot_name("compose_local")
+            })
+            .expect(
+                "synthetic direct-site controller should bind to the remote compose controller \
+                 internal route",
+            );
+        let BindingFrom::Component(remote_controller_provide) = &remote_controller_binding.from
+        else {
+            panic!("remote controller binding should lower to an ordinary component provide");
+        };
+        assert_eq!(remote_controller_provide.component, controller_id);
+        assert_eq!(
+            remote_controller_provide.name,
+            FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE,
+        );
+        assert!(
+            remote_controller_binding.weak,
+            "remote controller bindings should not impose cross-site startup ordering",
+        );
+        assert_eq!(
+            graph::component_path(scenario, remote_controller_binding.to.component),
+            direct_controller.moniker.as_str(),
+        );
+        assert!(
+            scenario.bindings.iter().any(|binding| {
+                binding.to.component == controller_id
+                    && binding.to.name
+                        == framework_component_controller_remote_slot_name("direct_local")
+            }),
+            "component-hosting sites keep reverse controller routes because dynamic capabilities \
+             can be shared in either direction at runtime",
+        );
+    }
+
+    #[tokio::test]
+    async fn framework_component_lowering_routes_creators_to_standby_child_site_controllers() {
+        let dir = tmp_dir("run-plan-framework-component-standby-controller-");
+        let admin = dir.path().join("admin.json5");
+        let worker = dir.path().join("worker.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&admin, framework_admin_path_manifest());
+        write(&worker, image_server_manifest());
+        write(
+            &root,
+            r##"{
+  manifest_version: "0.3.0",
+  slots: { realm: { kind: "component", optional: true } },
+  components: { admin: "./admin.json5" },
+  child_templates: {
+    worker: { manifest: "./worker.json5" }
+  },
+  bindings: [
+    { to: "#admin.ctl", from: "framework.component" }
+  ],
+  exports: { admin_api: "#admin.api" }
+}"##,
+        );
+        let placement = PlacementFile {
+            schema: PLACEMENT_SCHEMA.to_string(),
+            version: PLACEMENT_VERSION,
+            sites: BTreeMap::from([
+                (
+                    "direct_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                        controller_site: None,
+                    },
+                ),
+                (
+                    "compose_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Compose,
+                        context: None,
+                        controller_site: None,
+                    },
+                ),
+            ]),
+            defaults: PlacementDefaults {
+                path: Some("direct_local".to_string()),
+                image: Some("compose_local".to_string()),
+                vm: None,
+            },
+            components: BTreeMap::new(),
+            dynamic_capabilities: None,
+            framework_children: None,
+        };
+
+        let compiled = compile(&root).await;
+        let plan = build_run_plan(&compiled, Some(&placement)).expect("run plan should build");
+        assert_eq!(plan.standby_sites, vec!["compose_local".to_string()]);
+        let lowered = CompiledScenario::from_ir(plan.base_scenario.clone())
+            .expect("lowered scenario should deserialize");
+        let scenario = lowered.scenario();
+        let (direct_controller_id, direct_controller, _) =
+            framework_controller_component_for_site(scenario, "direct_local");
+        let (compose_controller_id, _compose_controller, compose_metadata) =
+            framework_controller_component_for_site(scenario, "compose_local");
+        assert!(
+            compose_metadata.grants.is_empty(),
+            "the compose controller is needed as a standby create target, not because it owns an \
+             existing framework.component grant",
+        );
+
+        let remote_controller_binding = scenario
+            .bindings
+            .iter()
+            .find(|binding| {
+                binding.to.component == direct_controller_id
+                    && binding.to.name
+                        == framework_component_controller_remote_slot_name("compose_local")
+            })
+            .expect("direct controller should have a route to the standby compose controller");
+        let BindingFrom::Component(remote_controller_provide) = &remote_controller_binding.from
+        else {
+            panic!("remote controller binding should lower to an ordinary component provide");
+        };
+        assert_eq!(remote_controller_provide.component, compose_controller_id);
+        assert_eq!(
+            remote_controller_provide.name,
+            FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE,
+        );
+        assert_eq!(
+            graph::component_path(scenario, remote_controller_binding.to.component),
+            direct_controller.moniker.as_str(),
+        );
+        assert!(remote_controller_binding.weak);
+        assert!(
+            scenario.bindings.iter().all(|binding| {
+                binding.to.component != compose_controller_id
+                    || binding.to.name
+                        != framework_component_controller_remote_slot_name("direct_local")
+            }),
+            "creating into the compose standby site should not synthesize an unused reverse route",
+        );
+    }
+
+    #[tokio::test]
+    async fn framework_component_lowering_routes_vm_template_creators_to_controller_site() {
+        let dir = tmp_dir("run-plan-framework-component-vm-template-controller-");
+        let admin = dir.path().join("admin.json5");
+        let worker = dir.path().join("worker.json5");
+        let root = dir.path().join("root.json5");
+
+        write(
+            &admin,
+            r#"{
+  manifest_version: "0.3.0",
+  slots: { ctl: { kind: "component" } },
+  program: {
+    image: "busybox:1.36.1",
+    entrypoint: ["sh", "-c", "sleep 30"],
+    env: { CTL_URL: "${slots.ctl.url}" },
+    network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+  },
+  provides: { api: { kind: "http", endpoint: "http" } },
+  exports: { api: "api" }
+}"#,
+        );
+        write(&worker, vm_server_manifest());
+        write(
+            &root,
+            r##"{
+  manifest_version: "0.3.0",
+  slots: { realm: { kind: "component", optional: true } },
+  components: { admin: "./admin.json5" },
+  child_templates: {
+    worker: { manifest: "./worker.json5" }
+  },
+  bindings: [
+    { to: "#admin.ctl", from: "framework.component" }
+  ],
+  exports: { admin_api: "#admin.api" }
+}"##,
+        );
+        let placement = PlacementFile {
+            schema: PLACEMENT_SCHEMA.to_string(),
+            version: PLACEMENT_VERSION,
+            sites: BTreeMap::from([
+                (
+                    "compose_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Compose,
+                        context: None,
+                        controller_site: None,
+                    },
+                ),
+                (
+                    "direct_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                        controller_site: None,
+                    },
+                ),
+                (
+                    "vm_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Vm,
+                        context: None,
+                        controller_site: None,
+                    },
+                ),
+            ]),
+            defaults: PlacementDefaults {
+                path: Some("direct_local".to_string()),
+                image: Some("compose_local".to_string()),
+                vm: Some("vm_local".to_string()),
+            },
+            components: BTreeMap::new(),
+            dynamic_capabilities: None,
+            framework_children: None,
+        };
+
+        let compiled = compile(&root).await;
+        let plan = build_run_plan(&compiled, Some(&placement)).expect("run plan should build");
+        assert_eq!(
+            plan.standby_sites,
+            vec!["direct_local".to_string(), "vm_local".to_string()]
+        );
+        let lowered = CompiledScenario::from_ir(plan.base_scenario.clone())
+            .expect("lowered scenario should deserialize");
+        let scenario = lowered.scenario();
+        let (compose_controller_id, _compose_controller, _) =
+            framework_controller_component_for_site(scenario, "compose_local");
+        let (direct_controller_id, _direct_controller, direct_metadata) =
+            framework_controller_component_for_site(scenario, "direct_local");
+        assert!(
+            direct_metadata.grants.is_empty(),
+            "the direct controller is needed because it controls vm creates, not because it owns \
+             an existing framework.component grant",
+        );
+
+        let remote_controller_binding = scenario
+            .bindings
+            .iter()
+            .find(|binding| {
+                binding.to.component == compose_controller_id
+                    && binding.to.name
+                        == framework_component_controller_remote_slot_name("direct_local")
+            })
+            .expect("compose controller should route vm creates to the direct controller");
+        let BindingFrom::Component(remote_controller_provide) = &remote_controller_binding.from
+        else {
+            panic!("remote controller binding should lower to an ordinary component provide");
+        };
+        assert_eq!(remote_controller_provide.component, direct_controller_id);
+        assert_eq!(
+            remote_controller_provide.name,
+            FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE,
+        );
+        assert!(
+            scenario.bindings.iter().all(|binding| {
+                binding.to.component != compose_controller_id
+                    || binding.to.name
+                        != framework_component_controller_remote_slot_name("vm_local")
+            }),
+            "vm workload sites do not host framework.component controllers; the route target is \
+             the vm controller_site",
+        );
+    }
+
+    #[tokio::test]
+    async fn framework_component_lowering_does_not_synthesize_legacy_controller_peer_bindings() {
+        let dir = tmp_dir("run-plan-framework-component-legacy-controller-peer-");
+        let admin = dir.path().join("admin.json5");
+        let authority = dir.path().join("authority.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&admin, framework_admin_path_manifest());
+        write(&authority, framework_authority_manifest());
+        write(
+            &root,
+            r##"{
+  manifest_version: "0.3.0",
+  components: { authority: "./authority.json5" },
+  exports: {
+    authority_api: "#authority.api",
+    authority_admin_api: "#authority.admin_api"
+  }
+}"##,
+        );
+
+        let compiled = compile(&root).await;
+        let plan = build_run_plan(&compiled, None).expect("run plan should build");
+        let lowered = CompiledScenario::from_ir(plan.base_scenario.clone())
+            .expect("lowered base scenario should deserialize");
+        let scenario = lowered.scenario();
+
+        assert!(
+            scenario.components_iter().all(|(_, component)| {
+                component.slots.keys().all(|slot| {
+                    !slot.starts_with("__amber_internal_framework_component_controller_peer")
+                })
+            }),
+            "framework controller lowering must not synthesize legacy controller-peer slots",
+        );
+        assert!(
+            scenario.bindings.iter().all(|binding| {
+                !matches!(
+                    &binding.from,
+                    BindingFrom::Component(ProvideRef { name, .. })
+                        if name == "__amber_internal_site_controller_peer"
+                )
+            }),
+            "framework controller lowering must not synthesize legacy controller-peer capability \
+             bindings",
+        );
     }
 
     #[tokio::test]
@@ -3476,11 +4271,14 @@ mod tests {
         assert_eq!(plan.defaults.path.as_deref(), Some("direct_local"));
         assert_eq!(
             plan.sites["compose_local"].assigned_components,
-            vec!["/".to_string()]
+            vec![
+                "/".to_string(),
+                "/__amber_internal_framework_component_controller/compose_local".to_string(),
+            ]
         );
         assert_eq!(
             plan.sites["direct_local"].assigned_components,
-            Vec::<String>::new()
+            vec!["/__amber_internal_framework_component_controller/direct_local".to_string()]
         );
         assert!(
             plan.sites["direct_local"]
@@ -3695,7 +4493,16 @@ mod tests {
                 "direct_local".to_string()
             ]
         );
-        assert_eq!(plan.links.len(), 6);
+        let controller_prefix = "/__amber_internal_framework_component_controller/";
+        let user_link_count = plan
+            .links
+            .iter()
+            .filter(|link| {
+                !link.provider_component.starts_with(controller_prefix)
+                    && !link.consumer_component.starts_with(controller_prefix)
+            })
+            .count();
+        assert_eq!(user_link_count, 6);
     }
 
     #[test]
@@ -3987,5 +4794,36 @@ mod tests {
                 .files
                 .contains_key(&PathBuf::from("kustomization.yaml"))
         );
+    }
+
+    #[tokio::test]
+    async fn build_homogeneous_export_run_plan_rejects_vm_without_controller_site() {
+        let dir = tmp_dir("run-plan-homogeneous-vm-export-");
+        let vm_child = dir.path().join("vm.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&vm_child, vm_server_manifest());
+        write(
+            &root,
+            r##"{
+  manifest_version: "0.3.0",
+  components: {
+    vm: "./vm.json5"
+  },
+  exports: {
+    vm_api: "#vm.api"
+  }
+}"##,
+        );
+
+        let compiled = compile(&root).await;
+        let err = build_homogeneous_export_run_plan(&compiled, SiteKind::Vm)
+            .expect_err("homogeneous vm export should require an explicit controlling site");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("homogeneous vm exports are unsupported"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("controller_site"), "{rendered}");
     }
 }

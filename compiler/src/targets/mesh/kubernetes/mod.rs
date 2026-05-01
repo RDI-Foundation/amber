@@ -1281,8 +1281,13 @@ pub(crate) fn emit_kubernetes_artifact_with_options(
         }
 
         let egress_from_consumers = egress_allow.get(id);
-        let egress_to_router = egress_router_allow.get(id);
-        if egress_from_consumers.is_some() || egress_to_router.is_some() {
+        let mut egress_to_router = egress_router_allow.get(id).cloned().unwrap_or_default();
+        if framework_component_controller_metadata(s.component(*id).metadata.as_ref()).is_some()
+            && needs_router
+        {
+            egress_to_router.insert(ROUTER_CONTROL_PORT_BASE);
+        }
+        if egress_from_consumers.is_some() || !egress_to_router.is_empty() {
             netpol.add_egress_rule(NetworkPolicyEgressRule {
                 to: vec![NetworkPolicyPeer {
                     pod_selector: None,
@@ -1344,7 +1349,7 @@ pub(crate) fn emit_kubernetes_artifact_with_options(
                 }
             }
 
-            if let Some(ports) = egress_to_router {
+            if !egress_to_router.is_empty() {
                 netpol.add_egress_rule(NetworkPolicyEgressRule {
                     to: vec![NetworkPolicyPeer {
                         pod_selector: Some(LabelSelector {
@@ -1353,7 +1358,7 @@ pub(crate) fn emit_kubernetes_artifact_with_options(
                         namespace_selector: None,
                         ip_block: None,
                     }],
-                    ports: ports
+                    ports: egress_to_router
                         .iter()
                         .map(|port| NetworkPolicyPort {
                             protocol: "TCP",

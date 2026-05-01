@@ -82,9 +82,11 @@ fn lowered_framework_component_controller_uses_real_internal_image_in_kubernetes
         r##"
         {
           manifest_version: "0.1.0",
+          slots: { external: { kind: "http" } },
           components: { admin: "./admin.json5" },
           bindings: [
-            { to: "#admin.ctl", from: "framework.component" }
+            { to: "#admin.ctl", from: "framework.component" },
+            { to: "#admin.external", from: "self.external", weak: true }
           ]
         }
         "##,
@@ -99,7 +101,10 @@ fn lowered_framework_component_controller_uses_real_internal_image_in_kubernetes
             image: "busybox:1.36.1",
             entrypoint: ["sh", "-lc", "sleep 3600"]
           },
-          slots: { ctl: { kind: "component" } }
+          slots: {
+            ctl: { kind: "component" },
+            external: { kind: "http" }
+          }
         }
         "#,
     )
@@ -115,6 +120,12 @@ fn lowered_framework_component_controller_uses_real_internal_image_in_kubernetes
         .files
         .get(&PathBuf::from("04-services/amber-site-controller.yaml"))
         .expect("site controller service");
+    let netpol = artifact
+        .files
+        .get(&PathBuf::from(
+            "05-networkpolicies/amber-site-controller-netpol.yaml",
+        ))
+        .expect("site controller network policy");
     let site_controller_image = internal_images().site_controller;
 
     assert!(
@@ -130,6 +141,30 @@ fn lowered_framework_component_controller_uses_real_internal_image_in_kubernetes
         service.contains("name: amber-site-controller"),
         "the lowered controller should render an ordinary service for the controller workload: \
          {service}"
+    );
+    let netpol_doc: serde_yaml::Value =
+        serde_yaml::from_str(netpol).expect("parse site controller network policy");
+    let egress = netpol_doc["spec"]["egress"]
+        .as_sequence()
+        .expect("site controller network policy should have egress rules");
+    let has_router_control_egress = egress.iter().any(|rule| {
+        let to_router = rule["to"].as_sequence().is_some_and(|peers| {
+            peers.iter().any(|peer| {
+                peer["podSelector"]["matchLabels"]["amber.io/component"].as_str()
+                    == Some("amber-router")
+            })
+        });
+        let has_control_port = rule["ports"].as_sequence().is_some_and(|ports| {
+            ports.iter().any(|port| {
+                port["protocol"].as_str() == Some("TCP") && port["port"].as_u64() == Some(24100)
+            })
+        });
+        to_router && has_control_port
+    });
+    assert!(
+        has_router_control_egress,
+        "site controller must be able to reach the local router control port without opening a \
+         broader egress surface: {netpol}"
     );
 }
 

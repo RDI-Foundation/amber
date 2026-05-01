@@ -200,11 +200,12 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
     let mut component_configs: HashMap<ComponentId, MeshConfigTemplate> = HashMap::new();
     let mut component_sidecar_env_passthrough = Vec::new();
     push_env_passthrough_once(&mut component_sidecar_env_passthrough, SCENARIO_RUN_ID_ENV);
-
-    push_env_passthrough_once(
-        &mut component_sidecar_env_passthrough,
-        DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
-    );
+    if local_controller_component.is_some() {
+        push_env_passthrough_once(
+            &mut component_sidecar_env_passthrough,
+            DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
+        );
+    }
     for &id in mesh_plan.program_components() {
         let identity = identities_by_component
             .get(&id)
@@ -446,11 +447,16 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         let mesh_listen = format!("{}:{mesh_port}", options.component_mesh_listen_addr)
             .parse()
             .expect("mesh listen");
-        let dynamic_caps_listen = route_ports.dynamic_caps_port(id).map(|port| {
-            format!("{}:{port}", options.component_mesh_listen_addr)
-                .parse()
-                .expect("dynamic caps listen")
-        });
+        let dynamic_caps_listen =
+            if local_controller_component.is_some() && Some(id) != local_controller_component {
+                route_ports.dynamic_caps_port(id).map(|port| {
+                    format!("{}:{port}", options.component_mesh_listen_addr)
+                        .parse()
+                        .expect("dynamic caps listen")
+                })
+            } else {
+                None
+            };
         let config_peers = required_peers(&identity.id, &inbound, &outbound);
 
         let config = MeshConfigTemplate {
@@ -937,6 +943,19 @@ mod tests {
             internal_route.allowed_issuers,
             vec!["/consumer".to_string(), "/site/test/router".to_string()],
             "controller internal routing must admit local component sidecars and the site router",
+        );
+        assert!(
+            controller_config.dynamic_caps_listen.is_none(),
+            "synthetic controller sidecars should not expose the ordinary dynamic caps listener",
+        );
+
+        let consumer_config = plan
+            .component_configs
+            .get(&ComponentId(0))
+            .expect("consumer config");
+        assert!(
+            consumer_config.dynamic_caps_listen.is_some(),
+            "ordinary components should still expose the dynamic caps listener",
         );
     }
 

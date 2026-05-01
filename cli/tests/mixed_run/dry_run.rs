@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::*;
 
 #[test]
@@ -176,15 +178,66 @@ fn mixed_run_dry_run_emits_launch_bundle_without_starting_sites() {
     let stitching = launch_bundle["stitching"]
         .as_array()
         .expect("launch bundle stitching should serialize as an array");
-    assert_eq!(stitching.len(), 1);
-    assert_eq!(stitching[0]["provider_site"], json!("compose_local"));
-    assert_eq!(stitching[0]["consumer_site"], json!("direct_local"));
+    let controller_prefix = "/__amber_internal_framework_component_controller/";
+    let controller_stitching = stitching
+        .iter()
+        .filter(|link| {
+            link["provider_component"]
+                .as_str()
+                .is_some_and(|component| component.starts_with(controller_prefix))
+                || link["consumer_component"]
+                    .as_str()
+                    .is_some_and(|component| component.starts_with(controller_prefix))
+        })
+        .collect::<Vec<_>>();
+    let user_stitching = stitching
+        .iter()
+        .filter(|link| {
+            !link["provider_component"]
+                .as_str()
+                .is_some_and(|component| component.starts_with(controller_prefix))
+                && !link["consumer_component"]
+                    .as_str()
+                    .is_some_and(|component| component.starts_with(controller_prefix))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(user_stitching.len(), 1);
     assert_eq!(
-        stitching[0]["resolution"],
+        controller_stitching.len(),
+        2,
+        "the two-site fixture has program components on both sites, so dynamic capabilities need \
+         controller routes in both directions",
+    );
+    let controller_pairs = controller_stitching
+        .iter()
+        .map(|link| {
+            (
+                link["provider_site"]
+                    .as_str()
+                    .expect("controller stitching should record provider site")
+                    .to_string(),
+                link["consumer_site"]
+                    .as_str()
+                    .expect("controller stitching should record consumer site")
+                    .to_string(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        controller_pairs,
+        BTreeSet::from([
+            ("compose_local".to_string(), "direct_local".to_string()),
+            ("direct_local".to_string(), "compose_local".to_string()),
+        ]),
+    );
+    assert_eq!(user_stitching[0]["provider_site"], json!("compose_local"));
+    assert_eq!(user_stitching[0]["consumer_site"], json!("direct_local"));
+    assert_eq!(
+        user_stitching[0]["resolution"],
         json!("requires_runtime_discovery")
     );
     assert!(
-        stitching[0]["unresolved_reason"]
+        user_stitching[0]["unresolved_reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("Docker")),
         "compose-backed stitching should explain why the exact external URL is not known"

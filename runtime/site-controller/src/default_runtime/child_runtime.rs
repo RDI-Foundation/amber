@@ -9,6 +9,8 @@ pub(super) struct SiteControllerRuntimeState {
     pub(super) kind: SiteKind,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) children: BTreeMap<u64, SiteControllerRuntimeChildRecord>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(super) direct_input_overlay_providers: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -17,12 +19,12 @@ pub(super) struct SiteControllerRuntimeChildRecord {
     pub(super) artifact_root: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) assigned_components: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) controller_routes: Vec<InboundRoute>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) proxy_exports: BTreeMap<String, DynamicProxyExportRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) direct_inputs: Vec<DynamicInputDirectRecord>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) routed_inputs: Vec<DynamicInputRouteRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) process_pid: Option<u32>,
     pub(super) published: bool,
@@ -89,9 +91,10 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
         plan: &'a SiteControllerPlan,
         state: FrameworkControlState,
         child: LiveChildRecord,
+        site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async move {
-            let app = self.runtime_app(plan)?;
+            let app = self.runtime_app_for_site(plan, site_id)?;
             site_controller_runtime_prepare_child(&app, &state, &child).await
         })
     }
@@ -101,9 +104,10 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
         plan: &'a SiteControllerPlan,
         state: FrameworkControlState,
         child: LiveChildRecord,
+        site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async move {
-            let app = self.runtime_app(plan)?;
+            let app = self.runtime_app_for_site(plan, site_id)?;
             site_controller_runtime_publish_child(&app, &state, &child).await
         })
     }
@@ -112,9 +116,10 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
         &'a self,
         plan: &'a SiteControllerPlan,
         child_id: u64,
+        site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async move {
-            let app = self.runtime_app(plan)?;
+            let app = self.runtime_app_for_site(plan, site_id)?;
             site_controller_runtime_rollback_child(&app, child_id).await
         })
     }
@@ -124,9 +129,10 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
         plan: &'a SiteControllerPlan,
         state: FrameworkControlState,
         child: LiveChildRecord,
+        site_id: &'a str,
     ) -> SiteControllerRuntimeFuture<'a, ()> {
         Box::pin(async move {
-            let app = self.runtime_app(plan)?;
+            let app = self.runtime_app_for_site(plan, site_id)?;
             site_controller_runtime_destroy_child(&app, &state, &child).await
         })
     }
@@ -200,10 +206,13 @@ impl SiteControllerRuntime for DefaultSiteControllerRuntime {
 }
 
 impl DefaultSiteControllerRuntime {
-    fn runtime_app(&self, plan: &SiteControllerPlan) -> Result<SiteControllerRuntimeApp> {
-        self.runtime_app_for_plan(
-            &crate::runtime_api::site_controller_runtime_plan_from_controller_plan(plan),
-        )
+    fn runtime_app_for_site(
+        &self,
+        controller_plan: &SiteControllerPlan,
+        site_id: &str,
+    ) -> Result<SiteControllerRuntimeApp> {
+        let runtime_plan = runtime_plan_for_site_from_controller_plan(controller_plan, site_id)?;
+        self.runtime_app_for_plan(&runtime_plan)
     }
 
     fn runtime_app_for_plan(
@@ -238,6 +247,7 @@ pub(super) fn build_site_controller_runtime_app(
             site_id: plan.site_id.clone(),
             kind: plan.kind,
             children: BTreeMap::new(),
+            direct_input_overlay_providers: BTreeSet::new(),
         };
         write_json(&state_path, &state)?;
         state
@@ -247,6 +257,90 @@ pub(super) fn build_site_controller_runtime_app(
         state_path,
         state: Arc::new(AsyncMutex::new(initial_state)),
     })
+}
+
+pub(crate) fn runtime_plan_for_site_from_controller_plan(
+    controller_plan: &SiteControllerPlan,
+    site_id: &str,
+) -> Result<SiteControllerRuntimePlan> {
+    if site_id == controller_plan.site_id {
+        return Ok(site_controller_runtime_plan_from_controller_plan(
+            controller_plan,
+        ));
+    }
+
+    let site_state_root = Path::new(&controller_plan.state_root).join(site_id);
+    let supervisor: SiteSupervisorPlan = read_json(
+        &site_supervisor_plan_path(&site_state_root),
+        "site supervisor plan",
+    )?;
+    let manager_state_path =
+        crate::runtime_api::site_state_path(Path::new(&controller_plan.state_root), site_id);
+    let manager = manager_state_path
+        .is_file()
+        .then(|| read_json::<SiteManagerState>(&manager_state_path, "site manager state"))
+        .transpose()?;
+    let local_router_control = manager
+        .as_ref()
+        .and_then(|state| state.router_control.clone())
+        .or_else(|| {
+            Some(site_runtime_local_router_control(
+                supervisor.kind,
+                Path::new(&supervisor.artifact_dir),
+            ))
+        });
+    let router_identity_id = manager
+        .as_ref()
+        .and_then(|state| state.router_identity_id.clone())
+        .or_else(|| {
+            controller_plan
+                .peer_router_identities
+                .get(site_id)
+                .map(|identity| identity.id.clone())
+        })
+        .ok_or_else(|| miette::miette!("site `{site_id}` is missing its router identity"))?;
+    let router_mesh_port = manager
+        .as_ref()
+        .and_then(|state| state.router_mesh_addr.as_deref())
+        .and_then(|addr| addr.rsplit_once(':'))
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .or(supervisor.router_mesh_port)
+        .or(supervisor.port_forward_mesh_port);
+
+    let mut runtime_plan = site_controller_runtime_plan_from_controller_plan(controller_plan);
+    runtime_plan.run_id = supervisor.run_id;
+    runtime_plan.mesh_scope = supervisor.mesh_scope;
+    runtime_plan.run_root = supervisor.run_root;
+    runtime_plan.site_id = supervisor.site_id;
+    runtime_plan.kind = supervisor.kind;
+    runtime_plan.router_identity_id = router_identity_id;
+    runtime_plan.local_router_control = local_router_control;
+    runtime_plan.artifact_dir = supervisor.artifact_dir;
+    runtime_plan.site_state_root = supervisor.site_state_root;
+    runtime_plan.storage_root = supervisor.storage_root;
+    runtime_plan.runtime_root = supervisor.runtime_root;
+    runtime_plan.router_mesh_port = router_mesh_port;
+    runtime_plan.compose_project = supervisor.compose_project;
+    runtime_plan.kubernetes_namespace = supervisor.kubernetes_namespace;
+    runtime_plan.context = supervisor.context;
+    runtime_plan.observability_endpoint = supervisor.observability_endpoint;
+    runtime_plan.launch_env = supervisor.launch_env;
+    Ok(runtime_plan)
+}
+
+fn site_runtime_local_router_control(kind: SiteKind, artifact_dir: &Path) -> String {
+    match kind {
+        SiteKind::Direct => format!(
+            "unix://{}",
+            super::direct_current_control_socket_path(artifact_dir).display()
+        ),
+        SiteKind::Vm => format!(
+            "unix://{}",
+            super::vm_current_control_socket_path(artifact_dir).display()
+        ),
+        SiteKind::Compose => "unix:///amber/control/router-control.sock".to_string(),
+        SiteKind::Kubernetes => "amber-router:24100".to_string(),
+    }
 }
 
 #[derive(Clone)]
@@ -397,10 +491,11 @@ pub fn cleanup_dynamic_site_children(site_state_root: &Path, kind: SiteKind) -> 
         );
         remove_dynamic_child_root(kind, &child_root, Some(Path::new(&child.artifact_root)))?;
     }
-    if state.children.is_empty() {
+    if state.children.is_empty() && state.direct_input_overlay_providers.is_empty() {
         return Ok(());
     }
     state.children.clear();
+    state.direct_input_overlay_providers.clear();
     write_json(&state_path, &state)
 }
 
@@ -614,23 +709,6 @@ pub(super) async fn site_controller_runtime_prepare_child(
                 &runtime_spec.direct_inputs,
                 &live_components,
             )?;
-            rewrite_dynamic_routed_inputs_in_artifact(
-                &artifact_root,
-                &runtime_spec.routed_inputs,
-                app.plan.kind,
-                &app.plan.router_identity_id,
-                app.plan.router_mesh_port,
-            )?;
-            write_direct_vm_startup_route_overlay_payload(
-                &artifact_root,
-                "direct",
-                &runtime_spec.routed_inputs,
-                &overlay_peer_addr_map_from_ports(&local_direct_peer_ports_for_children(
-                    &app.plan,
-                    &published_children,
-                )?),
-                &local_direct_peer_identities_for_children(&app.plan, &published_children)?,
-            )?;
         }
         SiteKind::Vm => {
             filter_vm_stage_plan(&artifact_root, &runtime_spec.component_ids)?;
@@ -643,23 +721,6 @@ pub(super) async fn site_controller_runtime_prepare_child(
                 &artifact_root,
                 &runtime_spec.direct_inputs,
                 &live_components,
-            )?;
-            rewrite_dynamic_routed_inputs_in_artifact(
-                &artifact_root,
-                &runtime_spec.routed_inputs,
-                app.plan.kind,
-                &app.plan.router_identity_id,
-                app.plan.router_mesh_port,
-            )?;
-            write_direct_vm_startup_route_overlay_payload(
-                &artifact_root,
-                "vm",
-                &runtime_spec.routed_inputs,
-                &overlay_peer_addr_map_from_ports(&local_vm_peer_ports_for_children(
-                    &app.plan,
-                    &published_children,
-                )?),
-                &local_vm_peer_identities_for_children(&app.plan, &published_children)?,
             )?;
         }
         SiteKind::Compose => {
@@ -700,9 +761,9 @@ pub(super) async fn site_controller_runtime_prepare_child(
             child_id: child.child_id,
             artifact_root: artifact_root.display().to_string(),
             assigned_components: runtime_spec.assigned_components.clone(),
+            controller_routes: runtime_spec.controller_routes.clone(),
             proxy_exports: runtime_spec.proxy_exports.clone(),
             direct_inputs: runtime_spec.direct_inputs.clone(),
-            routed_inputs: runtime_spec.routed_inputs.clone(),
             process_pid: None,
             published: false,
         },
@@ -816,7 +877,6 @@ pub(super) async fn site_controller_runtime_publish_child(
                 Path::new(&child.artifact_root),
                 &child.assigned_components,
                 &child.proxy_exports,
-                &child.routed_inputs,
                 &live_peer_ports,
                 &live_peer_identities,
             )?;
@@ -834,6 +894,7 @@ pub(super) async fn site_controller_runtime_publish_child(
             drop(state);
             project_dynamic_direct_router_surface(&app.plan, &child)?;
             reconcile_dynamic_site_router_overlays(app).await?;
+            reconcile_dynamic_site_controller_overlay(app).await?;
             reconcile_dynamic_direct_input_overlays(app).await?;
             reconcile_site_proxy_metadata(
                 Path::new(&app.plan.artifact_dir),
@@ -930,7 +991,6 @@ pub(super) async fn site_controller_runtime_publish_child(
                 Path::new(&child.artifact_root),
                 &child.assigned_components,
                 &child.proxy_exports,
-                &child.routed_inputs,
                 &live_peer_ports,
                 &live_peer_identities,
             )?;
@@ -948,6 +1008,7 @@ pub(super) async fn site_controller_runtime_publish_child(
             drop(state);
             project_dynamic_vm_router_surface(&app.plan, &child)?;
             reconcile_dynamic_site_router_overlays(app).await?;
+            reconcile_dynamic_site_controller_overlay(app).await?;
             reconcile_dynamic_direct_input_overlays(app).await?;
             reconcile_site_proxy_metadata(
                 Path::new(&app.plan.artifact_dir),
@@ -1018,6 +1079,7 @@ pub(super) async fn site_controller_runtime_publish_child(
                 write_json(&app.state_path, &*state)?;
             }
             reconcile_dynamic_site_router_overlays(app).await?;
+            reconcile_dynamic_site_controller_overlay(app).await?;
             reconcile_dynamic_direct_input_overlays(app).await?;
             if !workload_services.is_empty() {
                 let status =
@@ -1077,7 +1139,6 @@ pub(super) async fn site_controller_runtime_publish_child(
                 artifact_root,
                 &child.assigned_components,
                 &child.proxy_exports,
-                &child.routed_inputs,
                 &live_peer_identities,
             )?;
             apply_dynamic_site_router_overlay(&app.plan, &child).await?;
@@ -1090,6 +1151,7 @@ pub(super) async fn site_controller_runtime_publish_child(
             write_json(&app.state_path, &*state)?;
             drop(state);
             reconcile_dynamic_site_router_overlays(app).await?;
+            reconcile_dynamic_site_controller_overlay(app).await?;
             reconcile_dynamic_direct_input_overlays(app).await?;
             wait_for_kubernetes_site_router_ready(
                 &app.plan,
@@ -1252,6 +1314,7 @@ pub(super) async fn site_controller_runtime_destroy_child(
         SiteKind::Direct | SiteKind::Vm | SiteKind::Compose | SiteKind::Kubernetes
     ) {
         reconcile_dynamic_site_router_overlays(app).await?;
+        reconcile_dynamic_site_controller_overlay(app).await?;
         reconcile_dynamic_direct_input_overlays(app).await?;
     }
     let child_root = site_controller_runtime_child_root(&app.plan, child_id);
@@ -1286,6 +1349,270 @@ mod tests {
                 "ghcr.io/rdi-foundation/amber-helper:test-tag".to_string(),
                 "python:3.13-alpine".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn runtime_plan_for_kubernetes_site_uses_port_forward_mesh_runtime_metadata() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_root = temp.path().join("state");
+        let compose_state_root = state_root.join("compose_local");
+        let kind_state_root = state_root.join("kind_local");
+        let compose_artifact = temp.path().join("artifact").join("compose_local");
+        let kind_artifact = temp.path().join("artifact").join("kind_local");
+        fs::create_dir_all(&compose_state_root).expect("compose state root");
+        fs::create_dir_all(&kind_state_root).expect("kind state root");
+        fs::create_dir_all(&compose_artifact).expect("compose artifact");
+        fs::create_dir_all(&kind_artifact).expect("kind artifact");
+
+        write_json(
+            &site_supervisor_plan_path(&kind_state_root),
+            &serde_json::json!({
+                "schema": "amber.run.site_supervisor_plan",
+                "version": 2,
+                "run_id": "test-run",
+                "mesh_scope": "test-mesh",
+                "run_root": temp.path().join("run").display().to_string(),
+                "coordinator_pid": 1u32,
+                "site_id": "kind_local",
+                "kind": "kubernetes",
+                "artifact_dir": kind_artifact.display().to_string(),
+                "site_state_root": kind_state_root.display().to_string(),
+                "kubernetes_namespace": "amber-test-kind",
+                "context": "kind-amber-test",
+                "port_forward_mesh_port": 24036u16,
+                "port_forward_control_port": 24037u16,
+                "launch_env": {"KUBECONFIG": "/tmp/kubeconfig"}
+            }),
+        )
+        .expect("kubernetes supervisor plan should write");
+        write_json(
+            &crate::runtime_api::site_state_path(&state_root, "kind_local"),
+            &serde_json::json!({
+                "schema": "amber.run.site_manager_state",
+                "version": 1,
+                "run_id": "test-run",
+                "site_id": "kind_local",
+                "kind": "kubernetes",
+                "status": "running",
+                "artifact_dir": kind_artifact.display().to_string(),
+                "supervisor_pid": 1u32,
+                "kubernetes_namespace": "amber-test-kind",
+                "context": "kind-amber-test",
+                "router_control": "127.0.0.1:24037",
+                "router_mesh_addr": "127.0.0.1:24036",
+                "router_identity_id": "/site/kind_local/router",
+                "router_public_key_b64": base64::engine::general_purpose::STANDARD.encode([8u8; 32])
+            }),
+        )
+        .expect("kubernetes manager state should write");
+
+        let controller_plan = SiteControllerPlan {
+            schema: "amber.framework_component.site_controller_plan".to_string(),
+            version: 1,
+            run_id: "test-run".to_string(),
+            mesh_scope: "test-mesh".to_string(),
+            site_id: "compose_local".to_string(),
+            kind: SiteKind::Compose,
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            authority_url: "http://127.0.0.1:0".to_string(),
+            router_identity_id: "/site/compose_local/router".to_string(),
+            peer_site_router_urls: BTreeMap::new(),
+            peer_router_identities: BTreeMap::from([(
+                "kind_local".to_string(),
+                MeshIdentityPublic {
+                    id: "/site/kind_local/router".to_string(),
+                    public_key: [8u8; 32],
+                    mesh_scope: Some("test-mesh".to_string()),
+                },
+            )]),
+            peer_router_mesh_addrs: BTreeMap::new(),
+            local_router_control: Some("unix:///tmp/compose-control.sock".to_string()),
+            published_router_mesh_addr: Some("127.0.0.1:24034".to_string()),
+            compose_consumer_router_mesh_addr: None,
+            kubernetes_consumer_router_mesh_addr: None,
+            state_path: compose_state_root
+                .join("site-controller-state.json")
+                .display()
+                .to_string(),
+            run_root: temp.path().join("run").display().to_string(),
+            state_root: state_root.display().to_string(),
+            site_state_root: compose_state_root.display().to_string(),
+            artifact_dir: compose_artifact.display().to_string(),
+            control_state_auth_token: "test-auth".to_string(),
+            dynamic_caps_token_verify_key_b64: String::new(),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: Some(24034),
+            compose_project: Some("amber-test-compose".to_string()),
+            kubernetes_namespace: None,
+            context: None,
+            observability_endpoint: None,
+            launch_env: BTreeMap::new(),
+        };
+
+        let runtime_plan =
+            runtime_plan_for_site_from_controller_plan(&controller_plan, "kind_local")
+                .expect("kubernetes runtime plan should derive from the managed site");
+        assert_eq!(runtime_plan.site_id, "kind_local");
+        assert_eq!(runtime_plan.kind, SiteKind::Kubernetes);
+        assert_eq!(
+            runtime_plan.artifact_dir,
+            kind_artifact.display().to_string()
+        );
+        assert_eq!(
+            runtime_plan.site_state_root,
+            kind_state_root.display().to_string()
+        );
+        assert_eq!(
+            runtime_plan.local_router_control.as_deref(),
+            Some("127.0.0.1:24037")
+        );
+        assert_eq!(runtime_plan.router_identity_id, "/site/kind_local/router");
+        assert_eq!(runtime_plan.router_mesh_port, Some(24036));
+        assert_eq!(
+            runtime_plan.kubernetes_namespace.as_deref(),
+            Some("amber-test-kind")
+        );
+        assert_eq!(runtime_plan.context.as_deref(), Some("kind-amber-test"));
+        assert_eq!(
+            runtime_plan
+                .launch_env
+                .get("KUBECONFIG")
+                .map(String::as_str),
+            Some("/tmp/kubeconfig")
+        );
+    }
+
+    #[test]
+    fn runtime_plan_for_vm_site_uses_managed_vm_runtime_metadata() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_root = temp.path().join("state");
+        let direct_state_root = state_root.join("direct_local");
+        let vm_state_root = state_root.join("vm_local");
+        let direct_artifact = temp.path().join("artifact").join("direct_local");
+        let vm_artifact = temp.path().join("artifact").join("vm_local");
+        fs::create_dir_all(&direct_state_root).expect("direct state root");
+        fs::create_dir_all(&vm_state_root).expect("vm state root");
+        fs::create_dir_all(&direct_artifact).expect("direct artifact");
+        fs::create_dir_all(&vm_artifact).expect("vm artifact");
+
+        write_json(
+            &site_supervisor_plan_path(&vm_state_root),
+            &serde_json::json!({
+                "schema": "amber.run.site_supervisor_plan",
+                "version": 2,
+                "run_id": "test-run",
+                "mesh_scope": "test-mesh",
+                "run_root": temp.path().join("run").display().to_string(),
+                "coordinator_pid": 1u32,
+                "site_id": "vm_local",
+                "kind": "vm",
+                "artifact_dir": vm_artifact.display().to_string(),
+                "site_state_root": vm_state_root.display().to_string(),
+                "storage_root": temp.path().join("storage").join("vm_local").display().to_string(),
+                "runtime_root": temp.path().join("runtime").join("vm_local").display().to_string(),
+                "router_mesh_port": 24001u16,
+                "launch_env": {"AMBER_TEST": "1"}
+            }),
+        )
+        .expect("vm supervisor plan should write");
+        write_json(
+            &crate::runtime_api::site_state_path(&state_root, "vm_local"),
+            &serde_json::json!({
+                "schema": "amber.run.site_manager_state",
+                "version": 1,
+                "run_id": "test-run",
+                "site_id": "vm_local",
+                "kind": "vm",
+                "status": "running",
+                "artifact_dir": vm_artifact.display().to_string(),
+                "supervisor_pid": 1u32,
+                "router_control": "unix:///tmp/vm-control.sock",
+                "router_mesh_addr": "127.0.0.1:24001",
+                "router_identity_id": "/site/vm_local/router",
+                "router_public_key_b64": base64::engine::general_purpose::STANDARD.encode([9u8; 32])
+            }),
+        )
+        .expect("vm manager state should write");
+
+        let controller_plan = SiteControllerPlan {
+            schema: "amber.framework_component.site_controller_plan".to_string(),
+            version: 1,
+            run_id: "test-run".to_string(),
+            mesh_scope: "test-mesh".to_string(),
+            site_id: "direct_local".to_string(),
+            kind: SiteKind::Direct,
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            authority_url: "http://127.0.0.1:0".to_string(),
+            router_identity_id: "/site/direct_local/router".to_string(),
+            peer_site_router_urls: BTreeMap::new(),
+            peer_router_identities: BTreeMap::from([(
+                "vm_local".to_string(),
+                MeshIdentityPublic {
+                    id: "/site/vm_local/router".to_string(),
+                    public_key: [9u8; 32],
+                    mesh_scope: Some("test-mesh".to_string()),
+                },
+            )]),
+            peer_router_mesh_addrs: BTreeMap::new(),
+            local_router_control: Some("unix:///tmp/direct-control.sock".to_string()),
+            published_router_mesh_addr: Some("127.0.0.1:24000".to_string()),
+            compose_consumer_router_mesh_addr: None,
+            kubernetes_consumer_router_mesh_addr: None,
+            state_path: direct_state_root
+                .join("site-controller-state.json")
+                .display()
+                .to_string(),
+            run_root: temp.path().join("run").display().to_string(),
+            state_root: state_root.display().to_string(),
+            site_state_root: direct_state_root.display().to_string(),
+            artifact_dir: direct_artifact.display().to_string(),
+            control_state_auth_token: "test-auth".to_string(),
+            dynamic_caps_token_verify_key_b64: String::new(),
+            storage_root: Some(
+                temp.path()
+                    .join("storage")
+                    .join("direct_local")
+                    .display()
+                    .to_string(),
+            ),
+            runtime_root: Some(
+                temp.path()
+                    .join("runtime")
+                    .join("direct_local")
+                    .display()
+                    .to_string(),
+            ),
+            router_mesh_port: Some(24000),
+            compose_project: None,
+            kubernetes_namespace: None,
+            context: None,
+            observability_endpoint: None,
+            launch_env: BTreeMap::new(),
+        };
+
+        let runtime_plan = runtime_plan_for_site_from_controller_plan(&controller_plan, "vm_local")
+            .expect("vm runtime plan should derive from the managed site");
+        assert_eq!(runtime_plan.site_id, "vm_local");
+        assert_eq!(runtime_plan.kind, SiteKind::Vm);
+        assert_eq!(runtime_plan.artifact_dir, vm_artifact.display().to_string());
+        assert_eq!(
+            runtime_plan.site_state_root,
+            vm_state_root.display().to_string()
+        );
+        assert_eq!(
+            runtime_plan.local_router_control.as_deref(),
+            Some("unix:///tmp/vm-control.sock")
+        );
+        assert_eq!(runtime_plan.router_identity_id, "/site/vm_local/router");
+        assert_eq!(runtime_plan.router_mesh_port, Some(24001));
+        assert_eq!(
+            runtime_plan
+                .launch_env
+                .get("AMBER_TEST")
+                .map(String::as_str),
+            Some("1")
         );
     }
 }

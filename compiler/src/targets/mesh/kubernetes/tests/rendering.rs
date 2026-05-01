@@ -712,7 +712,7 @@ fn kubernetes_emits_otelcol_and_wires_otel_env() {
 }
 
 #[test]
-fn kubernetes_templates_dynamic_caps_sidecar_control_env() {
+fn kubernetes_templates_omit_dynamic_caps_sidecar_control_env_without_local_controller() {
     let dir = tempdir().expect("temp dir");
     let root_path = dir.path().join("root.json5");
     let worker_path = dir.path().join("worker.json5");
@@ -763,57 +763,43 @@ fn kubernetes_templates_dynamic_caps_sidecar_control_env() {
         })
         .expect("worker deployment");
     assert!(
-        component_deploy.contains("AMBER_DYNAMIC_CAPS_API_URL"),
+        !component_deploy.contains("AMBER_DYNAMIC_CAPS_API_URL"),
         "{component_deploy}"
     );
     assert!(
-        component_deploy.contains("http://127.0.0.1:19000"),
+        !component_deploy.contains("http://127.0.0.1:19000"),
         "{component_deploy}"
     );
     assert!(
-        component_deploy.contains("amber-component-sidecar-env"),
+        !component_deploy.contains("amber-component-sidecar-env"),
         "{component_deploy}"
     );
 
-    let sidecar_env = artifact
+    if let Some(sidecar_env) = artifact
         .files
         .get(&PathBuf::from(super::COMPONENT_SIDECAR_ENV_FILE))
-        .expect("component sidecar env template");
-    assert!(
-        !sidecar_env.contains("AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL="),
-        "controller URLs must not be injected as ambient sidecar env: {sidecar_env}"
-    );
-    assert!(
-        !sidecar_env.contains("AMBER_FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN="),
-        "controller auth must not be injected as ambient sidecar env: {sidecar_env}"
-    );
-    assert!(
-        sidecar_env.contains("AMBER_DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64="),
-        "{sidecar_env}"
-    );
+    {
+        assert!(
+            !sidecar_env.contains("AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL="),
+            "controller URLs must not be injected as ambient sidecar env: {sidecar_env}"
+        );
+        assert!(
+            !sidecar_env.contains("AMBER_FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN="),
+            "controller auth must not be injected as ambient sidecar env: {sidecar_env}"
+        );
+        assert!(
+            !sidecar_env.contains("AMBER_DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64="),
+            "dynamic caps verify keys must not be injected when no local controller exists: \
+             {sidecar_env}"
+        );
+    }
 
     let kustomization = artifact
         .files
         .get(&PathBuf::from("kustomization.yaml"))
         .expect("kustomization");
     assert!(
-        kustomization.contains("name: amber-component-sidecar-env"),
+        !kustomization.contains("amber-component-sidecar-env"),
         "{kustomization}"
-    );
-    assert!(
-        kustomization.contains(super::COMPONENT_SIDECAR_ENV_FILE),
-        "{kustomization}"
-    );
-    assert!(
-        !kustomization.contains(&format!(
-            "resources:\n- {}",
-            super::COMPONENT_SIDECAR_ENV_FILE
-        )),
-        "{kustomization}"
-    );
-    assert!(
-        !kustomization.contains(&format!("\n- {}\n", super::COMPONENT_SIDECAR_ENV_FILE)),
-        "kustomization resources must not treat the sidecar env template as a manifest: \
-         {kustomization}"
     );
 }

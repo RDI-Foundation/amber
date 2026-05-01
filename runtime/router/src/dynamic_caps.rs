@@ -1129,11 +1129,16 @@ fn local_dynamic_caps_controller_url(config: &MeshConfig) -> Option<String> {
 fn resolve_dynamic_caps_controller_env(
     config: &MeshConfig,
 ) -> Result<Option<DynamicCapsControllerEnv>, RouterError> {
-    let local_control_url = local_dynamic_caps_controller_url(config);
-    let verify_key_raw = nonempty_env_var(amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV);
-    if local_control_url.is_none() && verify_key_raw.is_none() {
+    if config.dynamic_caps_listen.is_none() {
         return Ok(None);
     }
+
+    let Some(verify_key_raw) = nonempty_env_var(amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV)
+    else {
+        return Ok(None);
+    };
+
+    let local_control_url = local_dynamic_caps_controller_url(config);
     let run_id =
         required_dynamic_caps_env_var(SCENARIO_RUN_ID_ENV, nonempty_env_var(SCENARIO_RUN_ID_ENV))?;
     let control_url = local_control_url.ok_or_else(|| {
@@ -1143,10 +1148,7 @@ fn resolve_dynamic_caps_controller_env(
     })?;
     Ok(Some(DynamicCapsControllerEnv {
         control_url,
-        verify_key_raw: required_dynamic_caps_env_var(
-            amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
-            verify_key_raw,
-        )?,
+        verify_key_raw,
         run_id,
     }))
 }
@@ -1229,6 +1231,12 @@ mod tests {
         config
     }
 
+    fn mesh_config_without_dynamic_caps_listener() -> MeshConfig {
+        let mut config = mesh_config_with_internal_controller_route();
+        config.dynamic_caps_listen = None;
+        config
+    }
+
     #[test]
     fn resolve_dynamic_caps_controller_env_disables_listener_when_control_env_is_absent() {
         let _guard = ENV_LOCK
@@ -1245,6 +1253,28 @@ mod tests {
                 .expect("dynamic caps env should resolve")
                 .is_none(),
             "sidecars without dynamic caps controller env should leave the listener disabled",
+        );
+    }
+
+    #[test]
+    fn resolve_dynamic_caps_controller_env_ignores_control_env_when_listener_is_disabled() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock");
+        let _env = EnvGuard::replace([
+            (
+                amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
+                Some("verify-key"),
+            ),
+            (SCENARIO_RUN_ID_ENV, Some("run-1234")),
+        ]);
+
+        assert!(
+            resolve_dynamic_caps_controller_env(&mesh_config_without_dynamic_caps_listener())
+                .expect("dynamic caps env should resolve")
+                .is_none(),
+            "sidecars without a dynamic caps listener must ignore controller env",
         );
     }
 

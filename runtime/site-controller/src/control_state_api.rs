@@ -3,8 +3,8 @@ use base64::Engine as _;
 use super::{
     dynamic_caps,
     orchestration::{
-        ProtocolApiError, load_site_manager_state, local_router_identity_for_overlay,
-        publish_dynamic_capability_origin,
+        ProtocolApiError, load_site_manager_state, publish_dynamic_capability_origin,
+        router_identity_for_overlay,
     },
     planner::{ControlStateApp, live_assignment_map, protocol_error},
     state::{FrameworkControlState, persist_control_state_update},
@@ -227,7 +227,7 @@ pub(crate) async fn resolve_dynamic_capability_origin_internal(
             ))
         })?;
     let _origin_runtime = local_component_runtime(app, &state, &root.holder_component_id)?;
-    let origin_peer = local_router_identity_for_overlay(app).await?;
+    let origin_peer = router_identity_for_overlay(app, &app.controller_plan.site_id).await?;
     let origin_state = load_site_manager_state(app, &app.controller_plan.site_id)?;
     let origin_receipt = super::orchestration::site_receipt_from_manager_state(&origin_state);
     let origin_peer_addr = if let Some(router_mesh_addr) =
