@@ -403,10 +403,22 @@ fn write_kubernetes_smoke_fixture(root: &Path) -> PathBuf {
       "\
         mkdir content\n\
         cd content\n\
-        wget '${slots.server.url}/runtime_secret.txt'\n\
-        wget '${slots.server.url}/runtime_config.txt'\n\
-        wget '${slots.server.url}/static_secret.txt'\n\
-        wget '${slots.server.url}/static_config.txt'\n\
+        fetch() {\n\
+          path=\"$1\"\n\
+          attempts=0\n\
+          until wget -O \"$path\" '${slots.server.url}/'\"$path\"; do\n\
+            rm -f \"$path\"\n\
+            attempts=$((attempts + 1))\n\
+            if [ \"$attempts\" -ge 60 ]; then\n\
+              exit 1\n\
+            fi\n\
+            sleep 1\n\
+          done\n\
+        }\n\
+        fetch runtime_secret.txt\n\
+        fetch runtime_config.txt\n\
+        fetch static_secret.txt\n\
+        fetch static_config.txt\n\
         httpd -f -p 8080\n\
       ",
     ],
@@ -1015,6 +1027,63 @@ fn kubectl_logs(namespace: &str, pod: &str, kubeconfig: &Path) -> String {
     match output {
         Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
         Err(err) => format!("failed to run kubectl logs: {err}"),
+    }
+}
+
+fn wait_for_pod_http(
+    namespace: &str,
+    pod: &str,
+    container: &str,
+    url: &str,
+    kubeconfig: &Path,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    let mut last_status = String::new();
+    let mut last_stdout = String::new();
+    let mut last_stderr = String::new();
+
+    loop {
+        let output = kubectl_cmd(kubeconfig)
+            .arg("exec")
+            .arg("-n")
+            .arg(namespace)
+            .arg(pod)
+            .arg("-c")
+            .arg(container)
+            .arg("--")
+            .arg("wget")
+            .arg("-q")
+            .arg("-O")
+            .arg("-")
+            .arg(url)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                return String::from_utf8_lossy(&output.stdout).trim().to_string();
+            }
+            Ok(output) => {
+                last_status = output.status.to_string();
+                last_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                last_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            }
+            Err(err) => {
+                last_status = format!("failed to run kubectl exec: {err}");
+                last_stdout.clear();
+                last_stderr.clear();
+            }
+        }
+
+        if Instant::now() >= deadline {
+            let pod_logs = kubectl_logs(namespace, pod, kubeconfig);
+            panic!(
+                "pod HTTP endpoint {url} did not become ready in container {container}\nlast \
+                 status: {last_status}\nlast stdout:\n{last_stdout}\nlast \
+                 stderr:\n{last_stderr}\npod logs:\n{pod_logs}"
+            );
+        }
+
+        thread::sleep(Duration::from_secs(1));
     }
 }
 

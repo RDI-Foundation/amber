@@ -176,6 +176,12 @@ pub(super) fn launch_env(
         env.entry(amber_images::DEV_IMAGE_TAGS_ENV.to_string())
             .or_insert_with(|| overrides.to_string());
     }
+    if let Some(force_tcg) = std::env::var_os("AMBER_VM_FORCE_TCG")
+        && let Some(force_tcg) = force_tcg.to_str()
+    {
+        env.entry("AMBER_VM_FORCE_TCG".to_string())
+            .or_insert_with(|| force_tcg.to_string());
+    }
     env.insert(SCENARIO_RUN_ID_ENV.to_string(), run_id.to_string());
     env.insert(SCENARIO_SCOPE_ENV.to_string(), mesh_scope.to_string());
     if let Some(endpoint) = observability_endpoint {
@@ -2253,6 +2259,28 @@ mod tests {
         );
         unsafe {
             std::env::remove_var(amber_images::DEV_IMAGE_TAGS_ENV);
+        }
+    }
+
+    #[test]
+    fn launch_env_includes_vm_tcg_override() {
+        let previous = std::env::var_os("AMBER_VM_FORCE_TCG");
+        unsafe {
+            std::env::set_var("AMBER_VM_FORCE_TCG", "1");
+        }
+        let env = launch_env(
+            "run-test",
+            "scope",
+            SiteKind::Kubernetes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+        .expect("launch env should build");
+        assert_eq!(env.get("AMBER_VM_FORCE_TCG").map(String::as_str), Some("1"));
+        match previous {
+            Some(value) => unsafe { std::env::set_var("AMBER_VM_FORCE_TCG", value) },
+            None => unsafe { std::env::remove_var("AMBER_VM_FORCE_TCG") },
         }
     }
 

@@ -372,6 +372,16 @@ fn kubernetes_smoke_config_roundtrip() {
         .arg(&client_pod);
     checked_status(&mut cmd, "kubectl wait for client pod");
 
+    let client_runtime_secret = wait_for_pod_http(
+        &namespace,
+        &client_pod,
+        "main",
+        "http://127.0.0.1:8080/runtime_secret.txt",
+        &kubeconfig,
+        Duration::from_secs(120),
+    );
+    assert_eq!(client_runtime_secret, "test-secret-value");
+
     let port_forward_log = dir.path().join("port-forward.log");
     let mut port_forward =
         PortForwardGuard::new(&namespace, &client_pod, &port_forward_log, &kubeconfig);

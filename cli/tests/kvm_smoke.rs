@@ -8,7 +8,7 @@ mod target_dir_support;
 mod workspace_root_support;
 
 use std::{
-    fs,
+    env, fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -76,27 +76,37 @@ fn build_checker_image(workspace_root: &Path) {
 }
 
 fn ensure_internal_images(workspace_root: &Path) {
-    build_internal_image_if_needed(
-        AMBER_HELPER.reference,
-        &workspace_root.join("docker/amber-helper/Dockerfile"),
-    );
-    build_internal_image_if_needed(
-        AMBER_PROVISIONER.reference,
-        &workspace_root.join("docker/amber-provisioner/Dockerfile"),
-    );
-    build_internal_image_if_needed(
-        AMBER_ROUTER.reference,
-        &workspace_root.join("docker/amber-router/Dockerfile"),
-    );
-    build_internal_image_if_needed(
-        AMBER_SITE_CONTROLLER.reference,
-        &workspace_root.join("docker/amber-site-controller/Dockerfile"),
-    );
+    for (tag, dockerfile) in [
+        (
+            AMBER_HELPER.reference,
+            workspace_root.join("docker/amber-helper/Dockerfile"),
+        ),
+        (
+            AMBER_PROVISIONER.reference,
+            workspace_root.join("docker/amber-provisioner/Dockerfile"),
+        ),
+        (
+            AMBER_ROUTER.reference,
+            workspace_root.join("docker/amber-router/Dockerfile"),
+        ),
+        (
+            AMBER_SITE_CONTROLLER.reference,
+            workspace_root.join("docker/amber-site-controller/Dockerfile"),
+        ),
+    ] {
+        ensure_internal_image(tag, &dockerfile);
+    }
 }
 
-fn build_internal_image_if_needed(tag: &str, dockerfile: &Path) {
+fn ensure_internal_image(tag: &str, dockerfile: &Path) {
     if docker_image_exists(tag) {
         return;
+    }
+    if env::var_os("AMBER_TEST_USE_PREBUILT_IMAGES").is_some() {
+        panic!(
+            "AMBER_TEST_USE_PREBUILT_IMAGES is set but {tag} is not available locally. Pull and \
+             retag CI images before running the KVM smoke test."
+        );
     }
 
     progress(format!("building internal image {tag}"));
