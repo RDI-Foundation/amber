@@ -588,6 +588,10 @@ pub(crate) async fn supervise_children(
                         if child.wrapper_pid == child.managed_pid
                             || !linux_pid_is_alive(child.managed_pid)
                         {
+                            eprintln!(
+                                "direct runtime observed {} exit with status {}",
+                                child.name, status
+                            );
                             let exit_code = if status.success() {
                                 0
                             } else {
@@ -605,6 +609,10 @@ pub(crate) async fn supervise_children(
                     #[cfg(target_os = "linux")]
                     if child.wrapper.is_none() && !linux_pid_is_alive(child.managed_pid) {
                         let status = synthetic_failure_exit_status();
+                        eprintln!(
+                            "direct runtime observed {} exit without a wrapper status",
+                            child.name
+                        );
                         return Ok((
                             RuntimeExitReason::ChildExited {
                                 name: child.name.clone(),
@@ -617,6 +625,10 @@ pub(crate) async fn supervise_children(
                     if let Some(wrapper) = child.wrapper.as_mut()
                         && let Some(status) = wrapper.try_wait().into_diagnostic()?
                     {
+                        eprintln!(
+                            "direct runtime observed {} exit with status {}",
+                            child.name, status
+                        );
                         let exit_code = if status.success() {
                             0
                         } else {

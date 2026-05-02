@@ -98,7 +98,7 @@ fn local_site_controller_inbound_target(
         Some(EmbeddedMeshPlanKind::Kubernetes) => {
             kubernetes_component_mesh_peer_addr(artifact_root, &peer_id, &target.output, mesh_port)?
         }
-        None => local_component_mesh_peer_addr(mesh_port),
+        None => local_router_mesh_peer_addr(mesh_port),
     };
     Ok(InboundTarget::MeshForward {
         peer_addr,

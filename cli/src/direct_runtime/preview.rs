@@ -128,6 +128,35 @@ pub(crate) fn component_program_spec(
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn direct_component_uses_isolated_network(component: &DirectComponentPlan) -> bool {
+    !matches!(
+        component.program.execution,
+        DirectProgramExecutionPlan::InternalSiteController
+    )
+}
+
+pub(crate) fn direct_component_sidecar_network(component: &DirectComponentPlan) -> ProcessNetwork {
+    #[cfg(target_os = "linux")]
+    {
+        if direct_component_uses_isolated_network(component) {
+            ProcessNetwork::Isolated
+        } else {
+            ProcessNetwork::Host
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = component;
+        ProcessNetwork::Host
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn direct_component_program_joins_sidecar(component: &DirectComponentPlan) -> bool {
+    direct_component_uses_isolated_network(component)
+}
+
 fn internal_site_controller_plan_path(runtime_root: &Path) -> PathBuf {
     let site_state_root = runtime_root.parent().unwrap_or(runtime_root);
     mixed_run::site_controller_plan_path(site_state_root)
@@ -324,16 +353,7 @@ pub(crate) fn build_direct_site_launch_preview(
                 bind_dirs: Vec::new(),
                 bind_mounts: Vec::new(),
                 hidden_paths: Vec::new(),
-                network: {
-                    #[cfg(target_os = "linux")]
-                    {
-                        ProcessNetwork::Isolated
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        ProcessNetwork::Host
-                    }
-                },
+                network: direct_component_sidecar_network(component),
             },
             "sidecar",
             Some(component.moniker.as_str()),
@@ -367,7 +387,7 @@ pub(crate) fn build_direct_site_launch_preview(
             spec,
             "program",
             Some(component.moniker.as_str()),
-            Some(direct_program_network_override()),
+            Some(direct_program_network_override(component)),
             resolved_process,
         ));
     }
@@ -529,13 +549,18 @@ pub(crate) fn direct_process_network_label(network: ProcessNetwork) -> String {
     }
 }
 
-pub(crate) fn direct_program_network_override() -> &'static str {
+pub(crate) fn direct_program_network_override(component: &DirectComponentPlan) -> &'static str {
     #[cfg(target_os = "linux")]
     {
-        "join_component_sidecar"
+        if direct_component_program_joins_sidecar(component) {
+            "join_component_sidecar"
+        } else {
+            "host"
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = component;
         "host"
     }
 }
@@ -645,13 +670,10 @@ pub(crate) async fn wait_for_component_local_targets(
     if ports.is_empty() {
         return Ok(());
     }
-    let sidecar_pid = sidecar_pid.ok_or_else(|| {
-        miette::miette!(
-            "missing sidecar pid while waiting for component {} local targets",
-            component.moniker
-        )
-    })?;
-    let namespace_join = prepare_linux_namespace_join(sidecar_pid)?;
+    let namespace_join = sidecar_pid
+        .map(prepare_linux_namespace_join)
+        .transpose()?
+        .flatten();
     let amber_cli = env::current_exe()
         .into_diagnostic()
         .wrap_err("failed to locate current amber binary for direct local probe")?;
@@ -1163,9 +1185,9 @@ pub(crate) async fn spawn_managed_process(
         ProcessSandbox::Sandboxed => sandbox.wrap_command(&spec)?,
         ProcessSandbox::Unsandboxed => {
             #[cfg(target_os = "linux")]
-            if !matches!(spec.network, ProcessNetwork::Host) {
+            if matches!(spec.network, ProcessNetwork::Isolated) {
                 return Err(miette::miette!(
-                    "unsandboxed direct processes must use host networking"
+                    "unsandboxed direct processes cannot create isolated networking"
                 ));
             }
             (spec.program.clone(), spec.args.clone())
@@ -1174,15 +1196,9 @@ pub(crate) async fn spawn_managed_process(
     #[cfg(target_os = "linux")]
     let mut args = args;
     #[cfg(target_os = "linux")]
-    let namespace_join = if matches!(spec.sandbox, ProcessSandbox::Sandboxed)
-        && matches!(sandbox, DirectSandbox::Bubblewrap { .. })
-    {
-        match spec.network {
-            ProcessNetwork::Join(pid) => prepare_linux_namespace_join(pid)?,
-            _ => None,
-        }
-    } else {
-        None
+    let namespace_join = match spec.network {
+        ProcessNetwork::Join(pid) => prepare_linux_namespace_join(pid)?,
+        _ => None,
     };
     #[cfg(target_os = "linux")]
     let pid_capture = if matches!(spec.sandbox, ProcessSandbox::Sandboxed)

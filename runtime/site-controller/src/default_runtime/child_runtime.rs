@@ -864,6 +864,7 @@ pub(super) async fn site_controller_runtime_publish_child(
                 &direct_runtime_state_path(Path::new(&child.artifact_root)),
                 site_ready_timeout_for_kind(SiteKind::Direct),
                 &child_root.join("site.log"),
+                DetachedChildRuntimeReadiness::DirectReady,
             )
             .await?;
             let mut live_children = published_children.clone();
@@ -971,6 +972,7 @@ pub(super) async fn site_controller_runtime_publish_child(
                     .join("vm-runtime.json"),
                 vm_endpoint_forward_ready_timeout(),
                 &child_root.join("site.log"),
+                DetachedChildRuntimeReadiness::VmMaterialized,
             )
             .await?;
             wait_for_detached_vm_child_endpoints_ready(

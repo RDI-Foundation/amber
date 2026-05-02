@@ -32,6 +32,8 @@ use crate::{
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct DirectRuntimeState {
     #[serde(default)]
+    ready: bool,
+    #[serde(default)]
     slot_ports_by_component: BTreeMap<usize, BTreeMap<String, u16>>,
     #[serde(default)]
     slot_route_ports_by_component: BTreeMap<usize, BTreeMap<String, Vec<u16>>>,
@@ -3788,13 +3790,8 @@ fn inject_site_controller_peer_router_routes_records_peer_router_identities() {
                         ref peer_addr,
                         ref route_id,
                         ref capability,
-                    } if peer_id == "/site/local/controller"
-                        && peer_addr
-                            == if cfg!(target_os = "linux") {
-                                "10.0.2.2:23001"
-                            } else {
-                                "127.0.0.1:23001"
-                            }
+                        } if peer_id == "/site/local/controller"
+                            && peer_addr == "127.0.0.1:23001"
                         && route_id
                             == &amber_mesh::component_route_id(
                                 "/site/local/controller",

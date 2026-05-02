@@ -228,6 +228,8 @@ struct DesiredExportPeer {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct DirectRuntimeState {
     #[serde(default)]
+    ready: bool,
+    #[serde(default)]
     slot_ports_by_component: BTreeMap<usize, BTreeMap<String, u16>>,
     #[serde(default)]
     slot_route_ports_by_component: BTreeMap<usize, BTreeMap<String, Vec<u16>>>,
@@ -1380,21 +1382,51 @@ fn filter_dynamic_mesh_provision_plan(
     write_json(&plan_path, &plan)
 }
 
+#[derive(Clone, Copy)]
+enum DetachedChildRuntimeReadiness {
+    DirectReady,
+    VmMaterialized,
+}
+
+impl DetachedChildRuntimeReadiness {
+    fn description(self) -> &'static str {
+        match self {
+            Self::DirectReady => "direct child runtime state",
+            Self::VmMaterialized => "vm child runtime state",
+        }
+    }
+
+    fn ready(self, state_path: &Path) -> Result<bool> {
+        match self {
+            Self::DirectReady => {
+                let state: DirectRuntimeState = read_json(state_path, self.description())?;
+                Ok(state.ready)
+            }
+            Self::VmMaterialized => {
+                let _: VmRuntimeState = read_json(state_path, self.description())?;
+                Ok(true)
+            }
+        }
+    }
+}
+
 async fn wait_for_detached_child_runtime_state(
     pid: u32,
     state_path: &Path,
     timeout: Duration,
     log_path: &Path,
+    readiness: DetachedChildRuntimeReadiness,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if state_path.is_file() {
+        if state_path.is_file() && readiness.ready(state_path)? {
             return Ok(());
         }
         if !pid_is_alive(pid) {
             let log = fs::read_to_string(log_path).unwrap_or_default();
             return Err(miette::miette!(
-                "dynamic child runtime exited before becoming ready\nlog ({}):\n{}",
+                "dynamic child runtime exited before {} became ready\nlog ({}):\n{}",
+                readiness.description(),
                 log_path.display(),
                 log
             ));
@@ -1403,7 +1435,8 @@ async fn wait_for_detached_child_runtime_state(
     }
     let log = fs::read_to_string(log_path).unwrap_or_default();
     Err(miette::miette!(
-        "timed out waiting for dynamic child runtime state {}\nlog ({}):\n{}",
+        "timed out waiting for dynamic {}\nstate ({}):\nlog ({}):\n{}",
+        readiness.description(),
         state_path.display(),
         log_path.display(),
         log
@@ -1982,5 +2015,77 @@ mod tests {
             Some(value) => unsafe { env::set_var("AMBER_VM_FORCE_TCG", value) },
             None => unsafe { env::remove_var("AMBER_VM_FORCE_TCG") },
         }
+    }
+
+    #[tokio::test]
+    async fn detached_direct_child_runtime_state_waits_for_ready_flag() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("direct-runtime.json");
+        let log_path = temp.path().join("site.log");
+        write_json(
+            &state_path,
+            &DirectRuntimeState {
+                ready: false,
+                ..Default::default()
+            },
+        )
+        .expect("direct runtime state should write");
+
+        let err = wait_for_detached_child_runtime_state(
+            std::process::id(),
+            &state_path,
+            Duration::from_millis(1),
+            &log_path,
+            DetachedChildRuntimeReadiness::DirectReady,
+        )
+        .await
+        .expect_err("not-ready direct runtime state should time out");
+        assert!(
+            err.to_string().contains("direct child runtime state"),
+            "error should identify the direct child runtime state: {err}"
+        );
+
+        write_json(
+            &state_path,
+            &DirectRuntimeState {
+                ready: true,
+                ..Default::default()
+            },
+        )
+        .expect("direct runtime state should write");
+        wait_for_detached_child_runtime_state(
+            std::process::id(),
+            &state_path,
+            Duration::from_secs(1),
+            &log_path,
+            DetachedChildRuntimeReadiness::DirectReady,
+        )
+        .await
+        .expect("ready direct runtime state should be accepted");
+    }
+
+    #[tokio::test]
+    async fn detached_vm_child_runtime_state_accepts_materialized_vm_state() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("vm-runtime.json");
+        let log_path = temp.path().join("site.log");
+        write_json(
+            &state_path,
+            &VmRuntimeState {
+                router_mesh_port: Some(23000),
+                ..Default::default()
+            },
+        )
+        .expect("vm runtime state should write");
+
+        wait_for_detached_child_runtime_state(
+            std::process::id(),
+            &state_path,
+            Duration::from_secs(1),
+            &log_path,
+            DetachedChildRuntimeReadiness::VmMaterialized,
+        )
+        .await
+        .expect("materialized VM runtime state should be accepted");
     }
 }

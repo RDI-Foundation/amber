@@ -2056,13 +2056,8 @@ mod direct_input_tests {
                             ref peer_addr,
                             ref route_id,
                             ref capability,
-                        } if peer_id == "/site/local/controller"
-                            && peer_addr
-                                == if cfg!(target_os = "linux") {
-                                    "10.0.2.2:23001"
-                                } else {
-                                    "127.0.0.1:23001"
-                                }
+                    } if peer_id == "/site/local/controller"
+                        && peer_addr == "127.0.0.1:23001"
                             && route_id
                                 == &amber_mesh::component_route_id(
                                     "/site/local/controller",

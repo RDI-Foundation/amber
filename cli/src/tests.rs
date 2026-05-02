@@ -222,6 +222,73 @@ fn proxy_telemetry_keeps_router_info_without_verbose_output() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn direct_runtime_only_isolates_non_controller_components() {
+    let controller = DirectComponentPlan {
+        id: 1,
+        moniker: "/__amber_internal_framework_component_controller/direct_local".to_string(),
+        log_name: "controller".to_string(),
+        source_dir: None,
+        depends_on: Vec::new(),
+        sidecar: amber_compiler::reporter::direct::DirectSidecarPlan {
+            log_name: "controller-sidecar".to_string(),
+            mesh_port: 0,
+            mesh_config_path: "mesh/components/controller/mesh-config.json".to_string(),
+            mesh_identity_path: "mesh/components/controller/mesh-identity.json".to_string(),
+            env_passthrough: Vec::new(),
+        },
+        program: amber_compiler::reporter::direct::DirectProgramPlan {
+            log_name: "controller-program".to_string(),
+            work_dir: "work/components/controller".to_string(),
+            storage_mounts: Vec::new(),
+            execution: DirectProgramExecutionPlan::InternalSiteController,
+        },
+    };
+    let app = DirectComponentPlan {
+        id: 2,
+        moniker: "/app".to_string(),
+        log_name: "app".to_string(),
+        source_dir: Some("/workspace/scenarios/app".to_string()),
+        depends_on: Vec::new(),
+        sidecar: amber_compiler::reporter::direct::DirectSidecarPlan {
+            log_name: "app-sidecar".to_string(),
+            mesh_port: 0,
+            mesh_config_path: "mesh/components/app/mesh-config.json".to_string(),
+            mesh_identity_path: "mesh/components/app/mesh-identity.json".to_string(),
+            env_passthrough: Vec::new(),
+        },
+        program: amber_compiler::reporter::direct::DirectProgramPlan {
+            log_name: "app-program".to_string(),
+            work_dir: "work/components/app".to_string(),
+            storage_mounts: Vec::new(),
+            execution: DirectProgramExecutionPlan::Direct {
+                entrypoint: vec!["/bin/true".to_string()],
+                env: BTreeMap::new(),
+            },
+        },
+    };
+
+    assert_eq!(
+        direct_component_sidecar_network(&controller),
+        ProcessNetwork::Host
+    );
+    assert!(!direct_component_uses_isolated_network(&controller));
+    assert!(!direct_component_program_joins_sidecar(&controller));
+    assert_eq!(direct_program_network_override(&controller), "host");
+
+    assert_eq!(
+        direct_component_sidecar_network(&app),
+        ProcessNetwork::Isolated
+    );
+    assert!(direct_component_uses_isolated_network(&app));
+    assert!(direct_component_program_joins_sidecar(&app));
+    assert_eq!(
+        direct_program_network_override(&app),
+        "join_component_sidecar"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn component_program_read_only_mounts_resolve_parent_escape_paths() {
     let component = DirectComponentPlan {
         id: 3,
@@ -310,6 +377,7 @@ fn build_runtime_template_context_uses_runtime_slot_ports() {
         dynamic_caps_port_by_component: BTreeMap::new(),
         component_mesh_port_by_id: BTreeMap::new(),
         router_mesh_port: None,
+        ready: false,
     };
 
     let context =

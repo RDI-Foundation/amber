@@ -31,15 +31,38 @@ fn mixed_run_five_site_startup_state_and_teardown() {
             ["direct_a"]
         ])
     );
+    let assignments = run_plan["assignments"]
+        .as_object()
+        .expect("run plan assignments should be an object");
+    let controller_prefix = "/__amber_internal_framework_component_controller/";
+    let user_assignments = assignments
+        .iter()
+        .filter(|(component, _)| !component.starts_with(controller_prefix))
+        .map(|(component, site)| (component.clone(), site.clone()))
+        .collect::<serde_json::Map<_, _>>();
     assert_eq!(
-        run_plan["assignments"],
-        json!({
-            "/a": "direct_a",
-            "/b": "compose_b",
-            "/c": "kind_c",
-            "/d": "vm_d",
-            "/e": "compose_e"
-        })
+        user_assignments,
+        serde_json::Map::from_iter([
+            ("/a".to_string(), json!("direct_a")),
+            ("/b".to_string(), json!("compose_b")),
+            ("/c".to_string(), json!("kind_c")),
+            ("/d".to_string(), json!("vm_d")),
+            ("/e".to_string(), json!("compose_e")),
+        ])
+    );
+    let controller_assignments = assignments
+        .iter()
+        .filter(|(component, _)| component.starts_with(controller_prefix))
+        .map(|(component, site)| (component.clone(), site.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    assert_eq!(
+        controller_assignments,
+        serde_json::Map::from_iter([
+            (format!("{controller_prefix}compose_b"), json!("compose_b")),
+            (format!("{controller_prefix}compose_e"), json!("compose_e")),
+            (format!("{controller_prefix}direct_a"), json!("direct_a")),
+            (format!("{controller_prefix}kind_c"), json!("kind_c")),
+        ])
     );
     assert_eq!(
         run.receipt["sites"]
@@ -109,7 +132,7 @@ fn mixed_run_five_site_startup_state_and_teardown() {
             .as_object()
             .expect("direct external slots")
             .len(),
-        2
+        5
     );
     assert_eq!(
         read_json(
@@ -121,7 +144,7 @@ fn mixed_run_five_site_startup_state_and_teardown() {
             .as_object()
             .expect("compose_b external slots")
             .len(),
-        2
+        5
     );
     assert_eq!(
         read_json(
@@ -133,7 +156,7 @@ fn mixed_run_five_site_startup_state_and_teardown() {
             .as_object()
             .expect("kind external slots")
             .len(),
-        1
+        4
     );
     assert_eq!(
         read_json(

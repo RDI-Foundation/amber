@@ -807,8 +807,9 @@ impl LinuxVmHarness {
                  AMBER_VM_SMOKE_BASE_IMAGE=\"$HOME/{image_filename}\"\nexport \
                  AMBER_MIXED_RUN_BASE_IMAGE=\"$HOME/{image_filename}\"\nexport \
                  CARGO_TARGET_DIR=\"$HOME/amber-target\"\nexport CARGO_TERM_QUIET=true\nexport \
-                 CARGO_TERM_PROGRESS_WHEN=never\n{extra_exports}log_dir=\"$HOME/\
-                 linux-vm-test-logs\"\nmkdir -p \
+                 CARGO_TERM_PROGRESS_WHEN=never\nexport CARGO_HTTP_MULTIPLEXING=false\nexport \
+                 CARGO_HTTP_TIMEOUT=120\nexport \
+                 CARGO_NET_RETRY=5\n{extra_exports}log_dir=\"$HOME/linux-vm-test-logs\"\nmkdir -p \
                  \"$log_dir\"\nstdout_log=\"$log_dir/{label}.stdout.log\"\nstderr_log=\"$log_dir/\
                  {label}.stderr.log\"\nif {command} >\"$stdout_log\" 2>\"$stderr_log\"; then\ncat \
                  \"$stdout_log\"\nelse\nstatus=$?\necho \"===== guest test panic lines \
@@ -840,19 +841,23 @@ impl LinuxVmHarness {
              then\ncontinue\nfi\necho \"===== state root: $state_root =====\"\nwhile IFS= read -r \
              path; do\necho \"----- $path -----\"\nsed -n '1,260p' \"$path\"\ndone < <(find \
              \"$state_root\" -type f \\( -name 'manager-state.json' -o -name \
-             'direct-runtime-state.json' -o -name 'vm-runtime-state.json' -o -name \
+             'direct-runtime-state.json' -o -name 'direct-runtime.json' -o -name \
+             'vm-runtime-state.json' -o -name 'vm-runtime.json' -o -name \
              'site-controller-state.json' -o -name 'site-controller-runtime-state.json' -o -name \
              'supervisor.log' -o -name 'port-forward.log' -o -name 'site.log' -o -name \
-             'site-controller.log' -o -name 'site-controller-plan.json' -o -name \
-             'site-controller-runtime-plan.json' \\) 2>/dev/null | \
-             sort)\ndone\nruns_root=\"$(find {guest_workspace} -path '*/.amber-runs/runs/run-*' \
-             -type d | sort | tail -n 1)\"\nif [ -n \"$runs_root\" ]; then\necho \"latest guest \
-             run root: $runs_root\"\nfind \"$runs_root/state\" -maxdepth 2 -type f \\( -name \
-             'manager-state.json' -o -name 'supervisor.log' -o -name 'port-forward.log' -o -name \
-             'site.log' -o -name 'site-controller.log' -o -name 'site-controller-state.json' -o \
-             -name 'site-controller-runtime-state.json' -o -name 'site-controller-plan.json' -o \
-             -name 'site-controller-runtime-plan.json' \\) | sort | while IFS= read -r path; \
-             do\necho \"----- $path -----\"\nsed -n '1,260p' \"$path\"\ndone\nfi\n"
+             'outside-proxy.log' -o -name 'site-controller.log' -o -name \
+             'site-controller-plan.json' -o -name 'site-controller-runtime-plan.json' -o -name \
+             'mesh-config.json' \\) 2>/dev/null | sort)\ndone\nruns_root=\"$(find \
+             {guest_workspace} -path '*/.amber-runs/runs/run-*' -type d | sort | tail -n 1)\"\nif \
+             [ -n \"$runs_root\" ]; then\necho \"latest guest run root: $runs_root\"\nfind \
+             \"$runs_root/state\" -maxdepth 2 -type f \\( -name 'manager-state.json' -o -name \
+             'direct-runtime.json' -o -name 'vm-runtime.json' -o -name 'supervisor.log' -o -name \
+             'port-forward.log' -o -name 'site.log' -o -name 'outside-proxy.log' -o -name \
+             'site-controller.log' -o -name 'site-controller-state.json' -o -name \
+             'site-controller-runtime-state.json' -o -name 'site-controller-plan.json' -o -name \
+             'site-controller-runtime-plan.json' -o -name 'mesh-config.json' \\) | sort | while \
+             IFS= read -r path; do\necho \"----- $path -----\"\nsed -n '1,260p' \
+             \"$path\"\ndone\nfi\n"
         );
         self.ssh_output(&script)
             .ok()

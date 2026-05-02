@@ -612,12 +612,14 @@ pub(crate) fn wait_for_body(
             last_response = Some((status, body));
         }
         if let Ok(Some(status)) = proxy.child.try_wait() {
+            let diagnostics = proxy_target_diagnostics(&proxy.output_dir);
             panic!(
                 "amber proxy exited before http://127.0.0.1:{port}{path} became ready\nstatus: \
-                 {status}\noutput dir: {}\nlog ({}):\n{}",
+                 {status}\noutput dir: {}\n{diagnostics}log ({}):\n{}",
                 proxy.output_dir.display(),
                 proxy.log_path.display(),
-                fs::read_to_string(&proxy.log_path).unwrap_or_default()
+                fs::read_to_string(&proxy.log_path).unwrap_or_default(),
+                diagnostics = diagnostics,
             );
         }
         thread::sleep(Duration::from_millis(250));
@@ -625,13 +627,92 @@ pub(crate) fn wait_for_body(
     let last_response = last_response
         .map(|(status, body)| format!("last http response: {status}\n{body}\n"))
         .unwrap_or_else(|| "last http response: <none>\n".to_string());
+    let diagnostics = proxy_target_diagnostics(&proxy.output_dir);
     panic!(
-        "timed out waiting for http://127.0.0.1:{port}{path}\noutput dir: {}\n{last_response}log \
-         ({}):\n{}",
+        "timed out waiting for http://127.0.0.1:{port}{path}\noutput dir: \
+         {}\n{last_response}{diagnostics}log ({}):\n{}",
         proxy.output_dir.display(),
         proxy.log_path.display(),
-        fs::read_to_string(&proxy.log_path).unwrap_or_default()
+        fs::read_to_string(&proxy.log_path).unwrap_or_default(),
+        diagnostics = diagnostics,
     );
+}
+
+fn proxy_target_diagnostics(output_dir: &Path) -> String {
+    let Some(child_root) = output_dir.parent() else {
+        return String::new();
+    };
+    let mut files = Vec::new();
+    collect_proxy_target_diagnostic_files(child_root, &mut files);
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return String::new();
+    }
+
+    let mut diagnostics = String::from("proxy target diagnostics:\n");
+    for path in files {
+        diagnostics.push_str(&format!("----- {} -----\n", path.display()));
+        diagnostics.push_str(&read_diagnostic_file_excerpt(&path));
+        diagnostics.push('\n');
+    }
+    diagnostics
+}
+
+fn collect_proxy_target_diagnostic_files(root: &Path, files: &mut Vec<PathBuf>) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_file() {
+            if is_proxy_target_diagnostic_file(&path) {
+                files.push(path);
+            }
+            continue;
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            stack.push(entry.path());
+        }
+    }
+}
+
+fn is_proxy_target_diagnostic_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        "direct-runtime.json"
+            | "vm-runtime.json"
+            | "direct-plan.json"
+            | "vm-plan.json"
+            | "mesh-provision-plan.json"
+            | "mesh-config.json"
+            | "site.log"
+            | "supervisor.log"
+            | "manager-state.json"
+            | "site-controller-runtime-state.json"
+            | "site-controller-state.json"
+    )
+}
+
+fn read_diagnostic_file_excerpt(path: &Path) -> String {
+    const MAX_BYTES: usize = 24 * 1024;
+    let Ok(mut bytes) = fs::read(path) else {
+        return "<unreadable>\n".to_string();
+    };
+    bytes.retain(|byte| *byte != 0);
+    if bytes.len() > MAX_BYTES {
+        bytes = bytes[bytes.len() - MAX_BYTES..].to_vec();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 pub(crate) fn wait_for_path(proxy: &mut SpawnedProxy, port: u16, path: &str, timeout: Duration) {
@@ -2756,9 +2837,11 @@ pub(crate) fn write_single_site_vm_fixture(root: &Path) -> ScenarioFixture {
             "schema": "amber.run.placement",
             "version": 1,
             "sites": {
-                "vm_local": { "kind": "vm" }
+                "direct_controller": { "kind": "direct" },
+                "vm_local": { "kind": "vm", "controller_site": "direct_controller" }
             },
             "defaults": {
+                "path": "direct_controller",
                 "vm": "vm_local"
             }
         }),

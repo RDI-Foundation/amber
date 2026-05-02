@@ -634,6 +634,8 @@ pub(crate) struct ResolvedRunProxyTarget {
 #[derive(Debug, Deserialize)]
 struct DirectRuntimeStateView {
     #[serde(default)]
+    ready: bool,
+    #[serde(default)]
     router_mesh_port: Option<u16>,
 }
 

@@ -207,7 +207,7 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 "direct runtime requires `slirp4netns` on Linux for isolated component networking"
             )
         })?;
-        let runtime_state = if args.skip_router || !existing_peer_ports_by_id.is_empty() {
+        let mut runtime_state = if args.skip_router || !existing_peer_ports_by_id.is_empty() {
             materialize_direct_runtime_with_existing(
                 &plan_root,
                 &runtime_root,
@@ -448,21 +448,12 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 bind_dirs: vec![control_socket_dir],
                 bind_mounts: Vec::new(),
                 hidden_paths: Vec::new(),
-                network: {
-                    #[cfg(target_os = "linux")]
-                    {
-                        ProcessNetwork::Isolated
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        ProcessNetwork::Host
-                    }
-                },
+                network: direct_component_sidecar_network(component),
             };
             let sidecar_pid =
                 spawn_managed_process(spec, &mut sandbox, &mut children, &mut log_tasks).await?;
             #[cfg(target_os = "linux")]
-            {
+            if direct_component_uses_isolated_network(component) {
                 let mesh_port = mesh_network
                     .component_mesh_port_by_id
                     .get(&component.id)
@@ -504,13 +495,18 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
             spec.hidden_paths.push(runtime_root.join("mesh"));
             #[cfg(target_os = "linux")]
             {
-                let pid = component_sidecar_pid_by_id
-                    .get(component_id)
-                    .copied()
-                    .ok_or_else(|| {
-                        miette::miette!("missing sidecar pid for component {}", component.moniker)
-                    })?;
-                spec.network = ProcessNetwork::Join(pid);
+                if direct_component_program_joins_sidecar(component) {
+                    let pid = component_sidecar_pid_by_id
+                        .get(component_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            miette::miette!(
+                                "missing sidecar pid for component {}",
+                                component.moniker
+                            )
+                        })?;
+                    spec.network = ProcessNetwork::Join(pid);
+                }
             }
             let _ =
                 spawn_managed_process(spec, &mut sandbox, &mut children, &mut log_tasks).await?;
@@ -518,7 +514,11 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
             wait_for_component_local_targets(
                 component,
                 &runtime_root,
-                component_sidecar_pid_by_id.get(component_id).copied(),
+                if direct_component_program_joins_sidecar(component) {
+                    component_sidecar_pid_by_id.get(component_id).copied()
+                } else {
+                    None
+                },
                 DIRECT_LOCAL_TARGET_READY_TIMEOUT,
             )
             .await?;
@@ -533,6 +533,7 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
         }
 
         wait_for_direct_mesh_endpoints(&runtime_state, DIRECT_MESH_ENDPOINT_READY_TIMEOUT).await?;
+        runtime_state.ready = true;
         write_direct_runtime_state(&plan_root, &runtime_state)?;
         supervise_children(&mut children).await
     }
@@ -832,6 +833,8 @@ pub(crate) fn direct_runtime_state_path(plan_root: &Path) -> PathBuf {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct DirectRuntimeState {
+    #[serde(default)]
+    pub(crate) ready: bool,
     #[serde(default)]
     pub(crate) slot_ports_by_component: BTreeMap<usize, BTreeMap<String, u16>>,
     #[serde(default)]
@@ -1181,7 +1184,10 @@ pub(crate) fn materialize_direct_runtime_with_existing(
 ) -> Result<DirectRuntimeState> {
     let runtime_state_path = direct_runtime_state_path(plan_root);
     if existing.reuse_existing && runtime_state_path.is_file() {
-        return read_direct_runtime_state(&runtime_state_path);
+        let mut runtime_state = read_direct_runtime_state(&runtime_state_path)?;
+        runtime_state.ready = false;
+        write_direct_runtime_state(plan_root, &runtime_state)?;
+        return Ok(runtime_state);
     }
     if runtime_state_path.exists() {
         let _ = fs::remove_file(&runtime_state_path);
@@ -1240,14 +1246,16 @@ pub(crate) fn configure_direct_mesh_network(
                 })?;
             plan.component_mesh_port_by_id
                 .insert(component.id, mesh_port);
-            config.mesh_listen = rewrite_mesh_listen_for_slirp_guest(config.mesh_listen);
+            if direct_component_uses_isolated_network(component) {
+                config.mesh_listen = rewrite_mesh_listen_for_slirp_guest(config.mesh_listen);
 
-            for route in &mut config.outbound {
-                route.peer_addr = rewrite_peer_addr_for_slirp_gateway(route.peer_addr.as_str());
-            }
-            for route in &mut config.inbound {
-                if let InboundTarget::MeshForward { peer_addr, .. } = &mut route.target {
-                    *peer_addr = rewrite_peer_addr_for_slirp_gateway(peer_addr.as_str());
+                for route in &mut config.outbound {
+                    route.peer_addr = rewrite_peer_addr_for_slirp_gateway(route.peer_addr.as_str());
+                }
+                for route in &mut config.inbound {
+                    if let InboundTarget::MeshForward { peer_addr, .. } = &mut route.target {
+                        *peer_addr = rewrite_peer_addr_for_slirp_gateway(peer_addr.as_str());
+                    }
                 }
             }
 

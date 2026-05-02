@@ -14,7 +14,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER};
+use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER, AMBER_SITE_CONTROLLER};
 use outputs_root_support::cli_test_outputs_root;
 use target_dir_support::cargo_target_dir;
 use workspace_root_support::workspace_root;
@@ -87,6 +87,10 @@ fn ensure_internal_images(workspace_root: &Path) {
     build_internal_image_if_needed(
         AMBER_ROUTER.reference,
         &workspace_root.join("docker/amber-router/Dockerfile"),
+    );
+    build_internal_image_if_needed(
+        AMBER_SITE_CONTROLLER.reference,
+        &workspace_root.join("docker/amber-site-controller/Dockerfile"),
     );
 }
 

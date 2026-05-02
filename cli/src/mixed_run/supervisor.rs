@@ -812,6 +812,9 @@ pub(super) async fn try_discover_direct_site(
             &direct_runtime_state_path(&artifact_dir),
             "direct runtime state",
         )?;
+        if !state.ready {
+            return Ok(None);
+        }
         let Some(router_mesh_port) = state.router_mesh_port else {
             return Ok(None);
         };
@@ -1893,9 +1896,20 @@ pub(super) fn spawn_runtime_process_with_executable(
     build: impl FnOnce(&mut Command),
 ) -> Result<Child> {
     let log_path = site_state_root.join(log_name);
-    let log = fs::File::create(&log_path)
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create {}", log_path.display()))?;
+    writeln!(log, "\n--- starting runtime process ---")
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to write runtime start marker to {}",
+                log_path.display()
+            )
+        })?;
     let log_err = log
         .try_clone()
         .into_diagnostic()

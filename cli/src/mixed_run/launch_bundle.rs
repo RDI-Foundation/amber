@@ -79,6 +79,43 @@ fn site_controller_component_port(site_plan: &RunSitePlan) -> Result<Option<u16>
     }
 }
 
+pub(super) fn prepare_site_state_root(site_state_root: &Path, kind: SiteKind) -> Result<()> {
+    fs::create_dir_all(site_state_root)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create site state directory {}",
+                site_state_root.display()
+            )
+        })?;
+
+    #[cfg(unix)]
+    if kind == SiteKind::Compose {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut permissions = fs::metadata(site_state_root)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to read permissions for site state directory {}",
+                    site_state_root.display()
+                )
+            })?
+            .permissions();
+        permissions.set_mode(0o777);
+        fs::set_permissions(site_state_root, permissions)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to make compose site state directory writable {}",
+                    site_state_root.display()
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn dry_run_run_plan(
     source_plan_path: Option<&Path>,
     run_plan: &RunPlan,
@@ -159,6 +196,7 @@ pub(super) fn materialize_launch_bundle(
         let artifact_dir = materialize_site_artifacts(&sites_root, site_id, site_plan)?;
         amber_site_controller::set_site_artifact_mesh_identity_seed(&artifact_dir, run_id)?;
         let site_state_root = state_root.join(site_id);
+        prepare_site_state_root(&site_state_root, site_plan.site.kind)?;
         let controller = site_controller_component_port(site_plan)?.map(|controller_port| {
             let listen_addr = match site_plan.site.kind {
                 SiteKind::Direct | SiteKind::Vm => {

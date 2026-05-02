@@ -36,6 +36,27 @@ fn site_state_paths_are_site_scoped() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn compose_site_state_root_is_writable_by_container_uid_mappings() {
+    let temp = TempDir::new().expect("temp dir should create");
+    let site_state_root = temp.path().join("state").join("compose-local");
+
+    launch_bundle::prepare_site_state_root(&site_state_root, SiteKind::Compose)
+        .expect("compose state root should prepare");
+
+    let mode = fs::metadata(&site_state_root)
+        .expect("state root metadata should read")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o777,
+        "compose site controllers run in Docker and must be able to persist state through Linux \
+         bind mounts even when the daemon remaps container uid 0"
+    );
+}
+
 #[test]
 fn site_controller_image_override_uses_dev_tag() {
     let overrides = BTreeMap::from([(
