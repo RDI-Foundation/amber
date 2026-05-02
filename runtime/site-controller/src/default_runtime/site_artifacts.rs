@@ -1110,6 +1110,7 @@ mod tests {
             kubernetes_namespace: None,
             context: None,
             observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: None,
             launch_env: BTreeMap::new(),
         })
         .expect("metadata collection should succeed without a runtime state file");

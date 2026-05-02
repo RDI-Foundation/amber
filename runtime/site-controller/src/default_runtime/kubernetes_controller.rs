@@ -913,6 +913,7 @@ mod tests {
             kubernetes_namespace: Some("test-ns".to_string()),
             context: Some("test-context".to_string()),
             observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: None,
             launch_env: BTreeMap::from([(
                 "AMBER_DEV_IMAGE_TAGS".to_string(),
                 "router=dev-tag,helper=dev-tag".to_string(),

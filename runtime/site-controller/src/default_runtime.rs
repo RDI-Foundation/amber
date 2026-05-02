@@ -62,7 +62,7 @@ pub use self::{
     },
     site_runtime_support::{
         host_service_bind_addr_for_consumer, observability_endpoint_for_site,
-        prepare_kubernetes_artifact_namespace, reserve_loopback_port,
+        prepare_kubernetes_artifact_namespace, reserve_host_port, reserve_loopback_port,
         router_mesh_addr_for_consumer, site_controller_peer_router_url, walk_files,
     },
 };
@@ -373,6 +373,14 @@ pub fn vm_endpoint_forward_ready_timeout() -> Duration {
     } else {
         Duration::from_secs(120)
     }
+}
+
+fn vm_endpoint_forward_ready_timeout_for_runtime_plan(
+    plan: &SiteControllerRuntimePlan,
+) -> Duration {
+    plan.vm_endpoint_forward_ready_timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or_else(vm_endpoint_forward_ready_timeout)
 }
 
 fn required_existing_mesh_peer_identities(
@@ -1901,6 +1909,7 @@ mod tests {
             kubernetes_namespace: Some("ns".to_string()),
             context: None,
             observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: None,
             launch_env: BTreeMap::new(),
         };
         let stale_manager_state = SiteManagerState {
@@ -1961,6 +1970,7 @@ mod tests {
             kubernetes_namespace: Some("ns".to_string()),
             context: None,
             observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: None,
             launch_env: BTreeMap::new(),
         };
         let manager_state = SiteManagerState {
@@ -2015,6 +2025,39 @@ mod tests {
             Some(value) => unsafe { env::set_var("AMBER_VM_FORCE_TCG", value) },
             None => unsafe { env::remove_var("AMBER_VM_FORCE_TCG") },
         }
+    }
+
+    #[test]
+    fn runtime_plan_vm_ready_timeout_uses_explicit_budget() {
+        let plan = SiteControllerRuntimePlan {
+            schema: "amber.run.site_controller_runtime_plan".to_string(),
+            version: 1,
+            run_id: "run".to_string(),
+            mesh_scope: "scope".to_string(),
+            run_root: "/tmp/run".to_string(),
+            site_id: "vm_local".to_string(),
+            kind: SiteKind::Vm,
+            router_identity_id: "/site/vm_local/router".to_string(),
+            local_router_control: None,
+            artifact_dir: "/tmp/artifact".to_string(),
+            site_state_root: "/tmp/state".to_string(),
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 4100)),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: Some(24000),
+            compose_project: None,
+            kubernetes_namespace: None,
+            context: None,
+            observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: Some(721),
+            launch_env: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            vm_endpoint_forward_ready_timeout_for_runtime_plan(&plan),
+            Duration::from_secs(721),
+            "dynamic VM child publication should consume the budget written into the runtime plan",
+        );
     }
 
     #[tokio::test]

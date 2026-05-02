@@ -965,12 +965,13 @@ pub(super) async fn site_controller_runtime_publish_child(
                 record.process_pid = Some(process.id());
                 write_json(&app.state_path, &*state)?;
             }
+            let vm_ready_timeout = vm_endpoint_forward_ready_timeout_for_runtime_plan(&app.plan);
             wait_for_detached_child_runtime_state(
                 process.id(),
                 &Path::new(&child.artifact_root)
                     .join(".amber")
                     .join("vm-runtime.json"),
-                vm_endpoint_forward_ready_timeout(),
+                vm_ready_timeout,
                 &child_root.join("site.log"),
                 DetachedChildRuntimeReadiness::VmMaterialized,
             )
@@ -979,7 +980,7 @@ pub(super) async fn site_controller_runtime_publish_child(
                 process.id(),
                 Path::new(&child.artifact_root),
                 &runtime_root,
-                vm_endpoint_forward_ready_timeout(),
+                vm_ready_timeout,
                 &child_root.join("site.log"),
             )?;
             let mut live_children = published_children.clone();
@@ -1450,6 +1451,7 @@ mod tests {
             kubernetes_namespace: None,
             context: None,
             observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: None,
             launch_env: BTreeMap::new(),
         };
 
@@ -1591,6 +1593,7 @@ mod tests {
             kubernetes_namespace: None,
             context: None,
             observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: None,
             launch_env: BTreeMap::new(),
         };
 

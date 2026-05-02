@@ -1325,6 +1325,7 @@ mod direct_input_tests {
             kubernetes_namespace: Some("amber-test-kind-local".to_string()),
             context: None,
             observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: None,
             launch_env: BTreeMap::new(),
         }
     }
@@ -1370,6 +1371,7 @@ mod direct_input_tests {
             kubernetes_namespace: None,
             context: None,
             observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: None,
             launch_env: BTreeMap::new(),
         };
 
@@ -1421,6 +1423,7 @@ mod direct_input_tests {
             kubernetes_namespace: Some("amber-test-kind-local".to_string()),
             context: None,
             observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: None,
             launch_env: BTreeMap::new(),
         };
 
@@ -1862,6 +1865,7 @@ mod direct_input_tests {
             kubernetes_namespace: None,
             context: None,
             observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: None,
             launch_env: BTreeMap::new(),
         };
         let child = SiteControllerRuntimeChildRecord {

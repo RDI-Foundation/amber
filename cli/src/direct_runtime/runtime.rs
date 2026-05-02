@@ -886,11 +886,19 @@ pub(crate) fn assign_direct_runtime_ports_with_existing(
         }
         mesh_port_by_peer_id.insert(peer_id.clone(), *port);
     }
+    if let Some(port) = fixed_router_mesh_port
+        && !reserved.insert(port)
+    {
+        return Err(miette::miette!(
+            "router mesh port {} conflicts with an existing direct runtime port",
+            port
+        ));
+    }
 
     for component in &direct_plan.components {
         let path = runtime_root.join(&component.sidecar.mesh_config_path);
         let mut config = read_mesh_config_public(path.as_path())?;
-        let mesh_port = allocate_direct_runtime_port(&mut reserved, None)?;
+        let mesh_port = allocate_direct_runtime_port(&mut reserved)?;
         if mesh_port_by_peer_id
             .insert(config.identity.id.clone(), mesh_port)
             .is_some()
@@ -902,7 +910,7 @@ pub(crate) fn assign_direct_runtime_ports_with_existing(
         }
         config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
         if let Some(dynamic_caps_listen) = config.dynamic_caps_listen.as_mut() {
-            let port = allocate_direct_runtime_port(&mut reserved, None)?;
+            let port = allocate_direct_runtime_port(&mut reserved)?;
             *dynamic_caps_listen = SocketAddr::new(dynamic_caps_listen.ip(), port);
             state
                 .dynamic_caps_port_by_component
@@ -912,7 +920,7 @@ pub(crate) fn assign_direct_runtime_ports_with_existing(
         let mut slot_route_ports: BTreeMap<String, Vec<(u16, u16)>> = BTreeMap::new();
         for route in &mut config.outbound {
             let authored_port = route.listen_port;
-            let port = allocate_direct_runtime_port(&mut reserved, None)?;
+            let port = allocate_direct_runtime_port(&mut reserved)?;
             route.listen_port = port;
             slot_route_ports
                 .entry(route.slot.clone())
@@ -958,7 +966,10 @@ pub(crate) fn assign_direct_runtime_ports_with_existing(
     let mut router_config = if let Some(router) = direct_plan.router.as_ref() {
         let path = runtime_root.join(&router.mesh_config_path);
         let mut config = read_mesh_config_public(path.as_path())?;
-        let mesh_port = allocate_direct_runtime_port(&mut reserved, fixed_router_mesh_port)?;
+        let mesh_port = match fixed_router_mesh_port {
+            Some(port) => port,
+            None => allocate_direct_runtime_port(&mut reserved)?,
+        };
         if let Some(existing) = mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port)
             && existing != mesh_port
         {
@@ -1009,19 +1020,7 @@ pub(crate) fn cross_site_router_mesh_bind_ip(
     }
 }
 
-pub(crate) fn allocate_direct_runtime_port(
-    reserved: &mut BTreeSet<u16>,
-    preferred: Option<u16>,
-) -> Result<u16> {
-    if let Some(preferred) = preferred {
-        if reserved.insert(preferred) {
-            return Ok(preferred);
-        }
-        return Err(miette::miette!(
-            "runtime port {} was requested twice in one direct runtime",
-            preferred
-        ));
-    }
+pub(crate) fn allocate_direct_runtime_port(reserved: &mut BTreeSet<u16>) -> Result<u16> {
     for _ in 0..256 {
         let port = amber_site_controller::reserve_loopback_port()?;
         if reserved.insert(port) {
@@ -1434,7 +1433,7 @@ mod tests {
         let mut reserved = BTreeSet::new();
 
         for _ in 0..32 {
-            let port = allocate_direct_runtime_port(&mut reserved, None)
+            let port = allocate_direct_runtime_port(&mut reserved)
                 .expect("direct runtime port allocation should succeed");
             assert_ne!(
                 port, reserved_port,

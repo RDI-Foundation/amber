@@ -228,11 +228,19 @@ pub(crate) fn assign_vm_runtime_ports_with_existing(
         }
         mesh_port_by_peer_id.insert(peer_id.clone(), *port);
     }
+    if let Some(port) = fixed_router_mesh_port
+        && !reserved.insert(port)
+    {
+        return Err(miette::miette!(
+            "router mesh port {} conflicts with an existing vm runtime port",
+            port
+        ));
+    }
 
     for component in &vm_plan.components {
         let path = runtime_root.join(&component.mesh_config_path);
         let mut config = read_mesh_config_public(&path)?;
-        let mesh_port = allocate_runtime_port(&mut reserved, None)?;
+        let mesh_port = allocate_runtime_port(&mut reserved)?;
         if mesh_port_by_peer_id
             .insert(config.identity.id.clone(), mesh_port)
             .is_some()
@@ -247,7 +255,7 @@ pub(crate) fn assign_vm_runtime_ports_with_existing(
         let mut route_guest_host_pairs = BTreeMap::<String, Vec<(u16, u16)>>::new();
         for route in &mut config.outbound {
             let guest_port = route.listen_port;
-            let host_port = allocate_runtime_port(&mut reserved, None)?;
+            let host_port = allocate_runtime_port(&mut reserved)?;
             route.listen_port = host_port;
             route_guest_host_pairs
                 .entry(route.slot.clone())
@@ -289,7 +297,7 @@ pub(crate) fn assign_vm_runtime_ports_with_existing(
                 let host_port = if let Some(existing) = endpoint_forwards.get(&guest_port) {
                     *existing
                 } else {
-                    let host_port = allocate_runtime_port(&mut reserved, None)?;
+                    let host_port = allocate_runtime_port(&mut reserved)?;
                     endpoint_forwards.insert(guest_port, host_port);
                     host_port
                 };
@@ -324,7 +332,10 @@ pub(crate) fn assign_vm_runtime_ports_with_existing(
     let mut router_config = if let Some(router) = vm_plan.router.as_ref() {
         let path = runtime_root.join(&router.mesh_config_path);
         let mut config = read_mesh_config_public(&path)?;
-        let mesh_port = allocate_runtime_port(&mut reserved, fixed_router_mesh_port)?;
+        let mesh_port = match fixed_router_mesh_port {
+            Some(port) => port,
+            None => allocate_runtime_port(&mut reserved)?,
+        };
         if let Some(existing) = mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port)
             && existing != mesh_port
         {
@@ -365,19 +376,7 @@ pub(crate) fn assign_vm_runtime_ports_with_existing(
     })
 }
 
-pub(crate) fn allocate_runtime_port(
-    reserved: &mut BTreeSet<u16>,
-    preferred: Option<u16>,
-) -> Result<u16> {
-    if let Some(preferred) = preferred {
-        if reserved.insert(preferred) {
-            return Ok(preferred);
-        }
-        return Err(miette::miette!(
-            "runtime port {} was requested twice in one vm runtime",
-            preferred
-        ));
-    }
+pub(crate) fn allocate_runtime_port(reserved: &mut BTreeSet<u16>) -> Result<u16> {
     for _ in 0..256 {
         let port = amber_site_controller::reserve_loopback_port()?;
         if reserved.insert(port) {
@@ -1057,7 +1056,7 @@ mod tests {
         let mut reserved = BTreeSet::new();
 
         for _ in 0..32 {
-            let port = allocate_runtime_port(&mut reserved, None)
+            let port = allocate_runtime_port(&mut reserved)
                 .expect("vm runtime port allocation should succeed");
             assert_ne!(
                 port, reserved_port,

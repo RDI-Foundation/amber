@@ -1114,6 +1114,10 @@ pub(crate) fn reserve_loopback_port() -> Result<u16> {
     amber_site_controller::reserve_loopback_port()
 }
 
+pub(crate) fn reserve_host_port() -> Result<u16> {
+    amber_site_controller::reserve_host_port()
+}
+
 pub(crate) fn new_run_id() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)

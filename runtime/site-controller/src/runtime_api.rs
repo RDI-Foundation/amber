@@ -185,6 +185,8 @@ pub struct SiteControllerRuntimePlan {
     pub context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observability_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_endpoint_forward_ready_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub launch_env: BTreeMap<String, String>,
 }
@@ -253,6 +255,7 @@ pub fn site_controller_runtime_plan_from_controller_plan(
         kubernetes_namespace: plan.kubernetes_namespace.clone(),
         context: plan.context.clone(),
         observability_endpoint: plan.observability_endpoint.clone(),
+        vm_endpoint_forward_ready_timeout_secs: plan.vm_endpoint_forward_ready_timeout_secs,
         launch_env: plan.launch_env.clone(),
     }
 }

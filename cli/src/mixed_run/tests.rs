@@ -499,6 +499,19 @@ fn reserve_loopback_port_shares_allocator_with_site_controller_runtime() {
     }
 }
 
+#[test]
+fn reserve_host_port_shares_allocator_with_loopback_reservations() {
+    let host_port = reserve_host_port().expect("host port reservation should succeed");
+    for _ in 0..32 {
+        let loopback_port =
+            reserve_loopback_port().expect("loopback port reservation should succeed");
+        assert_ne!(
+            loopback_port, host_port,
+            "host and loopback reservations must use the same shared pool",
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn stop_kubernetes_namespace_force_deletes_stuck_pods_before_retrying() {

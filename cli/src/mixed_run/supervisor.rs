@@ -244,7 +244,7 @@ pub(super) fn build_supervisor_plan(
             input.site_plan.site.kind,
             SiteKind::Direct | SiteKind::Vm | SiteKind::Compose
         ) {
-            Some(reserve_loopback_port()?)
+            Some(reserve_host_port()?)
         } else {
             None
         },

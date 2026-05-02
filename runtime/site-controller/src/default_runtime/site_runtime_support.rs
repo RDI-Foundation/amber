@@ -228,7 +228,21 @@ pub fn observability_endpoint_for_site(kind: SiteKind, endpoint: &str) -> Result
     Ok(url.to_string())
 }
 
+#[derive(Clone, Copy)]
+enum PortBindScope {
+    Loopback,
+    Host,
+}
+
 pub fn reserve_loopback_port() -> Result<u16> {
+    reserve_port(PortBindScope::Loopback)
+}
+
+pub fn reserve_host_port() -> Result<u16> {
+    reserve_port(PortBindScope::Host)
+}
+
+fn reserve_port(scope: PortBindScope) -> Result<u16> {
     const LOOPBACK_PORT_RANGE_START: u16 = 30000;
     const LOOPBACK_PORT_RANGE_END: u16 = 60000;
     static RESERVED_LOOPBACK_PORTS: OnceLock<std::sync::Mutex<BTreeSet<u16>>> = OnceLock::new();
@@ -249,21 +263,25 @@ pub fn reserve_loopback_port() -> Result<u16> {
         if reserved.contains(&port) {
             continue;
         }
-        match TcpListener::bind(("127.0.0.1", port)) {
-            Ok(listener) => {
-                drop(listener);
-                reserved.insert(port);
-                return Ok(port);
-            }
-            Err(_) => continue,
+        if port_available(port, scope) {
+            reserved.insert(port);
+            return Ok(port);
         }
     }
 
     Err(miette::miette!(
-        "failed to allocate a unique loopback port in {}-{}",
+        "failed to allocate a unique local port in {}-{}",
         LOOPBACK_PORT_RANGE_START,
         LOOPBACK_PORT_RANGE_END - 1
     ))
+}
+
+fn port_available(port: u16, scope: PortBindScope) -> bool {
+    let addr = match scope {
+        PortBindScope::Loopback => "127.0.0.1",
+        PortBindScope::Host => "0.0.0.0",
+    };
+    TcpListener::bind((addr, port)).is_ok()
 }
 
 pub(super) fn site_supervisor_plan_path(site_state_root: &Path) -> PathBuf {
@@ -1183,7 +1201,11 @@ pub(super) fn resolve_desktop_container_host_ip() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, net::SocketAddr};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        net::{SocketAddr, TcpListener},
+    };
 
     use amber_compiler::{
         mesh::{PROXY_METADATA_FILENAME, PROXY_METADATA_VERSION},
@@ -1196,12 +1218,32 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        LaunchedSite, SITE_PLAN_SCHEMA, SITE_PLAN_VERSION, SiteReceipt, SiteSupervisorPlan,
-        external_slot_url, resolve_link_external_url_for_output, router_mesh_addr_for_consumer,
+        LaunchedSite, PortBindScope, SITE_PLAN_SCHEMA, SITE_PLAN_VERSION, SiteReceipt,
+        SiteSupervisorPlan, external_slot_url, port_available,
+        resolve_link_external_url_for_output, router_mesh_addr_for_consumer,
         should_prepare_kubernetes_namespace,
     };
     #[cfg(unix)]
     use super::{parse_process_status_code, process_tree_postorder_from_ps};
+
+    #[test]
+    fn host_port_availability_rejects_ports_bound_on_non_primary_loopback() {
+        let Ok(listener) = TcpListener::bind(("127.0.0.2", 0)) else {
+            return;
+        };
+        let port = listener
+            .local_addr()
+            .expect("listener local addr should be available")
+            .port();
+        if !port_available(port, PortBindScope::Loopback) {
+            return;
+        }
+
+        assert!(
+            !port_available(port, PortBindScope::Host),
+            "host-port reservations must reject ports that would make a 0.0.0.0 bind fail"
+        );
+    }
 
     fn kubernetes_supervisor_plan(context: Option<&str>) -> SiteSupervisorPlan {
         SiteSupervisorPlan {

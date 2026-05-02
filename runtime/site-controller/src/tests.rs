@@ -2752,6 +2752,7 @@ fn test_control_state_app(
             kubernetes_namespace: None,
             context: None,
             observability_endpoint: None,
+            vm_endpoint_forward_ready_timeout_secs: None,
             launch_env: BTreeMap::new(),
         }),
         authority_locks: Arc::new(Mutex::new(BTreeMap::new())),

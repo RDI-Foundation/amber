@@ -289,6 +289,8 @@ pub struct SiteControllerPlan {
     pub context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observability_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_endpoint_forward_ready_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub launch_env: BTreeMap<String, String>,
 }
@@ -1283,6 +1285,9 @@ pub fn write_site_controller_plan(
         kubernetes_namespace: kubernetes_namespace.map(str::to_string),
         context: context.map(str::to_string),
         observability_endpoint: observability_endpoint.map(str::to_string),
+        vm_endpoint_forward_ready_timeout_secs: Some(
+            crate::default_runtime::vm_endpoint_forward_ready_timeout().as_secs(),
+        ),
         launch_env: launch_env.clone(),
     };
     write_json(path, &plan)?;
