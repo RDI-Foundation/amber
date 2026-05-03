@@ -234,6 +234,18 @@ enum PortBindScope {
     Host,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PortRange {
+    start: u16,
+    end: u16,
+}
+
+impl PortRange {
+    fn contains(self, port: u16) -> bool {
+        self.start <= port && port <= self.end
+    }
+}
+
 pub fn reserve_loopback_port() -> Result<u16> {
     reserve_port(PortBindScope::Loopback)
 }
@@ -244,13 +256,14 @@ pub fn reserve_host_port() -> Result<u16> {
 
 fn reserve_port(scope: PortBindScope) -> Result<u16> {
     const LOOPBACK_PORT_RANGE_START: u16 = 30000;
-    const LOOPBACK_PORT_RANGE_END: u16 = 60000;
+    const LOOPBACK_PORT_RANGE_END: u16 = 65000;
     static RESERVED_LOOPBACK_PORTS: OnceLock<std::sync::Mutex<BTreeSet<u16>>> = OnceLock::new();
 
     let reserved = RESERVED_LOOPBACK_PORTS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()));
     let mut reserved = reserved
         .lock()
         .expect("loopback port allocator should not be poisoned");
+    let ephemeral_range = host_ephemeral_port_range();
     let span = u32::from(LOOPBACK_PORT_RANGE_END - LOOPBACK_PORT_RANGE_START);
     let mut next =
         LOOPBACK_PORT_RANGE_START + (std::process::id() % span) as u16 + reserved.len() as u16;
@@ -261,6 +274,11 @@ fn reserve_port(scope: PortBindScope) -> Result<u16> {
         let port = next;
         next += 1;
         if reserved.contains(&port) {
+            continue;
+        }
+        // These ports become listeners after allocation; avoid ports the kernel may choose first
+        // for local outbound clients while the runtime is still starting.
+        if !port_allowed_for_runtime_listener(port, ephemeral_range) {
             continue;
         }
         if port_available(port, scope) {
@@ -274,6 +292,54 @@ fn reserve_port(scope: PortBindScope) -> Result<u16> {
         LOOPBACK_PORT_RANGE_START,
         LOOPBACK_PORT_RANGE_END - 1
     ))
+}
+
+fn port_allowed_for_runtime_listener(port: u16, ephemeral_range: Option<PortRange>) -> bool {
+    !ephemeral_range.is_some_and(|range| range.contains(port))
+}
+
+#[cfg(target_os = "linux")]
+fn host_ephemeral_port_range() -> Option<PortRange> {
+    parse_linux_ephemeral_port_range(
+        &fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").ok()?,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_ephemeral_port_range(raw: &str) -> Option<PortRange> {
+    let mut parts = raw.split_whitespace();
+    let start = parts.next()?.parse::<u16>().ok()?;
+    let end = parts.next()?.parse::<u16>().ok()?;
+    (start <= end).then_some(PortRange { start, end })
+}
+
+#[cfg(target_os = "macos")]
+fn host_ephemeral_port_range() -> Option<PortRange> {
+    let start = sysctl_port("net.inet.ip.portrange.first")?;
+    let end = sysctl_port("net.inet.ip.portrange.last")?;
+    (start <= end).then_some(PortRange { start, end })
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_port(name: &str) -> Option<u16> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&value);
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut libc::c_int).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && (0..=u16::MAX as libc::c_int).contains(&value)).then_some(value as u16)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn host_ephemeral_port_range() -> Option<PortRange> {
+    None
 }
 
 fn port_available(port: u16, scope: PortBindScope) -> bool {
@@ -1217,14 +1283,44 @@ mod tests {
     use base64::Engine as _;
     use tempfile::tempdir;
 
+    #[cfg(target_os = "linux")]
+    use super::parse_linux_ephemeral_port_range;
     use super::{
-        LaunchedSite, PortBindScope, SITE_PLAN_SCHEMA, SITE_PLAN_VERSION, SiteReceipt,
-        SiteSupervisorPlan, external_slot_url, port_available,
+        LaunchedSite, PortBindScope, PortRange, SITE_PLAN_SCHEMA, SITE_PLAN_VERSION, SiteReceipt,
+        SiteSupervisorPlan, external_slot_url, port_allowed_for_runtime_listener, port_available,
         resolve_link_external_url_for_output, router_mesh_addr_for_consumer,
         should_prepare_kubernetes_namespace,
     };
     #[cfg(unix)]
     use super::{parse_process_status_code, process_tree_postorder_from_ps};
+
+    #[test]
+    fn runtime_port_allocator_rejects_ephemeral_client_ports() {
+        let linux_default = Some(PortRange {
+            start: 32768,
+            end: 60999,
+        });
+
+        assert!(
+            !port_allowed_for_runtime_listener(46274, linux_default),
+            "runtime listeners must not use ports the kernel can choose for outbound clients"
+        );
+        assert!(port_allowed_for_runtime_listener(30000, linux_default));
+        assert!(port_allowed_for_runtime_listener(61000, linux_default));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_ephemeral_port_range() {
+        assert_eq!(
+            parse_linux_ephemeral_port_range("32768\t60999\n"),
+            Some(PortRange {
+                start: 32768,
+                end: 60999
+            })
+        );
+        assert_eq!(parse_linux_ephemeral_port_range("60999 32768"), None);
+    }
 
     #[test]
     fn host_port_availability_rejects_ports_bound_on_non_primary_loopback() {
