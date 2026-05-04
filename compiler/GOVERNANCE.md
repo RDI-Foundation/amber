@@ -63,9 +63,7 @@ At compile time, Amber:
 Each component that declares `policies` defines one governed realm rooted at that component's
 moniker.
 
-Today, governance-enabled compilation is supported through the CLI runtime path. `amber-manager`
-still rejects governance-enabled compilation until the governance runtime is extracted into a
-shared implementation.
+Governance-enabled compilation is supported through the CLI runtime path.
 
 ## Writing a Policy Manifest
 

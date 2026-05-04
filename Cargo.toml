@@ -9,7 +9,6 @@ members = [
   "compiler/scenario",
   "compiler/template",
   "images",
-  "manager",
   "runtime/docker-gateway",
   "runtime/helper",
   "runtime/mesh",
