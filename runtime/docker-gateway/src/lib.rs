@@ -629,7 +629,7 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
         let is_pull = req
             .uri()
             .query()
-            .and_then(|q| serde_urlencoded::from_str::<Vec<(String, String)>>(q).ok())
+            .map(parse_query_pairs)
             .map(|params| {
                 params.iter().any(|(k, _)| k == "fromImage")
                     && !params.iter().any(|(k, _)| k == "fromSrc")
@@ -916,8 +916,7 @@ fn build_label_filter_query(required_labels: &[String], include_all: bool) -> St
     }
     query_pairs.push(("filters".to_string(), encoded_filters));
 
-    serde_urlencoded::to_string(query_pairs)
-        .expect("serializing static label query params should succeed")
+    encode_query_pairs(&query_pairs)
 }
 
 async fn shutdown_signal() -> ShutdownReason {
@@ -1520,15 +1519,24 @@ fn ensure_host(req: &mut Request<ProxyBody>) {
     }
 }
 
+fn parse_query_pairs(query: &str) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect()
+}
+
+fn encode_query_pairs(pairs: &[(String, String)]) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in pairs {
+        serializer.append_pair(key, value);
+    }
+    serializer.finish()
+}
+
 fn add_label_filters_to_uri(uri: &Uri, required: &[String]) -> GatewayResult<Uri> {
     let path = uri.path().to_string();
     let mut pairs: Vec<(String, String)> = match uri.query() {
-        Some(query) => serde_urlencoded::from_str(query).map_err(|err| {
-            boxed_response(docker_error(
-                StatusCode::BAD_REQUEST,
-                format!("invalid query parameters: {err}"),
-            ))
-        })?,
+        Some(query) => parse_query_pairs(query),
         None => Vec::new(),
     };
 
@@ -1570,12 +1578,7 @@ fn add_label_filters_to_uri(uri: &Uri, required: &[String]) -> GatewayResult<Uri
         pairs.push(("filters".to_string(), new_filters));
     }
 
-    let new_query = serde_urlencoded::to_string(&pairs).map_err(|err| {
-        boxed_response(docker_error(
-            StatusCode::BAD_REQUEST,
-            format!("query parameter serialization error: {err}"),
-        ))
-    })?;
+    let new_query = encode_query_pairs(&pairs);
 
     let path_and_query = if new_query.is_empty() {
         path

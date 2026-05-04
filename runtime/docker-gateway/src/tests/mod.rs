@@ -535,8 +535,7 @@ fn decode_filters(req: &CapturedRequest) -> serde_json::Value {
         .path_and_query
         .split_once('?')
         .expect("request should include query");
-    let query_map: HashMap<String, String> =
-        serde_urlencoded::from_str(query).expect("query should decode");
+    let query_map: HashMap<String, String> = parse_query_pairs(query).into_iter().collect();
     let filters = query_map.get("filters").expect("filters query param");
     serde_json::from_str(filters).expect("filters should be valid json")
 }

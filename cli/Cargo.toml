@@ -23,7 +23,7 @@ axum = { version = "0.8.6", features = ["http1", "json", "tokio"] }
 base64 = { workspace = true }
 clap = { version = "4.5.46", features = ["derive"] }
 crossterm = "0.29.0"
-fatfs = "0.3.6"
+fatfs = { version = "=0.3.6", default-features = false, features = ["std", "alloc"] }
 jsonschema = { workspace = true, default-features = false }
 libc = "0.2.177"
 miette = { workspace = true, features = ["fancy"] }

@@ -50,8 +50,7 @@ fn add_label_filters_to_uri_accepts_object_labels() {
     let required = vec!["c=d".to_string()];
     let out = add_label_filters_to_uri(&uri, &required).expect("filters");
     let query = out.query().expect("query");
-    let parsed_query: HashMap<String, String> =
-        serde_urlencoded::from_str(query).expect("query should decode");
+    let parsed_query: HashMap<String, String> = parse_query_pairs(query).into_iter().collect();
     let filters = parsed_query.get("filters").expect("filters");
     let parsed_filters: serde_json::Value = serde_json::from_str(filters).expect("json");
     let labels = parsed_filters
@@ -77,8 +76,7 @@ fn add_label_filters_to_uri_uses_object_labels_with_name_filter() {
     let required = vec!["amber.component=/green".to_string()];
     let out = add_label_filters_to_uri(&uri, &required).expect("filters");
     let query = out.query().expect("query");
-    let parsed_query: HashMap<String, String> =
-        serde_urlencoded::from_str(query).expect("query should decode");
+    let parsed_query: HashMap<String, String> = parse_query_pairs(query).into_iter().collect();
     let filters = parsed_query.get("filters").expect("filters");
     let parsed_filters: serde_json::Value = serde_json::from_str(filters).expect("json");
 
@@ -121,8 +119,7 @@ fn add_label_filters_to_uri_rewrites_compose_project_filter() {
 
     let out = add_label_filters_to_uri(&uri, &required).expect("filters");
     let query = out.query().expect("query");
-    let parsed_query: HashMap<String, String> =
-        serde_urlencoded::from_str(query).expect("query should decode");
+    let parsed_query: HashMap<String, String> = parse_query_pairs(query).into_iter().collect();
     let filters = parsed_query.get("filters").expect("filters");
     let parsed_filters: serde_json::Value = serde_json::from_str(filters).expect("json");
     let labels = parsed_filters
