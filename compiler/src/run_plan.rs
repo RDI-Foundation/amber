@@ -2714,7 +2714,7 @@ fn framework_component_managed_site_id(
 fn framework_component_controller_provide_name(grant: &FrameworkComponentGrantKey) -> String {
     format!(
         "{FRAMEWORK_COMPONENT_CONTROLLER_PROVIDE_PREFIX}__site_{}__authority_{}",
-        sanitize_framework_component_identifier(grant.managed_site.as_str()),
+        framework_component_site_token(grant.managed_site.as_str()),
         grant.authority_realm.0,
     )
 }
@@ -2722,7 +2722,7 @@ fn framework_component_controller_provide_name(grant: &FrameworkComponentGrantKe
 pub fn framework_component_controller_remote_slot_name(site_id: &str) -> String {
     format!(
         "{FRAMEWORK_COMPONENT_CONTROLLER_REMOTE_SLOT_PREFIX}__{}",
-        sanitize_framework_component_identifier(site_id),
+        framework_component_site_token(site_id),
     )
 }
 
@@ -2732,7 +2732,7 @@ fn unique_framework_component_controller_moniker(
 ) -> String {
     let base = format!(
         "{FRAMEWORK_COMPONENT_CONTROLLER_MONIKER_PREFIX}/{}",
-        sanitize_framework_component_identifier(execution_site),
+        framework_component_site_token(execution_site),
     );
     let used = scenario
         .components_iter()
@@ -2751,20 +2751,18 @@ fn unique_framework_component_controller_moniker(
     }
 }
 
-fn sanitize_framework_component_identifier(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push('_');
-        }
+fn framework_component_site_token(site_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    // These tokens are embedded in synthetic slot/provide map keys, so lossy sanitization is not
+    // enough: distinct authored site ids must remain distinct after lowering.
+    let mut out = String::with_capacity("site_".len() + site_id.len() * 2);
+    out.push_str("site_");
+    for byte in site_id.bytes() {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    if out.is_empty() {
-        "internal".to_string()
-    } else {
-        out
-    }
+    out
 }
 
 fn next_framework_component_controller_port(
@@ -3094,6 +3092,21 @@ mod tests {
 }"#
     }
 
+    fn framework_admin_image_manifest() -> &'static str {
+        r#"{
+  manifest_version: "0.3.0",
+  slots: { ctl: { kind: "component" } },
+  program: {
+    image: "busybox:1.36.1",
+    entrypoint: ["sh", "-c", "sleep 30"],
+    env: { CTL_URL: "${slots.ctl.url}" },
+    network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+  },
+  provides: { api: { kind: "http", endpoint: "http" } },
+  exports: { api: "api" }
+}"#
+    }
+
     fn framework_admin_vm_manifest() -> &'static str {
         r##"{
   manifest_version: "0.3.0",
@@ -3184,6 +3197,13 @@ mod tests {
         panic!(
             "synthetic framework.component controller for site `{execution_site}` should be \
              present;\ncomponents:\n{seen}\nbindings:\n{bindings}"
+        )
+    }
+
+    fn framework_controller_moniker_for_site(site_id: &str) -> String {
+        format!(
+            "{FRAMEWORK_COMPONENT_CONTROLLER_MONIKER_PREFIX}/{}",
+            framework_component_site_token(site_id)
         )
     }
 
@@ -3430,7 +3450,7 @@ mod tests {
         assert!(plan.sites.contains_key("guest_vm"));
         assert_eq!(
             plan.sites["host_direct"].assigned_components,
-            vec!["/__amber_internal_framework_component_controller/host_direct".to_string()]
+            vec![framework_controller_moniker_for_site("host_direct")]
         );
         assert_eq!(
             plan.sites["guest_vm"].assigned_components,
@@ -3654,6 +3674,118 @@ mod tests {
             |binding| !matches!(&binding.from, BindingFrom::Framework(framework) if framework.capability.as_str() == "component")
         ));
         assert!(plan.links.is_empty());
+    }
+
+    #[tokio::test]
+    async fn framework_component_lowering_keeps_colliding_managed_site_grants_distinct() {
+        let dir = tmp_dir("run-plan-framework-component-colliding-grants-");
+        let admin = dir.path().join("admin.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&admin, framework_admin_vm_manifest());
+        write(
+            &root,
+            r###"{
+  manifest_version: "0.3.0",
+  components: {
+    dash: "./admin.json5",
+    underscore: "./admin.json5"
+  },
+  bindings: [
+    { to: "#dash.ctl", from: "framework.component" },
+    { to: "#underscore.ctl", from: "framework.component" }
+  ],
+  exports: {
+    dash_api: "#dash.api",
+    underscore_api: "#underscore.api"
+  }
+}"###,
+        );
+        let placement = PlacementFile {
+            schema: PLACEMENT_SCHEMA.to_string(),
+            version: PLACEMENT_VERSION,
+            sites: BTreeMap::from([
+                (
+                    "direct_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                        controller_site: None,
+                    },
+                ),
+                (
+                    "site-a".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Vm,
+                        context: None,
+                        controller_site: Some("direct_local".to_string()),
+                    },
+                ),
+                (
+                    "site_a".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Vm,
+                        context: None,
+                        controller_site: Some("direct_local".to_string()),
+                    },
+                ),
+            ]),
+            defaults: PlacementDefaults {
+                path: Some("direct_local".to_string()),
+                image: None,
+                vm: Some("site-a".to_string()),
+            },
+            components: BTreeMap::from([
+                ("/dash".to_string(), "site-a".to_string()),
+                ("/underscore".to_string(), "site_a".to_string()),
+            ]),
+            dynamic_capabilities: None,
+            framework_children: None,
+        };
+
+        let compiled = compile(&root).await;
+        let plan = build_run_plan(&compiled, Some(&placement)).expect("run plan should build");
+        let lowered = CompiledScenario::from_ir(plan.base_scenario.clone())
+            .expect("lowered base scenario should deserialize");
+        let scenario = lowered.scenario();
+        let (controller_id, controller, metadata) =
+            framework_controller_component_for_site(scenario, "direct_local");
+        let managed_sites = metadata
+            .grants
+            .values()
+            .map(|grant| grant.managed_site.clone())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            managed_sites,
+            BTreeSet::from(["site-a".to_string(), "site_a".to_string()]),
+            "colliding sanitized site ids must not overwrite each other's controller grants",
+        );
+        assert_eq!(
+            controller.provides.len(),
+            3,
+            "controller should expose one internal provide plus one provide per managed site",
+        );
+
+        for (moniker, expected_site) in [("/dash", "site-a"), ("/underscore", "site_a")] {
+            let binding = scenario
+                .bindings
+                .iter()
+                .find(|binding| {
+                    graph::component_path(scenario, binding.to.component) == moniker
+                        && binding.to.name == "ctl"
+                })
+                .expect("framework binding should remain present");
+            let BindingFrom::Component(provide) = &binding.from else {
+                panic!("framework binding should lower to a synthetic controller provide");
+            };
+            assert_eq!(provide.component, controller_id);
+            let grant = metadata
+                .grants
+                .get(&provide.name)
+                .expect("lowered controller provide should carry grant metadata");
+            assert_eq!(grant.managed_site, expected_site);
+        }
     }
 
     #[tokio::test]
@@ -3897,6 +4029,110 @@ mod tests {
                         != framework_component_controller_remote_slot_name("direct_local")
             }),
             "creating into the compose standby site should not synthesize an unused reverse route",
+        );
+    }
+
+    #[tokio::test]
+    async fn framework_component_lowering_keeps_colliding_remote_controller_slots_distinct() {
+        let dir = tmp_dir("run-plan-framework-component-colliding-remote-slots-");
+        let admin = dir.path().join("admin.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&admin, framework_admin_image_manifest());
+        write(
+            &root,
+            r##"{
+  manifest_version: "0.3.0",
+  slots: { realm: { kind: "component", optional: true } },
+  components: { admin: "./admin.json5" },
+  child_templates: {
+    worker: {
+      possible_backends: ["direct"]
+    }
+  },
+  bindings: [
+    { to: "#admin.ctl", from: "framework.component" }
+  ],
+  exports: { admin_api: "#admin.api" }
+}"##,
+        );
+        let placement = PlacementFile {
+            schema: PLACEMENT_SCHEMA.to_string(),
+            version: PLACEMENT_VERSION,
+            sites: BTreeMap::from([
+                (
+                    "compose_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Compose,
+                        context: None,
+                        controller_site: None,
+                    },
+                ),
+                (
+                    "site-a".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                        controller_site: None,
+                    },
+                ),
+                (
+                    "site_a".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                        controller_site: None,
+                    },
+                ),
+            ]),
+            defaults: PlacementDefaults {
+                path: Some("site-a".to_string()),
+                image: Some("compose_local".to_string()),
+                vm: None,
+            },
+            components: BTreeMap::new(),
+            dynamic_capabilities: None,
+            framework_children: None,
+        };
+
+        let compiled = compile(&root).await;
+        let plan = build_run_plan(&compiled, Some(&placement)).expect("run plan should build");
+        let lowered = CompiledScenario::from_ir(plan.base_scenario.clone())
+            .expect("lowered scenario should deserialize");
+        let scenario = lowered.scenario();
+        let (compose_controller_id, _, _) =
+            framework_controller_component_for_site(scenario, "compose_local");
+        let site_dash_slot = framework_component_controller_remote_slot_name("site-a");
+        let site_underscore_slot = framework_component_controller_remote_slot_name("site_a");
+
+        assert_ne!(
+            site_dash_slot, site_underscore_slot,
+            "remote controller slots must preserve distinct authored site ids",
+        );
+        let remote_bindings = scenario
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.to.component == compose_controller_id
+                    && binding
+                        .to
+                        .name
+                        .starts_with(FRAMEWORK_COMPONENT_CONTROLLER_REMOTE_SLOT_PREFIX)
+            })
+            .collect::<Vec<_>>();
+        let remote_slots = remote_bindings
+            .iter()
+            .map(|binding| binding.to.name.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            remote_bindings.len(),
+            2,
+            "compose controller should bind to both colliding direct-site controllers",
+        );
+        assert_eq!(
+            remote_slots,
+            BTreeSet::from([site_dash_slot, site_underscore_slot]),
+            "remote controller routes must not collapse onto one synthetic slot",
         );
     }
 
@@ -4273,12 +4509,12 @@ mod tests {
             plan.sites["compose_local"].assigned_components,
             vec![
                 "/".to_string(),
-                "/__amber_internal_framework_component_controller/compose_local".to_string(),
+                framework_controller_moniker_for_site("compose_local"),
             ]
         );
         assert_eq!(
             plan.sites["direct_local"].assigned_components,
-            vec!["/__amber_internal_framework_component_controller/direct_local".to_string()]
+            vec![framework_controller_moniker_for_site("direct_local")]
         );
         assert!(
             plan.sites["direct_local"]
