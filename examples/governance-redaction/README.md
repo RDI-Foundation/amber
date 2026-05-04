@@ -7,7 +7,9 @@ uses them directly, and the governance `use` config passes them to the policy as
 `redaction_terms` list using `$${config...}`. The policy forwards those refs into the generated
 interposer config, and the interposer resolves the concrete values later at normal runtime.
 
-The policy lives in [policy.py](/Users/staverm/code/work/amber/examples/governance-redaction/policy.py), with reusable request/response helpers in [policy_lib.py](/Users/staverm/code/work/amber/examples/governance-redaction/policy_lib.py) and the generated interposer builder in [redactor_interposer.py](/Users/staverm/code/work/amber/examples/governance-redaction/redactor_interposer.py).
+The policy lives in [policy.py](policy.py), with reusable request/response helpers in
+[policy_lib.py](policy_lib.py) and the generated interposer builder in
+[redactor_interposer.py](redactor_interposer.py).
 
 At runtime, `caller` sends both secret values to `responder` over `a2a`, `responder` echoes the
 payload back, and the policy injects a redaction interposer in between. The `status` export from
