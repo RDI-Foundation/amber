@@ -1637,28 +1637,33 @@ mod direct_input_tests {
 
     #[test]
     fn dynamic_site_controller_overlay_uses_child_controller_route_grants() {
+        let controller_moniker =
+            amber_compiler::run_plan::FrameworkComponentControllerMoniker::for_site("site-a")
+                .into_string();
+        let grant_provide =
+            amber_compiler::run_plan::FrameworkComponentSiteToken::for_site("site-a")
+                .controller_grant_provide_name(amber_scenario::ComponentId(0));
         let internal_route_id = component_route_id(
-            "/__amber_internal_framework_component_controller/site-a",
+            controller_moniker.as_str(),
             amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
             MeshProtocol::Http,
         );
         let grant_route_id = component_route_id(
-            "/__amber_internal_framework_component_controller/site-a",
-            "__amber_internal_framework_component__site_site-a__authority_root",
+            controller_moniker.as_str(),
+            grant_provide.as_str(),
             MeshProtocol::Http,
         );
         let live_components = BTreeMap::from([
             (
-                "/__amber_internal_framework_component_controller/site-a".to_string(),
+                controller_moniker.clone(),
                 LiveComponentRuntimeMetadata {
-                    moniker: "/__amber_internal_framework_component_controller/site-a".to_string(),
+                    moniker: controller_moniker.clone(),
                     router_reachable_mesh_addr: "127.0.0.1:24000".to_string(),
                     component_reachable_mesh_addr: "127.0.0.1:24000".to_string(),
                     control_endpoint: Some(ControlEndpoint::Unix("/tmp/controller.sock".into())),
                     mesh_config: MeshConfigPublic {
                         identity: MeshIdentityPublic {
-                            id: "/__amber_internal_framework_component_controller/site-a"
-                                .to_string(),
+                            id: controller_moniker.clone(),
                             public_key: [1; 32],
                             mesh_scope: None,
                         },
@@ -1725,8 +1730,7 @@ mod direct_input_tests {
                 assigned_components: vec!["/job-dynamic".to_string()],
                 controller_routes: vec![InboundRoute {
                     route_id: grant_route_id.clone(),
-                    capability: "__amber_internal_framework_component__site_site-a__authority_root"
-                        .to_string(),
+                    capability: grant_provide,
                     capability_kind: Some("framework.component".to_string()),
                     capability_profile: None,
                     protocol: MeshProtocol::Http,

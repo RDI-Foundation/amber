@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use amber_compiler::run_plan::FrameworkComponentControllerMoniker;
+
 use super::*;
 
 #[test]
@@ -178,16 +180,15 @@ fn mixed_run_dry_run_emits_launch_bundle_without_starting_sites() {
     let stitching = launch_bundle["stitching"]
         .as_array()
         .expect("launch bundle stitching should serialize as an array");
-    let controller_prefix = "/__amber_internal_framework_component_controller/";
     let controller_stitching = stitching
         .iter()
         .filter(|link| {
             link["provider_component"]
                 .as_str()
-                .is_some_and(|component| component.starts_with(controller_prefix))
+                .is_some_and(FrameworkComponentControllerMoniker::is_synthetic_component)
                 || link["consumer_component"]
                     .as_str()
-                    .is_some_and(|component| component.starts_with(controller_prefix))
+                    .is_some_and(FrameworkComponentControllerMoniker::is_synthetic_component)
         })
         .collect::<Vec<_>>();
     let user_stitching = stitching
@@ -195,10 +196,10 @@ fn mixed_run_dry_run_emits_launch_bundle_without_starting_sites() {
         .filter(|link| {
             !link["provider_component"]
                 .as_str()
-                .is_some_and(|component| component.starts_with(controller_prefix))
+                .is_some_and(FrameworkComponentControllerMoniker::is_synthetic_component)
                 && !link["consumer_component"]
                     .as_str()
-                    .is_some_and(|component| component.starts_with(controller_prefix))
+                    .is_some_and(FrameworkComponentControllerMoniker::is_synthetic_component)
         })
         .collect::<Vec<_>>();
     assert_eq!(user_stitching.len(), 1);

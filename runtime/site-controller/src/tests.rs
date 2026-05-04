@@ -9,7 +9,7 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use amber_compiler::run_plan::build_run_plan;
+use amber_compiler::run_plan::{FrameworkComponentControllerMoniker, build_run_plan};
 use amber_mesh::{
     InboundRoute, InboundTarget, MeshConfigPublic, MeshIdentityPublic, MeshPeer, MeshProtocol,
     OutboundRoute, TransportConfig,
@@ -6258,7 +6258,8 @@ async fn create_child_publishes_sites_before_resolving_cross_site_link_overlays(
         scenario.components.push(Some(amber_scenario::Component {
             id: controller_id,
             parent: Some(root_id),
-            moniker: format!("/__amber_internal_framework_component_controller/{execution_site}")
+            moniker: FrameworkComponentControllerMoniker::for_site(execution_site)
+                .into_string()
                 .into(),
             digest: scenario.component(root_id).digest,
             config: None,
@@ -6796,8 +6797,8 @@ async fn local_controller_requests_select_the_controller_for_the_current_site() 
     scenario.components.push(Some(amber_scenario::Component {
         id: compose_controller_id,
         parent: Some(root_id),
-        moniker: "/__amber_internal_framework_component_controller/compose_local"
-            .to_string()
+        moniker: FrameworkComponentControllerMoniker::for_site("compose_local")
+            .into_string()
             .into(),
         digest: scenario.component(root_id).digest,
         config: None,

@@ -863,9 +863,11 @@ mod tests {
                 "entrypoint": ["consumer"],
             }),
         );
+        let controller_moniker =
+            crate::run_plan::FrameworkComponentControllerMoniker::for_site("site-a").into_string();
         let mut controller = component(
             1,
-            "/__amber_internal_framework_component_controller/site-a",
+            controller_moniker.as_str(),
             json!({
                 "image": "controller",
                 "entrypoint": ["controller"],

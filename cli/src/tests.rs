@@ -225,7 +225,10 @@ fn proxy_telemetry_keeps_router_info_without_verbose_output() {
 fn direct_runtime_only_isolates_non_controller_components() {
     let controller = DirectComponentPlan {
         id: 1,
-        moniker: "/__amber_internal_framework_component_controller/direct_local".to_string(),
+        moniker: amber_compiler::run_plan::FrameworkComponentControllerMoniker::for_site(
+            "direct_local",
+        )
+        .into_string(),
         log_name: "controller".to_string(),
         source_dir: None,
         depends_on: Vec::new(),

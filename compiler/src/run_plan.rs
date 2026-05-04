@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    fmt,
     path::PathBuf,
 };
 
@@ -2321,6 +2322,87 @@ const FRAMEWORK_COMPONENT_CONTROLLER_CONTAINER_PATH: &str = "/usr/local/bin/ambe
 const FRAMEWORK_COMPONENT_CONTROLLER_PLAN_PATH: &str =
     "/amber/site/state/site-controller-plan.json";
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FrameworkComponentSiteToken(String);
+
+impl FrameworkComponentSiteToken {
+    pub fn for_site(site_id: &str) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        // These tokens are embedded in synthetic slot/provide map keys, so lossy sanitization is
+        // not enough: distinct authored site ids must remain distinct after lowering.
+        let mut out = String::with_capacity("site_".len() + site_id.len() * 2);
+        out.push_str("site_");
+        for byte in site_id.bytes() {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Self(out)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn controller_grant_provide_name(&self, authority_realm: ComponentId) -> String {
+        format!(
+            "{FRAMEWORK_COMPONENT_CONTROLLER_PROVIDE_PREFIX}__site_{}__authority_{}",
+            self.as_str(),
+            authority_realm.0,
+        )
+    }
+
+    pub fn controller_remote_slot_name(&self) -> String {
+        format!(
+            "{FRAMEWORK_COMPONENT_CONTROLLER_REMOTE_SLOT_PREFIX}__{}",
+            self.as_str(),
+        )
+    }
+}
+
+impl fmt::Display for FrameworkComponentSiteToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FrameworkComponentControllerMoniker(String);
+
+impl FrameworkComponentControllerMoniker {
+    pub fn for_site(site_id: &str) -> Self {
+        Self(format!(
+            "{FRAMEWORK_COMPONENT_CONTROLLER_MONIKER_PREFIX}/{}",
+            FrameworkComponentSiteToken::for_site(site_id),
+        ))
+    }
+
+    fn from_synthetic_string(moniker: String) -> Self {
+        debug_assert!(Self::is_synthetic_component(moniker.as_str()));
+        Self(moniker)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    pub fn is_synthetic_component(moniker: &str) -> bool {
+        moniker
+            .strip_prefix(FRAMEWORK_COMPONENT_CONTROLLER_MONIKER_PREFIX)
+            .is_some_and(|suffix| suffix.starts_with('/') && suffix.len() > 1)
+    }
+}
+
+impl fmt::Display for FrameworkComponentControllerMoniker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 fn has_public_framework_component_bindings(scenario: &Scenario) -> bool {
     scenario.bindings.iter().any(|binding| {
         matches!(
@@ -2555,6 +2637,7 @@ fn inject_site_controller_components(
             id: controller_id,
             parent: Some(rewritten.root),
             moniker: unique_framework_component_controller_moniker(&rewritten, &execution_site)
+                .into_string()
                 .into(),
             digest: rewritten.component(rewritten.root).digest,
             config: None,
@@ -2712,28 +2795,19 @@ fn framework_component_managed_site_id(
 }
 
 fn framework_component_controller_provide_name(grant: &FrameworkComponentGrantKey) -> String {
-    format!(
-        "{FRAMEWORK_COMPONENT_CONTROLLER_PROVIDE_PREFIX}__site_{}__authority_{}",
-        framework_component_site_token(grant.managed_site.as_str()),
-        grant.authority_realm.0,
-    )
+    FrameworkComponentSiteToken::for_site(grant.managed_site.as_str())
+        .controller_grant_provide_name(grant.authority_realm)
 }
 
 pub fn framework_component_controller_remote_slot_name(site_id: &str) -> String {
-    format!(
-        "{FRAMEWORK_COMPONENT_CONTROLLER_REMOTE_SLOT_PREFIX}__{}",
-        framework_component_site_token(site_id),
-    )
+    FrameworkComponentSiteToken::for_site(site_id).controller_remote_slot_name()
 }
 
 fn unique_framework_component_controller_moniker(
     scenario: &Scenario,
     execution_site: &str,
-) -> String {
-    let base = format!(
-        "{FRAMEWORK_COMPONENT_CONTROLLER_MONIKER_PREFIX}/{}",
-        framework_component_site_token(execution_site),
-    );
+) -> FrameworkComponentControllerMoniker {
+    let base = FrameworkComponentControllerMoniker::for_site(execution_site);
     let used = scenario
         .components_iter()
         .map(|(_, component)| component.moniker.as_str())
@@ -2745,24 +2819,10 @@ fn unique_framework_component_controller_moniker(
     loop {
         let candidate = format!("{base}-{suffix}");
         if !used.contains(candidate.as_str()) {
-            return candidate;
+            return FrameworkComponentControllerMoniker::from_synthetic_string(candidate);
         }
         suffix += 1;
     }
-}
-
-fn framework_component_site_token(site_id: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    // These tokens are embedded in synthetic slot/provide map keys, so lossy sanitization is not
-    // enough: distinct authored site ids must remain distinct after lowering.
-    let mut out = String::with_capacity("site_".len() + site_id.len() * 2);
-    out.push_str("site_");
-    for byte in site_id.bytes() {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 fn next_framework_component_controller_port(
@@ -3201,10 +3261,7 @@ mod tests {
     }
 
     fn framework_controller_moniker_for_site(site_id: &str) -> String {
-        format!(
-            "{FRAMEWORK_COMPONENT_CONTROLLER_MONIKER_PREFIX}/{}",
-            framework_component_site_token(site_id)
-        )
+        FrameworkComponentControllerMoniker::for_site(site_id).into_string()
     }
 
     async fn compile(root: &Path) -> CompiledScenario {
@@ -4729,16 +4786,37 @@ mod tests {
                 "direct_local".to_string()
             ]
         );
-        let controller_prefix = "/__amber_internal_framework_component_controller/";
         let user_link_count = plan
             .links
             .iter()
             .filter(|link| {
-                !link.provider_component.starts_with(controller_prefix)
-                    && !link.consumer_component.starts_with(controller_prefix)
+                !FrameworkComponentControllerMoniker::is_synthetic_component(
+                    link.provider_component.as_str(),
+                ) && !FrameworkComponentControllerMoniker::is_synthetic_component(
+                    link.consumer_component.as_str(),
+                )
             })
             .count();
         assert_eq!(user_link_count, 6);
+        let controller_assignment_sites = plan
+            .assignments
+            .iter()
+            .filter_map(|(component, site)| {
+                FrameworkComponentControllerMoniker::is_synthetic_component(component)
+                    .then_some(site.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            controller_assignment_sites,
+            BTreeSet::from([
+                "compose_b".to_string(),
+                "compose_e".to_string(),
+                "direct_local".to_string(),
+                "kind_c".to_string(),
+            ]),
+            "the five-site run plan should assign synthetic controllers for every non-VM active \
+             site before any live runtime work starts",
+        );
     }
 
     #[test]

@@ -1,3 +1,7 @@
+use std::collections::BTreeSet;
+
+use amber_compiler::run_plan::FrameworkComponentControllerMoniker;
+
 use super::*;
 
 #[test]
@@ -34,10 +38,11 @@ fn mixed_run_five_site_startup_state_and_teardown() {
     let assignments = run_plan["assignments"]
         .as_object()
         .expect("run plan assignments should be an object");
-    let controller_prefix = "/__amber_internal_framework_component_controller/";
     let user_assignments = assignments
         .iter()
-        .filter(|(component, _)| !component.starts_with(controller_prefix))
+        .filter(|(component, _)| {
+            !FrameworkComponentControllerMoniker::is_synthetic_component(component)
+        })
         .map(|(component, site)| (component.clone(), site.clone()))
         .collect::<serde_json::Map<_, _>>();
     assert_eq!(
@@ -50,19 +55,26 @@ fn mixed_run_five_site_startup_state_and_teardown() {
             ("/e".to_string(), json!("compose_e")),
         ])
     );
-    let controller_assignments = assignments
+    let controller_assignment_sites = assignments
         .iter()
-        .filter(|(component, _)| component.starts_with(controller_prefix))
-        .map(|(component, site)| (component.clone(), site.clone()))
-        .collect::<serde_json::Map<_, _>>();
+        .filter(|(component, _)| {
+            FrameworkComponentControllerMoniker::is_synthetic_component(component)
+        })
+        .map(|(_, site)| {
+            site.as_str()
+                .expect("assignment site should be a string")
+                .to_string()
+        })
+        .collect::<BTreeSet<_>>();
     assert_eq!(
-        controller_assignments,
-        serde_json::Map::from_iter([
-            (format!("{controller_prefix}compose_b"), json!("compose_b")),
-            (format!("{controller_prefix}compose_e"), json!("compose_e")),
-            (format!("{controller_prefix}direct_a"), json!("direct_a")),
-            (format!("{controller_prefix}kind_c"), json!("kind_c")),
-        ])
+        controller_assignment_sites,
+        BTreeSet::from([
+            "compose_b".to_string(),
+            "compose_e".to_string(),
+            "direct_a".to_string(),
+            "kind_c".to_string(),
+        ]),
+        "live startup should not depend on the private spelling of synthetic controller monikers",
     );
     assert_eq!(
         run.receipt["sites"]
