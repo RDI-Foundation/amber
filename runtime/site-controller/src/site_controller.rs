@@ -27,7 +27,10 @@ use super::{
         ControlDynamicRevokeRequest, ControlDynamicShareRequest,
         InternalDynamicResolveOriginRequest,
     },
-    http::{cleanup_dynamic_bridge_proxies, read_json, required_header, shutdown_signal},
+    http::{
+        cleanup_dynamic_bridge_proxies, post_json_with_retry, read_json, required_header,
+        shutdown_signal,
+    },
     orchestration::{
         ClearExportPeerOverlayRequest, ClearExternalSlotOverlayRequest, ProtocolApiError,
         PublishExportPeerOverlayRequest, PublishExternalSlotOverlayRequest,
@@ -515,16 +518,12 @@ async fn remote_controller_post<TReq: Serialize, TResp: DeserializeOwned>(
     path: &str,
     body: &TReq,
 ) -> std::result::Result<TResp, ProtocolApiError> {
-    let response = app
-        .control
-        .client
-        .post(format!(
-            "{}{}",
-            remote_controller_base_url(app, site_id)?.trim_end_matches('/'),
-            path
-        ))
-        .json(body)
-        .send()
+    let url = format!(
+        "{}{}",
+        remote_controller_base_url(app, site_id)?.trim_end_matches('/'),
+        path
+    );
+    let response = post_json_with_retry(&app.control.client, &url, body)
         .await
         .map_err(|err| {
             ProtocolApiError::control_state_unavailable(format!(

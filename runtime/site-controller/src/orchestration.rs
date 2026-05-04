@@ -731,39 +731,6 @@ fn remote_controller_base_url(
         })
 }
 
-const REMOTE_CONTROLLER_REQUEST_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
-const REMOTE_CONTROLLER_REQUEST_RETRY_DELAY: Duration = Duration::from_millis(250);
-
-fn should_retry_remote_controller_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
-    )
-}
-
-async fn post_json_with_retry<TReq: Serialize>(
-    client: &ReqwestClient,
-    url: &str,
-    body: &TReq,
-) -> std::result::Result<reqwest::Response, reqwest::Error> {
-    let deadline = tokio::time::Instant::now() + REMOTE_CONTROLLER_REQUEST_RETRY_TIMEOUT;
-    loop {
-        match client.post(url).json(body).send().await {
-            Ok(response)
-                if should_retry_remote_controller_status(response.status())
-                    && tokio::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(REMOTE_CONTROLLER_REQUEST_RETRY_DELAY).await;
-            }
-            Ok(response) => return Ok(response),
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(REMOTE_CONTROLLER_REQUEST_RETRY_DELAY).await;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
 async fn remote_controller_post_json<TReq: Serialize, TResp: for<'de> Deserialize<'de>>(
     app: &ControlStateApp,
     site_id: &str,
@@ -2280,57 +2247,4 @@ pub(super) async fn recover_control_state(app: &ControlStateApp) -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    use axum::{Json, Router, extract::State, response::Response, routing::post};
-    use serde_json::json;
-    use tokio::net::TcpListener;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn post_json_with_retry_tolerates_transient_service_unavailable() {
-        async fn handler(State(attempts): State<Arc<AtomicUsize>>) -> Response {
-            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-            if attempt < 2 {
-                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ok": false})))
-                    .into_response();
-            }
-            (StatusCode::OK, Json(json!({"ok": true}))).into_response()
-        }
-
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let app = Router::new()
-            .route("/retry", post(handler))
-            .with_state(attempts.clone());
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("listener should bind");
-        let addr = listener.local_addr().expect("listener addr");
-        let serve = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test server should run");
-        });
-
-        let response = post_json_with_retry(
-            &ReqwestClient::new(),
-            &format!("http://{addr}/retry"),
-            &json!({"hello": "world"}),
-        )
-        .await
-        .expect("request should eventually succeed");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
-
-        serve.abort();
-        let _ = serve.await;
-    }
 }

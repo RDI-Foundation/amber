@@ -2,7 +2,10 @@ use std::{
     fs,
     future::Future,
     io::{Read, Write},
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration as StdDuration,
 };
 
@@ -2941,6 +2944,69 @@ fn with_controller_endpoint(
         authority_locks: app.authority_locks.clone(),
         runtime: app.runtime.clone(),
     }
+}
+
+#[tokio::test]
+async fn remote_dynamic_capability_controller_post_retries_transient_unavailable() {
+    async fn handler(
+        axum::extract::State(attempts): axum::extract::State<Arc<AtomicUsize>>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+
+        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt < 2 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "code": "ControlStateUnavailable",
+                    "message": "site controller is still recovering"
+                })),
+            )
+                .into_response();
+        }
+        (StatusCode::OK, Json(json!({"held": []}))).into_response()
+    }
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (url, handle) = spawn_test_router(
+        Router::new()
+            .route(
+                "/v1/controller/dynamic-caps/held",
+                axum::routing::post(handler),
+            )
+            .with_state(attempts.clone()),
+    )
+    .await;
+    let (dir, state, state_path) = compile_empty_control_state().await;
+    let mut control = test_control_state_app(&dir, state, state_path);
+    install_remote_controller_peer_url_fixture(
+        &mut control,
+        &BTreeMap::from([("remote".to_string(), url)]),
+    );
+    let app = SiteControllerApp {
+        control,
+        ready: ready_site_controller_flag(),
+    };
+
+    let response = super::site_controller::execute_site_controller_dynamic_caps_inspect(
+        &app,
+        super::control_state_api::DynamicCapsInspectRequest::HeldList(
+            dynamic_caps::ControlDynamicHeldListRequest {
+                holder_component_id: "components./caller".to_string(),
+            },
+        ),
+        false,
+    )
+    .await
+    .expect("request should succeed after transient controller unavailability");
+    let super::control_state_api::DynamicCapsInspectResponse::HeldList(response) = response else {
+        panic!("held_list should return held entries");
+    };
+    assert!(response.held.is_empty());
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+    handle.abort();
+    let _ = handle.await;
 }
 
 async fn install_framework_site_controller_fixture(
