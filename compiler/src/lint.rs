@@ -955,8 +955,7 @@ mod tests {
     fn config_used_in_use_config_is_not_linted() {
         let input = r##"
         {
-          manifest_version: "0.1.0",
-          experimental_features: ["governance"],
+          manifest_version: "0.4.0",
           config_schema: {
             type: "object",
             properties: {
@@ -1399,8 +1398,7 @@ mod tests {
     fn unused_use_is_linted() {
         let input = r#"
         {
-          manifest_version: "0.1.0",
-          experimental_features: ["governance"],
+          manifest_version: "0.4.0",
           use: {
             wrapper: "./wrapper.json5",
           },
@@ -1419,8 +1417,7 @@ mod tests {
     fn use_referenced_by_policy_is_not_linted() {
         let input = r##"
         {
-          manifest_version: "0.1.0",
-          experimental_features: ["governance"],
+          manifest_version: "0.4.0",
           use: {
             wrapper: "./wrapper.json5",
           },

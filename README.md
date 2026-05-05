@@ -26,14 +26,14 @@ runtimes.
 Install from npm if you want `amber run` locally:
 
 ```sh
-npm install -g @rdif/amber@^0.3
+npm install -g @rdif/amber@^0.4
 amber --help
 ```
 
 For zero-install `check`, `compile`, or `docs`, use the Dockerized CLI:
 
 ```sh
-docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.3 --help
+docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.4 --help
 ```
 
 If you are working on Amber itself:

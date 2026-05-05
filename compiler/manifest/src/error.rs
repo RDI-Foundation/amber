@@ -189,22 +189,6 @@ pub enum Error {
     )]
     FrameworkCapabilityRequiresFeature { capability: String, feature: String },
 
-    #[error(
-        "{} requires experimental feature `{feature}`",
-        section_requires_feature_description(section)
-    )]
-    #[diagnostic(
-        code(manifest::section_requires_feature),
-        help(
-            "Add this feature to `experimental_features` in the same manifest, or remove this \
-             section."
-        )
-    )]
-    SectionRequiresFeature {
-        section: &'static str,
-        feature: String,
-    },
-
     #[error("duplicate endpoint name `{name}`")]
     #[diagnostic(code(manifest::duplicate_endpoint_name))]
     DuplicateEndpointName { name: String },
@@ -305,6 +289,18 @@ pub enum Error {
         pointer: String,
     },
 
+    #[error(
+        "using {feature} requires manifest_version >= {required_version}, but found \
+         {manifest_version}"
+    )]
+    #[diagnostic(code(manifest::feature_requires_manifest_version))]
+    UnsupportedManifestFeatureForManifestVersion {
+        manifest_version: Box<Version>,
+        required_version: &'static str,
+        feature: &'static str,
+        pointer: String,
+    },
+
     // --- Environments (resolution environments) ---
     #[error("environment `{name}` extends unknown environment `{extends}`")]
     #[diagnostic(code(manifest::unknown_environment_extends))]
@@ -334,14 +330,6 @@ pub enum Error {
         )
     )]
     UnknownPolicyUse { alias: String },
-}
-
-fn section_requires_feature_description(section: &str) -> String {
-    match section {
-        "use" => "governance `use` section".to_string(),
-        "policies" => "`policies` section".to_string(),
-        other => format!("`{other}` section"),
-    }
 }
 
 fn manifest_validation_path(diag: &DiagnosticError) -> &str {

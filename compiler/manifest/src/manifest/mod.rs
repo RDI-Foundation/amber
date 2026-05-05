@@ -84,7 +84,6 @@ pub struct RawManifest {
 pub enum ExperimentalFeature {
     Docker,
     Kvm,
-    Governance,
 }
 
 impl fmt::Display for ExperimentalFeature {
@@ -92,11 +91,13 @@ impl fmt::Display for ExperimentalFeature {
         match self {
             ExperimentalFeature::Docker => f.write_str("docker"),
             ExperimentalFeature::Kvm => f.write_str("kvm"),
-            ExperimentalFeature::Governance => f.write_str("governance"),
         }
     }
 }
 
+const LATEST_MANIFEST_VERSION: Version = Version::new(0, 4, 0);
+const GOVERNANCE_MANIFEST_VERSION: Version = Version::new(0, 4, 0);
+const GOVERNANCE_MANIFEST_VERSION_STR: &str = "0.4.0";
 const SUPPORTED_MANIFEST_VERSION_REQ: &str = ">=0.1.0, <1.0.0";
 
 fn supported_manifest_version_req() -> &'static VersionReq {
@@ -132,6 +133,36 @@ fn validate_program_syntax_manifest_version(
         feature: unsupported.feature,
         pointer: unsupported.pointer,
     })
+}
+
+fn validate_governance_manifest_version(
+    manifest_version: &Version,
+    uses: &BTreeMap<String, ComponentDecl>,
+    policies: &[RawPolicyDecl],
+) -> Result<(), Error> {
+    if manifest_version >= &GOVERNANCE_MANIFEST_VERSION {
+        return Ok(());
+    }
+
+    if !uses.is_empty() {
+        return Err(Error::UnsupportedManifestFeatureForManifestVersion {
+            manifest_version: Box::new(manifest_version.clone()),
+            required_version: GOVERNANCE_MANIFEST_VERSION_STR,
+            feature: "governance `use` section",
+            pointer: "/use".to_string(),
+        });
+    }
+
+    if !policies.is_empty() {
+        return Err(Error::UnsupportedManifestFeatureForManifestVersion {
+            manifest_version: Box::new(manifest_version.clone()),
+            required_version: GOVERNANCE_MANIFEST_VERSION_STR,
+            feature: "governance `policies` section",
+            pointer: "/policies/0".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn find_unsupported_program_syntax(
@@ -477,21 +508,6 @@ fn require_framework_capability_feature(
     Err(Error::FrameworkCapabilityRequiresFeature {
         capability: capability.to_string(),
         feature: feature.to_string(),
-    })
-}
-
-fn require_section_feature(
-    section: &'static str,
-    required_feature: ExperimentalFeature,
-    enabled_features: &BTreeSet<ExperimentalFeature>,
-) -> Result<(), Error> {
-    if enabled_features.contains(&required_feature) {
-        return Ok(());
-    }
-
-    Err(Error::SectionRequiresFeature {
-        section,
-        feature: required_feature.to_string(),
     })
 }
 
@@ -912,21 +928,7 @@ impl RawManifest {
             .map_or((None, false), |(program, used)| (Some(program), used));
 
         validate_program_syntax_manifest_version(&manifest_version, program.as_ref())?;
-
-        if !r#use.is_empty() {
-            require_section_feature(
-                "use",
-                ExperimentalFeature::Governance,
-                &experimental_features,
-            )?;
-        }
-        if !policies.is_empty() {
-            require_section_feature(
-                "policies",
-                ExperimentalFeature::Governance,
-                &experimental_features,
-            )?;
-        }
+        validate_governance_manifest_version(&manifest_version, &r#use, &policies)?;
 
         if let Some(schema) = config_schema.as_ref() {
             ConfigSchema::validate_value(&schema.0)?;
@@ -1105,7 +1107,7 @@ impl Manifest {
 
     pub fn empty() -> Self {
         RawManifest {
-            manifest_version: Version::new(0, 2, 0),
+            manifest_version: LATEST_MANIFEST_VERSION,
             experimental_features: BTreeSet::new(),
             program: None,
             components: BTreeMap::new(),
@@ -1138,7 +1140,7 @@ impl Manifest {
 impl Manifest {
     #[builder]
     pub fn new(
-        #[builder(default = Version::new(0, 2, 0))] manifest_version: Version,
+        #[builder(default = LATEST_MANIFEST_VERSION)] manifest_version: Version,
         #[builder(default)] experimental_features: BTreeSet<ExperimentalFeature>,
         program: Option<Program>,
         #[builder(default)] components: BTreeMap<String, ComponentDecl>,

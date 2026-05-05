@@ -2,10 +2,10 @@ Error: manifest::invalid_name
 
   × check failed
   ╰─▶ invalid use name `wrap.per`: dots are reserved
-   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_name_invalid.json5:5:5]
- 4 │   use: {
- 5 │     "wrap.per": "./use_name_invalid_wrapper.json5",
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_name_invalid.json5:4:5]
+ 3 │   use: {
+ 4 │     "wrap.per": "./use_name_invalid_wrapper.json5",
    ·     ─────┬────
    ·          ╰── invalid name
- 6 │   },
+ 5 │   },
    ╰────

@@ -4,8 +4,7 @@ use super::*;
 fn use_entries_and_policies_parse() {
     let manifest: Manifest = r##"
         {
-          manifest_version: "0.1.0",
-          experimental_features: ["governance"],
+          manifest_version: "0.4.0",
           use: {
             wrapper: "https://example.com/wrapper.json5",
             membrane: { manifest: "https://example.com/membrane.json5", config: { level: "info" } },
@@ -28,8 +27,7 @@ fn use_entries_and_policies_parse() {
 fn policy_ref_must_use_hash_alias_export_syntax() {
     let err = r##"
         {
-          manifest_version: "0.1.0",
-          experimental_features: ["governance"],
+          manifest_version: "0.4.0",
           use: {
             wrapper: "https://example.com/wrapper.json5",
           },
@@ -51,8 +49,7 @@ fn policy_ref_alias_must_exist_in_use_map() {
     let err = parse_raw(
         r##"
         {
-          manifest_version: "0.1.0",
-          experimental_features: ["governance"],
+          manifest_version: "0.4.0",
           use: {
             wrapper: "https://example.com/wrapper.json5",
           },
@@ -70,11 +67,11 @@ fn policy_ref_alias_must_exist_in_use_map() {
 }
 
 #[test]
-fn use_requires_policies_experimental_feature() {
+fn use_requires_manifest_version_0_4_0() {
     let err = parse_raw(
         r#"
         {
-          manifest_version: "0.1.0",
+          manifest_version: "0.3.0",
           use: {
             wrapper: "https://example.com/wrapper.json5",
           },
@@ -85,20 +82,29 @@ fn use_requires_policies_experimental_feature() {
     .unwrap_err();
 
     match err {
-        Error::SectionRequiresFeature { section, feature } => {
-            assert_eq!(section, "use");
-            assert_eq!(feature, "governance");
+        Error::UnsupportedManifestFeatureForManifestVersion {
+            manifest_version,
+            required_version,
+            feature,
+            pointer,
+        } => {
+            assert_eq!(*manifest_version, Version::new(0, 3, 0));
+            assert_eq!(required_version, "0.4.0");
+            assert_eq!(feature, "governance `use` section");
+            assert_eq!(pointer, "/use");
         }
-        other => panic!("expected SectionRequiresFeature error, got: {other}"),
+        other => {
+            panic!("expected UnsupportedManifestFeatureForManifestVersion error, got: {other}")
+        }
     }
 }
 
 #[test]
-fn policies_require_policies_experimental_feature() {
+fn policies_require_manifest_version_0_4_0() {
     let err = parse_raw(
         r##"
         {
-          manifest_version: "0.1.0",
+          manifest_version: "0.3.0",
           policies: ["#wrapper.rewrite"],
         }
         "##,
@@ -107,11 +113,20 @@ fn policies_require_policies_experimental_feature() {
     .unwrap_err();
 
     match err {
-        Error::SectionRequiresFeature { section, feature } => {
-            assert_eq!(section, "policies");
-            assert_eq!(feature, "governance");
+        Error::UnsupportedManifestFeatureForManifestVersion {
+            manifest_version,
+            required_version,
+            feature,
+            pointer,
+        } => {
+            assert_eq!(*manifest_version, Version::new(0, 3, 0));
+            assert_eq!(required_version, "0.4.0");
+            assert_eq!(feature, "governance `policies` section");
+            assert_eq!(pointer, "/policies/0");
         }
-        other => panic!("expected SectionRequiresFeature error, got: {other}"),
+        other => {
+            panic!("expected UnsupportedManifestFeatureForManifestVersion error, got: {other}")
+        }
     }
 }
 
@@ -120,8 +135,7 @@ fn use_names_must_not_contain_dots() {
     let err = parse_raw(
         r#"
         {
-          manifest_version: "0.1.0",
-          experimental_features: ["governance"],
+          manifest_version: "0.4.0",
           use: {
             "wrap.per": "https://example.com/wrapper.json5",
           },
@@ -145,8 +159,7 @@ fn use_environment_reference_must_exist() {
     let err = parse_raw(
         r#"
         {
-          manifest_version: "0.1.0",
-          experimental_features: ["governance"],
+          manifest_version: "0.4.0",
           use: {
             wrapper: {
               manifest: "https://example.com/wrapper.json5",

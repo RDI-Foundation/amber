@@ -774,8 +774,7 @@ async fn resolve_tree_keeps_use_entries_out_of_component_tree() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -839,8 +838,7 @@ async fn use_config_with_config_interpolation_compiles() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               config_schema: {{
                 type: "object",
                 properties: {{ api_key: {{ type: "string" }} }},
@@ -922,8 +920,7 @@ async fn use_config_with_config_interpolation_in_child_scope_compiles() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               config_schema: {{
                 type: "object",
                 properties: {{ api_key: {{ type: "string" }} }},
@@ -945,8 +942,7 @@ async fn use_config_with_config_interpolation_in_child_scope_compiles() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               config_schema: {{
                 type: "object",
                 properties: {{ root_api_key: {{ type: "string" }} }},
@@ -1033,8 +1029,7 @@ async fn policy_symbolic_config_is_composed_against_scope_config() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               config_schema: {{
                 type: "object",
                 properties: {{ hidden_secret: {{ type: "string" }} }},
@@ -1056,8 +1051,7 @@ async fn policy_symbolic_config_is_composed_against_scope_config() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               config_schema: {{
                 type: "object",
                 properties: {{ root_secret: {{ type: "string" }} }},
@@ -1160,8 +1154,7 @@ async fn assert_governance_root_schema_for_whole_config_ref(policy_config_ref: &
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               config_schema: {{
                 type: "object",
                 properties: {{
@@ -1287,8 +1280,7 @@ async fn governance_root_schema_handles_overlapping_config_paths() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               config_schema: {{
                 type: "object",
                 properties: {{
@@ -1320,8 +1312,7 @@ async fn governance_root_schema_handles_overlapping_config_paths() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               config_schema: {{
                 type: "object",
                 properties: {{
@@ -1430,8 +1421,7 @@ async fn used_manifest_must_not_require_root_slots() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -1489,8 +1479,7 @@ async fn compile_resolves_policy_exports_from_use_entries() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -1569,8 +1558,7 @@ async fn compile_follows_child_exports_for_policies() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -1618,8 +1606,7 @@ async fn policy_ref_requires_resolvable_export() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -1679,8 +1666,7 @@ async fn policy_ref_requires_http_policy_provide() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -1735,8 +1721,7 @@ async fn policy_ref_rejects_slot_exports() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -1797,8 +1782,7 @@ async fn compile_attaches_governance_artifact_for_policy_uses() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               use: {{
                 wrapper: "{wrapper}",
               }},
@@ -1865,8 +1849,7 @@ async fn compile_governance_artifact_ignores_unreferenced_use_entries() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               use: {{
                 wrapper: "{wrapper}",
                 unused: {{
@@ -1919,8 +1902,7 @@ async fn used_manifest_rejects_nested_governance() {
         &format!(
             r#"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               use: {{
                 nested: "{nested}",
               }},
@@ -1941,8 +1923,7 @@ async fn used_manifest_rejects_nested_governance() {
         &format!(
             r##"
             {{
-              manifest_version: "0.1.0",
-              experimental_features: ["governance"],
+              manifest_version: "0.4.0",
               use: {{
                 wrapper: "{wrapper}",
               }},

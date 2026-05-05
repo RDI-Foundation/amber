@@ -1,13 +1,6 @@
 # Governance
 
-Governance is an experimental compiler feature for rewriting the linked scenario with
-policy-generated interposers.
-
-Enable it with:
-
-```json5
-experimental_features: ["governance"]
-```
+Governance rewrites the linked scenario with policy-generated interposers.
 
 This document defines the policy authoring contract:
 
@@ -30,7 +23,7 @@ Example:
 
 ```json5
 {
-  experimental_features: ["governance"],
+  manifest_version: "0.4.0",
   use: {
     policy: { manifest: "./policy.json5" },
   },
@@ -74,6 +67,7 @@ Minimal example:
 
 ```json5
 {
+  manifest_version: "0.4.0",
   program: {
     path: "/usr/bin/env",
     args: ["python3", { file: "./policy.py" }],

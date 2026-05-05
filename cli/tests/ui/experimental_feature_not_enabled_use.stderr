@@ -3,12 +3,12 @@ Error: compiler::experimental_feature_not_enabled
   × check failed
   ╰─▶ component `#wrapper` requests experimental feature(s) not enabled by its
       parent: docker
-   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/experimental_feature_not_enabled_use.json5:5:14]
- 4 │   use: {
- 5 │     wrapper: "./experimental_feature_not_enabled_use_wrapper.json5",
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/experimental_feature_not_enabled_use.json5:4:14]
+ 3 │   use: {
+ 4 │     wrapper: "./experimental_feature_not_enabled_use_wrapper.json5",
    ·              ───────────────────────────┬──────────────────────────
    ·                                         ╰── child declaration here
- 6 │   },
+ 5 │   },
    ╰────
   help: Enable these features in the parent manifest's `experimental_features`
         list, or remove them from the child manifest.

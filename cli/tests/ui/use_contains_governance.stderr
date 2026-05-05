@@ -3,21 +3,21 @@ Error: compiler::use_contains_governance
   × check failed
   ╰─▶ use `#wrapper` contains governance declarations in its subtree: nested
       `use` is not supported
-   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_contains_governance.json5:5:14]
- 4 │   use: {
- 5 │     wrapper: "./use_contains_governance_wrapper.json5",
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_contains_governance.json5:4:14]
+ 3 │   use: {
+ 4 │     wrapper: "./use_contains_governance_wrapper.json5",
    ·              ────────────────────┬────────────────────
    ·                                  ╰── use declared here
- 6 │   },
+ 5 │   },
    ╰────
   help: Governance `use` components must be self-contained.
 
 Advice: 
   ☞ use `#wrapper` resolves to governance here
-   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_contains_governance_wrapper.json5:5:5]
- 4 │   use: {
- 5 │     nested: "./use_contains_governance_nested.json5",
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_contains_governance_wrapper.json5:4:5]
+ 3 │   use: {
+ 4 │     nested: "./use_contains_governance_nested.json5",
    ·     ───┬──
    ·        ╰── nested `use` declared here
- 6 │   },
+ 5 │   },
    ╰────

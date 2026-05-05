@@ -20,7 +20,7 @@ Minimal leaf component exporting an HTTP API:
 
 ```json5
 {
-  manifest_version: "0.3.0",
+  manifest_version: "0.4.0",
   program: {
     image: "ghcr.io/acme/hello:v1",
     entrypoint: "--port 8080",
@@ -44,7 +44,8 @@ Minimal leaf component exporting an HTTP API:
 This crate **parses JSON5**, deserializes into Rust types, and validates:
 
 * `manifest_version` must be valid SemVer and **satisfy `>=0.1.0, <1.0.0`**.
-  New manifests should use `0.3.0`; older pre-1.0 manifests are still accepted.
+  New manifests should use `0.4.0`; older pre-1.0 manifests are still accepted when they do not
+  use syntax introduced by later manifest versions.
 * `experimental_features` entries must be known feature names.
 * No dots (`.`) in:
 
@@ -110,7 +111,7 @@ Top-level object:
 
 ```json5
 {
-  manifest_version: "0.3.0",   // required
+  manifest_version: "0.4.0",   // required
   experimental_features: ["docker"], // optional; default []
 
   program: { /* ... */ },      // optional
@@ -135,7 +136,6 @@ Current values:
 
 * `"docker"`
 * `"kvm"`
-* `"governance"` - required for the `use` and `policies` top-level sections
 
 For governance policy request/response semantics and interposer behavior, see
 [`../GOVERNANCE.md`](../GOVERNANCE.md).
@@ -498,7 +498,7 @@ Notes:
 `use` is a map: **instance name → component declaration**.
 
 It uses the same declaration forms as [`components`](#components-child-components), but is only
-available with `experimental_features: ["governance"]`.
+available in `manifest_version: "0.4.0"` or newer.
 
 `use` entries declare governance-only helper manifests. They are referenced by `policies` and are
 kept out of the main compiled scenario.
@@ -508,6 +508,8 @@ kept out of the main compiled scenario.
 ## `policies`
 
 `policies` is an ordered list of policy capability refs in `#use_name.export` form.
+
+`policies` is available in `manifest_version: "0.4.0"` or newer.
 
 Each entry refers to an exported capability from the local `use` set. Link-time validation of
 those refs is handled by the compiler rather than this crate.

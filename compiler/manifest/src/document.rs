@@ -158,6 +158,18 @@ fn labels_for_manifest_error(
                 Some("unsupported program syntax used here".to_string()),
             )]
         }
+        ManifestError::UnsupportedManifestFeatureForManifestVersion { pointer, .. } => {
+            let root_span: SourceSpan = (0usize, source.len()).into();
+            let span = match pointer.as_str() {
+                "/use" => spans.use_section_key.or(spans.use_section),
+                _ => crate::span_for_json_pointer(source, root_span, pointer),
+            }
+            .or(spans.manifest_version);
+            vec![primary(
+                span_or_default(span),
+                Some("unsupported manifest feature used here".to_string()),
+            )]
+        }
         ManifestError::InvalidName { kind, name } => labels_for_invalid_name(spans, kind, name),
         ManifestError::MixedBindingForm { to, from } => {
             labels_for_mixed_binding_form(spans, to, from)
@@ -192,9 +204,6 @@ fn labels_for_manifest_error(
         ManifestError::UnknownFrameworkCapability { capability, .. }
         | ManifestError::FrameworkCapabilityRequiresFeature { capability, .. } => {
             labels_for_framework_capability_use(spans, capability)
-        }
-        ManifestError::SectionRequiresFeature { section, .. } => {
-            labels_for_section_requires_feature(spans, section)
         }
         ManifestError::DuplicateEndpointName { name } => {
             labels_for_duplicate_endpoint_name(spans, name)
@@ -305,9 +314,16 @@ fn help_for_manifest_error(err: &ManifestError) -> Option<String> {
     match err {
         ManifestError::Json5Path(de) => {
             (de.label().starts_with("missing field `manifest_version`"))
-                .then(|| "add `manifest_version: \"0.2.0\"` to the root object".to_string())
+                .then(|| "add `manifest_version: \"0.4.0\"` to the root object".to_string())
         }
         ManifestError::UnsupportedProgramSyntaxForManifestVersion {
+            required_version,
+            feature,
+            ..
+        } => Some(format!(
+            "set `manifest_version` to \"{required_version}\" or remove {feature}"
+        )),
+        ManifestError::UnsupportedManifestFeatureForManifestVersion {
             required_version,
             feature,
             ..
@@ -833,18 +849,6 @@ fn labels_for_policy_use(spans: &ManifestSpans, alias: &str) -> Vec<LabeledSpan>
     )]
 }
 
-fn labels_for_section_requires_feature(spans: &ManifestSpans, section: &str) -> Vec<LabeledSpan> {
-    let span = match section {
-        "use" => spans.use_section_key.or(spans.use_section),
-        "policies" => spans.policies.first().map(|policy| policy.whole),
-        _ => None,
-    };
-    vec![primary(
-        span_or_default(span),
-        Some(format!("`{section}` section used here")),
-    )]
-}
-
 fn binding_target_key_for_span(span: &crate::BindingSpans) -> Option<crate::BindingTargetKey> {
     let to = span.to_value.as_deref()?;
     crate::binding_target_key_for_binding(to, span.slot_value.as_deref())
@@ -1056,7 +1060,7 @@ mod tests {
         let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
         let help = err.help().unwrap().to_string();
         assert!(help.contains("manifest_version"));
-        assert!(help.contains("\"0.2.0\""));
+        assert!(help.contains("\"0.4.0\""));
     }
 
     #[test]

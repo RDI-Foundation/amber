@@ -2,10 +2,10 @@ Error: manifest::invalid_policy_ref
 
   × check failed
   ╰─▶ invalid policy ref `wrapper.rewrite`: expected `#<use>.<export>`
-   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/policy_ref_invalid.json5:7:14]
- 6 │   },
- 7 │   policies: ["wrapper.rewrite"],
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/policy_ref_invalid.json5:6:14]
+ 5 │   },
+ 6 │   policies: ["wrapper.rewrite"],
    ·              ────────┬────────
    ·                      ╰── policy ref here
- 8 │ }
+ 7 │ }
    ╰────

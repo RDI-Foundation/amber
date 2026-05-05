@@ -262,8 +262,7 @@ fn flatten_keeps_policy_declaring_nodes() {
 
     let parent_manifest: Manifest = r##"
         {
-          manifest_version: "0.3.0",
-          experimental_features: ["governance"],
+          manifest_version: "0.4.0",
           use: {
             policy: { manifest: "file:///policy.json5" },
           },

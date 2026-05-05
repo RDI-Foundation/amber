@@ -1,11 +1,11 @@
 compiler::invalid_use_config
 
   x invalid config for governance `use` entry `policy` in /: normal config interpolation ${config.missing} is not allowed because the parent component has no `config_schema`
-   ,-[<CARGO_MANIFEST_DIR>/tests/ui/invalid_use_config.json5:8:16]
- 7 |       config: {
- 8 |         token: "${config.missing}",
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/invalid_use_config.json5:7:16]
+ 6 |       config: {
+ 7 |         token: "${config.missing}",
    :                ^^^^^^^^^|^^^^^^^^^
    :                         `-- invalid config value here
- 9 |       },
+ 8 |       },
    `----
 Error:   × check failed

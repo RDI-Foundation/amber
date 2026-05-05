@@ -47,7 +47,7 @@ fn manifest_builder_constructs_a_valid_manifest() {
         .build()
         .expect("builder should produce a valid manifest");
 
-    assert_eq!(manifest.manifest_version(), &Version::new(0, 2, 0));
+    assert_eq!(manifest.manifest_version(), &Version::new(0, 4, 0));
     assert_eq!(manifest.provides().len(), 1);
 }
 
