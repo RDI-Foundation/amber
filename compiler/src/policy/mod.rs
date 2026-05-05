@@ -73,19 +73,20 @@ pub enum ScopeBindingFrom {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyOutput {
-    #[serde(default)]
     pub interpositions: Vec<Interposition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Interposition {
     pub interposer: InterposerComponent,
-    #[serde(default)]
     pub attachments: Vec<Attachment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Attachment {
     pub target: AttachmentId,
     pub interposer_slot: SlotName,
@@ -93,6 +94,7 @@ pub struct Attachment {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InterposerComponent {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -630,5 +632,101 @@ mod tests {
         .expect("policy output should deserialize");
 
         assert!(output.interpositions[0].interposer.resources.is_empty());
+    }
+
+    #[test]
+    fn policy_output_deserialize_accepts_explicit_noop() {
+        let output: PolicyOutput = serde_json::from_value(json!({
+            "interpositions": []
+        }))
+        .expect("explicit empty interpositions should deserialize");
+
+        validate_policy_output(
+            &output,
+            &ScenarioScope {
+                components: Vec::new(),
+                bindings: Vec::new(),
+                imports: Vec::new(),
+                exports: Vec::new(),
+            },
+            &BTreeSet::new(),
+        )
+        .expect("explicit no-op output should validate");
+    }
+
+    #[test]
+    fn policy_output_deserialize_rejects_missing_interpositions() {
+        let err = serde_json::from_value::<PolicyOutput>(json!({}))
+            .expect_err("top-level interpositions field must be required");
+
+        assert!(
+            err.to_string().contains("missing field `interpositions`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn policy_output_deserialize_rejects_misspelled_interpositions() {
+        let err = serde_json::from_value::<PolicyOutput>(json!({
+            "interposition": []
+        }))
+        .expect_err("misspelled top-level field must be rejected");
+
+        assert!(
+            err.to_string().contains("unknown field `interposition`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn policy_output_deserialize_rejects_missing_attachments() {
+        let err = serde_json::from_value::<PolicyOutput>(json!({
+            "interpositions": [{
+                "interposer": {
+                    "program": {
+                        "path": "/usr/bin/env",
+                        "args": ["python3"],
+                    },
+                },
+            }]
+        }))
+        .expect_err("interposition attachments field must be required");
+
+        assert!(
+            err.to_string().contains("missing field `attachments`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn policy_output_deserialize_rejects_unknown_nested_fields() {
+        let err = serde_json::from_value::<PolicyOutput>(json!({
+            "interpositions": [{
+                "interposer": {
+                    "program": {
+                        "path": "/usr/bin/env",
+                        "args": ["python3"],
+                    },
+                    "slots": {
+                        "in": { "kind": "http" }
+                    },
+                    "provides": {
+                        "out": { "kind": "http" }
+                    },
+                    "unexpected": true,
+                },
+                "attachments": [{
+                    "target": 1,
+                    "interposer_slot": "in",
+                    "interposer_provide": "out"
+                }]
+            }]
+        }))
+        .expect_err("unknown nested fields must be rejected");
+
+        assert!(
+            err.to_string().contains("unknown field `unexpected`"),
+            "unexpected error: {err}"
+        );
     }
 }
