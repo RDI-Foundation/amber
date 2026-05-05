@@ -827,19 +827,21 @@ fn labels_for_policy_use(spans: &ManifestSpans, alias: &str) -> Vec<LabeledSpan>
         .map(|policy| policy.whole);
     vec![primary(
         span_or_default(span),
-        Some("unknown use referenced here".to_string()),
+        Some(format!(
+            "policy reference expects a matching `use.{alias}` entry"
+        )),
     )]
 }
 
 fn labels_for_section_requires_feature(spans: &ManifestSpans, section: &str) -> Vec<LabeledSpan> {
     let span = match section {
-        "use" => spans.use_section,
+        "use" => spans.use_section_key.or(spans.use_section),
         "policies" => spans.policies.first().map(|policy| policy.whole),
         _ => None,
     };
     vec![primary(
         span_or_default(span),
-        Some(format!("`{section}` used here")),
+        Some(format!("`{section}` section used here")),
     )]
 }
 

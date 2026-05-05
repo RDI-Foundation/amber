@@ -1706,7 +1706,8 @@ async fn policy_ref_requires_http_policy_provide() {
             assert_eq!(policy.as_ref(), "#wrapper.rewrite");
             assert_eq!(
                 message.as_ref(),
-                "must resolve to an `http` provide with profile `policy`, got `http`"
+                "export `rewrite` resolves to provide `rewrite` with capability `http`; expected \
+                 `kind: \"http\"` and `profile: \"policy\"`"
             );
         }
         other => panic!("expected InvalidPolicyExport error, got: {other}"),
@@ -1759,7 +1760,10 @@ async fn policy_ref_rejects_slot_exports() {
             policy, message, ..
         }) => {
             assert_eq!(policy.as_ref(), "#wrapper.rewrite");
-            assert_eq!(message.as_ref(), "must resolve to a provide, not a slot");
+            assert_eq!(
+                message.as_ref(),
+                "export `rewrite` resolves to slot `rewrite`; expected an exported provide"
+            );
         }
         other => panic!("expected InvalidPolicyExport error, got: {other}"),
     }

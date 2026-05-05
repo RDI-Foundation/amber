@@ -1,0 +1,7 @@
+{
+  manifest_version: "0.1.0",
+  experimental_features: ["governance"],
+  use: {
+    "wrap.per": "./use_name_invalid_wrapper.json5",
+  },
+}

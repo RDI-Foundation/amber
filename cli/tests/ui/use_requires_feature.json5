@@ -1,0 +1,6 @@
+{
+  manifest_version: "0.1.0",
+  use: {
+    wrapper: "./use_requires_feature_wrapper.json5",
+  },
+}

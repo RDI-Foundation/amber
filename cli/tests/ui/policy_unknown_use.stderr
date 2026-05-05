@@ -1,0 +1,14 @@
+Error: manifest::unknown_policy_use
+
+  × check failed
+  ╰─▶ policy reference points to governance `use` entry `#missing`, but this
+      manifest does not declare that entry
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/policy_unknown_use.json5:4:14]
+ 3 │   experimental_features: ["governance"],
+ 4 │   policies: ["#missing.rewrite"],
+   ·              ─────────┬────────
+   ·                       ╰── policy reference expects a matching `use.missing` entry
+ 5 │ }
+   ╰────
+  help: Add a `use` entry named `missing` in this manifest, or change/remove
+        the policy reference.

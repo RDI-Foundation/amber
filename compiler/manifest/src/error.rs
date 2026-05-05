@@ -189,11 +189,14 @@ pub enum Error {
     )]
     FrameworkCapabilityRequiresFeature { capability: String, feature: String },
 
-    #[error("`{section}` requires experimental feature `{feature}`")]
+    #[error(
+        "{} requires experimental feature `{feature}`",
+        section_requires_feature_description(section)
+    )]
     #[diagnostic(
         code(manifest::section_requires_feature),
         help(
-            "Add this feature to `experimental_features` in the same manifest, or stop using this \
+            "Add this feature to `experimental_features` in the same manifest, or remove this \
              section."
         )
     )]
@@ -319,9 +322,26 @@ pub enum Error {
     #[diagnostic(code(manifest::unknown_use_environment))]
     UnknownUseEnvironment { name: String, environment: String },
 
-    #[error("policy references unknown use `#{alias}`")]
-    #[diagnostic(code(manifest::unknown_policy_use))]
+    #[error(
+        "policy reference points to governance `use` entry `#{alias}`, but this manifest does not \
+         declare that entry"
+    )]
+    #[diagnostic(
+        code(manifest::unknown_policy_use),
+        help(
+            "Add a `use` entry named `{alias}` in this manifest, or change/remove the policy \
+             reference."
+        )
+    )]
     UnknownPolicyUse { alias: String },
+}
+
+fn section_requires_feature_description(section: &str) -> String {
+    match section {
+        "use" => "governance `use` section".to_string(),
+        "policies" => "`policies` section".to_string(),
+        other => format!("`{other}` section"),
+    }
 }
 
 fn manifest_validation_path(diag: &DiagnosticError) -> &str {

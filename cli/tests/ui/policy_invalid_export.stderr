@@ -1,22 +1,22 @@
 compiler::invalid_policy_export
 
-  x policy `#wrapper.rewrite` must resolve to a provide, not a slot
+  x governance policy reference `#wrapper.rewrite` is invalid: export `rewrite` resolves to slot `rewrite`; expected an exported provide
    ,-[<CARGO_MANIFEST_DIR>/tests/ui/policy_invalid_export.json5:7:14]
  6 |   },
  7 |   policies: ["#wrapper.rewrite"],
    :              ^^^^^^^^^|^^^^^^^^
-   :                       `-- policy referenced here
+   :                       `-- governance policy reference here
  8 | }
    `----
-  help: Policy refs must resolve to an exported `http` provide with profile `policy`.
+  help: A governance policy reference must target an exported `http` provide with `profile: "policy"`. Update the exported provide or reference a different export.
 
 Advice: 
-  > policy `#wrapper.rewrite` resolves here
+  > governance policy reference `#wrapper.rewrite` resolves here
    ,-[<CARGO_MANIFEST_DIR>/tests/ui/policy_invalid_export_wrapper.json5:4:5]
  3 |   slots: {
  4 |     rewrite: { kind: "http", profile: "policy", optional: true },
    :     ^^^|^^^
-   :        `-- resolved slot declared here
+   :        `-- slot resolved from policy reference
  5 |   },
    `----
 Error:   × check failed

@@ -7,21 +7,64 @@ pub fn parse_instance_config_template(
     value: Option<&Value>,
     parent_schema: Option<&Value>,
 ) -> Result<ConfigNode, ConfigError> {
+    parse_instance_config_template_located(value, parent_schema).map_err(|err| err.error)
+}
+
+#[derive(Debug)]
+pub(crate) struct ConfigTemplateError {
+    error: ConfigError,
+    pointer: String,
+}
+
+impl ConfigTemplateError {
+    pub(crate) fn error(&self) -> &ConfigError {
+        &self.error
+    }
+
+    pub(crate) fn pointer(&self) -> &str {
+        &self.pointer
+    }
+}
+
+pub(crate) fn parse_instance_config_template_located(
+    value: Option<&Value>,
+    parent_schema: Option<&Value>,
+) -> Result<ConfigNode, ConfigTemplateError> {
     let Some(value) = value else {
         return Ok(ConfigNode::empty_object());
     };
 
     let Value::Object(map) = value else {
-        return Err(ConfigError::validation(
-            "component config must be a JSON object".to_string(),
+        return Err(config_error(
+            "",
+            ConfigError::validation("component config must be a JSON object".to_string()),
         ));
     };
 
     let mut out = std::collections::BTreeMap::new();
     for (k, v) in map {
-        out.insert(k.clone(), parse_config_value_template(v, parent_schema)?);
+        let pointer = append_pointer("", k);
+        out.insert(
+            k.clone(),
+            parse_config_value_template_at(v, parent_schema, &pointer)?,
+        );
     }
     Ok(ConfigNode::Object(out))
+}
+
+fn config_error(pointer: &str, error: ConfigError) -> ConfigTemplateError {
+    ConfigTemplateError {
+        error,
+        pointer: pointer.to_string(),
+    }
+}
+
+fn escape_pointer_segment(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
+}
+
+fn append_pointer(parent: &str, segment: &str) -> String {
+    format!("{parent}/{}", escape_pointer_segment(segment))
 }
 
 fn parse_string_template(
@@ -82,47 +125,80 @@ fn parse_string_template(
     Ok(ConfigNode::StringTemplate(parts))
 }
 
-fn parse_config_value_template(
+fn parse_config_value_template_at(
     v: &Value,
     parent_schema: Option<&Value>,
-) -> Result<ConfigNode, ConfigError> {
+    pointer: &str,
+) -> Result<ConfigNode, ConfigTemplateError> {
     match v {
         Value::Null => Ok(ConfigNode::Null),
         Value::Bool(b) => Ok(ConfigNode::Bool(*b)),
         Value::Number(n) => Ok(ConfigNode::Number(n.clone())),
-        Value::String(s) => parse_string_template(s, parent_schema),
-        Value::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(parse_config_value_template(item, parent_schema)?);
-            }
-            Ok(ConfigNode::Array(out))
+        Value::String(s) => {
+            parse_string_template(s, parent_schema).map_err(|err| config_error(pointer, err))
         }
+        Value::Array(items) => parse_config_array_template(items, parent_schema, pointer),
         Value::Object(map) => {
             if let Some(path) = map.get("$symbolic_config") {
                 let Value::String(path) = path else {
-                    return Err(ConfigError::validation(
-                        "`$symbolic_config` value must be a string".to_string(),
+                    return Err(config_error(
+                        &append_pointer(pointer, "$symbolic_config"),
+                        ConfigError::validation(
+                            "`$symbolic_config` value must be a string".to_string(),
+                        ),
                     ));
                 };
                 return validate_config_path(path, parent_schema, true)
-                    .map(|_| ConfigNode::SymbolicConfigRef(path.clone()));
+                    .map(|_| ConfigNode::SymbolicConfigRef(path.clone()))
+                    .map_err(|err| {
+                        config_error(&append_pointer(pointer, "$symbolic_config"), err)
+                    });
             }
             if let Some(value) = map.get("$symbolic_string") {
                 let Value::String(value) = value else {
-                    return Err(ConfigError::validation(
-                        "`$symbolic_string` value must be a string".to_string(),
+                    return Err(config_error(
+                        &append_pointer(pointer, "$symbolic_string"),
+                        ConfigError::validation(
+                            "`$symbolic_string` value must be a string".to_string(),
+                        ),
                     ));
                 };
                 return Ok(ConfigNode::SymbolicString(value.clone()));
             }
-            let mut out = std::collections::BTreeMap::new();
-            for (k, vv) in map {
-                out.insert(k.clone(), parse_config_value_template(vv, parent_schema)?);
-            }
-            Ok(ConfigNode::Object(out))
+            parse_config_object_template(map, parent_schema, pointer)
         }
     }
+}
+
+fn parse_config_array_template(
+    items: &[Value],
+    parent_schema: Option<&Value>,
+    pointer: &str,
+) -> Result<ConfigNode, ConfigTemplateError> {
+    let mut out = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        out.push(parse_config_value_template_at(
+            item,
+            parent_schema,
+            &append_pointer(pointer, &idx.to_string()),
+        )?);
+    }
+    Ok(ConfigNode::Array(out))
+}
+
+fn parse_config_object_template(
+    map: &serde_json::Map<String, Value>,
+    parent_schema: Option<&Value>,
+    pointer: &str,
+) -> Result<ConfigNode, ConfigTemplateError> {
+    let mut out = std::collections::BTreeMap::new();
+    for (k, vv) in map {
+        out.insert(
+            k.clone(),
+            parse_config_value_template_at(vv, parent_schema, &append_pointer(pointer, k))?,
+        );
+    }
+    Ok(ConfigNode::Object(out))
 }
 
 fn validate_config_path(
@@ -131,11 +207,12 @@ fn validate_config_path(
     symbolic: bool,
 ) -> Result<(), ConfigError> {
     let schema = parent_schema.ok_or_else(|| {
+        let sigil = if symbolic { "$$" } else { "$" };
         ConfigError::schema(format!(
             "{} config interpolation {}{{config{}}} is not allowed because the parent component \
              has no `config_schema`",
             if symbolic { "symbolic" } else { "normal" },
-            if symbolic { "$" } else { "" },
+            sigil,
             if path.is_empty() {
                 "".to_string()
             } else {

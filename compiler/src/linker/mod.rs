@@ -151,17 +151,20 @@ pub enum Error {
         span: Option<SourceSpan>,
     },
 
-    #[error("policy `{policy}` {message}")]
+    #[error("governance policy reference `{policy}` is invalid: {message}")]
     #[diagnostic(
         code(compiler::invalid_policy_export),
-        help("Policy refs must resolve to an exported `http` provide with profile `policy`.")
+        help(
+            "A governance policy reference must target an exported `http` provide with `profile: \
+             \"policy\"`. Update the exported provide or reference a different export."
+        )
     )]
     InvalidPolicyExport {
         policy: Box<str>,
         message: Box<str>,
         #[source_code]
         src: Option<NamedSource<Arc<str>>>,
-        #[label(primary, "policy referenced here")]
+        #[label(primary, "governance policy reference here")]
         span: Option<SourceSpan>,
         #[related]
         related: Vec<RelatedSpan>,
@@ -421,7 +424,9 @@ pub enum Error {
         related: Vec<RelatedSpan>,
     },
 
-    #[error("invalid config for use `{use_name}` in {component_path}: {message}")]
+    #[error(
+        "invalid config for governance `use` entry `{use_name}` in {component_path}: {message}"
+    )]
     #[diagnostic(code(compiler::invalid_use_config))]
     InvalidUseConfig {
         component_path: String,
@@ -429,8 +434,9 @@ pub enum Error {
         message: String,
         #[source_code]
         src: Option<NamedSource<Arc<str>>>,
-        #[label(primary, "config declared here")]
+        #[label(primary, "{label}")]
         span: Option<SourceSpan>,
+        label: String,
     },
 
     #[error("unsupported manifest feature `{feature}` in {component_path}")]
@@ -869,14 +875,74 @@ pub fn link(
     Ok((scenario, governance, provenance))
 }
 
+struct UseConfigError {
+    message: String,
+    pointer: Option<String>,
+}
+
 fn compose_use_config(
     use_config: &Value,
     scope_template: &rc::RootConfigTemplate,
     scope_schema: Option<&serde_json::Value>,
-) -> Result<rc::ConfigNode, rc::ConfigError> {
-    let parsed =
-        crate::config::template::parse_instance_config_template(Some(use_config), scope_schema)?;
-    rc::compose_config_template(parsed, scope_template)
+) -> Result<rc::ConfigNode, UseConfigError> {
+    let parsed = crate::config::template::parse_instance_config_template_located(
+        Some(use_config),
+        scope_schema,
+    )
+    .map_err(|err| UseConfigError {
+        message: err.error().to_string(),
+        pointer: Some(err.pointer().to_string()),
+    })?;
+    rc::compose_config_template(parsed, scope_template).map_err(|err| UseConfigError {
+        message: err.to_string(),
+        pointer: None,
+    })
+}
+
+fn use_config_error_site(
+    store: &DigestStore,
+    manifest_url: &Url,
+    use_name: &str,
+    pointer: Option<&str>,
+) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>, String) {
+    let Some(stored) = store.get_source(manifest_url) else {
+        return (
+            None,
+            None,
+            "governance `use` config declared here".to_string(),
+        );
+    };
+
+    let src = NamedSource::new(display_url(manifest_url), Arc::clone(&stored.source))
+        .with_language("json5");
+    let Some(use_spans) = stored.spans.uses.get(use_name) else {
+        return (
+            Some(src),
+            None,
+            "governance `use` config declared here".to_string(),
+        );
+    };
+
+    if let (Some(pointer), Some(config_span)) = (pointer, use_spans.config)
+        && !pointer.is_empty()
+        && let Some(span) = span_for_json_pointer(stored.source.as_ref(), config_span, pointer)
+    {
+        return (
+            Some(src),
+            Some(span),
+            "invalid config value here".to_string(),
+        );
+    }
+
+    let span = use_spans
+        .config_key
+        .or(use_spans.config)
+        .or(Some(use_spans.whole));
+    (
+        Some(src),
+        span,
+        "governance `use` config declared here".to_string(),
+    )
 }
 
 fn collect_config_ref_paths(node: &rc::ConfigNode) -> BTreeSet<String> {
@@ -1051,21 +1117,19 @@ fn build_governance(
                     let composed =
                         compose_use_config(raw_config, sa.template(), sa.component_schema())
                             .map_err(|err| {
-                                let (src, span) = store
-                                    .diagnostic_source(&scope.manifest_url)
-                                    .map_or((None, None), |(src, spans)| {
-                                        let span = spans
-                                            .uses
-                                            .get(use_name.as_str())
-                                            .and_then(|s| s.config);
-                                        (Some(src), span)
-                                    });
+                                let (src, span, label) = use_config_error_site(
+                                    store,
+                                    &scope.manifest_url,
+                                    use_name,
+                                    err.pointer.as_deref(),
+                                );
                                 Error::InvalidUseConfig {
                                     component_path: scope.root_moniker.to_string(),
                                     use_name: use_name.clone(),
-                                    message: err.to_string(),
+                                    message: err.message,
                                     src,
                                     span,
+                                    label,
                                 }
                             })?;
                     governance_root_config_paths.extend(collect_config_ref_paths(&composed));
@@ -1116,13 +1180,15 @@ fn build_governance(
                 ResolvedPolicyEndpoint::Provide { decl, .. }
                     if decl.kind == CapabilityKind::Http
                         && decl.profile.as_deref() == Some("policy") => {}
-                ResolvedPolicyEndpoint::Provide { decl, .. } => {
+                ResolvedPolicyEndpoint::Provide { name, decl, .. } => {
                     let (src, span) =
                         policy_ref_decl_site(store, &scope.manifest_url, policy_index);
                     return Err(Error::InvalidPolicyExport {
                         policy: policy_ref.to_string().into(),
                         message: format!(
-                            "must resolve to an `http` provide with profile `policy`, got `{decl}`"
+                            "export `{}` resolves to provide `{name}` with capability `{decl}`; \
+                             expected `kind: \"http\"` and `profile: \"policy\"`",
+                            policy_ref.export
                         )
                         .into(),
                         src,
@@ -1130,12 +1196,16 @@ fn build_governance(
                         related: policy_endpoint_related_spans(store, policy_ref, &endpoint),
                     });
                 }
-                ResolvedPolicyEndpoint::Slot { .. } => {
+                ResolvedPolicyEndpoint::Slot { name, .. } => {
                     let (src, span) =
                         policy_ref_decl_site(store, &scope.manifest_url, policy_index);
                     return Err(Error::InvalidPolicyExport {
                         policy: policy_ref.to_string().into(),
-                        message: "must resolve to a provide, not a slot".into(),
+                        message: format!(
+                            "export `{}` resolves to slot `{name}`; expected an exported provide",
+                            policy_ref.export
+                        )
+                        .into(),
                         src,
                         span,
                         related: policy_endpoint_related_spans(store, policy_ref, &endpoint),
@@ -1289,10 +1359,10 @@ fn policy_endpoint_related_spans(
     let (resolved_url, name, label) = match endpoint {
         ResolvedPolicyEndpoint::Provide {
             resolved_url, name, ..
-        } => (resolved_url, name, "resolved provide declared here"),
+        } => (resolved_url, name, "provide resolved from policy reference"),
         ResolvedPolicyEndpoint::Slot {
             resolved_url, name, ..
-        } => (resolved_url, name, "resolved slot declared here"),
+        } => (resolved_url, name, "slot resolved from policy reference"),
     };
 
     let Some(stored) = store.get_source(resolved_url) else {
@@ -1311,7 +1381,7 @@ fn policy_endpoint_related_spans(
     .unwrap_or((0usize, 0usize).into());
 
     vec![RelatedSpan {
-        message: format!("policy `{policy}` resolves here"),
+        message: format!("governance policy reference `{policy}` resolves here"),
         src: NamedSource::new(display_url(resolved_url), stored.source).with_language("json5"),
         span,
         label: label.to_string(),

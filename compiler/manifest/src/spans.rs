@@ -11,6 +11,7 @@ pub struct ManifestSpans {
     pub manifest_version: Option<SourceSpan>,
     pub experimental_features: Option<SourceSpan>,
     pub use_section: Option<SourceSpan>,
+    pub use_section_key: Option<SourceSpan>,
     pub program: Option<ProgramSpans>,
     pub config_schema: Option<SourceSpan>,
     pub components: HashMap<Arc<str>, ComponentDeclSpans>,
@@ -278,6 +279,7 @@ pub(crate) fn parse_manifest_spans(source: &str) -> Option<ManifestSpans> {
         manifest_version: root.child_span("manifest_version"),
         experimental_features: root.child_span("experimental_features"),
         use_section: root.child_span("use"),
+        use_section_key: root.child_key_span("use"),
         config_schema: root.child_span("config_schema"),
         ..ManifestSpans::default()
     };
