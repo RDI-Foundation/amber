@@ -110,6 +110,7 @@ dependencies = [
  "amber-resolver",
  "amber-router",
  "amber-scenario",
+ "amber-scenario-runner",
  "amber-template",
  "axum",
  "base64",
@@ -150,6 +151,7 @@ dependencies = [
  "amber-resolver",
  "amber-router",
  "amber-scenario",
+ "amber-scenario-runner",
  "amber-template",
  "base64",
  "dashmap",
@@ -379,6 +381,15 @@ dependencies = [
  "amber-manifest",
  "amber-template",
  "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "amber-scenario-runner"
+version = "0.0.0"
+dependencies = [
+ "amber-manifest",
  "serde_json",
  "thiserror 2.0.18",
 ]

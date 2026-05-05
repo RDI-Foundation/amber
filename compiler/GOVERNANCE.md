@@ -63,7 +63,8 @@ At compile time, Amber:
 Each component that declares `policies` defines one governed realm rooted at that component's
 moniker.
 
-Governance-enabled compilation is supported through the CLI runtime path.
+During CLI compilation, Amber runs the synthetic policy scenario with the same local run-plan
+machinery used by `amber run`.
 
 ## Writing a Policy Manifest
 

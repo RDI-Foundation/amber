@@ -22,13 +22,13 @@ use tempfile::TempDir;
 use url::Url;
 
 use crate::{
-    CompileOptions, Compiler, DigestStore, GovernanceFuture, GovernanceRuntime,
-    GovernanceRuntimeError, GovernanceSession, ResolvedNode, ResolvedTree, ResolverRegistry,
+    CompileOptions, Compiler, DigestStore, ResolvedNode, ResolvedTree, ResolverRegistry,
+    RunningScenario, ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError, ScenarioRunnerFuture,
     bundle::{
         BUNDLE_INDEX_NAME, BUNDLE_SCHEMA, BUNDLE_VERSION, BundleBuilder, BundleIndex, BundleLoader,
         BundleRequest,
     },
-    policy::{PolicyOutput, PolicyRequest},
+    policy::PolicyOutput,
     reporter::{Reporter as _, scenario_ir::ScenarioIrReporter},
 };
 
@@ -60,7 +60,7 @@ fn default_compiler() -> Compiler {
 
 fn compiler_with_noop_governance() -> Compiler {
     Compiler::new(Resolver::new(), DigestStore::default())
-        .with_governance_runtime(Arc::new(TestGovernanceRuntime))
+        .with_scenario_runner(Arc::new(TestScenarioRunner))
 }
 
 fn manifest_ref_for_path(path: &Path) -> ManifestRef {
@@ -127,30 +127,33 @@ fn has_diagnostic_code(diagnostics: &[miette::Report], code: &str) -> bool {
     })
 }
 
-struct TestGovernanceRuntime;
+struct TestScenarioRunner;
 
-impl GovernanceRuntime for TestGovernanceRuntime {
+impl ScenarioRunner<crate::reporter::CompiledScenario> for TestScenarioRunner {
     fn start<'a>(
         &'a self,
         _compiled: &'a crate::reporter::CompiledScenario,
-        _policy_display_names: &'a std::collections::BTreeMap<String, String>,
-    ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>> {
-        Box::pin(async { Ok(Box::new(TestGovernanceSession) as Box<dyn GovernanceSession>) })
+        _options: ScenarioRunOptions,
+    ) -> ScenarioRunnerFuture<'a, Result<Box<dyn RunningScenario>, ScenarioRunnerError>> {
+        Box::pin(async { Ok(Box::new(TestRunningScenario) as Box<dyn RunningScenario>) })
     }
 }
 
-struct TestGovernanceSession;
+struct TestRunningScenario;
 
-impl GovernanceSession for TestGovernanceSession {
-    fn invoke_policy<'a>(
+impl RunningScenario for TestRunningScenario {
+    fn post_json_export<'a>(
         &'a self,
-        _policy_export: &'a amber_manifest::ExportName,
-        _request: &'a PolicyRequest,
-    ) -> GovernanceFuture<'a, Result<PolicyOutput, GovernanceRuntimeError>> {
-        Box::pin(async { Ok(PolicyOutput::default()) })
+        _export: &'a amber_manifest::ExportName,
+        _request: &'a serde_json::Value,
+    ) -> ScenarioRunnerFuture<'a, Result<String, ScenarioRunnerError>> {
+        Box::pin(async {
+            serde_json::to_string(&PolicyOutput::default())
+                .map_err(|err| ScenarioRunnerError::message(err.to_string()))
+        })
     }
 
-    fn finish(self: Box<Self>) -> GovernanceFuture<'static, Result<(), GovernanceRuntimeError>> {
+    fn finish(self: Box<Self>) -> ScenarioRunnerFuture<'static, Result<(), ScenarioRunnerError>> {
         Box::pin(async { Ok(()) })
     }
 }

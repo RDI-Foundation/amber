@@ -15,6 +15,7 @@ members = [
   "runtime/proxy",
   "runtime/provisioner",
   "runtime/router",
+  "runtime/scenario-runner",
 ]
 resolver = "2"
 
@@ -29,6 +30,7 @@ amber-proxy = { path = "runtime/proxy" }
 amber-resolver = { path = "compiler/resolver" }
 amber-router = { path = "runtime/router" }
 amber-scenario = { path = "compiler/scenario" }
+amber-scenario-runner = { path = "runtime/scenario-runner" }
 amber-template = { path = "compiler/template" }
 base64 = "0.22.1"
 futures = "0.3.31"

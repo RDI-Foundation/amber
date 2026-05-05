@@ -16,7 +16,6 @@ use thiserror::Error;
 mod config;
 mod frontend;
 mod governance;
-mod governance_runtime;
 mod linker;
 mod lint;
 pub mod mesh;
@@ -31,11 +30,11 @@ mod targets;
 pub mod bundle;
 pub mod reporter;
 
+pub use amber_scenario_runner::{
+    RunningScenario, ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError, ScenarioRunnerFuture,
+};
 pub use frontend::{DigestStore, ResolveOptions, ResolvedNode, ResolvedTree, ResolverRegistry};
 pub use governance::{Governance, GovernedScope};
-pub use governance_runtime::{
-    GovernanceFuture, GovernanceRuntime, GovernanceRuntimeError, GovernanceSession,
-};
 pub use linker::{ComponentProvenance, Provenance};
 
 #[derive(Clone, Debug, Default)]
@@ -90,7 +89,7 @@ pub struct Compiler {
     resolver: Resolver,
     store: DigestStore,
     registry: ResolverRegistry,
-    governance_runtime: Option<Arc<dyn GovernanceRuntime>>,
+    scenario_runner: Option<Arc<dyn ScenarioRunner<reporter::CompiledScenario>>>,
 }
 
 impl Compiler {
@@ -99,7 +98,7 @@ impl Compiler {
             resolver,
             store,
             registry: ResolverRegistry::default(),
-            governance_runtime: None,
+            scenario_runner: None,
         }
     }
 
@@ -120,11 +119,11 @@ impl Compiler {
         self
     }
 
-    pub fn with_governance_runtime(
+    pub fn with_scenario_runner(
         mut self,
-        governance_runtime: Arc<dyn GovernanceRuntime>,
+        scenario_runner: Arc<dyn ScenarioRunner<reporter::CompiledScenario>>,
     ) -> Self {
-        self.governance_runtime = Some(governance_runtime);
+        self.scenario_runner = Some(scenario_runner);
         self
     }
 
@@ -276,7 +275,7 @@ impl Compiler {
         let scenario = policy_pass::apply_policies(
             scenario,
             governance.as_ref(),
-            self.governance_runtime.as_deref(),
+            self.scenario_runner.as_deref(),
         )
         .await?;
         Ok((scenario, governance, provenance))

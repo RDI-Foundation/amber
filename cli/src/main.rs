@@ -2,10 +2,10 @@ mod command_support;
 mod direct_runtime;
 mod docs;
 mod framework_component;
-mod governance_runtime;
 mod mixed_run;
 mod run_inputs;
 mod run_logs;
+mod scenario_runner;
 mod site_proxy_metadata;
 mod tcp_readiness;
 mod vm_runtime;
@@ -1075,9 +1075,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
         CompileInput::Manifest(resolved) => {
             let compiler = Compiler::new(resolved.resolver, Default::default())
                 .with_registry(resolved.registry)
-                .with_governance_runtime(Arc::new(
-                    governance_runtime::CliGovernanceRuntime::default(),
-                ));
+                .with_scenario_runner(Arc::new(scenario_runner::CliScenarioRunner::default()));
             let mut opts = CompileOptions::default();
             if args.no_opt {
                 opts.optimize.dce = false;
@@ -1212,7 +1210,7 @@ async fn check(args: CheckArgs) -> Result<()> {
     let resolved = resolve_input(&args.manifest).await?;
     let compiler = Compiler::new(resolved.resolver, Default::default())
         .with_registry(resolved.registry)
-        .with_governance_runtime(Arc::new(governance_runtime::CliGovernanceRuntime::default()));
+        .with_scenario_runner(Arc::new(scenario_runner::CliScenarioRunner::default()));
 
     let output = compiler
         .check(resolved.manifest, CompileOptions::default())
@@ -2000,17 +1998,6 @@ async fn stop_run_with_cleanup_notice(
     }
 }
 
-fn cleanup_temporary_run_outside_proxy(
-    run_root: &Path,
-    proxy_child: &mut Option<Child>,
-) -> Result<()> {
-    if let Some(mut proxy_child) = proxy_child.take() {
-        let _ = proxy_child.kill();
-        let _ = proxy_child.wait();
-    }
-    mixed_run::clear_run_outside_proxy_state(run_root)
-}
-
 enum AttachedRunStorage {
     Persistent(PathBuf),
     Managed(PathBuf),
@@ -2057,16 +2044,6 @@ async fn run_attached_mixed_run(
     let attached_storage = AttachedRunStorage::new(storage_root_override)?;
     let storage_root_override = Some(attached_storage.storage_root());
     let startup = async {
-        let receipt = mixed_run::run_run_plan(
-            source_plan_path,
-            run_plan,
-            storage_root_override,
-            observability,
-            &prepared.root_env,
-        )
-        .await?;
-        let run_root = PathBuf::from(&receipt.run_root);
-
         let export_bindings = auto_export_bindings(&prepared.interface)?;
         let slot_bindings = prepared
             .interface
@@ -2079,24 +2056,23 @@ async fn run_attached_mixed_run(
                     .map(|value| (slot.name.clone(), value.clone()))
             })
             .collect::<BTreeMap<_, _>>();
-        let mut proxy_child = if slot_bindings.is_empty() && export_bindings.is_empty() {
-            None
-        } else {
-            Some(mixed_run::spawn_run_outside_proxy(
-                &run_root,
-                &slot_bindings,
-                &export_bindings,
-            )?)
-        };
-        if proxy_child.is_some()
-            && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
-        {
-            cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child)?;
-            let _ = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
-            return Err(err);
-        }
+        let started = scenario_runner::start_run_with_outside_proxy(
+            source_plan_path,
+            run_plan,
+            storage_root_override,
+            observability,
+            &prepared.root_env,
+            &slot_bindings,
+            export_bindings,
+        )
+        .await?;
 
-        Ok((receipt, run_root, export_bindings, proxy_child))
+        Ok::<_, miette::Report>((
+            started.receipt,
+            started.run_root,
+            started.export_bindings,
+            started.proxy_child,
+        ))
     };
 
     let ((receipt, run_root, export_bindings, mut proxy_child), startup_status_shown) =
@@ -2137,7 +2113,8 @@ async fn run_attached_mixed_run(
         },
     )
     .await;
-    let proxy_cleanup_result = cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
+    let proxy_cleanup_result =
+        scenario_runner::cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
     let stop_result = stop_run_with_cleanup_notice(&receipt.run_id, storage_root_override).await;
     result?;
     proxy_cleanup_result?;
@@ -2168,7 +2145,7 @@ async fn attach(args: AttachArgs) -> Result<()> {
     if proxy_child.is_some()
         && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
     {
-        cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child)?;
+        scenario_runner::cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child)?;
         return Err(err);
     }
 
@@ -2190,7 +2167,8 @@ async fn attach(args: AttachArgs) -> Result<()> {
         },
     )
     .await;
-    let cleanup_result = cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
+    let cleanup_result =
+        scenario_runner::cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
     result?;
     cleanup_result?;
     Ok(())
@@ -2326,9 +2304,7 @@ async fn compile_for_run(input: &str) -> Result<CompiledScenario> {
         CompileInput::Manifest(resolved) => {
             let compiler = Compiler::new(resolved.resolver, Default::default())
                 .with_registry(resolved.registry)
-                .with_governance_runtime(Arc::new(
-                    governance_runtime::CliGovernanceRuntime::default(),
-                ));
+                .with_scenario_runner(Arc::new(scenario_runner::CliScenarioRunner::default()));
             let output = compiler
                 .compile_from_tree(
                     compiler

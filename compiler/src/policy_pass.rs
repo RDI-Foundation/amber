@@ -5,13 +5,13 @@ use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, ScenarioIr, ScenarioIrError, SlotRef,
 };
+use amber_scenario_runner::{ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError};
 use futures::future;
 use miette::Diagnostic;
 use thiserror::Error;
 
 use crate::{
     Governance, GovernedScope,
-    governance_runtime::{GovernanceRuntime, GovernanceRuntimeError},
     policy::{
         AttachmentId, PolicyInput, PolicyOutput, PolicyRequest, ScenarioScope, ScopeBinding,
         ScopeBindingFrom, ScopeExport, ScopeImport, ValidationError, validate_policy_output,
@@ -79,31 +79,31 @@ pub enum Error {
     },
 
     #[error(
-        "governance policies require a runtime, but none was configured while compiling scope \
-         `{scope_root}`"
+        "governance policies require a scenario runner, but none was configured while compiling \
+         scope `{scope_root}`"
     )]
-    #[diagnostic(code(compiler::policy_pass_missing_governance_runtime))]
-    MissingGovernanceRuntime { scope_root: Moniker },
+    #[diagnostic(code(compiler::policy_pass_missing_scenario_runner))]
+    MissingScenarioRunner { scope_root: Moniker },
 
-    #[error("failed to start governance artifact")]
-    #[diagnostic(code(compiler::policy_pass_start_governance))]
-    StartGovernance {
+    #[error("failed to start policy scenario: {source}")]
+    #[diagnostic(code(compiler::policy_pass_start_policy_scenario))]
+    StartPolicyScenario {
         #[source]
-        source: GovernanceRuntimeError,
+        source: ScenarioRunnerError,
     },
 
-    #[error("failed to compile governance artifact")]
-    #[diagnostic(code(compiler::policy_pass_compile_governance))]
-    CompileGovernance {
+    #[error("failed to compile policy scenario")]
+    #[diagnostic(code(compiler::policy_pass_compile_policy_scenario))]
+    CompilePolicyScenario {
         #[source]
         source: CompiledScenarioError,
     },
 
-    #[error("failed to stop governance artifact")]
-    #[diagnostic(code(compiler::policy_pass_stop_governance))]
-    StopGovernance {
+    #[error("failed to stop policy scenario: {source}")]
+    #[diagnostic(code(compiler::policy_pass_stop_policy_scenario))]
+    StopPolicyScenario {
         #[source]
-        source: GovernanceRuntimeError,
+        source: ScenarioRunnerError,
     },
 
     #[error("policy `{policy}` in scope `{scope_root}` failed")]
@@ -112,7 +112,28 @@ pub enum Error {
         scope_root: Moniker,
         policy: String,
         #[source]
-        source: GovernanceRuntimeError,
+        source: ScenarioRunnerError,
+    },
+
+    #[error("failed to serialize request for policy `{policy}` in scope `{scope_root}`")]
+    #[diagnostic(code(compiler::policy_pass_policy_request_serialize))]
+    PolicyRequestSerialize {
+        scope_root: Moniker,
+        policy: String,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error(
+        "policy `{policy}` in scope `{scope_root}` returned response body that was not valid \
+         policy output JSON: {source}\n\nbody:\n{body}"
+    )]
+    #[diagnostic(code(compiler::policy_pass_policy_output_deserialize))]
+    PolicyOutputDeserialize {
+        scope_root: Moniker,
+        policy: String,
+        source: serde_json::Error,
+        body: String,
     },
 
     #[error("policy `{policy}` in scope `{scope_root}` returned invalid output")]
@@ -139,7 +160,7 @@ pub enum Error {
 pub(crate) async fn apply_policies(
     scenario: Scenario,
     governance: Option<&Governance>,
-    runtime: Option<&dyn GovernanceRuntime>,
+    runner: Option<&dyn ScenarioRunner<CompiledScenario>>,
 ) -> Result<Scenario, Error> {
     let Some(governance) = governance else {
         return Ok(scenario);
@@ -147,37 +168,39 @@ pub(crate) async fn apply_policies(
     if governance.scopes.is_empty() {
         return Ok(scenario);
     }
-    let Some(runtime) = runtime else {
-        return Err(Error::MissingGovernanceRuntime {
+    let Some(runner) = runner else {
+        return Err(Error::MissingScenarioRunner {
             scope_root: governance.scopes[0].root_moniker.clone(),
         });
     };
 
-    let collected = collect_policy_outputs(&scenario, governance, runtime).await?;
+    let collected = collect_policy_outputs(&scenario, governance, runner).await?;
     rewrite_scenario(scenario, &collected)
 }
 
 async fn collect_policy_outputs(
     scenario: &Scenario,
     governance: &Governance,
-    runtime: &dyn GovernanceRuntime,
+    runner: &dyn ScenarioRunner<CompiledScenario>,
 ) -> Result<Vec<PolicyApplication>, Error> {
     let compiled = CompiledScenario::from_scenario_with_provenance(
         &governance.scenario,
         &governance.provenance,
     )
-    .map_err(|source| Error::CompileGovernance { source })?;
-    let policy_display_names = governance
-        .scopes
-        .iter()
-        .flat_map(|scope| scope.policies.iter())
-        .map(|policy| (policy.export.to_string(), policy.display_name.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let session = runtime
-        .start(&compiled, &policy_display_names)
+    .map_err(|source| Error::CompilePolicyScenario { source })?;
+    let options = ScenarioRunOptions {
+        export_display_names: governance
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.policies.iter())
+            .map(|policy| (policy.export.to_string(), policy.display_name.clone()))
+            .collect(),
+    };
+    let run = runner
+        .start(&compiled, options)
         .await
-        .map_err(|source| Error::StartGovernance { source })?;
-    let session_ref = session.as_ref();
+        .map_err(|source| Error::StartPolicyScenario { source })?;
+    let run_ref = run.as_ref();
     let collected = async {
         let mut invocations = Vec::new();
 
@@ -197,14 +220,29 @@ async fn collect_policy_outputs(
                 let targets = targets.clone();
 
                 invocations.push(async move {
-                    let output = session_ref
-                        .invoke_policy(&policy_export, &request)
+                    let request_json = serde_json::to_value(&request).map_err(|source| {
+                        Error::PolicyRequestSerialize {
+                            scope_root: scope_root.clone(),
+                            policy: policy_display_name.clone(),
+                            source,
+                        }
+                    })?;
+                    let body = run_ref
+                        .post_json_export(&policy_export, &request_json)
                         .await
                         .map_err(|source| Error::InvokePolicy {
                             scope_root: scope_root.clone(),
                             policy: policy_display_name.clone(),
                             source,
                         })?;
+                    let output = serde_json::from_str::<PolicyOutput>(&body).map_err(|source| {
+                        Error::PolicyOutputDeserialize {
+                            scope_root: scope_root.clone(),
+                            policy: policy_display_name.clone(),
+                            source,
+                            body: body.trim().to_string(),
+                        }
+                    })?;
                     // Generated interposers may not rely on experimental features.
                     validate_policy_output(
                         &output,
@@ -232,10 +270,10 @@ async fn collect_policy_outputs(
     }
     .await;
 
-    let finish_result = session.finish().await;
+    let finish_result = run.finish().await;
     match (collected, finish_result) {
         (Ok(collected), Ok(())) => Ok(collected),
-        (Ok(_), Err(source)) => Err(Error::StopGovernance { source }),
+        (Ok(_), Err(source)) => Err(Error::StopPolicyScenario { source }),
         (Err(err), _) => Err(err),
     }
 }
@@ -684,31 +722,30 @@ mod tests {
         BindingEdge, Component, Moniker, Program, ProgramCommon, ProgramPath, ProvideRef,
         ScenarioExport,
     };
+    use amber_scenario_runner::{
+        RunningScenario, ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError,
+        ScenarioRunnerFuture,
+    };
 
     use super::*;
-    use crate::{
-        governance_runtime::{
-            GovernanceFuture, GovernanceRuntime, GovernanceRuntimeError, GovernanceSession,
-        },
-        policy::{Attachment, InterposerComponent, Interposition},
-    };
+    use crate::policy::{Attachment, InterposerComponent, Interposition};
 
     #[derive(Default)]
     struct MockRunner {
         outputs: BTreeMap<String, PolicyOutput>,
     }
 
-    impl GovernanceRuntime for MockRunner {
+    impl ScenarioRunner<CompiledScenario> for MockRunner {
         fn start<'a>(
             &'a self,
             _compiled: &'a CompiledScenario,
-            _policy_display_names: &'a BTreeMap<String, String>,
-        ) -> GovernanceFuture<'a, Result<Box<dyn GovernanceSession>, GovernanceRuntimeError>>
+            _options: ScenarioRunOptions,
+        ) -> ScenarioRunnerFuture<'a, Result<Box<dyn RunningScenario>, ScenarioRunnerError>>
         {
             Box::pin(async move {
                 Ok(Box::new(MockSession {
                     outputs: self.outputs.clone(),
-                }) as Box<dyn GovernanceSession>)
+                }) as Box<dyn RunningScenario>)
             })
         }
     }
@@ -717,25 +754,46 @@ mod tests {
         outputs: BTreeMap<String, PolicyOutput>,
     }
 
-    impl GovernanceSession for MockSession {
-        fn invoke_policy<'a>(
+    impl RunningScenario for MockSession {
+        fn post_json_export<'a>(
             &'a self,
-            policy_export: &'a ExportName,
-            _request: &'a PolicyRequest,
-        ) -> GovernanceFuture<'a, Result<PolicyOutput, GovernanceRuntimeError>> {
+            export: &'a ExportName,
+            _request: &'a serde_json::Value,
+        ) -> ScenarioRunnerFuture<'a, Result<String, ScenarioRunnerError>> {
             Box::pin(async move {
-                Ok(self
-                    .outputs
-                    .get(policy_export.as_str())
-                    .cloned()
-                    .unwrap_or_default())
+                serde_json::to_string(
+                    &self
+                        .outputs
+                        .get(export.as_str())
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+                .map_err(|err| ScenarioRunnerError::message(err.to_string()))
             })
         }
 
         fn finish(
             self: Box<Self>,
-        ) -> GovernanceFuture<'static, Result<(), GovernanceRuntimeError>> {
+        ) -> ScenarioRunnerFuture<'static, Result<(), ScenarioRunnerError>> {
             Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct StartFailureRunner;
+
+    impl ScenarioRunner<CompiledScenario> for StartFailureRunner {
+        fn start<'a>(
+            &'a self,
+            _compiled: &'a CompiledScenario,
+            options: ScenarioRunOptions,
+        ) -> ScenarioRunnerFuture<'a, Result<Box<dyn RunningScenario>, ScenarioRunnerError>>
+        {
+            Box::pin(async move {
+                let display_name = options.display_name_for("policy_0_0").to_string();
+                Err(ScenarioRunnerError::message(format!(
+                    "scenario exports did not become ready in time: {display_name}"
+                )))
+            })
         }
     }
 
@@ -796,6 +854,27 @@ mod tests {
         .expect("empty outputs should keep scenario unchanged");
 
         assert_eq!(rewritten, scenario);
+    }
+
+    #[tokio::test]
+    async fn apply_policies_start_failure_mentions_policy_display_name() {
+        let scenario = fixture_scenario();
+        let mut governance = fixture_governance();
+        governance.scopes[0].policies[0].display_name = "/left".to_string();
+
+        let err = apply_policies(scenario, Some(&governance), Some(&StartFailureRunner))
+            .await
+            .expect_err("startup should fail");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to start policy scenario:"),
+            "missing startup context: {message}"
+        );
+        assert!(
+            message.contains("/left"),
+            "missing policy display name: {message}"
+        );
     }
 
     #[tokio::test]
