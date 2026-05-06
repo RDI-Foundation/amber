@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::linker::program_lowering::validate_lowered_program_mounts;
+use crate::{
+    config::{analysis::ComponentConfigAnalysis, validation},
+    linker::program_lowering::validate_lowered_program_mounts,
+};
 
 pub type PolicyInput = ScenarioScope;
 
@@ -178,8 +181,46 @@ pub fn validate_policy_output(
     input: &PolicyInput,
     enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<(), ValidationError> {
+    let parent_template = rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object());
+    validate_policy_output_with_config_context(
+        output,
+        input,
+        enabled_features,
+        None,
+        &parent_template,
+    )
+}
+
+pub(crate) fn validate_policy_output_for_scope(
+    output: &PolicyOutput,
+    input: &PolicyInput,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
+    scope_config: &ComponentConfigAnalysis,
+) -> Result<(), ValidationError> {
+    validate_policy_output_with_config_context(
+        output,
+        input,
+        enabled_features,
+        scope_config.component_schema(),
+        scope_config.template(),
+    )
+}
+
+fn validate_policy_output_with_config_context(
+    output: &PolicyOutput,
+    input: &PolicyInput,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
+    parent_schema: Option<&Value>,
+    parent_template: &rc::RootConfigTemplate,
+) -> Result<(), ValidationError> {
     for interposition in &output.interpositions {
-        validate_interposition(interposition, input, enabled_features)?;
+        validate_interposition(
+            interposition,
+            input,
+            enabled_features,
+            parent_schema,
+            parent_template,
+        )?;
     }
 
     Ok(())
@@ -189,12 +230,19 @@ fn validate_interposition(
     interposition: &Interposition,
     input: &PolicyInput,
     enabled_features: &BTreeSet<ExperimentalFeature>,
+    parent_schema: Option<&Value>,
+    parent_template: &rc::RootConfigTemplate,
 ) -> Result<(), ValidationError> {
     if interposition.attachments.is_empty() {
         return Err(ValidationError::EmptyAttachments);
     }
 
-    validate_interposer_component(&interposition.interposer, enabled_features)?;
+    validate_interposer_component(
+        &interposition.interposer,
+        enabled_features,
+        parent_schema,
+        parent_template,
+    )?;
 
     let mut seen_targets = HashSet::new();
     let mut seen_slots = HashSet::new();
@@ -262,6 +310,8 @@ fn validate_interposition(
 fn validate_interposer_component(
     component: &InterposerComponent,
     enabled_features: &BTreeSet<ExperimentalFeature>,
+    parent_schema: Option<&Value>,
+    parent_template: &rc::RootConfigTemplate,
 ) -> Result<(), ValidationError> {
     if component.config.is_some() && component.config_schema.is_none() {
         return Err(ValidationError::MissingInterposerConfigSchema);
@@ -272,8 +322,20 @@ fn validate_interposer_component(
                 message: err.to_string(),
             }
         })?;
-        if let Some(config) = component.config.as_ref() {
-            validate_interposer_config(schema, config)?;
+        let composed = validation::compose_component_config_template(
+            component.config.as_ref(),
+            parent_schema,
+            parent_template,
+            schema,
+        )
+        .map_err(|message| ValidationError::InvalidInterposerConfig { message })?;
+        if let Some(err) = validation::validate_composed_component_config(schema, &composed)
+            .into_iter()
+            .next()
+        {
+            return Err(ValidationError::InvalidInterposerConfig {
+                message: err.message,
+            });
         }
     }
 
@@ -296,15 +358,6 @@ fn validate_interposer_component(
             .next()
             .expect("program validation returned at least one error")
             .message,
-    })
-}
-
-fn validate_interposer_config(schema: &Value, config: &Value) -> Result<(), ValidationError> {
-    let mut config = config.clone();
-    rc::validate_config_value(schema, &mut config).map_err(|err| {
-        ValidationError::InvalidInterposerConfig {
-            message: err.to_string(),
-        }
     })
 }
 
@@ -337,6 +390,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::config::analysis::ComponentConfigAnalysis;
 
     fn http_capability() -> CapabilityDecl {
         CapabilityDecl::builder().kind(CapabilityKind::Http).build()
@@ -604,6 +658,117 @@ mod tests {
             err,
             ValidationError::InvalidInterposerConfig { .. }
         ));
+    }
+
+    #[test]
+    fn validation_rejects_interposer_config_slot_interpolation() {
+        let mut output = valid_output();
+        output.interpositions[0].interposer.config = Some(serde_json::json!({
+            "upstream": "${slots.in.url}",
+        }));
+        output.interpositions[0].interposer.config_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "upstream": { "type": "string" },
+            },
+            "required": ["upstream"],
+        }));
+
+        let err = validate_policy_output(
+            &output,
+            &scope_with_binding(http_capability()),
+            &BTreeSet::new(),
+        )
+        .expect_err("slot interpolation in interposer config must be rejected");
+
+        match err {
+            ValidationError::InvalidInterposerConfig { message } => assert!(
+                message.contains("slot interpolation is not allowed"),
+                "unexpected error message: {message}"
+            ),
+            other => panic!("unexpected validation error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validation_rejects_missing_required_interposer_config_without_defaults() {
+        let mut output = valid_output();
+        output.interpositions[0].interposer.config_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "token": { "type": "string" },
+            },
+            "required": ["token"],
+        }));
+
+        let err = validate_policy_output(
+            &output,
+            &scope_with_binding(http_capability()),
+            &BTreeSet::new(),
+        )
+        .expect_err("missing required interposer config must be rejected");
+
+        match err {
+            ValidationError::InvalidInterposerConfig { message } => assert!(
+                message.contains("missing required field config.token"),
+                "unexpected error message: {message}"
+            ),
+            other => panic!("unexpected validation error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validation_accepts_interposer_config_references_to_scope_config() {
+        let mut output = valid_output();
+        output.interpositions[0].interposer.config = Some(serde_json::json!({
+            "redaction_terms": ["${config.secret}"],
+            "snapshot": "${config.settings}",
+        }));
+        output.interpositions[0].interposer.config_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "redaction_terms": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                },
+                "snapshot": {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "type": "string" },
+                    },
+                    "required": ["mode"],
+                },
+            },
+            "required": ["redaction_terms", "snapshot"],
+        }));
+        let parent_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "secret": { "type": "string" },
+                "settings": {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "type": "string" },
+                    },
+                    "required": ["mode"],
+                },
+            },
+            "required": ["secret", "settings"],
+        });
+        let scope_config = ComponentConfigAnalysis::standalone(
+            None,
+            Some(parent_schema.clone()),
+            Some(parent_schema),
+        )
+        .expect("scope config analysis");
+
+        validate_policy_output_for_scope(
+            &output,
+            &scope_with_binding(http_capability()),
+            &BTreeSet::new(),
+            &scope_config,
+        )
+        .expect("scope config references should validate as normal config templates");
     }
 
     #[test]

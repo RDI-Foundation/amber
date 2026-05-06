@@ -12,9 +12,11 @@ use thiserror::Error;
 
 use crate::{
     Governance, GovernedScope,
+    config::analysis::ScenarioConfigAnalysis,
     policy::{
         AttachmentId, PolicyInput, PolicyOutput, PolicyRequest, ScenarioScope, ScopeBinding,
-        ScopeBindingFrom, ScopeExport, ScopeImport, ValidationError, validate_policy_output,
+        ScopeBindingFrom, ScopeExport, ScopeImport, ValidationError,
+        validate_policy_output_for_scope,
     },
     reporter::{CompiledScenario, CompiledScenarioError},
 };
@@ -145,6 +147,10 @@ pub enum Error {
         source: Box<ValidationError>,
     },
 
+    #[error("scenario config analysis failed before policy execution: {message}")]
+    #[diagnostic(code(compiler::policy_pass_config_analysis_failed))]
+    ConfigAnalysisFailed { message: String },
+
     #[error("attachment target {target} is missing while rewriting scope `{scope_root}`")]
     #[diagnostic(code(compiler::policy_pass_missing_attachment_target))]
     MissingAttachmentTarget {
@@ -183,6 +189,14 @@ async fn collect_policy_outputs(
     governance: &Governance,
     runner: &dyn ScenarioRunner<CompiledScenario>,
 ) -> Result<Vec<PolicyApplication>, Error> {
+    let config_analysis = ScenarioConfigAnalysis::from_scenario(scenario)
+        .map_err(|message| Error::ConfigAnalysisFailed { message })?;
+    if let Some(err) = config_analysis.template_errors().first() {
+        return Err(Error::ConfigAnalysisFailed {
+            message: err.message.clone(),
+        });
+    }
+
     let compiled = CompiledScenario::from_scenario_with_provenance(
         &governance.scenario,
         &governance.provenance,
@@ -207,6 +221,8 @@ async fn collect_policy_outputs(
         for scope in &governance.scopes {
             let ScopeArtifacts { input, targets } = build_scope_artifacts(scenario, scope)?;
             let scope_depth_value = scope_depth(&scope.root_moniker);
+            let scope_root = scope_root_component_id(scenario, &scope.root_moniker);
+            let scope_config = config_analysis.expect_component(scope_root);
 
             for (policy_index, policy) in scope.policies.iter().enumerate() {
                 let scope_root = scope.root_moniker.clone();
@@ -244,10 +260,11 @@ async fn collect_policy_outputs(
                         }
                     })?;
                     // Generated interposers may not rely on experimental features.
-                    validate_policy_output(
+                    validate_policy_output_for_scope(
                         &output,
                         &input,
                         &BTreeSet::<ExperimentalFeature>::new(),
+                        scope_config,
                     )
                     .map_err(|source| Error::InvalidPolicyOutput {
                         scope_root: scope_root.clone(),
@@ -943,7 +960,24 @@ mod tests {
 
     #[tokio::test]
     async fn apply_policies_preserves_interposer_config() {
-        let scenario = fixture_scenario();
+        let mut scenario = fixture_scenario();
+        scenario.component_mut(ComponentId(0)).config_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "secret": { "type": "string" },
+            },
+            "required": ["secret"],
+        }));
+        scenario.component_mut(ComponentId(1)).config_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "secret": { "type": "string" },
+            },
+            "required": ["secret"],
+        }));
+        scenario.component_mut(ComponentId(1)).config = Some(serde_json::json!({
+            "secret": "${config.secret}",
+        }));
         let governance = fixture_governance();
 
         let runner = MockRunner {
@@ -1020,6 +1054,74 @@ mod tests {
                 "required": ["redaction_terms"],
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn apply_policies_rejects_interposer_config_slot_interpolation() {
+        let scenario = fixture_scenario();
+        let governance = fixture_governance();
+
+        let runner = MockRunner {
+            outputs: BTreeMap::from([(
+                "policy_0_0".to_string(),
+                PolicyOutput {
+                    interpositions: vec![Interposition {
+                        interposer: InterposerComponent {
+                            config: Some(serde_json::json!({
+                                "upstream": "${slots.in.url}",
+                            })),
+                            config_schema: Some(serde_json::json!({
+                                "type": "object",
+                                "properties": {
+                                    "upstream": { "type": "string" },
+                                },
+                                "required": ["upstream"],
+                            })),
+                            program: Some(Program::Path(ProgramPath {
+                                path: "./interposer".to_string(),
+                                args: amber_manifest::ProgramEntrypoint::default(),
+                                common: ProgramCommon::default(),
+                            })),
+                            slots: BTreeMap::from([(
+                                SlotName::try_from("in").expect("valid slot name"),
+                                SlotDecl::builder()
+                                    .decl(http_capability())
+                                    .optional(false)
+                                    .multiple(false)
+                                    .build(),
+                            )]),
+                            provides: BTreeMap::from([(
+                                ProvideName::try_from("out").expect("valid provide name"),
+                                ProvideDecl::builder().decl(http_capability()).build(),
+                            )]),
+                            resources: BTreeMap::new(),
+                            metadata: None,
+                        },
+                        attachments: vec![Attachment {
+                            target: AttachmentId(0),
+                            interposer_slot: SlotName::try_from("in").expect("valid slot name"),
+                            interposer_provide: ProvideName::try_from("out")
+                                .expect("valid provide name"),
+                        }],
+                    }],
+                },
+            )]),
+        };
+
+        let err = apply_policies(scenario, Some(&governance), Some(&runner))
+            .await
+            .expect_err("slot interpolation in generated interposer config must be rejected");
+
+        let Error::InvalidPolicyOutput { source, .. } = err else {
+            panic!("unexpected policy pass error: {err:?}");
+        };
+        match *source {
+            ValidationError::InvalidInterposerConfig { message } => assert!(
+                message.contains("slot interpolation is not allowed"),
+                "unexpected error message: {message}"
+            ),
+            other => panic!("unexpected validation error: {other:?}"),
+        }
     }
 
     #[tokio::test]
