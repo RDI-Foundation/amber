@@ -58,6 +58,24 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Relax AppArmor user namespace restrictions when present
+        run: |
+          set -euo pipefail
+
+          if sysctl kernel.apparmor_restrict_unprivileged_unconfined >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
+          fi
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Ensure direct runtime sandbox packages are available
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap slirp4netns
+          bwrap --version
+          slirp4netns --version
       - run: cargo test --workspace --all-features
 
   direct-tests:

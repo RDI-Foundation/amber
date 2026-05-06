@@ -203,10 +203,10 @@ Examples:
 
 const CHECK_LONG_ABOUT: &str = "\
 Resolve a root manifest or bundle, run static validation and lint passes, print diagnostics, and \
-stop before emitting artifacts.
+                                stop before emitting artifacts.
 
 By default, this command does not execute governance policy programs. Use `--apply-policies` when \
-you need to run policies and validate the policy-rewritten graph.";
+                                you need to run policies and validate the policy-rewritten graph.";
 
 const CHECK_AFTER_HELP: &str = "\
 Examples:
@@ -1216,8 +1216,8 @@ async fn compile(args: CompileArgs) -> Result<()> {
 
 async fn check(args: CheckArgs) -> Result<()> {
     let resolved = resolve_input(&args.manifest).await?;
-    let mut compiler = Compiler::new(resolved.resolver, Default::default())
-        .with_registry(resolved.registry);
+    let mut compiler =
+        Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
     if args.apply_policies {
         compiler =
             compiler.with_scenario_runner(Arc::new(scenario_runner::CliScenarioRunner::default()));

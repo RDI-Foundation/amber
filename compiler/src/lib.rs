@@ -64,21 +64,11 @@ impl Default for OptimizeOptions {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CheckOptions {
     pub resolve: ResolveOptions,
     pub optimize: OptimizeOptions,
     pub apply_policies: bool,
-}
-
-impl Default for CheckOptions {
-    fn default() -> Self {
-        Self {
-            resolve: ResolveOptions::default(),
-            optimize: OptimizeOptions::default(),
-            apply_policies: false,
-        }
-    }
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -383,19 +373,10 @@ pub struct CheckOutput {
     pub has_errors: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct CheckFinalizeOptions {
     optimize: OptimizeOptions,
     apply_policies: bool,
-}
-
-impl Default for CheckFinalizeOptions {
-    fn default() -> Self {
-        Self {
-            optimize: OptimizeOptions::default(),
-            apply_policies: false,
-        }
-    }
 }
 
 fn collect_manifest_diagnostics(

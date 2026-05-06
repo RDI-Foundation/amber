@@ -31,6 +31,8 @@ use crate::{
     },
 };
 
+const EXPORT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) struct CliScenarioRunner {
     client: Client,
 }
@@ -364,7 +366,7 @@ async fn wait_for_exports_ready(
     options: &ScenarioRunOptions,
     run_root: &Path,
 ) -> Result<(), ScenarioRunnerError> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + EXPORT_READY_TIMEOUT;
     loop {
         let mut pending = Vec::new();
 
