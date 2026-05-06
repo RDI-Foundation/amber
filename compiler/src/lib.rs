@@ -64,6 +64,23 @@ impl Default for OptimizeOptions {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct CheckOptions {
+    pub resolve: ResolveOptions,
+    pub optimize: OptimizeOptions,
+    pub apply_policies: bool,
+}
+
+impl Default for CheckOptions {
+    fn default() -> Self {
+        Self {
+            resolve: ResolveOptions::default(),
+            optimize: OptimizeOptions::default(),
+            apply_policies: false,
+        }
+    }
+}
+
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum Error {
@@ -175,6 +192,16 @@ impl Compiler {
 
     #[allow(clippy::result_large_err)]
     pub async fn check_from_tree(&self, tree: ResolvedTree) -> Result<CheckOutput, Error> {
+        self.check_from_tree_with_options(tree, CheckFinalizeOptions::default())
+            .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn check_from_tree_with_options(
+        &self,
+        tree: ResolvedTree,
+        opts: CheckFinalizeOptions,
+    ) -> Result<CheckOutput, Error> {
         let mut diagnostics =
             slots::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
         let mut has_errors = false;
@@ -187,15 +214,15 @@ impl Compiler {
                     &provenance,
                     &self.store,
                 ));
-                if let Err(err) = self
-                    .finalize_linked_scenario(
-                        scenario,
-                        governance,
-                        provenance,
-                        OptimizeOptions::default(),
-                    )
-                    .await
-                {
+                let finalization = if opts.apply_policies {
+                    self.finalize_linked_scenario(scenario, governance, provenance, opts.optimize)
+                        .await
+                        .map(|_| ())
+                } else {
+                    self.optimize_linked_scenario(scenario, governance, provenance, opts.optimize)
+                        .map(|_| ())
+                };
+                if let Err(err) = finalization {
                     has_errors = true;
                     diagnostics.push(Report::new(err));
                 }
@@ -240,11 +267,36 @@ impl Compiler {
         opts: CompileOptions,
     ) -> Result<CheckOutput, Error> {
         let tree = self.resolve_tree(root, opts.resolve).await?;
-        self.check_from_tree(tree).await
+        self.check_from_tree_with_options(
+            tree,
+            CheckFinalizeOptions {
+                optimize: opts.optimize,
+                apply_policies: false,
+            },
+        )
+        .await
+    }
+
+    /// Resolve manifests, optionally apply governance policies, and report diagnostics without
+    /// emitting artifacts.
+    pub async fn check_with_options(
+        &self,
+        root: ManifestRef,
+        opts: CheckOptions,
+    ) -> Result<CheckOutput, Error> {
+        let tree = self.resolve_tree(root, opts.resolve).await?;
+        self.check_from_tree_with_options(
+            tree,
+            CheckFinalizeOptions {
+                optimize: opts.optimize,
+                apply_policies: opts.apply_policies,
+            },
+        )
+        .await
     }
 
     #[allow(clippy::result_large_err)]
-    async fn finalize_linked_scenario(
+    fn optimize_linked_scenario(
         &self,
         scenario: Scenario,
         governance: Option<Governance>,
@@ -272,6 +324,19 @@ impl Compiler {
                 })
             })
             .transpose()?;
+        Ok((scenario, governance, provenance))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn finalize_linked_scenario(
+        &self,
+        scenario: Scenario,
+        governance: Option<Governance>,
+        provenance: Provenance,
+        opts: OptimizeOptions,
+    ) -> Result<(Scenario, Option<Governance>, Provenance), Error> {
+        let (scenario, governance, provenance) =
+            self.optimize_linked_scenario(scenario, governance, provenance, opts)?;
         let scenario = policy_pass::apply_policies(
             scenario,
             governance.as_ref(),
@@ -316,6 +381,21 @@ impl CompileOutput {
 pub struct CheckOutput {
     pub diagnostics: Vec<Report>,
     pub has_errors: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CheckFinalizeOptions {
+    optimize: OptimizeOptions,
+    apply_policies: bool,
+}
+
+impl Default for CheckFinalizeOptions {
+    fn default() -> Self {
+        Self {
+            optimize: OptimizeOptions::default(),
+            apply_policies: false,
+        }
+    }
 }
 
 fn collect_manifest_diagnostics(

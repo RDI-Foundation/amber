@@ -57,7 +57,9 @@ Each component that declares `policies` defines one governed realm rooted at tha
 moniker.
 
 During CLI compilation, Amber runs the synthetic policy scenario with the same local run-plan
-machinery used by `amber run`.
+machinery used by `amber run`. `amber check` stays static by default and does not execute policy
+programs; use `amber check --apply-policies` when you need to run policies and validate the
+rewritten graph without emitting artifacts.
 
 ## Writing a Policy Manifest
 
@@ -233,6 +235,8 @@ Attachment checks:
 - the attachment target capability must exactly match:
   - the interposer slot capability
   - the interposer provide capability
+- storage targets cannot be interposed; storage mounts must remain bound directly from storage
+  resources
 
 Interposer checks:
 

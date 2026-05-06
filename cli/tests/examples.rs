@@ -53,7 +53,6 @@ fn examples_check_deny_warnings() {
 
     let mut manifests: Vec<PathBuf> = examples
         .iter()
-        .filter(|example| !example_requires_runtime_during_compile(example))
         .map(|example| example.root_manifest.clone())
         .collect();
     manifests.extend(collect_scenario_variants(&examples_dir));

@@ -244,10 +244,17 @@ amber logs <run-id>
 amber stop <run-id>
 ```
 
-Use `amber check` when you want validation without starting anything:
+Use `amber check` when you want static validation without starting anything:
 
 ```sh
 amber check path/to/root
+```
+
+If the scenario uses governance and you want to execute policies and validate the rewritten graph,
+opt in explicitly:
+
+```sh
+amber check --apply-policies path/to/root
 ```
 
 Use `amber compile` when you want explicit artifacts:

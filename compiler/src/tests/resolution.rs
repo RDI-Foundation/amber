@@ -809,6 +809,60 @@ async fn resolve_tree_keeps_use_entries_out_of_component_tree() {
 }
 
 #[tokio::test]
+async fn check_with_governance_stays_static_by_default() {
+    let dir = tmp_dir("scenario-governance-static-check");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+    let policy_path = dir.path().join("policy.json5");
+
+    write_file(&child_path, r#"{ manifest_version: "0.1.0" }"#);
+    write_file(
+        &policy_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "policy",
+            entrypoint: ["policy"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          exports: { apply: "apply" },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.4.0",
+              use: {{
+                policy: "{policy}",
+              }},
+              policies: ["#policy.apply"],
+              components: {{
+                child: "{child}",
+              }},
+            }}
+            "##,
+            policy = file_url(&policy_path),
+            child = file_url(&child_path),
+        ),
+    );
+
+    let output = default_compiler()
+        .check(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect("static check should not require a policy scenario runner");
+
+    assert!(!output.has_errors);
+}
+
+#[tokio::test]
 async fn use_config_with_config_interpolation_compiles() {
     let dir = tmp_dir("scenario-use-config-interp");
     let root_path = dir.path().join("root.json5");

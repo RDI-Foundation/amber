@@ -29,7 +29,7 @@ use std::{
 };
 
 use amber_compiler::{
-    CompileOptions, Compiler, ResolverRegistry,
+    CheckOptions, CompileOptions, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
     reporter::{
         CompiledScenario, Reporter as _,
@@ -202,12 +202,16 @@ Examples:
   amber compile path/to/root.json5 --vm /tmp/amber-vm";
 
 const CHECK_LONG_ABOUT: &str = "\
-Resolve a root manifest or bundle, run the same validation and lint passes as `amber compile`, \
-                                print diagnostics, and stop before emitting artifacts.";
+Resolve a root manifest or bundle, run static validation and lint passes, print diagnostics, and \
+stop before emitting artifacts.
+
+By default, this command does not execute governance policy programs. Use `--apply-policies` when \
+you need to run policies and validate the policy-rewritten graph.";
 
 const CHECK_AFTER_HELP: &str = "\
 Examples:
   amber check path/to/root.json5
+  amber check --apply-policies path/to/root.json5
   amber check -D warnings path/to/root.json5
 
 Use `amber compile --help` when you are ready to write outputs.";
@@ -503,6 +507,10 @@ struct CheckArgs {
     /// Treat the given lints as errors (e.g. `warnings`, `manifest::unused_slot`).
     #[arg(short = 'D', long = "deny", value_name = "LINT")]
     deny: Vec<String>,
+
+    /// Execute governance policy programs and validate the policy-rewritten graph.
+    #[arg(long = "apply-policies")]
+    apply_policies: bool,
 
     /// Root manifest or bundle to check (URL or local path).
     #[arg(value_name = "MANIFEST")]
@@ -1208,12 +1216,21 @@ async fn compile(args: CompileArgs) -> Result<()> {
 
 async fn check(args: CheckArgs) -> Result<()> {
     let resolved = resolve_input(&args.manifest).await?;
-    let compiler = Compiler::new(resolved.resolver, Default::default())
-        .with_registry(resolved.registry)
-        .with_scenario_runner(Arc::new(scenario_runner::CliScenarioRunner::default()));
+    let mut compiler = Compiler::new(resolved.resolver, Default::default())
+        .with_registry(resolved.registry);
+    if args.apply_policies {
+        compiler =
+            compiler.with_scenario_runner(Arc::new(scenario_runner::CliScenarioRunner::default()));
+    }
 
     let output = compiler
-        .check(resolved.manifest, CompileOptions::default())
+        .check_with_options(
+            resolved.manifest,
+            CheckOptions {
+                apply_policies: args.apply_policies,
+                ..CheckOptions::default()
+            },
+        )
         .await
         .wrap_err("check failed")?;
 

@@ -5,8 +5,8 @@ use std::{
 
 use amber_config as rc;
 use amber_manifest::{
-    CapabilityDecl, ExperimentalFeature, ProvideDecl, ProvideName, ResourceDecl, ResourceName,
-    SlotDecl, SlotName,
+    CapabilityDecl, CapabilityKind, ConfigSchema, ExperimentalFeature, ProvideDecl, ProvideName,
+    ResourceDecl, ResourceName, SlotDecl, SlotName,
 };
 use amber_scenario::{Component, FrameworkRef, Program, ProvideRef, ResourceRef, SlotRef};
 use serde::{Deserialize, Serialize};
@@ -160,6 +160,9 @@ pub enum ValidationError {
         interposer_capability: CapabilityDecl,
     },
 
+    #[error("attachment target {target} carries storage, which cannot be interposed")]
+    UnsupportedStorageInterposition { target: AttachmentId },
+
     #[error("interposer program is invalid: {message}")]
     InvalidProgram { message: String },
 
@@ -264,6 +267,11 @@ fn validate_interposition(
                 target: attachment.target,
             },
         )?;
+        if target_capability.kind == CapabilityKind::Storage {
+            return Err(ValidationError::UnsupportedStorageInterposition {
+                target: attachment.target,
+            });
+        }
 
         let slot_decl = interposition
             .interposer
@@ -316,12 +324,18 @@ fn validate_interposer_component(
     if component.config.is_some() && component.config_schema.is_none() {
         return Err(ValidationError::MissingInterposerConfigSchema);
     }
+    let config_schema = component
+        .config_schema
+        .as_ref()
+        .map(|schema| {
+            ConfigSchema::new(schema.clone()).map_err(|err| {
+                ValidationError::InvalidInterposerConfigSchema {
+                    message: err.to_string(),
+                }
+            })
+        })
+        .transpose()?;
     if let Some(schema) = component.config_schema.as_ref() {
-        rc::validate_config_schema(schema).map_err(|err| {
-            ValidationError::InvalidInterposerConfigSchema {
-                message: err.to_string(),
-            }
-        })?;
         let composed = validation::compose_component_config_template(
             component.config.as_ref(),
             parent_schema,
@@ -342,12 +356,13 @@ fn validate_interposer_component(
     let Some(program) = component.program.as_ref() else {
         return Err(ValidationError::MissingInterposerProgram);
     };
+    validate_lowered_program_slot_uses(program, &component.slots)?;
 
     let mount_source_indices = (0..program.mounts().len()).collect::<Vec<_>>();
     validate_lowered_program_mounts(
         program,
         &mount_source_indices,
-        None,
+        config_schema.as_ref(),
         &component.resources,
         &component.slots,
         enabled_features,
@@ -359,6 +374,28 @@ fn validate_interposer_component(
             .expect("program validation returned at least one error")
             .message,
     })
+}
+
+fn validate_lowered_program_slot_uses(
+    program: &Program,
+    slots: &BTreeMap<SlotName, SlotDecl>,
+) -> Result<(), ValidationError> {
+    let mut missing_slots = BTreeSet::new();
+    program.visit_slot_uses(|slot| {
+        if !slots.contains_key(slot) {
+            missing_slots.insert(slot.to_string());
+        }
+    });
+
+    if let Some(slot) = missing_slots.into_iter().next() {
+        return Err(ValidationError::InvalidProgram {
+            message: format!(
+                "program references slot `{slot}`, but no such slot exists on the interposer"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 fn target_capability(input: &PolicyInput, target: AttachmentId) -> Option<&CapabilityDecl> {
@@ -385,8 +422,9 @@ fn target_capability(input: &PolicyInput, target: AttachmentId) -> Option<&Capab
 
 #[cfg(test)]
 mod tests {
-    use amber_manifest::CapabilityKind;
-    use amber_scenario::{ProgramCommon, ProgramMount, ProgramPath};
+    use amber_manifest::{CapabilityKind, ProgramEnvValue};
+    use amber_scenario::{FileMount, FileMountSource, ProgramCommon, ProgramMount, ProgramPath};
+    use amber_template::TemplatePart;
     use serde_json::json;
 
     use super::*;
@@ -415,6 +453,16 @@ mod tests {
                     .build(),
             )
             .optional(optional)
+            .build()
+    }
+
+    fn storage_provide() -> ProvideDecl {
+        ProvideDecl::builder()
+            .decl(
+                CapabilityDecl::builder()
+                    .kind(CapabilityKind::Storage)
+                    .build(),
+            )
             .build()
     }
 
@@ -575,6 +623,37 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_storage_interposition() {
+        let mut output = valid_output();
+        output.interpositions[0]
+            .interposer
+            .slots
+            .insert(SlotName::try_from("in").unwrap(), storage_slot(false));
+        output.interpositions[0]
+            .interposer
+            .provides
+            .insert(ProvideName::try_from("out").unwrap(), storage_provide());
+
+        let err = validate_policy_output(
+            &output,
+            &scope_with_binding(
+                CapabilityDecl::builder()
+                    .kind(CapabilityKind::Storage)
+                    .build(),
+            ),
+            &BTreeSet::new(),
+        )
+        .expect_err("storage interposition must be rejected");
+
+        assert_eq!(
+            err,
+            ValidationError::UnsupportedStorageInterposition {
+                target: AttachmentId(1)
+            }
+        );
+    }
+
+    #[test]
     fn validation_rejects_invalid_program_mounts() {
         let mut output = valid_output();
         output.interpositions[0].interposer.program = Some(Program::Path(ProgramPath {
@@ -597,6 +676,80 @@ mod tests {
         )
         .expect_err("invalid program mount must be rejected");
         assert!(matches!(err, ValidationError::InvalidProgram { .. }));
+    }
+
+    #[test]
+    fn validation_rejects_program_slot_uses_missing_from_interposer() {
+        let mut output = valid_output();
+        output.interpositions[0].interposer.program = Some(Program::Path(ProgramPath {
+            path: "./interposer".to_string(),
+            args: amber_manifest::ProgramEntrypoint::default(),
+            common: ProgramCommon {
+                env: BTreeMap::from([(
+                    "UPSTREAM_URL".to_string(),
+                    ProgramEnvValue::from(
+                        "${slots.missing.url}"
+                            .parse::<amber_manifest::InterpolatedString>()
+                            .unwrap(),
+                    ),
+                )]),
+                network: None,
+                mounts: Vec::new(),
+            },
+        }));
+
+        let err = validate_policy_output(
+            &output,
+            &scope_with_binding(http_capability()),
+            &BTreeSet::new(),
+        )
+        .expect_err("missing program slot use must be rejected");
+
+        match err {
+            ValidationError::InvalidProgram { message } => assert!(
+                message.contains("program references slot `missing`"),
+                "unexpected error message: {message}"
+            ),
+            other => panic!("unexpected validation error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validation_accepts_config_file_mount_with_interposer_schema() {
+        let mut output = valid_output();
+        output.interpositions[0].interposer.config = Some(json!({
+            "config_file": "secret",
+        }));
+        output.interpositions[0].interposer.config_schema = Some(json!({
+            "type": "object",
+            "properties": {
+                "config_file": { "type": "string" },
+            },
+            "required": ["config_file"],
+        }));
+        output.interpositions[0].interposer.program = Some(Program::Path(ProgramPath {
+            path: "./interposer".to_string(),
+            args: amber_manifest::ProgramEntrypoint::default(),
+            common: ProgramCommon {
+                env: BTreeMap::new(),
+                network: None,
+                mounts: vec![ProgramMount::File(FileMount {
+                    when: None,
+                    each: None,
+                    path: vec![TemplatePart::lit("/etc/interposer/config")],
+                    source: FileMountSource::Config {
+                        path: vec![TemplatePart::config("config_file")],
+                    },
+                })],
+            },
+        }));
+
+        validate_policy_output(
+            &output,
+            &scope_with_binding(http_capability()),
+            &BTreeSet::new(),
+        )
+        .expect("config file mount with interposer schema should validate");
     }
 
     #[test]
