@@ -126,6 +126,8 @@ pub(crate) const DIRECT_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5)
 pub(crate) const DIRECT_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
 pub(crate) const DIRECT_LOCAL_TARGET_READY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DIRECT_MESH_ENDPOINT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
+const DIRECT_RUNTIME_STARTUP_LOCK_NAME: &str = "amber-direct-runtime-startup";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DirectControlSocketPaths {
@@ -180,6 +182,7 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
     let mut log_tasks = Vec::new();
     let mut component_sidecar_pid_by_id = HashMap::new();
     let mut control_socket_paths = None;
+    let mut startup_lock = Some(DirectRuntimeStartupLock::acquire()?);
     let existing_peer_ports_by_id = read_existing_peer_ports(
         args.existing_peer_ports.as_deref(),
         "direct existing peer ports",
@@ -508,6 +511,7 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
 
         wait_for_direct_mesh_endpoints(&runtime_state, DIRECT_MESH_ENDPOINT_READY_TIMEOUT).await?;
         write_direct_runtime_state(&plan_root, &runtime_state)?;
+        drop(startup_lock.take());
         supervise_children(&mut children).await
     }
     .await;
@@ -519,6 +523,7 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
         runtime_dir,
     )
     .await;
+    drop(startup_lock);
 
     let (reason, exit_code) = supervision?;
     match reason {
@@ -535,6 +540,63 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
             }
         }
     }
+}
+
+struct DirectRuntimeStartupLock {
+    #[cfg(unix)]
+    file: fs::File,
+}
+
+impl DirectRuntimeStartupLock {
+    fn acquire() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            let path = direct_runtime_startup_lock_path();
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to open direct runtime startup lock {}",
+                        path.display()
+                    )
+                })?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(miette::miette!(
+                    "failed to lock direct runtime startup lock {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self { file })
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DirectRuntimeStartupLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(unix)]
+fn direct_runtime_startup_lock_path() -> PathBuf {
+    let uid = unsafe { libc::geteuid() };
+    env::temp_dir().join(format!("{DIRECT_RUNTIME_STARTUP_LOCK_NAME}-{uid}.lock"))
 }
 
 fn read_existing_peer_ports(

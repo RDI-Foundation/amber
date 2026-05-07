@@ -16,7 +16,7 @@ use crate::{
     policy::{
         AttachmentId, PolicyInput, PolicyOutput, PolicyRequest, ScenarioScope, ScopeBinding,
         ScopeBindingFrom, ScopeExport, ScopeImport, ValidationError,
-        validate_policy_output_for_scope,
+        validate_interposer_program_ir, validate_policy_output_for_scope,
     },
     reporter::{CompiledScenario, CompiledScenarioError},
 };
@@ -26,6 +26,7 @@ pub(crate) struct PolicyApplication {
     pub scope_root: Moniker,
     pub scope_depth: usize,
     pub policy_index: usize,
+    pub policy_display_name: String,
     pub input: PolicyInput,
     targets: BTreeMap<AttachmentId, TargetDescriptor>,
     pub output: PolicyOutput,
@@ -275,6 +276,7 @@ async fn collect_policy_outputs(
                         scope_root,
                         scope_depth: scope_depth_value,
                         policy_index: policy_index_value,
+                        policy_display_name,
                         input,
                         targets,
                         output,
@@ -504,6 +506,17 @@ fn insert_interposer_component(
     let moniker =
         unique_interposer_moniker(scenario, parent, application_index, interposition_index);
     let component_id = ComponentId(scenario.components.len());
+
+    validate_interposer_program_ir(
+        &interposition.interposer,
+        component_id,
+        &BTreeSet::<ExperimentalFeature>::new(),
+    )
+    .map_err(|source| Error::InvalidPolicyOutput {
+        scope_root: application.scope_root.clone(),
+        policy: application.policy_display_name.clone(),
+        source: Box::new(source),
+    })?;
 
     scenario.components.push(Some(Component {
         id: component_id,

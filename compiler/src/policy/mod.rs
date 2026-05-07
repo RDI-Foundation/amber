@@ -8,14 +8,16 @@ use amber_manifest::{
     CapabilityDecl, CapabilityKind, ConfigSchema, ExperimentalFeature, ProvideDecl, ProvideName,
     ResourceDecl, ResourceName, SlotDecl, SlotName,
 };
-use amber_scenario::{Component, FrameworkRef, Program, ProvideRef, ResourceRef, SlotRef};
+use amber_scenario::{
+    Component, ComponentId, FrameworkRef, Program, ProvideRef, ResourceRef, SlotRef,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
     config::{analysis::ComponentConfigAnalysis, validation},
-    linker::program_lowering::validate_lowered_program_mounts,
+    linker::program_lowering::{LoweredProgramValidation, validate_lowered_program},
 };
 
 pub type PolicyInput = ScenarioScope;
@@ -353,20 +355,58 @@ fn validate_interposer_component(
         }
     }
 
+    validate_interposer_program_ir_with_schema(
+        component,
+        None,
+        config_schema.as_ref(),
+        enabled_features,
+    )
+}
+
+pub(crate) fn validate_interposer_program_ir(
+    component: &InterposerComponent,
+    component_id: ComponentId,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
+) -> Result<(), ValidationError> {
+    let config_schema = component
+        .config_schema
+        .as_ref()
+        .map(|schema| {
+            ConfigSchema::new(schema.clone()).map_err(|err| {
+                ValidationError::InvalidInterposerConfigSchema {
+                    message: err.to_string(),
+                }
+            })
+        })
+        .transpose()?;
+    validate_interposer_program_ir_with_schema(
+        component,
+        Some(component_id),
+        config_schema.as_ref(),
+        enabled_features,
+    )
+}
+
+fn validate_interposer_program_ir_with_schema(
+    component: &InterposerComponent,
+    component_id: Option<ComponentId>,
+    config_schema: Option<&ConfigSchema>,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
+) -> Result<(), ValidationError> {
     let Some(program) = component.program.as_ref() else {
         return Err(ValidationError::MissingInterposerProgram);
     };
-    validate_lowered_program_slot_uses(program, &component.slots)?;
-
     let mount_source_indices = (0..program.mounts().len()).collect::<Vec<_>>();
-    validate_lowered_program_mounts(
+    validate_lowered_program(LoweredProgramValidation {
         program,
-        &mount_source_indices,
-        config_schema.as_ref(),
-        &component.resources,
-        &component.slots,
+        mount_source_indices: &mount_source_indices,
+        component_id,
+        config_schema,
+        resources: &component.resources,
+        slots: &component.slots,
         enabled_features,
-    )
+        validate_source_interpolations: true,
+    })
     .map_err(|errors| ValidationError::InvalidProgram {
         message: errors
             .into_iter()
@@ -374,28 +414,6 @@ fn validate_interposer_component(
             .expect("program validation returned at least one error")
             .message,
     })
-}
-
-fn validate_lowered_program_slot_uses(
-    program: &Program,
-    slots: &BTreeMap<SlotName, SlotDecl>,
-) -> Result<(), ValidationError> {
-    let mut missing_slots = BTreeSet::new();
-    program.visit_slot_uses(|slot| {
-        if !slots.contains_key(slot) {
-            missing_slots.insert(slot.to_string());
-        }
-    });
-
-    if let Some(slot) = missing_slots.into_iter().next() {
-        return Err(ValidationError::InvalidProgram {
-            message: format!(
-                "program references slot `{slot}`, but no such slot exists on the interposer"
-            ),
-        });
-    }
-
-    Ok(())
 }
 
 fn target_capability(input: &PolicyInput, target: AttachmentId) -> Option<&CapabilityDecl> {
@@ -707,7 +725,7 @@ mod tests {
 
         match err {
             ValidationError::InvalidProgram { message } => assert!(
-                message.contains("program references slot `missing`"),
+                message.contains("unknown slot `missing`"),
                 "unexpected error message: {message}"
             ),
             other => panic!("unexpected validation error: {other:?}"),

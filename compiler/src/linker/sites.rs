@@ -464,6 +464,20 @@ pub(super) fn endpoint_site(
     Some((src, span))
 }
 
+pub(super) fn program_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    id: ComponentId,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    let (src, spans) = source_for_component(provenance, store, id)?;
+    let span = spans
+        .program
+        .as_ref()
+        .map(|program| program.whole)
+        .unwrap_or((0usize, 0usize).into());
+    Some((src, span))
+}
+
 pub(super) fn authored_mount_index(
     mount_source_indices_by_component: &HashMap<ComponentId, Vec<usize>>,
     component: ComponentId,

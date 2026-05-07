@@ -37,8 +37,8 @@ use url::Url;
 use self::{
     bindings::*,
     program_lowering::{
-        ProgramLoweringError, ProgramLoweringSite, lower_program_with_config_analysis,
-        validate_lowered_program_mounts,
+        LoweredProgramValidation, ProgramLoweringError, ProgramLoweringSite,
+        lower_program_with_config_analysis, validate_lowered_program,
     },
     sites::*,
 };
@@ -356,6 +356,17 @@ pub enum Error {
         span: SourceSpan,
     },
 
+    #[error("unsupported program on {component_path}: {message}")]
+    #[diagnostic(code(linker::unsupported_program))]
+    UnsupportedProgram {
+        component_path: String,
+        message: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "program declared here")]
+        span: SourceSpan,
+    },
+
     #[error("slot `{slot}` on {component_path} is not bound (non-optional slots must be filled)")]
     #[diagnostic(code(linker::unbound_slot))]
     UnboundSlot {
@@ -588,14 +599,16 @@ pub fn link(
         let component_config = config_analysis.expect_component(id);
         match lower_program_with_config_analysis(id, program, component_config) {
             Ok(lowered) => {
-                if let Err(program_errors) = validate_lowered_program_mounts(
-                    &lowered.program,
-                    &lowered.mount_source_indices,
-                    manifest.config_schema(),
-                    manifest.resources(),
-                    manifest.slots(),
-                    manifest.experimental_features(),
-                ) {
+                if let Err(program_errors) = validate_lowered_program(LoweredProgramValidation {
+                    program: &lowered.program,
+                    mount_source_indices: &lowered.mount_source_indices,
+                    component_id: Some(id),
+                    config_schema: manifest.config_schema(),
+                    resources: manifest.resources(),
+                    slots: manifest.slots(),
+                    enabled_features: manifest.experimental_features(),
+                    validate_source_interpolations: false,
+                }) {
                     record_program_lowering_errors(
                         id,
                         &component_path_for(&components, id),
@@ -1605,7 +1618,8 @@ fn validate_config_tree(
         }
     }
 
-    // 2) Validate config use-sites and program `${config.*}` references.
+    // 2) Validate config use-sites on authored manifests. Generated policy IR is validated by
+    // the lowered-program verifier because it has no manifest source entry.
 
     fn validate_program_config_refs(
         id: ComponentId,
@@ -1645,11 +1659,13 @@ fn validate_config_tree(
             };
             match rc::schema_lookup(schema, query) {
                 Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => {}
-                Err(e) => {
+                Err(err) => {
                     errors.push(invalid_config_error(
                         component_path.clone(),
                         &site,
-                        format!("invalid ${{config{interp_suffix}}} reference in {location}: {e}"),
+                        format!(
+                            "invalid ${{config{interp_suffix}}} reference in {location}: {err}"
+                        ),
                         Some("invalid config reference".to_string()),
                         Vec::new(),
                     ));
@@ -2040,6 +2056,16 @@ fn record_program_lowering_errors(
 ) {
     for program_error in program_errors {
         match program_error.site {
+            ProgramLoweringSite::Program => {
+                let (src, span) = program_site(provenance, store, component)
+                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                errors.push(Error::UnsupportedProgram {
+                    component_path: component_path.to_string(),
+                    message: program_error.message.clone(),
+                    src,
+                    span,
+                });
+            }
             ProgramLoweringSite::Mount(mount_index) => {
                 let (src, span) = mount_source_site(provenance, store, component, mount_index)
                     .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
