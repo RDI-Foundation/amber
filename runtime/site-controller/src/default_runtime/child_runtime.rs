@@ -1443,7 +1443,7 @@ mod tests {
             site_state_root: compose_state_root.display().to_string(),
             artifact_dir: compose_artifact.display().to_string(),
             control_state_auth_token: "test-auth".to_string(),
-            dynamic_caps_token_verify_key_b64: String::new(),
+            controller_identity_path: None,
             storage_root: None,
             runtime_root: None,
             router_mesh_port: Some(24034),
@@ -1573,7 +1573,7 @@ mod tests {
             site_state_root: direct_state_root.display().to_string(),
             artifact_dir: direct_artifact.display().to_string(),
             control_state_auth_token: "test-auth".to_string(),
-            dynamic_caps_token_verify_key_b64: String::new(),
+            controller_identity_path: None,
             storage_root: Some(
                 temp.path()
                     .join("storage")

@@ -80,12 +80,13 @@ pub use self::{
     default_runtime::{
         SiteControllerPeerRouterRoute, assign_compose_egress_network_subnets,
         cleanup_dynamic_site_children, host_service_bind_addr_for_consumer,
-        inject_compose_site_controller, inject_kubernetes_site_controller,
-        inject_site_controller_peer_router_routes, observability_endpoint_for_site,
-        prepare_kubernetes_artifact_namespace, reserve_host_port, reserve_loopback_port,
-        router_mesh_addr_for_consumer, set_compose_router_published_mesh_port,
-        set_site_artifact_mesh_identity_seed, site_controller_peer_router_url,
-        vm_endpoint_forward_ready_timeout, vm_uses_tcg_accel, walk_files,
+        inject_compose_site_controller, inject_compose_site_controller_with_mount_sources,
+        inject_kubernetes_site_controller, inject_site_controller_peer_router_routes,
+        observability_endpoint_for_site, prepare_kubernetes_artifact_namespace, reserve_host_port,
+        reserve_loopback_port, router_mesh_addr_for_consumer,
+        set_compose_router_published_mesh_port, set_site_artifact_mesh_identity_seed,
+        site_controller_peer_router_url, vm_endpoint_forward_ready_timeout, vm_uses_tcg_accel,
+        walk_files,
     },
     runtime_api::{
         DesiredExportPeerOverlay, DesiredExternalSlotOverlay, DesiredRouteOverlay, LaunchedSite,
@@ -97,10 +98,10 @@ pub use self::{
     },
     state::{
         DynamicInputDirectRecord, DynamicInputRouteTarget, DynamicProxyExportRecord,
-        SITE_CONTROLLER_INTERNAL_CAPABILITY, SITE_CONTROLLER_SERVICE_NAME, SiteControllerPlan,
-        authority_url_for_listen_addr, build_site_controller_state,
-        generate_control_state_auth_token, site_controller_internal_route_id, write_control_state,
-        write_site_controller_plan,
+        SITE_CONTROLLER_INTERNAL_CAPABILITY, SITE_CONTROLLER_MESH_IDENTITY_PATH,
+        SITE_CONTROLLER_SERVICE_NAME, SiteControllerPlan, authority_url_for_listen_addr,
+        build_site_controller_state, generate_control_state_auth_token,
+        site_controller_internal_route_id, write_control_state, write_site_controller_plan,
     },
 };
 

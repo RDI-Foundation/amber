@@ -905,7 +905,7 @@ mod tests {
             site_state_root: root.join("site-state").display().to_string(),
             artifact_dir: root.join("artifact").display().to_string(),
             control_state_auth_token: "token".to_string(),
-            dynamic_caps_token_verify_key_b64: "verify".to_string(),
+            controller_identity_path: None,
             storage_root: None,
             runtime_root: None,
             router_mesh_port: Some(24000),

@@ -2747,7 +2747,7 @@ fn test_control_state_app(
             site_state_root: site_state_root.display().to_string(),
             artifact_dir: artifact_dir.display().to_string(),
             control_state_auth_token: "test-control-state-auth".to_string(),
-            dynamic_caps_token_verify_key_b64: String::new(),
+            controller_identity_path: None,
             storage_root: Some(storage_root.display().to_string()),
             runtime_root: Some(runtime_root.display().to_string()),
             router_mesh_port: Some(24000),
@@ -3103,6 +3103,84 @@ fn install_remote_controller_peer_url_fixture(
 ) {
     let plan = Arc::make_mut(&mut app.controller_plan);
     plan.peer_site_router_urls.extend(remote_base_urls.clone());
+}
+
+fn retarget_test_controller_site(app: &mut ControlStateApp, site_id: &str) {
+    let plan = Arc::make_mut(&mut app.controller_plan);
+    plan.site_id = site_id.to_string();
+    plan.router_identity_id = format!("/site/{site_id}/router");
+    plan.site_state_root = app.state_root.join(site_id).display().to_string();
+    if let Some(parent) = Path::new(&plan.artifact_dir).parent() {
+        plan.artifact_dir = parent.join(site_id).display().to_string();
+    }
+    if let Some(parent) = plan
+        .runtime_root
+        .as_deref()
+        .and_then(|runtime_root| Path::new(runtime_root).parent())
+    {
+        plan.runtime_root = Some(parent.join(site_id).display().to_string());
+    }
+    if let Some(parent) = plan
+        .storage_root
+        .as_deref()
+        .and_then(|storage_root| Path::new(storage_root).parent())
+    {
+        plan.storage_root = Some(parent.join(site_id).display().to_string());
+    }
+}
+
+fn install_bob_holder_runtime_fixture(app: &ControlStateApp) {
+    let plan = app.controller_plan.as_ref();
+    let artifact_dir = PathBuf::from(&plan.artifact_dir);
+    let runtime_root = PathBuf::from(
+        plan.runtime_root
+            .as_deref()
+            .expect("test controller plan should include runtime root"),
+    );
+    fs::create_dir_all(&artifact_dir).expect("artifact dir should exist");
+    fs::create_dir_all(&runtime_root).expect("runtime root should exist");
+    write_json(
+        &artifact_dir.join("direct-plan.json"),
+        &json!({
+            "components": [{
+                "id": 3,
+                "moniker": "/bob",
+                "sidecar": {
+                    "mesh_config_path": "bob-mesh.json",
+                },
+            }],
+            "router": {
+                "mesh_config_path": "router-mesh.json",
+            },
+        }),
+    )
+    .expect("holder direct plan should write");
+    write_json(
+        &direct_runtime_state_path(&artifact_dir),
+        &DirectRuntimeState {
+            component_mesh_port_by_id: BTreeMap::from([(3, 24003)]),
+            ..Default::default()
+        },
+    )
+    .expect("holder direct runtime state should write");
+    write_json(
+        &runtime_root.join("bob-mesh.json"),
+        &test_live_component_runtime(
+            "/bob",
+            "/bob",
+            "127.0.0.1:24003",
+            "127.0.0.1:24003",
+            Vec::new(),
+            Vec::new(),
+        )
+        .mesh_config,
+    )
+    .expect("holder mesh config should write");
+    write_json(
+        &runtime_root.join("router-mesh.json"),
+        &test_live_site_router(Vec::new()),
+    )
+    .expect("holder router mesh config should write");
 }
 
 struct TestMcpClient {
@@ -4391,9 +4469,7 @@ async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
     let (authority_base_url, _authority_handle) = spawn_test_router(router).await;
 
     let mut app = test_control_state_app(&dir, holder_state, state_path);
-    let controller_plan = Arc::make_mut(&mut app.controller_plan);
-    controller_plan.site_id = "direct_b".to_string();
-    controller_plan.router_identity_id = "/site/direct_b/router".to_string();
+    retarget_test_controller_site(&mut app, "direct_b");
     install_remote_controller_peer_url_fixture(
         &mut app,
         &BTreeMap::from([("direct_a".to_string(), authority_base_url)]),
@@ -4428,6 +4504,196 @@ async fn inspect_ref_routes_remote_grants_via_synced_authority_site() {
             .as_slice(),
         &[shared_ref],
         "inspect_ref should route exactly once through the authority site router",
+    );
+}
+
+#[tokio::test]
+async fn resolve_ref_routes_remote_grants_and_preserves_ref_suffix() {
+    let dir = TempDir::new().expect("temp dir");
+    let placement = PlacementFile {
+        schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+        version: amber_compiler::run_plan::PLACEMENT_VERSION,
+        sites: BTreeMap::from([
+            (
+                "direct_a".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                    controller_site: None,
+                },
+            ),
+            (
+                "direct_b".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                    controller_site: None,
+                },
+            ),
+        ]),
+        defaults: PlacementDefaults {
+            path: Some("direct_a".to_string()),
+            ..PlacementDefaults::default()
+        },
+        components: BTreeMap::from([
+            ("/provider".to_string(), "direct_a".to_string()),
+            ("/alice".to_string(), "direct_a".to_string()),
+            ("/bob".to_string(), "direct_b".to_string()),
+        ]),
+        dynamic_capabilities: None,
+        framework_children: None,
+    };
+    let mut authoritative = compile_control_state_from_ir_with_run_id(
+        dynamic_caps_binding_scenario_ir(),
+        Some(&placement),
+        "test-run",
+    )
+    .await;
+    let alice_root = super::dynamic_caps::source_key_from_held_id(
+        &authoritative,
+        "components./alice",
+        &root_held_id_for(&authoritative, "components./alice"),
+    )
+    .expect("alice root source should resolve");
+    let share = super::dynamic_caps::share_dynamic_capability(
+        &mut authoritative,
+        "components./alice",
+        &alice_root,
+        "components./bob",
+        None,
+        &json!({}),
+    )
+    .expect("cross-site share should succeed");
+    let (grant_id, shared_ref) = match share {
+        super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, r#ref } => {
+            (grant_id, r#ref)
+        }
+        _ => panic!("cross-site share should create a grant"),
+    };
+    let mut suffixed_ref = Url::parse(&shared_ref).expect("shared ref should be a URL");
+    let token_path = suffixed_ref.path().trim_end_matches('/');
+    suffixed_ref.set_path(&format!("{token_path}/nested/path"));
+    suffixed_ref.set_query(Some("q=1"));
+    suffixed_ref.set_fragment(Some("section"));
+    let suffixed_ref = suffixed_ref.to_string();
+
+    let mut holder_state = authoritative.clone();
+    localize_framework_control_state(&mut holder_state, "direct_b")
+        .expect("holder site state should localize");
+    let state_path = dir.path().join("control-state.json");
+    write_control_state(&state_path, &holder_state).expect("holder state should write");
+
+    let hits = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let remote_grant_id = grant_id.clone();
+    let router = Router::new()
+        .route(
+            "/v1/controller/dynamic-caps/inspect-ref",
+            axum::routing::post({
+                let hits = hits.clone();
+                let remote_grant_id = remote_grant_id.clone();
+                move |_headers: HeaderMap,
+                      Json(request): Json<dynamic_caps::ControlDynamicInspectRefRequest>| {
+                    let hits = hits.clone();
+                    let remote_grant_id = remote_grant_id.clone();
+                    async move {
+                        hits.lock()
+                            .expect("resolve-ref hit log poisoned")
+                            .push(format!("inspect:{}", request.r#ref));
+                        Json(amber_mesh::dynamic_caps::InspectRefResponse {
+                            state: HeldEntryState::Live,
+                            grant_id: remote_grant_id.clone(),
+                            holder_component_id: "components./bob".to_string(),
+                            descriptor: DescriptorIr {
+                                kind: "http".to_string(),
+                                label: "provider.http".to_string(),
+                                profile: None,
+                            },
+                            held_id: Some(super::dynamic_caps::held_id_for_grant(
+                                &remote_grant_id,
+                            )),
+                        })
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/internal/dynamic-caps/resolve-origin",
+            axum::routing::post({
+                let hits = hits.clone();
+                let remote_grant_id = remote_grant_id.clone();
+                move |_headers: HeaderMap,
+                      Json(request): Json<dynamic_caps::InternalDynamicResolveOriginRequest>| {
+                    let hits = hits.clone();
+                    let remote_grant_id = remote_grant_id.clone();
+                    async move {
+                        let dynamic_caps::DynamicCapabilityControlSourceRequest::Grant {
+                            grant_id,
+                        } = request.source
+                        else {
+                            panic!("resolve-ref should resolve the inspected grant");
+                        };
+                        hits.lock()
+                            .expect("resolve-ref hit log poisoned")
+                            .push(format!("resolve:{grant_id}"));
+                        Json(dynamic_caps::ControlDynamicResolveOriginResponse {
+                            held_id: super::dynamic_caps::held_id_for_grant(&remote_grant_id),
+                            descriptor: DescriptorIr {
+                                kind: "http".to_string(),
+                                label: "provider.http".to_string(),
+                                profile: None,
+                            },
+                            origin_route_id: "dynamic-origin".to_string(),
+                            origin_capability: "provider.http".to_string(),
+                            origin_protocol: "http".to_string(),
+                            origin_peer_id: "/site/direct_a/router".to_string(),
+                            origin_peer_key_b64: base64::engine::general_purpose::STANDARD
+                                .encode([9u8; 32]),
+                            origin_peer_addr: "127.0.0.1:24000".to_string(),
+                        })
+                    }
+                }
+            }),
+        );
+    let (authority_base_url, _authority_handle) = spawn_test_router(router).await;
+
+    let mut app = test_control_state_app(&dir, holder_state, state_path);
+    retarget_test_controller_site(&mut app, "direct_b");
+    install_remote_controller_peer_url_fixture(
+        &mut app,
+        &BTreeMap::from([("direct_a".to_string(), authority_base_url)]),
+    );
+    install_bob_holder_runtime_fixture(&app);
+    let controller_app = SiteControllerApp {
+        control: app,
+        ready: ready_site_controller_flag(),
+    };
+
+    let response = super::site_controller::execute_site_controller_dynamic_caps_resolve_ref(
+        &controller_app,
+        dynamic_caps::ControlDynamicResolveRefRequest {
+            holder_component_id: "components./bob".to_string(),
+            r#ref: suffixed_ref.clone(),
+        },
+    )
+    .await
+    .expect("holder site should resolve remote refs through the authority site");
+
+    assert_eq!(
+        response.origin.held_id,
+        super::dynamic_caps::held_id_for_grant(&grant_id)
+    );
+    assert_eq!(response.relative_path, "/nested/path");
+    assert_eq!(response.query.as_deref(), Some("q=1"));
+    assert_eq!(response.fragment.as_deref(), Some("section"));
+    assert_eq!(
+        hits.lock()
+            .expect("resolve-ref hit log poisoned")
+            .as_slice(),
+        &[
+            format!("inspect:{suffixed_ref}"),
+            format!("resolve:{grant_id}")
+        ],
+        "resolve_ref should validate the raw ref and then resolve the inspected grant",
     );
 }
 
@@ -5364,17 +5630,9 @@ async fn open_template_replay_uses_admitted_manifest_after_source_mutation() {
         CompiledScenario::from_ir(replay_scenario_ir).expect("snapshot replay should compile");
     let replay_run_plan =
         build_run_plan(&replay_compiled, Some(&replay_placement)).expect("replay run plan");
-    let mut localized_replay = build_site_controller_state(
-        "replay-run",
-        &replay_run_plan,
-        "direct_local",
-        0,
-        1,
-        &mesh_dynamic_caps::signing_seed_b64(&mesh_dynamic_caps::signing_key_from_seed(
-            mesh_dynamic_caps::generate_dynamic_capability_signing_seed(),
-        )),
-    )
-    .expect("site-local replay state should build");
+    let mut localized_replay =
+        build_site_controller_state("replay-run", &replay_run_plan, "direct_local", 0, 1)
+            .expect("site-local replay state should build");
     assert!(
         localized_replay
             .live_children
@@ -7350,11 +7608,7 @@ fn shared_cross_site_link_is_retained_while_another_child_still_needs_it() {
         next_tx_id: 0,
         id_stride: 1,
         next_component_id: 0,
-        dynamic_capability_signing_seed_b64: mesh_dynamic_caps::signing_seed_b64(
-            &mesh_dynamic_caps::signing_key_from_seed(
-                mesh_dynamic_caps::generate_dynamic_capability_signing_seed(),
-            ),
-        ),
+        controller_identity: None,
         next_dynamic_capability_grant_id: 0,
         dynamic_capability_grants: BTreeMap::new(),
         dynamic_capability_grant_authority_sites: BTreeMap::new(),
@@ -9770,13 +10024,18 @@ async fn dynamic_capabilities_inspect_ref_rejects_unsupported_token_versions() {
         super::dynamic_caps::DynamicCapabilityShareOutcome::Created { grant_id, .. } => grant_id,
         other => panic!("unexpected share outcome: {other:?}"),
     };
-    let signing_key =
-        mesh_dynamic_caps::signing_key_from_seed_b64(&state.dynamic_capability_signing_seed_b64)
-            .expect("test signing key should decode");
+    let identity = state
+        .controller_identity
+        .as_ref()
+        .expect("test controller identity should be loaded");
+    let signing_key = identity
+        .signing_key()
+        .expect("test controller identity should be valid");
     let unsupported_ref = mesh_dynamic_caps::build_dynamic_capability_ref_url(
         DynamicCapabilityRefClaims {
             version: mesh_dynamic_caps::DYNAMIC_CAPS_REF_VERSION + 1,
             run_id: state.run_id.clone(),
+            issuer_id: identity.id.clone(),
             grant_id,
             holder_component_id: "components./carol".to_string(),
             descriptor_hint: Some("provider.http".to_string()),
@@ -9852,7 +10111,7 @@ volumes:
         &site_state_root,
         &artifact_root,
         "test-auth",
-        "test-verify-key",
+        Some(SITE_CONTROLLER_MESH_IDENTITY_PATH),
         None,
         None,
         Some(24000),
@@ -10120,7 +10379,7 @@ spec:
         &site_state_root,
         &artifact_root,
         "test-auth",
-        "test-verify-key",
+        Some(SITE_CONTROLLER_MESH_IDENTITY_PATH),
         None,
         None,
         Some(24000),
@@ -10276,11 +10535,7 @@ fn local_site_manager_state_uses_controller_plan_when_host_state_is_absent() {
         next_component_id: 0,
         capability_instances: BTreeMap::new(),
         journal: Vec::new(),
-        dynamic_capability_signing_seed_b64: mesh_dynamic_caps::signing_seed_b64(
-            &mesh_dynamic_caps::signing_key_from_seed(
-                mesh_dynamic_caps::generate_dynamic_capability_signing_seed(),
-            ),
-        ),
+        controller_identity: None,
         next_dynamic_capability_grant_id: 0,
         dynamic_capability_grants: BTreeMap::new(),
         dynamic_capability_grant_authority_sites: BTreeMap::new(),
@@ -10368,11 +10623,7 @@ fn site_execution_site_routes_vm_sites_to_their_direct_controller() {
         next_component_id: 0,
         capability_instances: BTreeMap::new(),
         journal: Vec::new(),
-        dynamic_capability_signing_seed_b64: mesh_dynamic_caps::signing_seed_b64(
-            &mesh_dynamic_caps::signing_key_from_seed(
-                mesh_dynamic_caps::generate_dynamic_capability_signing_seed(),
-            ),
-        ),
+        controller_identity: None,
         next_dynamic_capability_grant_id: 0,
         dynamic_capability_grants: BTreeMap::new(),
         dynamic_capability_grant_authority_sites: BTreeMap::new(),
@@ -10437,11 +10688,7 @@ fn load_site_manager_state_prefers_local_controller_view_over_stale_host_state()
         next_component_id: 0,
         capability_instances: BTreeMap::new(),
         journal: Vec::new(),
-        dynamic_capability_signing_seed_b64: mesh_dynamic_caps::signing_seed_b64(
-            &mesh_dynamic_caps::signing_key_from_seed(
-                mesh_dynamic_caps::generate_dynamic_capability_signing_seed(),
-            ),
-        ),
+        controller_identity: None,
         next_dynamic_capability_grant_id: 0,
         dynamic_capability_grants: BTreeMap::new(),
         dynamic_capability_grant_authority_sites: BTreeMap::new(),

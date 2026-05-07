@@ -1,7 +1,7 @@
-use std::{collections::BTreeMap, env, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use amber_mesh::{
-    MeshProtocol,
+    MeshProtocol, OutboundRoute,
     component_protocol::{ProtocolErrorCode, ProtocolErrorResponse},
     dynamic_caps::{
         self as mesh_dynamic_caps, DescriptorIr, HeldEntryDetail, HeldEntryKind, HeldEntryState,
@@ -10,7 +10,6 @@ use amber_mesh::{
         MaterializedHandleSummary, RevokeRequest, RevokeResponse, RootAuthoritySelectorIr,
         ShareRequest, ShareResponse, ShareSource,
     },
-    telemetry::SCENARIO_RUN_ID_ENV,
 };
 use base64::Engine as _;
 use http_body_util::{BodyExt as _, Full};
@@ -25,6 +24,7 @@ const DYNAMIC_CAPS_CONTROLLER_HELD_DETAIL_PATH: &str = "/v1/controller/dynamic-c
 const DYNAMIC_CAPS_CONTROLLER_SHARE_PATH: &str = "/v1/controller/dynamic-caps/share";
 const DYNAMIC_CAPS_CONTROLLER_INSPECT_REF_PATH: &str = "/v1/controller/dynamic-caps/inspect-ref";
 const DYNAMIC_CAPS_CONTROLLER_REVOKE_PATH: &str = "/v1/controller/dynamic-caps/revoke";
+const DYNAMIC_CAPS_CONTROLLER_RESOLVE_REF_PATH: &str = "/v1/controller/dynamic-caps/resolve-ref";
 const DYNAMIC_CAPS_CONTROLLER_RESOLVE_ORIGIN_PATH: &str =
     "/v1/controller/dynamic-caps/resolve-origin";
 const DYNAMIC_CAPS_HANDLE_PREFIX: &str = "/v1/handles/";
@@ -34,8 +34,6 @@ const DYNAMIC_CAPS_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug)]
 struct DynamicCapsControllerEnv {
     control_url: String,
-    verify_key_raw: String,
-    run_id: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -92,6 +90,12 @@ struct ControlDynamicResolveOriginRequest {
     source: DynamicCapabilityControlSourceRequest,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct ControlDynamicResolveRefRequest {
+    holder_component_id: String,
+    r#ref: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct ControlDynamicResolveOriginResponse {
     held_id: String,
@@ -104,13 +108,22 @@ struct ControlDynamicResolveOriginResponse {
     origin_peer_addr: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct ControlDynamicResolveRefResponse {
+    #[serde(flatten)]
+    origin: ControlDynamicResolveOriginResponse,
+    relative_path: String,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    fragment: Option<String>,
+}
+
 #[derive(Clone)]
 pub(super) struct DynamicCapsRuntime {
     listen_addr: SocketAddr,
     component_id: Arc<str>,
-    run_id: Arc<str>,
     control_url: Arc<str>,
-    verify_key: ed25519_dalek::VerifyingKey,
     config: Arc<MeshConfig>,
     client: Arc<HttpClient>,
     a2a_url_rewrite_table: Arc<a2a::UrlRewriteTable>,
@@ -227,14 +240,10 @@ impl DynamicCapsRuntime {
             );
             return Ok(None);
         };
-        let verify_key = mesh_dynamic_caps::verify_key_from_b64(&control_env.verify_key_raw)
-            .map_err(|err| RouterError::InvalidConfig(err.to_string()))?;
         Ok(Some(Arc::new(Self {
             listen_addr,
             component_id: Arc::<str>::from(format!("components.{}", config.identity.id)),
-            run_id: Arc::<str>::from(control_env.run_id),
             control_url: Arc::<str>::from(control_env.control_url),
-            verify_key,
             config,
             client,
             a2a_url_rewrite_table,
@@ -360,6 +369,34 @@ impl DynamicCapsRuntime {
         .await
     }
 
+    async fn control_inspect_ref(
+        &self,
+        raw_ref: &str,
+    ) -> Result<InspectRefResponse, ProtocolErrorResponse> {
+        self.control_post_json(
+            DYNAMIC_CAPS_CONTROLLER_INSPECT_REF_PATH,
+            &ControlDynamicInspectRefRequest {
+                holder_component_id: self.component_id.to_string(),
+                r#ref: raw_ref.to_string(),
+            },
+        )
+        .await
+    }
+
+    async fn control_resolve_ref(
+        &self,
+        raw_ref: &str,
+    ) -> Result<ControlDynamicResolveRefResponse, ProtocolErrorResponse> {
+        self.control_post_json(
+            DYNAMIC_CAPS_CONTROLLER_RESOLVE_REF_PATH,
+            &ControlDynamicResolveRefRequest {
+                holder_component_id: self.component_id.to_string(),
+                r#ref: raw_ref.to_string(),
+            },
+        )
+        .await
+    }
+
     fn next_handle_id(state: &mut DynamicCapsLocalState) -> String {
         let handle_id = format!(
             "{DYNAMIC_CAPS_HANDLE_ID_PREFIX}{:016x}",
@@ -384,38 +421,6 @@ impl DynamicCapsRuntime {
         url.set_query(query);
         url.set_fragment(fragment);
         Ok(url.to_string())
-    }
-
-    fn parse_ref_for_local_holder(
-        &self,
-        raw_ref: &str,
-    ) -> Result<mesh_dynamic_caps::ParsedDynamicCapabilityRef, ProtocolErrorResponse> {
-        let parsed = mesh_dynamic_caps::decode_dynamic_capability_ref_unverified(raw_ref)
-            .map_err(|err| self.protocol_error(ProtocolErrorCode::MalformedRef, err.to_string()))?;
-        if parsed.claims.version != mesh_dynamic_caps::DYNAMIC_CAPS_REF_VERSION {
-            return Err(self.protocol_error(
-                ProtocolErrorCode::MalformedRef,
-                format!(
-                    "dynamic capability ref version {} is unsupported",
-                    parsed.claims.version
-                ),
-            ));
-        }
-        if parsed.claims.run_id != self.run_id.as_ref() {
-            return Err(self.protocol_error(
-                ProtocolErrorCode::MalformedRef,
-                "dynamic capability ref belongs to a different run",
-            ));
-        }
-        if parsed.claims.holder_component_id != self.component_id.as_ref() {
-            return Err(self.protocol_error(
-                ProtocolErrorCode::RecipientMismatch,
-                "dynamic capability ref is bound to a different holder",
-            ));
-        }
-        mesh_dynamic_caps::verify_dynamic_capability_ref(&parsed, &self.verify_key)
-            .map_err(|err| self.protocol_error(ProtocolErrorCode::MalformedRef, err.to_string()))?;
-        Ok(parsed)
     }
 
     fn source_from_held_detail(
@@ -654,6 +659,15 @@ impl DynamicCapsRuntime {
         descriptor_hint: Option<DescriptorIr>,
     ) -> Result<MaterializeResponse, ProtocolErrorResponse> {
         let resolved = self.control_resolve_origin(source).await?;
+        self.ensure_resolved_dynamic_handle_materialized(resolved, descriptor_hint)
+            .await
+    }
+
+    async fn ensure_resolved_dynamic_handle_materialized(
+        &self,
+        resolved: ControlDynamicResolveOriginResponse,
+        descriptor_hint: Option<DescriptorIr>,
+    ) -> Result<MaterializeResponse, ProtocolErrorResponse> {
         if resolved.origin_protocol != "http" {
             return Err(self.protocol_error(
                 ProtocolErrorCode::PathEstablishmentFailed,
@@ -816,23 +830,18 @@ impl DynamicCapsRuntime {
         request: MaterializeRequest,
     ) -> Result<MaterializeResponse, ProtocolErrorResponse> {
         if let Some(raw_ref) = request.r#ref.as_deref() {
-            let parsed = self.parse_ref_for_local_holder(raw_ref)?;
+            let resolved = self.control_resolve_ref(raw_ref).await?;
             let materialized = self
-                .ensure_dynamic_handle_materialized(
-                    DynamicCapabilityControlSourceRequest::Grant {
-                        grant_id: parsed.claims.grant_id.clone(),
-                    },
-                    None,
-                )
+                .ensure_resolved_dynamic_handle_materialized(resolved.origin, None)
                 .await?;
             return Ok(MaterializeResponse {
                 held_id: materialized.held_id,
                 handle_id: materialized.handle_id.clone(),
                 url: self.materialized_handle_url(
                     &materialized.handle_id,
-                    &parsed.relative_path,
-                    parsed.query.as_deref(),
-                    parsed.fragment.as_deref(),
+                    &resolved.relative_path,
+                    resolved.query.as_deref(),
+                    resolved.fragment.as_deref(),
                 )?,
             });
         }
@@ -1096,34 +1105,11 @@ impl DynamicCapsRuntime {
     }
 }
 
-fn nonempty_env_var(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn required_dynamic_caps_env_var(
-    name: &'static str,
-    value: Option<String>,
-) -> Result<String, RouterError> {
-    value.ok_or_else(|| {
-        RouterError::InvalidConfig(format!(
-            "{name} must be set when dynamic_caps_listen is configured"
-        ))
+fn local_dynamic_caps_controller_route(config: &MeshConfig) -> Option<&OutboundRoute> {
+    config.outbound.iter().find(|route| {
+        route.protocol == MeshProtocol::Http
+            && route.capability == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
     })
-}
-
-fn local_dynamic_caps_controller_url(config: &MeshConfig) -> Option<String> {
-    config
-        .outbound
-        .iter()
-        .find(|route| {
-            route.protocol == MeshProtocol::Http
-                && route.capability
-                    == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
-        })
-        .map(|route| format!("http://127.0.0.1:{}", route.listen_port))
 }
 
 fn resolve_dynamic_caps_controller_env(
@@ -1133,69 +1119,20 @@ fn resolve_dynamic_caps_controller_env(
         return Ok(None);
     }
 
-    let Some(verify_key_raw) = nonempty_env_var(amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV)
-    else {
-        return Ok(None);
-    };
-
-    let local_control_url = local_dynamic_caps_controller_url(config);
-    let run_id =
-        required_dynamic_caps_env_var(SCENARIO_RUN_ID_ENV, nonempty_env_var(SCENARIO_RUN_ID_ENV))?;
-    let control_url = local_control_url.ok_or_else(|| {
+    let controller_route = local_dynamic_caps_controller_route(config);
+    let controller_route = controller_route.ok_or_else(|| {
         RouterError::InvalidConfig(
             "dynamic_caps_listen requires a local framework.component controller route".to_string(),
         )
     })?;
     Ok(Some(DynamicCapsControllerEnv {
-        control_url,
-        verify_key_raw,
-        run_id,
+        control_url: format!("http://127.0.0.1:{}", controller_route.listen_port),
     }))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
-
     use super::*;
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn replace(pairs: [(&'static str, Option<&str>); 2]) -> Self {
-            let saved = pairs
-                .iter()
-                .map(|(name, value)| {
-                    let previous = env::var(name).ok();
-                    unsafe {
-                        match value {
-                            Some(value) => env::set_var(name, value),
-                            None => env::remove_var(name),
-                        }
-                    }
-                    (*name, previous)
-                })
-                .collect();
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in self.saved.drain(..) {
-                unsafe {
-                    match value {
-                        Some(value) => env::set_var(name, value),
-                        None => env::remove_var(name),
-                    }
-                }
-            }
-        }
-    }
 
     fn mesh_config_with_internal_controller_route() -> MeshConfig {
         MeshConfig {
@@ -1238,38 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dynamic_caps_controller_env_disables_listener_when_control_env_is_absent() {
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock");
-        let _env = EnvGuard::replace([
-            (amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, None),
-            (SCENARIO_RUN_ID_ENV, Some("run-1234")),
-        ]);
-
-        assert!(
-            resolve_dynamic_caps_controller_env(&mesh_config_without_internal_controller_route())
-                .expect("dynamic caps env should resolve")
-                .is_none(),
-            "sidecars without dynamic caps controller env should leave the listener disabled",
-        );
-    }
-
-    #[test]
     fn resolve_dynamic_caps_controller_env_ignores_control_env_when_listener_is_disabled() {
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock");
-        let _env = EnvGuard::replace([
-            (
-                amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
-                Some("verify-key"),
-            ),
-            (SCENARIO_RUN_ID_ENV, Some("run-1234")),
-        ]);
-
         assert!(
             resolve_dynamic_caps_controller_env(&mesh_config_without_dynamic_caps_listener())
                 .expect("dynamic caps env should resolve")
@@ -1280,18 +1186,6 @@ mod tests {
 
     #[test]
     fn resolve_dynamic_caps_controller_env_rejects_missing_local_controller_route() {
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock");
-        let _env = EnvGuard::replace([
-            (
-                amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
-                Some("verify-key"),
-            ),
-            (SCENARIO_RUN_ID_ENV, Some("run-1234")),
-        ]);
-
         let err =
             resolve_dynamic_caps_controller_env(&mesh_config_without_internal_controller_route())
                 .expect_err("dynamic caps without a local controller route must fail");
@@ -1307,18 +1201,6 @@ mod tests {
 
     #[test]
     fn resolve_dynamic_caps_controller_env_prefers_local_controller_route_without_auth_token() {
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock");
-        let _env = EnvGuard::replace([
-            (
-                amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
-                Some("verify-key"),
-            ),
-            (SCENARIO_RUN_ID_ENV, Some("run-1234")),
-        ]);
-
         let config = mesh_config_with_internal_controller_route();
         let env = resolve_dynamic_caps_controller_env(&config)
             .expect("dynamic caps env should resolve")
@@ -1500,12 +1382,12 @@ async fn dynamic_caps_service(
                     Err(err) => return Ok(protocol_response(&err)),
                 }
             } else if let Some(raw_ref) = request.r#ref.as_deref() {
-                let parsed = match state.parse_ref_for_local_holder(raw_ref) {
-                    Ok(parsed) => parsed,
+                let inspected = match state.control_inspect_ref(raw_ref).await {
+                    Ok(inspected) => inspected,
                     Err(err) => return Ok(protocol_response(&err)),
                 };
                 DynamicCapabilityControlSourceRequest::Grant {
-                    grant_id: parsed.claims.grant_id,
+                    grant_id: inspected.grant_id,
                 }
             } else {
                 return Ok(protocol_response(&ProtocolErrorResponse {
@@ -1539,9 +1421,6 @@ async fn dynamic_caps_service(
                 Ok(request) => request,
                 Err(response) => return Ok(response),
             };
-            if let Err(err) = state.parse_ref_for_local_holder(&request.r#ref) {
-                return Ok(protocol_response(&err));
-            }
             let response: InspectRefResponse = match state
                 .control_post_json(
                     DYNAMIC_CAPS_CONTROLLER_INSPECT_REF_PATH,

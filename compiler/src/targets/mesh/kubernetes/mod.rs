@@ -913,6 +913,13 @@ pub(crate) fn emit_kubernetes_artifact_with_options(
             MESH_SECRET_VOLUME_NAME.to_string(),
             mesh_secret,
         ));
+        if is_site_controller {
+            container.volume_mounts.push(VolumeMount {
+                name: MESH_SECRET_VOLUME_NAME.to_string(),
+                mount_path: MESH_CONFIG_DIR.to_string(),
+                read_only: Some(true),
+            });
+        }
 
         let mut sidecar_env = vec![
             EnvVar::literal(

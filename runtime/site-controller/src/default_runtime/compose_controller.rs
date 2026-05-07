@@ -142,6 +142,23 @@ pub fn inject_compose_site_controller(
     plan_path: &Path,
     controller_image: &str,
 ) -> Result<()> {
+    let plan_mount_source = plan_path.display().to_string();
+    inject_compose_site_controller_with_mount_sources(
+        artifact_root,
+        plan,
+        &plan.run_root,
+        &plan_mount_source,
+        controller_image,
+    )
+}
+
+pub fn inject_compose_site_controller_with_mount_sources(
+    artifact_root: &Path,
+    plan: &SiteControllerPlan,
+    run_root_mount_source: &str,
+    plan_mount_source: &str,
+    controller_image: &str,
+) -> Result<()> {
     let compose_path = artifact_root.join("compose.yaml");
     let mut document = read_compose_document(&compose_path)?;
     let services = compose_services_mut(&mut document, &compose_path)?;
@@ -205,8 +222,8 @@ pub fn inject_compose_site_controller(
             miette::miette!("compose site controller service has a non-sequence volumes field")
         })?;
     for volume in [
-        format!("{}:{}", plan.run_root, plan.run_root),
-        format!("{}:{COMPOSE_CONTROLLER_PLAN_PATH}", plan_path.display()),
+        format!("{run_root_mount_source}:{}", plan.run_root),
+        format!("{plan_mount_source}:{COMPOSE_CONTROLLER_PLAN_PATH}"),
         format!("{COMPOSE_ROUTER_CONTROL_VOLUME_NAME}:{COMPOSE_ROUTER_CONTROL_SOCKET_DIR}"),
         format!("{DOCKER_SOCK_PATH}:{DOCKER_SOCK_PATH}"),
     ] {
@@ -256,7 +273,7 @@ mod tests {
             site_state_root: run_root.join("site-state").display().to_string(),
             artifact_dir: run_root.join("artifact").display().to_string(),
             control_state_auth_token: "token".to_string(),
-            dynamic_caps_token_verify_key_b64: "verify".to_string(),
+            controller_identity_path: None,
             storage_root: None,
             runtime_root: None,
             router_mesh_port: Some(24000),

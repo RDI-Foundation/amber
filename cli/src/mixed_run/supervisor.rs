@@ -1833,7 +1833,7 @@ fn wait_for_named_kubernetes_resource(
     }
 }
 
-pub(super) fn compose_project_name(run_id: &str, site_id: &str) -> String {
+pub(crate) fn compose_project_name(run_id: &str, site_id: &str) -> String {
     let mut out = String::from("amber_");
     for ch in format!("{run_id}_{site_id}").chars() {
         if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {

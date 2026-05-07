@@ -134,6 +134,12 @@ pub(crate) struct ControlDynamicInspectRefRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ControlDynamicResolveRefRequest {
+    pub(crate) holder_component_id: String,
+    pub(crate) r#ref: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ControlDynamicRevokeRequest {
     pub(crate) caller_component_id: String,
     #[serde(flatten)]
@@ -189,6 +195,17 @@ pub(crate) struct ControlDynamicResolveOriginResponse {
     pub(crate) origin_peer_id: String,
     pub(crate) origin_peer_key_b64: String,
     pub(crate) origin_peer_addr: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ControlDynamicResolveRefResponse {
+    #[serde(flatten)]
+    pub(crate) origin: ControlDynamicResolveOriginResponse,
+    pub(crate) relative_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fragment: Option<String>,
 }
 
 fn dynamic_grant_live_default() -> bool {
@@ -1087,19 +1104,18 @@ pub(crate) fn mint_dynamic_capability_ref(
     state: &FrameworkControlState,
     grant: &DynamicGrantRecord,
 ) -> std::result::Result<String, ProtocolErrorResponse> {
-    let signing_key = amber_mesh::dynamic_caps::signing_key_from_seed_b64(
-        &state.dynamic_capability_signing_seed_b64,
-    )
-    .map_err(|err| {
+    let identity = dynamic_ref_issuer_identity(state)?;
+    let signing_key = identity.signing_key().map_err(|err| {
         protocol_error(
             ProtocolErrorCode::ControlStateUnavailable,
-            &format!("dynamic capability signing key is invalid: {err}"),
+            &format!("site controller mesh identity is invalid: {err}"),
         )
     })?;
     amber_mesh::dynamic_caps::build_dynamic_capability_ref_url(
         amber_mesh::dynamic_caps::DynamicCapabilityRefClaims {
             version: amber_mesh::dynamic_caps::DYNAMIC_CAPS_REF_VERSION,
             run_id: state.run_id.clone(),
+            issuer_id: identity.id.clone(),
             grant_id: grant.grant_id.clone(),
             holder_component_id: grant.holder_component_id.clone(),
             descriptor_hint: Some(grant.descriptor.label.clone()),
@@ -1117,20 +1133,22 @@ pub(crate) fn mint_dynamic_capability_ref(
     })
 }
 
+fn dynamic_ref_issuer_identity(
+    state: &FrameworkControlState,
+) -> std::result::Result<&amber_mesh::MeshIdentitySecret, ProtocolErrorResponse> {
+    state.controller_identity.as_ref().ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            "site controller mesh identity is not loaded",
+        )
+    })
+}
+
 pub(crate) fn inspect_dynamic_ref(
     state: &FrameworkControlState,
     holder_component_id: &str,
     raw_ref: &str,
 ) -> std::result::Result<amber_mesh::dynamic_caps::InspectRefResponse, ProtocolErrorResponse> {
-    let signing_key = amber_mesh::dynamic_caps::signing_key_from_seed_b64(
-        &state.dynamic_capability_signing_seed_b64,
-    )
-    .map_err(|err| {
-        protocol_error(
-            ProtocolErrorCode::ControlStateUnavailable,
-            &format!("dynamic capability signing key is invalid: {err}"),
-        )
-    })?;
     let parsed = amber_mesh::dynamic_caps::decode_dynamic_capability_ref_unverified(raw_ref)
         .map_err(|err| {
             protocol_error(
@@ -1159,6 +1177,19 @@ pub(crate) fn inspect_dynamic_ref(
             "dynamic capability ref is bound to a different holder",
         ));
     }
+    let identity = dynamic_ref_issuer_identity(state)?;
+    if parsed.claims.issuer_id != identity.id {
+        return Err(protocol_error(
+            ProtocolErrorCode::MalformedRef,
+            "dynamic capability ref issuer is not this site controller",
+        ));
+    }
+    let signing_key = identity.signing_key().map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("site controller mesh identity is invalid: {err}"),
+        )
+    })?;
     amber_mesh::dynamic_caps::verify_dynamic_capability_ref(&parsed, &signing_key.verifying_key())
         .map_err(|err| {
             protocol_error(

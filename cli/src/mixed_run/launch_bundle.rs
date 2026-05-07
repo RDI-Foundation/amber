@@ -9,14 +9,14 @@ pub(super) fn site_controller_image_reference_from_overrides(
         .unwrap_or_else(|| amber_images::AMBER_SITE_CONTROLLER.reference.to_string())
 }
 
-fn site_controller_image_reference() -> Result<String> {
+pub(crate) fn site_controller_image_reference() -> Result<String> {
     let overrides =
         amber_images::parse_dev_image_tag_overrides(amber_images::INTERNAL_IMAGE_OVERRIDE_KEYS)
             .map_err(|err| miette::miette!(err))?;
     Ok(site_controller_image_reference_from_overrides(&overrides))
 }
 
-pub(super) fn site_controller_local_router_control(kind: SiteKind, artifact_dir: &Path) -> String {
+pub(crate) fn site_controller_local_router_control(kind: SiteKind, artifact_dir: &Path) -> String {
     match kind {
         SiteKind::Direct => format!(
             "unix://{}",
@@ -31,7 +31,7 @@ pub(super) fn site_controller_local_router_control(kind: SiteKind, artifact_dir:
     }
 }
 
-fn site_controller_component_port(site_plan: &RunSitePlan) -> Result<Option<u16>> {
+pub(crate) fn site_controller_component_port(site_plan: &RunSitePlan) -> Result<Option<u16>> {
     let scenario =
         amber_scenario::Scenario::try_from(site_plan.scenario_ir.clone()).map_err(|err| {
             miette::miette!(
@@ -79,7 +79,50 @@ fn site_controller_component_port(site_plan: &RunSitePlan) -> Result<Option<u16>
     }
 }
 
-pub(super) fn prepare_site_state_root(site_state_root: &Path, kind: SiteKind) -> Result<()> {
+pub(crate) fn site_controller_identity_path(
+    kind: SiteKind,
+    artifact_dir: &Path,
+    runtime_root: Option<&str>,
+) -> Result<Option<String>> {
+    match kind {
+        SiteKind::Compose | SiteKind::Kubernetes => Ok(Some(
+            amber_site_controller::SITE_CONTROLLER_MESH_IDENTITY_PATH.to_string(),
+        )),
+        SiteKind::Direct => {
+            let Some(runtime_root) = runtime_root else {
+                return Ok(None);
+            };
+            let direct_plan_path =
+                artifact_dir.join(amber_compiler::reporter::direct::DIRECT_PLAN_FILENAME);
+            let direct_plan: amber_compiler::reporter::direct::DirectPlan =
+                read_json(&direct_plan_path, "direct plan")?;
+            let controller = direct_plan
+                .components
+                .iter()
+                .find(|component| {
+                    matches!(
+                        component.program.execution,
+                        amber_compiler::reporter::direct::DirectProgramExecutionPlan::InternalSiteController
+                    )
+                })
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "direct site controller plan is missing its internal site controller \
+                         component"
+                    )
+                })?;
+            Ok(Some(
+                Path::new(runtime_root)
+                    .join(&controller.sidecar.mesh_identity_path)
+                    .display()
+                    .to_string(),
+            ))
+        }
+        SiteKind::Vm => Ok(None),
+    }
+}
+
+pub(crate) fn prepare_site_state_root(site_state_root: &Path, kind: SiteKind) -> Result<()> {
     fs::create_dir_all(site_state_root)
         .into_diagnostic()
         .wrap_err_with(|| {
@@ -174,17 +217,6 @@ pub(super) fn materialize_launch_bundle(
         &run_plan.mesh_scope,
         "site-controller",
     );
-    let dynamic_capability_signing_seed_b64 = amber_mesh::dynamic_caps::signing_seed_b64(
-        &amber_mesh::dynamic_caps::signing_key_from_seed(
-            amber_mesh::dynamic_caps::generate_dynamic_capability_signing_seed(),
-        ),
-    );
-    let dynamic_caps_token_verify_key_b64 = amber_mesh::dynamic_caps::verify_key_b64(
-        &amber_mesh::dynamic_caps::signing_key_from_seed_b64(&dynamic_capability_signing_seed_b64)
-            .map_err(|err| {
-                miette::miette!("site controller dynamic capability signing seed is invalid: {err}")
-            })?,
-    );
     let observability =
         materialize_observability(bundle_root, run_id, &run_plan.mesh_scope, observability)?;
     let observability_endpoint = observability
@@ -223,11 +255,7 @@ pub(super) fn materialize_launch_bundle(
                 url,
             }
         });
-        let mut framework_env = BTreeMap::new();
-        framework_env.insert(
-            amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV.to_string(),
-            dynamic_caps_token_verify_key_b64.clone(),
-        );
+        let framework_env = BTreeMap::new();
         patch_site_artifacts(
             &artifact_dir,
             run_id,
@@ -275,7 +303,6 @@ pub(super) fn materialize_launch_bundle(
                 site_id,
                 site_index,
                 run_plan.sites.len(),
-                &dynamic_capability_signing_seed_b64,
             )?;
             amber_site_controller::write_control_state(&controller.state_path, &controller_state)?;
         }
@@ -434,7 +461,12 @@ pub(super) fn materialize_launch_bundle(
                 &site.site_state_root,
                 &site.artifact_dir,
                 &control_state_auth_token,
-                &dynamic_caps_token_verify_key_b64,
+                site_controller_identity_path(
+                    site.site_plan.site.kind,
+                    &site.artifact_dir,
+                    site.base_supervisor_plan.runtime_root.as_deref(),
+                )?
+                .as_deref(),
                 site.base_supervisor_plan.storage_root.as_deref(),
                 site.base_supervisor_plan.runtime_root.as_deref(),
                 site.base_supervisor_plan.router_mesh_port,

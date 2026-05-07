@@ -375,7 +375,12 @@ pub(crate) fn build_direct_site_launch_preview(
             &direct_plan.runtime_addresses,
             &runtime_state,
         )?;
-        spec.hidden_paths.push(runtime_root.join("mesh"));
+        if !matches!(
+            component.program.execution,
+            DirectProgramExecutionPlan::InternalSiteController
+        ) {
+            spec.hidden_paths.push(runtime_root.join("mesh"));
+        }
         let resolved_process = match &component.program.execution {
             DirectProgramExecutionPlan::Direct { .. } => None,
             DirectProgramExecutionPlan::HelperRunner { .. } => {

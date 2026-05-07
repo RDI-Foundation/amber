@@ -24,7 +24,7 @@ use super::{
         self, ControlDynamicGrantAuthoritySyncRequest, ControlDynamicGrantAuthoritySyncResponse,
         ControlDynamicHeldDetailRequest, ControlDynamicHeldListRequest,
         ControlDynamicInspectRefRequest, ControlDynamicResolveOriginRequest,
-        ControlDynamicRevokeRequest, ControlDynamicShareRequest,
+        ControlDynamicResolveRefRequest, ControlDynamicRevokeRequest, ControlDynamicShareRequest,
         InternalDynamicResolveOriginRequest,
     },
     http::{
@@ -61,6 +61,12 @@ pub(crate) async fn run_site_controller(
     let plan: SiteControllerPlan = read_json(plan_path.as_path(), "site controller plan")?;
     let mut control_state: FrameworkControlState =
         read_json(Path::new(&plan.state_path), "site controller state file")?;
+    if let Some(identity_path) = plan.controller_identity_path.as_deref() {
+        control_state.controller_identity = Some(read_json(
+            Path::new(identity_path),
+            "site controller mesh identity",
+        )?);
+    }
     persist_control_state(Path::new(&plan.state_path), &mut control_state)?;
     let control = ControlStateApp {
         control_state: Arc::new(Mutex::new(control_state)),
@@ -215,6 +221,10 @@ pub(crate) fn site_controller_router(app_state: SiteControllerApp) -> Router {
         .route(
             "/v1/controller/dynamic-caps/inspect-ref",
             post(control_dynamic_inspect_ref_route),
+        )
+        .route(
+            "/v1/controller/dynamic-caps/resolve-ref",
+            post(control_dynamic_resolve_ref_route),
         )
         .route(
             "/v1/controller/dynamic-caps/revoke",
@@ -612,6 +622,53 @@ async fn local_resolve_origin(
         DynamicCapsInspectResponse::ResolveOrigin(response) => Ok(response),
         _ => unreachable!("resolve_origin should return origin resolution"),
     }
+}
+
+pub(super) async fn execute_site_controller_dynamic_caps_resolve_ref(
+    app: &SiteControllerApp,
+    request: ControlDynamicResolveRefRequest,
+) -> std::result::Result<dynamic_caps::ControlDynamicResolveRefResponse, ProtocolApiError> {
+    let inspected = match execute_site_controller_dynamic_caps_inspect(
+        app,
+        DynamicCapsInspectRequest::InspectRef(ControlDynamicInspectRefRequest {
+            holder_component_id: request.holder_component_id.clone(),
+            r#ref: request.r#ref.clone(),
+        }),
+        false,
+    )
+    .await?
+    {
+        DynamicCapsInspectResponse::InspectRef(response) => response,
+        _ => unreachable!("inspect_ref should return inspect response"),
+    };
+    let origin = match execute_site_controller_dynamic_caps_inspect(
+        app,
+        DynamicCapsInspectRequest::ResolveOrigin(ControlDynamicResolveOriginRequest {
+            holder_component_id: request.holder_component_id,
+            source: dynamic_caps::DynamicCapabilityControlSourceRequest::Grant {
+                grant_id: inspected.grant_id.clone(),
+            },
+        }),
+        false,
+    )
+    .await?
+    {
+        DynamicCapsInspectResponse::ResolveOrigin(response) => response,
+        _ => unreachable!("resolve_origin should return origin resolution"),
+    };
+    let parsed = amber_mesh::dynamic_caps::decode_dynamic_capability_ref_unverified(&request.r#ref)
+        .map_err(|err| {
+            ProtocolApiError::from(protocol_error(
+                ProtocolErrorCode::MalformedRef,
+                &format!("dynamic capability ref is malformed: {err}"),
+            ))
+        })?;
+    Ok(dynamic_caps::ControlDynamicResolveRefResponse {
+        origin,
+        relative_path: parsed.relative_path,
+        query: parsed.query,
+        fragment: parsed.fragment,
+    })
 }
 
 async fn local_share(
@@ -1414,6 +1471,23 @@ async fn control_dynamic_inspect_ref_route(
         DynamicCapsInspectResponse::InspectRef(response) => Ok(Json(response)),
         _ => unreachable!("inspect_ref should return inspect response"),
     }
+}
+
+async fn control_dynamic_resolve_ref_route(
+    State(app): State<SiteControllerApp>,
+    headers: HeaderMap,
+    Json(request): Json<ControlDynamicResolveRefRequest>,
+) -> std::result::Result<Json<dynamic_caps::ControlDynamicResolveRefResponse>, ProtocolApiError> {
+    let auth = authorize_dynamic_caps_request(&app, &headers, &request.holder_component_id).await?;
+    if auth != DynamicCapsRequestAuth::Sidecar {
+        return Err(ProtocolApiError::unauthorized(
+            "dynamic capability ref resolution must be requested by the holder component sidecar"
+                .to_string(),
+        ));
+    }
+    Ok(Json(
+        execute_site_controller_dynamic_caps_resolve_ref(&app, request).await?,
+    ))
 }
 
 async fn control_dynamic_revoke_route(

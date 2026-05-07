@@ -12,6 +12,7 @@ pub(super) const CONTROL_STATE_AUTH_HEADER: &str = "x-amber-control-state-auth";
 pub const SITE_CONTROLLER_INTERNAL_CAPABILITY: &str =
     amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME;
 pub const SITE_CONTROLLER_SERVICE_NAME: &str = "amber-site-controller";
+pub const SITE_CONTROLLER_MESH_IDENTITY_PATH: &str = "/amber/mesh/mesh-identity.json";
 
 pub fn site_controller_internal_route_id(site_id: &str) -> String {
     format!("site-controller:{site_id}")
@@ -221,8 +222,8 @@ pub struct FrameworkControlState {
     pub(crate) capability_instances: BTreeMap<String, CapabilityInstanceRecord>,
     #[serde(default)]
     pub(crate) journal: Vec<ControlJournalEntry>,
-    #[serde(default)]
-    pub(crate) dynamic_capability_signing_seed_b64: String,
+    #[serde(skip)]
+    pub(crate) controller_identity: Option<amber_mesh::MeshIdentitySecret>,
     #[serde(default)]
     pub(crate) next_dynamic_capability_grant_id: u64,
     #[serde(default)]
@@ -274,7 +275,8 @@ pub struct SiteControllerPlan {
     pub site_state_root: String,
     pub artifact_dir: String,
     pub control_state_auth_token: String,
-    pub dynamic_caps_token_verify_key_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_identity_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -300,15 +302,18 @@ pub(crate) fn build_control_state(
     run_id: &str,
     run_plan: &RunPlan,
 ) -> Result<FrameworkControlState> {
-    build_control_state_with_signing_seed(
+    let mut state = build_control_state_base(run_id, run_plan)?;
+    state.controller_identity = Some(test_controller_identity(run_id));
+    Ok(state)
+}
+
+#[cfg(test)]
+pub(crate) fn test_controller_identity(run_id: &str) -> amber_mesh::MeshIdentitySecret {
+    amber_mesh::MeshIdentitySecret::from_identity(&amber_mesh::MeshIdentity::derive(
+        "/site/test/controller",
+        Some("test".to_string()),
         run_id,
-        run_plan,
-        &amber_mesh::dynamic_caps::signing_seed_b64(
-            &amber_mesh::dynamic_caps::signing_key_from_seed(
-                amber_mesh::dynamic_caps::generate_dynamic_capability_signing_seed(),
-            ),
-        ),
-    )
+    ))
 }
 
 pub fn build_site_controller_state(
@@ -317,13 +322,8 @@ pub fn build_site_controller_state(
     site_id: &str,
     site_index: usize,
     site_count: usize,
-    dynamic_capability_signing_seed_b64: &str,
 ) -> Result<FrameworkControlState> {
-    let mut state = build_control_state_with_signing_seed(
-        run_id,
-        run_plan,
-        dynamic_capability_signing_seed_b64,
-    )?;
+    let mut state = build_control_state_base(run_id, run_plan)?;
     localize_framework_control_state(&mut state, site_id)?;
     let site_offset = site_index as u64;
     let id_stride = site_count.max(1) as u64;
@@ -410,11 +410,7 @@ fn dynamic_capability_grant_counter(grant_id: &str) -> Option<u64> {
         .and_then(|suffix| u64::from_str_radix(suffix, 16).ok())
 }
 
-fn build_control_state_with_signing_seed(
-    run_id: &str,
-    run_plan: &RunPlan,
-    dynamic_capability_signing_seed_b64: &str,
-) -> Result<FrameworkControlState> {
+fn build_control_state_base(run_id: &str, run_plan: &RunPlan) -> Result<FrameworkControlState> {
     let scenario = Scenario::try_from(run_plan.base_scenario.clone())
         .into_diagnostic()
         .map_err(|err| miette::miette!("failed to decode frozen base scenario: {err}"))?;
@@ -448,7 +444,7 @@ fn build_control_state_with_signing_seed(
         next_component_id,
         capability_instances: BTreeMap::new(),
         journal: Vec::new(),
-        dynamic_capability_signing_seed_b64: dynamic_capability_signing_seed_b64.to_string(),
+        controller_identity: None,
         next_dynamic_capability_grant_id: 0,
         dynamic_capability_grants: BTreeMap::new(),
         dynamic_capability_grant_authority_sites: BTreeMap::new(),
@@ -1243,7 +1239,7 @@ pub fn write_site_controller_plan(
     site_state_root: &Path,
     artifact_dir: &Path,
     control_state_auth_token: &str,
-    dynamic_caps_token_verify_key_b64: &str,
+    controller_identity_path: Option<&str>,
     storage_root: Option<&str>,
     runtime_root: Option<&str>,
     router_mesh_port: Option<u16>,
@@ -1277,7 +1273,7 @@ pub fn write_site_controller_plan(
         site_state_root: site_state_root.display().to_string(),
         artifact_dir: artifact_dir.display().to_string(),
         control_state_auth_token: control_state_auth_token.to_string(),
-        dynamic_caps_token_verify_key_b64: dynamic_caps_token_verify_key_b64.to_string(),
+        controller_identity_path: controller_identity_path.map(str::to_string),
         storage_root: storage_root.map(str::to_string),
         runtime_root: runtime_root.map(str::to_string),
         router_mesh_port,

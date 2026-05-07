@@ -571,7 +571,336 @@ pub(crate) fn write_unmanaged_export_output(
         unmanaged_export_output_dir_label(kind),
         &export.files,
         unmanaged_export_executable_rel_path(kind),
+    )?;
+    materialize_standalone_site_controller_export(root, run_plan, &export)
+}
+
+fn materialize_standalone_site_controller_export(
+    root: &Path,
+    run_plan: &RunPlan,
+    export: &amber_compiler::run_plan::UnmanagedExport,
+) -> Result<()> {
+    if !matches!(export.kind, SiteKind::Compose | SiteKind::Kubernetes) {
+        return Ok(());
+    }
+    let site_plan = run_plan.sites.get(&export.site_id).ok_or_else(|| {
+        miette::miette!(
+            "unmanaged export references missing site `{}` in the run plan",
+            export.site_id
+        )
+    })?;
+    let Some(controller_port) = crate::mixed_run::site_controller_component_port(site_plan)? else {
+        return Ok(());
+    };
+
+    const COMPOSE_CONTROLLER_SITE_ROOT: &str = "/amber/site";
+    const COMPOSE_CONTROLLER_STATE_ROOT: &str = "/amber/site/.amber/site-controller";
+
+    let artifact_root = root
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to canonicalize export root `{}`", root.display()))?;
+    let base_run_id = format!(
+        "standalone-{}-{}",
+        unmanaged_export_label(export.kind),
+        export.site_id
+    );
+    let kubernetes_namespace = if export.kind == SiteKind::Kubernetes {
+        Some(
+            amber_site_controller::prepare_kubernetes_artifact_namespace(
+                &base_run_id,
+                &export.site_id,
+                &artifact_root,
+            )?,
+        )
+    } else {
+        None
+    };
+    let run_id = kubernetes_namespace
+        .as_deref()
+        .unwrap_or(base_run_id.as_str());
+    amber_site_controller::set_site_artifact_mesh_identity_seed(&artifact_root, run_id)?;
+
+    let state_root = if export.kind == SiteKind::Kubernetes {
+        standalone_controller_temp_state_root(&export.site_id)?
+    } else {
+        artifact_root.join(".amber").join("site-controller")
+    };
+    let site_state_root = state_root.join(&export.site_id);
+    crate::mixed_run::prepare_site_state_root(&site_state_root, export.kind)?;
+    let state_path = site_state_root.join("site-controller-state.json");
+    let plan_path = crate::mixed_run::site_controller_plan_path(&site_state_root);
+    let (plan_state_path, plan_run_root, plan_state_root, plan_site_state_root, plan_artifact_root) =
+        if export.kind == SiteKind::Compose {
+            let plan_state_root = PathBuf::from(COMPOSE_CONTROLLER_STATE_ROOT);
+            let plan_site_state_root = plan_state_root.join(&export.site_id);
+            (
+                plan_site_state_root.join("site-controller-state.json"),
+                PathBuf::from(COMPOSE_CONTROLLER_SITE_ROOT),
+                plan_state_root,
+                plan_site_state_root,
+                PathBuf::from(COMPOSE_CONTROLLER_SITE_ROOT),
+            )
+        } else {
+            (
+                state_path.clone(),
+                artifact_root.clone(),
+                state_root.clone(),
+                site_state_root.clone(),
+                artifact_root.clone(),
+            )
+        };
+
+    let mut launch_env = BTreeMap::new();
+    launch_env.insert(
+        amber_mesh::telemetry::SCENARIO_RUN_ID_ENV.to_string(),
+        run_id.to_string(),
+    );
+    launch_env.insert(
+        amber_mesh::telemetry::SCENARIO_SCOPE_ENV.to_string(),
+        run_plan.mesh_scope.clone(),
+    );
+
+    let controller_state = amber_site_controller::build_site_controller_state(
+        run_id,
+        run_plan,
+        &export.site_id,
+        0,
+        1,
+    )?;
+    amber_site_controller::write_control_state(&state_path, &controller_state)?;
+    write_json_file(
+        &crate::mixed_run::desired_links_path(&site_state_root),
+        &crate::mixed_run::DesiredLinkState {
+            schema: crate::mixed_run::DESIRED_LINKS_SCHEMA.to_string(),
+            version: crate::mixed_run::DESIRED_LINKS_VERSION,
+            ..Default::default()
+        },
+    )?;
+
+    let listen_addr = SocketAddr::from(([0, 0, 0, 0], controller_port));
+    let authority_url = format!(
+        "http://{}:{}",
+        amber_site_controller::SITE_CONTROLLER_SERVICE_NAME,
+        controller_port
+    );
+    let local_router_control =
+        crate::mixed_run::site_controller_local_router_control(export.kind, &artifact_root);
+    let control_state_auth_token =
+        standalone_control_state_auth_token(&run_plan.mesh_scope, run_id, "site-controller");
+    let router_mesh_port = Some(24000);
+    if let Some(port) = router_mesh_port
+        && export.kind == SiteKind::Compose
+    {
+        amber_site_controller::set_compose_router_published_mesh_port(&artifact_root, port)?;
+    }
+    let compose_project = (export.kind == SiteKind::Compose)
+        .then(|| crate::mixed_run::compose_project_name(run_id, &export.site_id));
+    let controller_identity_path =
+        crate::mixed_run::site_controller_identity_path(export.kind, &artifact_root, None)?;
+
+    let plan = amber_site_controller::write_site_controller_plan(
+        &plan_path,
+        run_id,
+        &run_plan.mesh_scope,
+        &export.site_id,
+        export.kind,
+        listen_addr,
+        &authority_url,
+        &site_plan.router_identity_id,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        Some(local_router_control.as_str()),
+        None,
+        None,
+        None,
+        &plan_state_path,
+        &plan_run_root,
+        &plan_state_root,
+        &plan_site_state_root,
+        &plan_artifact_root,
+        &control_state_auth_token,
+        controller_identity_path.as_deref(),
+        None,
+        None,
+        router_mesh_port,
+        compose_project.as_deref(),
+        kubernetes_namespace.as_deref(),
+        None,
+        None,
+        &launch_env,
+    )?;
+
+    let controller_image = crate::mixed_run::site_controller_image_reference()?;
+    match export.kind {
+        SiteKind::Compose => {
+            let plan_mount_source =
+                compose_mount_source_relative_to_artifact(&artifact_root, &plan_path)?;
+            amber_site_controller::inject_compose_site_controller_with_mount_sources(
+                &artifact_root,
+                &plan,
+                ".",
+                &plan_mount_source,
+                &controller_image,
+            )?;
+            set_compose_environment_values(&artifact_root, &launch_env)?;
+        }
+        SiteKind::Kubernetes => {
+            amber_site_controller::inject_kubernetes_site_controller(
+                &artifact_root,
+                &plan,
+                &controller_image,
+            )?;
+            let _ = std::fs::remove_dir_all(&state_root);
+        }
+        SiteKind::Direct | SiteKind::Vm => {}
+    }
+
+    Ok(())
+}
+
+fn compose_mount_source_relative_to_artifact(artifact_root: &Path, path: &Path) -> Result<String> {
+    let relative = path
+        .strip_prefix(artifact_root)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to express {} as a path relative to {}",
+                path.display(),
+                artifact_root.display()
+            )
+        })?;
+    let relative = relative
+        .iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(format!("./{relative}"))
+}
+
+fn standalone_control_state_auth_token(mesh_scope: &str, run_id: &str, purpose: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(
+        amber_mesh::MeshIdentity::derive(
+            format!("/framework/{purpose}"),
+            Some(mesh_scope.to_string()),
+            &format!("standalone-control-state:{run_id}"),
+        )
+        .public_key,
     )
+}
+
+fn standalone_controller_temp_state_root(site_id: &str) -> Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .into_diagnostic()
+        .wrap_err("system clock is before the Unix epoch")?
+        .as_nanos();
+    let mut safe_site = String::new();
+    for ch in site_id.chars() {
+        safe_site.push(if ch.is_ascii_alphanumeric() { ch } else { '-' });
+    }
+    Ok(std::env::temp_dir().join(format!(
+        "amber-standalone-controller-{safe_site}-{}-{nanos}",
+        std::process::id()
+    )))
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let json = serde_json::to_vec_pretty(value)
+        .map_err(|err| miette::miette!("failed to serialize {}: {err}", path.display()))?;
+    write_artifact(path, &json)
+}
+
+fn set_compose_environment_values(
+    artifact_root: &Path,
+    values: &BTreeMap<String, String>,
+) -> Result<()> {
+    let compose_path = artifact_root.join("compose.yaml");
+    let raw = fs::read_to_string(&compose_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", compose_path.display()))?;
+    let mut document: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to parse {}", compose_path.display()))?;
+    let services = document
+        .as_mapping_mut()
+        .and_then(|root| root.get_mut(yaml_string("services")))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or_else(|| {
+            miette::miette!(
+                "compose file {} is missing services",
+                compose_path.display()
+            )
+        })?;
+    for service in services.values_mut() {
+        let service = service.as_mapping_mut().ok_or_else(|| {
+            miette::miette!(
+                "compose service in {} is not a mapping",
+                compose_path.display()
+            )
+        })?;
+        let environment = service
+            .entry(yaml_string("environment"))
+            .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        set_compose_environment_entries(environment, values, &compose_path)?;
+    }
+    let rendered = serde_yaml::to_string(&document)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to serialize {}", compose_path.display()))?;
+    fs::write(&compose_path, rendered)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", compose_path.display()))
+}
+
+fn set_compose_environment_entries(
+    environment: &mut serde_yaml::Value,
+    values: &BTreeMap<String, String>,
+    compose_path: &Path,
+) -> Result<()> {
+    match environment {
+        serde_yaml::Value::Mapping(map) => {
+            for (name, value) in values {
+                map.insert(yaml_string(name), yaml_string(value));
+            }
+            Ok(())
+        }
+        serde_yaml::Value::Sequence(entries) => {
+            for (name, value) in values {
+                let rendered = format!("{name}={value}");
+                let mut found = false;
+                for entry in entries.iter_mut() {
+                    let Some(raw) = entry.as_str() else {
+                        continue;
+                    };
+                    if raw == name
+                        || raw
+                            .strip_prefix(name)
+                            .is_some_and(|tail| tail.starts_with('='))
+                    {
+                        *entry = yaml_string(&rendered);
+                        found = true;
+                    }
+                }
+                if !found {
+                    entries.push(yaml_string(&rendered));
+                }
+            }
+            Ok(())
+        }
+        serde_yaml::Value::Null => {
+            *environment = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+            set_compose_environment_entries(environment, values, compose_path)
+        }
+        _ => Err(miette::miette!(
+            "compose file {} has an unsupported environment shape",
+            compose_path.display()
+        )),
+    }
+}
+
+fn yaml_string(value: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(value.to_string())
 }
 
 pub(crate) fn write_directory_output(

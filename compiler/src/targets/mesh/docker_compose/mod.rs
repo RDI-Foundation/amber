@@ -876,11 +876,11 @@ fn render_docker_compose_inner(
 
         // depends_on: own sidecar + strong deps provider programs (+ amber-init for helper-backed services)
         let program_plan = program_plans.get(id).expect("program plan computed");
+        let is_site_controller =
+            framework_component_controller_metadata(s.component(*id).metadata.as_ref()).is_some();
         let image = if Some(*id) == docker_gateway_component {
             images.docker_gateway.clone()
-        } else if framework_component_controller_metadata(s.component(*id).metadata.as_ref())
-            .is_some()
-        {
+        } else if is_site_controller {
             images.site_controller.clone()
         } else {
             let image_plan = program_plan.image().ok_or_else(|| {
@@ -1037,6 +1037,11 @@ fn render_docker_compose_inner(
                 compose_storage_volume_name(&storage_mount.identity),
                 storage_mount.mount_path
             ));
+        }
+        if is_site_controller {
+            program_service
+                .volumes
+                .push(format!("{sidecar_volume}:{MESH_CONFIG_DIR}:ro"));
         }
         configure_program_log_shipping(
             &mut program_service,

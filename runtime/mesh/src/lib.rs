@@ -209,8 +209,6 @@ pub const MESH_IDENTITY_FILENAME: &str = "mesh-identity.json";
 pub const FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME: &str =
     dynamic_caps::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME;
 pub const DYNAMIC_CAPS_API_URL_ENV: &str = dynamic_caps::DYNAMIC_CAPS_API_URL_ENV;
-pub const DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV: &str =
-    dynamic_caps::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV;
 
 fn stable_temp_socket_root() -> PathBuf {
     #[cfg(unix)]

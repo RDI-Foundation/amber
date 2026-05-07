@@ -54,7 +54,9 @@ pub(crate) use self::child_runtime::{
 pub(super) use self::site_artifacts::*;
 pub use self::{
     child_runtime::cleanup_dynamic_site_children,
-    compose_controller::inject_compose_site_controller,
+    compose_controller::{
+        inject_compose_site_controller, inject_compose_site_controller_with_mount_sources,
+    },
     kubernetes_controller::inject_kubernetes_site_controller,
     site_artifacts::{
         SiteControllerPeerRouterRoute, inject_site_controller_peer_router_routes,

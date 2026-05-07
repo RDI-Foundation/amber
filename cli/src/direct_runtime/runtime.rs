@@ -492,7 +492,12 @@ pub(crate) async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 &direct_plan.runtime_addresses,
                 &runtime_state,
             )?;
-            spec.hidden_paths.push(runtime_root.join("mesh"));
+            if !matches!(
+                component.program.execution,
+                DirectProgramExecutionPlan::InternalSiteController
+            ) {
+                spec.hidden_paths.push(runtime_root.join("mesh"));
+            }
             #[cfg(target_os = "linux")]
             {
                 if direct_component_program_joins_sidecar(component) {
