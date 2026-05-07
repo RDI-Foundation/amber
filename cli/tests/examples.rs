@@ -7,6 +7,8 @@ use std::{
 
 #[path = "../src/example_catalog.rs"]
 mod example_catalog;
+#[path = "test_support/runtime_bins.rs"]
+mod runtime_bins_support;
 
 #[test]
 fn examples_check_deny_warnings() {
@@ -66,7 +68,7 @@ fn examples_check_deny_warnings() {
 
     let amber = env!("CARGO_BIN_EXE_amber");
     for manifest in manifests {
-        let output = Command::new(amber)
+        let output = amber_command(amber)
             .arg("check")
             .arg("--apply-policies")
             .arg("-D")
@@ -193,7 +195,7 @@ fn compile_example_outputs(
     let dot_output = output_root.join("scenario.dot");
     let metadata_output = output_root.join("metadata.json");
 
-    let mut command = Command::new(amber);
+    let mut command = amber_command(amber);
     command
         .arg("compile")
         .arg("--output")
@@ -239,6 +241,15 @@ fn compile_example_outputs(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+fn amber_command(amber: &str) -> Command {
+    let mut command = Command::new(amber);
+    command.env(
+        "AMBER_RUNTIME_BIN_DIR",
+        runtime_bins_support::runtime_bin_dir(&workspace_root()),
+    );
+    command
 }
 
 fn assert_same_file(left: &Path, right: &Path) {
