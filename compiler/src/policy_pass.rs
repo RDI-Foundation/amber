@@ -5,7 +5,10 @@ use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, ScenarioIr, ScenarioIrError, SlotRef,
 };
-use amber_scenario_runner::{ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError};
+use amber_scenario_runner::{
+    JSON_EXPORT_RESPONSE_PREVIEW_BYTES, ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError,
+    response_body_preview,
+};
 use futures::future;
 use miette::Diagnostic;
 use thiserror::Error;
@@ -129,14 +132,28 @@ pub enum Error {
 
     #[error(
         "policy `{policy}` in scope `{scope_root}` returned response body that was not valid \
-         policy output JSON: {source}\n\nbody:\n{body}"
+         JSON: {source}\n\nbody preview:\n{body_preview}"
+    )]
+    #[diagnostic(code(compiler::policy_pass_policy_output_deserialize))]
+    PolicyOutputInvalidJson {
+        scope_root: Moniker,
+        policy: String,
+        #[source]
+        source: serde_json::Error,
+        body_preview: String,
+    },
+
+    #[error(
+        "policy `{policy}` in scope `{scope_root}` returned JSON that did not match policy output \
+         schema at {path} (line {line}, column {column})"
     )]
     #[diagnostic(code(compiler::policy_pass_policy_output_deserialize))]
     PolicyOutputDeserialize {
         scope_root: Moniker,
         policy: String,
-        source: serde_json::Error,
-        body: String,
+        path: String,
+        line: usize,
+        column: usize,
     },
 
     #[error("policy `{policy}` in scope `{scope_root}` returned invalid output")]
@@ -252,12 +269,24 @@ async fn collect_policy_outputs(
                             policy: policy_display_name.clone(),
                             source,
                         })?;
-                    let output = serde_json::from_str::<PolicyOutput>(&body).map_err(|source| {
-                        Error::PolicyOutputDeserialize {
+                    let output = deserialize_policy_output(&body).map_err(|err| match err {
+                        PolicyOutputDecodeError::InvalidJson {
+                            source,
+                            body_preview,
+                        } => Error::PolicyOutputInvalidJson {
                             scope_root: scope_root.clone(),
                             policy: policy_display_name.clone(),
                             source,
-                            body: body.trim().to_string(),
+                            body_preview,
+                        },
+                        PolicyOutputDecodeError::InvalidShape { path, line, column } => {
+                            Error::PolicyOutputDeserialize {
+                                scope_root: scope_root.clone(),
+                                policy: policy_display_name.clone(),
+                                path,
+                                line,
+                                column,
+                            }
                         }
                     })?;
                     // Generated interposers may not rely on experimental features.
@@ -294,6 +323,55 @@ async fn collect_policy_outputs(
         (Ok(collected), Ok(())) => Ok(collected),
         (Ok(_), Err(source)) => Err(Error::StopPolicyScenario { source }),
         (Err(err), _) => Err(err),
+    }
+}
+
+enum PolicyOutputDecodeError {
+    InvalidJson {
+        source: serde_json::Error,
+        body_preview: String,
+    },
+    InvalidShape {
+        path: String,
+        line: usize,
+        column: usize,
+    },
+}
+
+fn deserialize_policy_output(body: &str) -> Result<PolicyOutput, PolicyOutputDecodeError> {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let output = match serde_path_to_error::deserialize::<_, PolicyOutput>(&mut deserializer) {
+        Ok(output) => output,
+        Err(source) if source.inner().is_data() => {
+            return Err(PolicyOutputDecodeError::InvalidShape {
+                path: display_policy_output_path(source.path()),
+                line: source.inner().line(),
+                column: source.inner().column(),
+            });
+        }
+        Err(source) => {
+            return Err(PolicyOutputDecodeError::InvalidJson {
+                source: source.into_inner(),
+                body_preview: response_body_preview(body, JSON_EXPORT_RESPONSE_PREVIEW_BYTES),
+            });
+        }
+    };
+
+    deserializer
+        .end()
+        .map_err(|source| PolicyOutputDecodeError::InvalidJson {
+            source,
+            body_preview: response_body_preview(body, JSON_EXPORT_RESPONSE_PREVIEW_BYTES),
+        })?;
+    Ok(output)
+}
+
+fn display_policy_output_path(path: &serde_path_to_error::Path) -> String {
+    let path = path.to_string();
+    if path.is_empty() {
+        "<root>".to_string()
+    } else {
+        path
     }
 }
 
@@ -827,6 +905,45 @@ mod tests {
         }
     }
 
+    struct RawBodyRunner {
+        body: String,
+    }
+
+    impl ScenarioRunner<CompiledScenario> for RawBodyRunner {
+        fn start<'a>(
+            &'a self,
+            _compiled: &'a CompiledScenario,
+            _options: ScenarioRunOptions,
+        ) -> ScenarioRunnerFuture<'a, Result<Box<dyn RunningScenario>, ScenarioRunnerError>>
+        {
+            Box::pin(async move {
+                Ok(Box::new(RawBodySession {
+                    body: self.body.clone(),
+                }) as Box<dyn RunningScenario>)
+            })
+        }
+    }
+
+    struct RawBodySession {
+        body: String,
+    }
+
+    impl RunningScenario for RawBodySession {
+        fn post_json_export<'a>(
+            &'a self,
+            _export: &'a ExportName,
+            _request: &'a serde_json::Value,
+        ) -> ScenarioRunnerFuture<'a, Result<String, ScenarioRunnerError>> {
+            Box::pin(async move { Ok(self.body.clone()) })
+        }
+
+        fn finish(
+            self: Box<Self>,
+        ) -> ScenarioRunnerFuture<'static, Result<(), ScenarioRunnerError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     #[tokio::test]
     async fn build_policy_input_classifies_bindings_imports_and_exports() {
         let scenario = fixture_scenario();
@@ -905,6 +1022,60 @@ mod tests {
             message.contains("/left"),
             "missing policy display name: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_policies_invalid_json_uses_bounded_body_preview() {
+        let hidden = "DO_NOT_LOG_POLICY_RESPONSE_TAIL";
+        let body = format!(
+            "{{{}{}",
+            "x".repeat(JSON_EXPORT_RESPONSE_PREVIEW_BYTES + 100),
+            hidden
+        );
+        let runner = RawBodyRunner { body };
+
+        let err = apply_policies(
+            fixture_scenario(),
+            Some(&fixture_governance()),
+            Some(&runner),
+        )
+        .await
+        .expect_err("invalid JSON should fail");
+        let message = err.to_string();
+
+        assert!(
+            matches!(&err, Error::PolicyOutputInvalidJson { .. }),
+            "unexpected policy error: {err:?}"
+        );
+        assert!(message.contains("body preview:"));
+        assert!(message.contains("truncated"));
+        assert!(!message.contains(hidden));
+    }
+
+    #[tokio::test]
+    async fn apply_policies_valid_json_invalid_shape_does_not_echo_response_body() {
+        let hidden = "DO_NOT_LOG_POLICY_RESPONSE_VALUE";
+        let body = format!(r#"{{"interpositions":"{hidden}"}}"#);
+        let runner = RawBodyRunner { body };
+
+        let err = apply_policies(
+            fixture_scenario(),
+            Some(&fixture_governance()),
+            Some(&runner),
+        )
+        .await
+        .expect_err("invalid policy output shape should fail");
+        let message = err.to_string();
+
+        match err {
+            Error::PolicyOutputDeserialize { path, .. } => {
+                assert_eq!(path, "interpositions");
+            }
+            other => panic!("unexpected policy error: {other:?}"),
+        }
+        assert!(message.contains("did not match policy output schema"));
+        assert!(!message.contains(hidden));
+        assert!(!message.contains("body preview:"));
     }
 
     #[tokio::test]

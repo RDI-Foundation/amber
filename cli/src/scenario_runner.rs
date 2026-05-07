@@ -12,7 +12,9 @@ use std::{
 use amber_compiler::{reporter::CompiledScenario, run_plan::build_run_plan};
 use amber_manifest::ExportName;
 use amber_scenario_runner::{
-    RunningScenario, ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError, ScenarioRunnerFuture,
+    JSON_EXPORT_RESPONSE_MAX_BYTES, JSON_EXPORT_RESPONSE_PREVIEW_BYTES, RunningScenario,
+    ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError, ScenarioRunnerFuture,
+    response_body_preview,
 };
 use miette::Result as MietteResult;
 use reqwest::{Client, StatusCode};
@@ -279,13 +281,15 @@ impl RunningScenario for CliRunningScenario {
                     ))
                 })?;
             let status = response.status();
-            let body = response.text().await.map_err(|err| {
-                ScenarioRunnerError::message(format!("response body could not be read: {err}"))
-            })?;
+            let body = read_json_export_response_body(
+                response,
+                self.options.display_name_for(export_name),
+            )
+            .await?;
             if !status.is_success() {
                 return Err(ScenarioRunnerError::message(format!(
                     "{status}: {}",
-                    body.trim()
+                    response_body_preview(&body, JSON_EXPORT_RESPONSE_PREVIEW_BYTES)
                 )));
             }
             Ok(body)
@@ -316,6 +320,39 @@ impl RunningScenario for CliRunningScenario {
                 .map_err(|err| ScenarioRunnerError::message(err.to_string()))
         })
     }
+}
+
+async fn read_json_export_response_body(
+    mut response: reqwest::Response,
+    export: &str,
+) -> Result<String, ScenarioRunnerError> {
+    if let Some(content_length) = response.content_length()
+        && content_length > JSON_EXPORT_RESPONSE_MAX_BYTES as u64
+    {
+        return Err(ScenarioRunnerError::ResponseTooLarge {
+            export: export.to_string(),
+            size: content_length,
+            max_bytes: JSON_EXPORT_RESPONSE_MAX_BYTES,
+        });
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
+        ScenarioRunnerError::message(format!("response body could not be read: {err}"))
+    })? {
+        let size = body.len() + chunk.len();
+        if size > JSON_EXPORT_RESPONSE_MAX_BYTES {
+            return Err(ScenarioRunnerError::ResponseTooLarge {
+                export: export.to_string(),
+                size: size as u64,
+                max_bytes: JSON_EXPORT_RESPONSE_MAX_BYTES,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body)
+        .map_err(|err| ScenarioRunnerError::message(format!("response body was not utf-8: {err}")))
 }
 
 fn reserve_export_bindings(
@@ -500,6 +537,8 @@ fn extract_log_message(line: &str) -> Option<&str> {
 mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
     use crate::run_inputs::RootInputSpec;
 
@@ -583,5 +622,86 @@ mod tests {
             calls.lock().expect("calls lock").as_slice(),
             ["cleanup", "stop"]
         );
+    }
+
+    #[tokio::test]
+    async fn post_json_export_rejects_response_body_larger_than_limit() {
+        let url = spawn_http_response(
+            "HTTP/1.1 200 OK",
+            JSON_EXPORT_RESPONSE_MAX_BYTES + 1,
+            String::new(),
+        )
+        .await;
+        let session = test_running_scenario(url);
+        let export = ExportName::try_from("policy").expect("valid export name");
+
+        let err = session
+            .post_json_export(&export, &serde_json::json!({}))
+            .await
+            .expect_err("oversized response must be rejected");
+
+        match err {
+            ScenarioRunnerError::ResponseTooLarge {
+                export, max_bytes, ..
+            } => {
+                assert_eq!(export, "policy");
+                assert_eq!(max_bytes, JSON_EXPORT_RESPONSE_MAX_BYTES);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_json_export_truncates_non_success_response_body() {
+        let hidden = "DO_NOT_LOG_POLICY_RESPONSE_TAIL";
+        let body = format!(
+            "{}{hidden}",
+            "x".repeat(JSON_EXPORT_RESPONSE_PREVIEW_BYTES + 100)
+        );
+        let url = spawn_http_response("HTTP/1.1 500 Internal Server Error", body.len(), body).await;
+        let session = test_running_scenario(url);
+        let export = ExportName::try_from("policy").expect("valid export name");
+
+        let err = session
+            .post_json_export(&export, &serde_json::json!({}))
+            .await
+            .expect_err("500 response must fail");
+        let message = err.to_string();
+
+        assert!(message.contains("500 Internal Server Error"));
+        assert!(message.contains("truncated"));
+        assert!(!message.contains(hidden));
+    }
+
+    fn test_running_scenario(url: Url) -> CliRunningScenario {
+        CliRunningScenario {
+            client: Client::builder()
+                .build()
+                .expect("test HTTP client should build"),
+            export_urls: BTreeMap::from([("policy".to_string(), url)]),
+            options: ScenarioRunOptions::default(),
+            cleanup: Mutex::new(None),
+        }
+    }
+
+    async fn spawn_http_response(status_line: &str, content_length: usize, body: String) -> Url {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("test listener address");
+        let status_line = status_line.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("test request should arrive");
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "{status_line}\r\nContent-Length: {content_length}\r\nConnection: \
+                 close\r\n\r\n{body}"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        Url::parse(&format!("http://{addr}/")).expect("test URL should parse")
     }
 }
