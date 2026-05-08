@@ -70,7 +70,7 @@ fn examples_check_deny_warnings() {
     for manifest in manifests {
         let output = amber_command(amber)
             .arg("check")
-            .arg("--apply-policies")
+            .arg("--apply-overlays")
             .arg("-D")
             .arg("warnings")
             .arg(&manifest)
@@ -173,7 +173,7 @@ enum ExampleBackend {
 fn example_backend(example: &example_catalog::Example) -> ExampleBackend {
     if matches!(
         example.name.as_str(),
-        "direct-security" | "framework-component" | "governance-redaction"
+        "direct-security" | "framework-component" | "overlay-redaction"
     ) {
         ExampleBackend::Direct
     } else if example.name == "vm-network-storage" {

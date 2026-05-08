@@ -17,8 +17,8 @@ use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
     ComponentDecl, ComponentRef, ConfigSchema, ExportName, ExportTarget, InterpolatedPart,
-    InterpolatedString, InterpolationSource, Manifest, ManifestDigest, ManifestRef, PolicyDecl,
-    PolicyRef, ProgramConfigUseSite, RawManifest, framework_capability, span_for_json_pointer,
+    InterpolatedString, InterpolationSource, Manifest, ManifestDigest, ManifestRef, OverlayDecl,
+    OverlayRef, ProgramConfigUseSite, RawManifest, framework_capability, span_for_json_pointer,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
@@ -46,7 +46,7 @@ use crate::{
     DigestStore,
     config::{analysis::ScenarioConfigAnalysis, validation},
     frontend::{ResolvedNode, ResolvedTree, store::display_url},
-    governance::{Governance, GovernedPolicy, GovernedScope},
+    overlays::{OverlayExport, OverlayPlan, OverlayScopePlan},
 };
 
 #[allow(unused_assignments)]
@@ -98,11 +98,11 @@ struct ScopeBuild {
     root_moniker: amber_scenario::Moniker,
     manifest_url: Url,
     uses: BTreeMap<String, ResolvedNode>,
-    policies: Vec<PolicyDecl>,
+    overlays: Vec<OverlayDecl>,
 }
 
 #[derive(Clone, Debug)]
-enum ResolvedPolicyEndpoint {
+enum OverlayExportEndpoint {
     Provide {
         name: String,
         decl: CapabilityDecl,
@@ -133,38 +133,38 @@ pub enum Error {
         digest: ManifestDigest,
     },
 
-    #[error("policy `{policy}` could not resolve export `{export}` from use `#{use_name}`")]
+    #[error("overlay `{overlay}` could not resolve export `{export}` from use `#{use_name}`")]
     #[diagnostic(
-        code(compiler::policy_export_unresolved),
+        code(compiler::overlay_export_unresolved),
         help(
             "Ensure the used manifest exports this capability and that any child export chain \
              resolves to a real export."
         )
     )]
-    PolicyExportUnresolved {
-        policy: Box<str>,
+    OverlayExportUnresolved {
+        overlay: Box<str>,
         use_name: Box<str>,
         export: Box<str>,
         #[source_code]
         src: Option<NamedSource<Arc<str>>>,
-        #[label(primary, "policy referenced here")]
+        #[label(primary, "overlay referenced here")]
         span: Option<SourceSpan>,
     },
 
-    #[error("governance policy reference `{policy}` is invalid: {message}")]
+    #[error("overlay reference `{overlay}` is invalid: {message}")]
     #[diagnostic(
-        code(compiler::invalid_policy_export),
+        code(compiler::invalid_overlay_export),
         help(
-            "A governance policy reference must target an exported `http` provide with `profile: \
-             \"policy\"`. Update the exported provide or reference a different export."
+            "An overlay reference must target an exported `http` provide with `profile: \
+             \"overlay\"`. Update the exported provide or reference a different export."
         )
     )]
-    InvalidPolicyExport {
-        policy: Box<str>,
+    InvalidOverlayExport {
+        overlay: Box<str>,
         message: Box<str>,
         #[source_code]
         src: Option<NamedSource<Arc<str>>>,
-        #[label(primary, "governance policy reference here")]
+        #[label(primary, "overlay reference here")]
         span: Option<SourceSpan>,
         #[related]
         related: Vec<RelatedSpan>,
@@ -435,9 +435,7 @@ pub enum Error {
         related: Vec<RelatedSpan>,
     },
 
-    #[error(
-        "invalid config for governance `use` entry `{use_name}` in {component_path}: {message}"
-    )]
+    #[error("invalid config for `use` entry `{use_name}` in {component_path}: {message}")]
     #[diagnostic(code(compiler::invalid_use_config))]
     InvalidUseConfig {
         component_path: String,
@@ -504,7 +502,7 @@ struct FlattenState<'a> {
 pub fn link(
     tree: ResolvedTree,
     store: &DigestStore,
-) -> Result<(Scenario, Option<Governance>, Provenance), Error> {
+) -> Result<(Scenario, Option<OverlayPlan>, Provenance), Error> {
     let mut components = Vec::new();
     let mut link_index = Vec::new();
     let mut provenance = Provenance::default();
@@ -867,7 +865,7 @@ pub fn link(
         exports,
         manifest_catalog,
     };
-    let governance = build_governance(&scope_builds, &config_analysis, store)?;
+    let overlays = build_overlays(&scope_builds, &config_analysis, store)?;
     scenario.normalize_order();
 
     if !errors.is_empty() {
@@ -881,11 +879,11 @@ pub fn link(
         return Err(err);
     }
     scenario.assert_invariants();
-    if let Some(governance) = &governance {
-        governance.scenario.assert_invariants();
+    if let Some(overlays) = &overlays {
+        overlays.scenario.assert_invariants();
     }
 
-    Ok((scenario, governance, provenance))
+    Ok((scenario, overlays, provenance))
 }
 
 struct UseConfigError {
@@ -919,21 +917,13 @@ fn use_config_error_site(
     pointer: Option<&str>,
 ) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>, String) {
     let Some(stored) = store.get_source(manifest_url) else {
-        return (
-            None,
-            None,
-            "governance `use` config declared here".to_string(),
-        );
+        return (None, None, "`use` config declared here".to_string());
     };
 
     let src = NamedSource::new(display_url(manifest_url), Arc::clone(&stored.source))
         .with_language("json5");
     let Some(use_spans) = stored.spans.uses.get(use_name) else {
-        return (
-            Some(src),
-            None,
-            "governance `use` config declared here".to_string(),
-        );
+        return (Some(src), None, "`use` config declared here".to_string());
     };
 
     if let (Some(pointer), Some(config_span)) = (pointer, use_spans.config)
@@ -951,11 +941,7 @@ fn use_config_error_site(
         .config_key
         .or(use_spans.config)
         .or(Some(use_spans.whole));
-    (
-        Some(src),
-        span,
-        "governance `use` config declared here".to_string(),
-    )
+    (Some(src), span, "`use` config declared here".to_string())
 }
 
 fn collect_config_ref_paths(node: &rc::ConfigNode) -> BTreeSet<String> {
@@ -1010,7 +996,7 @@ fn normalize_config_paths(paths: &BTreeSet<String>) -> BTreeSet<String> {
     result
 }
 
-fn governance_policy_display_name(scope_root: &Moniker, alias: &str) -> String {
+fn overlay_display_name(scope_root: &Moniker, alias: &str) -> String {
     if scope_root.as_str() == "/" {
         format!("/{alias}")
     } else {
@@ -1018,8 +1004,8 @@ fn governance_policy_display_name(scope_root: &Moniker, alias: &str) -> String {
     }
 }
 
-fn governance_root_schema_for_paths(root_schema: &Value, paths: &BTreeSet<String>) -> Value {
-    // An empty path is the internal sentinel for `${config}` / `$${config}`, meaning the policy
+fn overlays_root_schema_for_paths(root_schema: &Value, paths: &BTreeSet<String>) -> Value {
+    // An empty path is the internal sentinel for `${config}` / `$${config}`, meaning the overlay
     // needs the whole root object rather than a property literally named `""`.
     if paths.contains("") {
         return root_schema.clone();
@@ -1091,30 +1077,30 @@ fn governance_root_schema_for_paths(root_schema: &Value, paths: &BTreeSet<String
     schema
 }
 
-fn build_governance(
+fn build_overlays(
     scope_builds: &[ScopeBuild],
     config_analysis: &ScenarioConfigAnalysis,
     store: &DigestStore,
-) -> Result<Option<Governance>, Error> {
+) -> Result<Option<OverlayPlan>, Error> {
     if scope_builds.is_empty() {
         return Ok(None);
     }
 
-    let governance_root_url = Url::parse("governance://root").expect("valid governance root url");
-    let governance_root_ref = ManifestRef::new(governance_root_url.clone(), None);
+    let overlays_root_url = Url::parse("overlays://root").expect("valid overlays root url");
+    let overlays_root_ref = ManifestRef::new(overlays_root_url.clone(), None);
 
-    let mut governance_children = BTreeMap::new();
-    let mut governance_root_components = BTreeMap::new();
-    let mut governance_root_exports = BTreeMap::new();
-    let mut governance_root_config_paths: BTreeSet<String> = BTreeSet::new();
+    let mut overlays_children = BTreeMap::new();
+    let mut overlays_root_components = BTreeMap::new();
+    let mut overlays_root_exports = BTreeMap::new();
+    let mut overlays_root_config_paths: BTreeSet<String> = BTreeSet::new();
     let mut scopes = Vec::with_capacity(scope_builds.len());
 
     for (scope_index, scope) in scope_builds.iter().enumerate() {
         let scope_ca = config_analysis.component(scope.root_id);
         let referenced_uses: BTreeSet<&str> = scope
-            .policies
+            .overlays
             .iter()
-            .map(|policy| policy.policy.alias.as_str())
+            .map(|overlay| overlay.overlay.alias.as_str())
             .collect();
 
         let mut use_child_names = BTreeMap::new();
@@ -1145,7 +1131,7 @@ fn build_governance(
                                     label,
                                 }
                             })?;
-                    governance_root_config_paths.extend(collect_config_ref_paths(&composed));
+                    overlays_root_config_paths.extend(collect_config_ref_paths(&composed));
                     Some(composed.to_manifest_value())
                 }
                 _ => use_node.config.clone(),
@@ -1154,7 +1140,7 @@ fn build_governance(
             let mut child_node = use_node.clone();
             child_node.name = child_name.clone();
             child_node.config = composed_config.clone();
-            governance_children.insert(child_name.clone(), child_node.clone());
+            overlays_children.insert(child_name.clone(), child_node.clone());
 
             let manifest_ref =
                 ManifestRef::new(child_node.resolved_url.clone(), Some(child_node.digest));
@@ -1165,151 +1151,149 @@ fn build_governance(
                     .build(),
                 None => ComponentRef::builder().manifest(manifest_ref).build(),
             };
-            governance_root_components
+            overlays_root_components
                 .insert(child_name.clone(), ComponentDecl::Object(component_ref));
             use_child_names.insert(use_name.clone(), child_name);
         }
 
-        let mut policies = Vec::with_capacity(scope.policies.len());
-        for (policy_index, policy) in scope.policies.iter().enumerate() {
-            let policy_ref = &policy.policy;
+        let mut overlays = Vec::with_capacity(scope.overlays.len());
+        for (overlay_index, overlay) in scope.overlays.iter().enumerate() {
+            let overlay_ref = &overlay.overlay;
             let use_node = scope
                 .uses
-                .get(policy_ref.alias.as_str())
-                .expect("policy aliases are validated before resolution");
-            let endpoint = resolve_policy_export(store, use_node, policy_ref.export.as_str())
+                .get(overlay_ref.alias.as_str())
+                .expect("overlay aliases are validated before resolution");
+            let endpoint = resolve_overlay_export(store, use_node, overlay_ref.export.as_str())
                 .map_err(|()| {
                     let (src, span) =
-                        policy_ref_decl_site(store, &scope.manifest_url, policy_index);
-                    Error::PolicyExportUnresolved {
-                        policy: policy_ref.to_string().into(),
-                        use_name: policy_ref.alias.clone().into(),
-                        export: policy_ref.export.clone().into(),
+                        overlay_ref_decl_site(store, &scope.manifest_url, overlay_index);
+                    Error::OverlayExportUnresolved {
+                        overlay: overlay_ref.to_string().into(),
+                        use_name: overlay_ref.alias.clone().into(),
+                        export: overlay_ref.export.clone().into(),
                         src,
                         span,
                     }
                 })?;
             match &endpoint {
-                ResolvedPolicyEndpoint::Provide { decl, .. }
+                OverlayExportEndpoint::Provide { decl, .. }
                     if decl.kind == CapabilityKind::Http
-                        && decl.profile.as_deref() == Some("policy") => {}
-                ResolvedPolicyEndpoint::Provide { name, decl, .. } => {
+                        && decl.profile.as_deref() == Some("overlay") => {}
+                OverlayExportEndpoint::Provide { name, decl, .. } => {
                     let (src, span) =
-                        policy_ref_decl_site(store, &scope.manifest_url, policy_index);
-                    return Err(Error::InvalidPolicyExport {
-                        policy: policy_ref.to_string().into(),
+                        overlay_ref_decl_site(store, &scope.manifest_url, overlay_index);
+                    return Err(Error::InvalidOverlayExport {
+                        overlay: overlay_ref.to_string().into(),
                         message: format!(
                             "export `{}` resolves to provide `{name}` with capability `{decl}`; \
-                             expected `kind: \"http\"` and `profile: \"policy\"`",
-                            policy_ref.export
+                             expected `kind: \"http\"` and `profile: \"overlay\"`",
+                            overlay_ref.export
                         )
                         .into(),
                         src,
                         span,
-                        related: policy_endpoint_related_spans(store, policy_ref, &endpoint),
+                        related: overlay_endpoint_related_spans(store, overlay_ref, &endpoint),
                     });
                 }
-                ResolvedPolicyEndpoint::Slot { name, .. } => {
+                OverlayExportEndpoint::Slot { name, .. } => {
                     let (src, span) =
-                        policy_ref_decl_site(store, &scope.manifest_url, policy_index);
-                    return Err(Error::InvalidPolicyExport {
-                        policy: policy_ref.to_string().into(),
+                        overlay_ref_decl_site(store, &scope.manifest_url, overlay_index);
+                    return Err(Error::InvalidOverlayExport {
+                        overlay: overlay_ref.to_string().into(),
                         message: format!(
                             "export `{}` resolves to slot `{name}`; expected an exported provide",
-                            policy_ref.export
+                            overlay_ref.export
                         )
                         .into(),
                         src,
                         span,
-                        related: policy_endpoint_related_spans(store, policy_ref, &endpoint),
+                        related: overlay_endpoint_related_spans(store, overlay_ref, &endpoint),
                     });
                 }
             }
 
             let child_name = use_child_names
-                .get(policy_ref.alias.as_str())
-                .expect("resolved policy alias should match a resolved use");
-            let export_name = ExportName::try_from(format!("policy_{scope_index}_{policy_index}"))
-                .expect("synthetic governance export names are valid");
-            governance_root_exports.insert(
+                .get(overlay_ref.alias.as_str())
+                .expect("resolved overlay alias should match a resolved use");
+            let export_name =
+                ExportName::try_from(format!("overlay_{scope_index}_{overlay_index}"))
+                    .expect("synthetic overlay export names are valid");
+            overlays_root_exports.insert(
                 export_name.to_string(),
-                format!("#{child_name}.{}", policy_ref.export)
+                format!("#{child_name}.{}", overlay_ref.export)
                     .parse()
-                    .expect("synthetic governance exports should be valid"),
+                    .expect("synthetic overlay exports should be valid"),
             );
-            policies.push(GovernedPolicy {
+            overlays.push(OverlayExport {
                 export: export_name,
-                display_name: governance_policy_display_name(
-                    &scope.root_moniker,
-                    &policy_ref.alias,
-                ),
+                display_name: overlay_display_name(&scope.root_moniker, &overlay_ref.alias),
             });
         }
 
-        scopes.push(GovernedScope {
+        scopes.push(OverlayScopePlan {
             root_moniker: scope.root_moniker.clone(),
-            policies,
+            overlays,
         });
     }
 
     let mut raw_manifest = RawManifest::from(&Manifest::empty());
-    raw_manifest.components = governance_root_components;
-    raw_manifest.exports = governance_root_exports;
-    if !governance_root_config_paths.is_empty() {
-        let normalized = normalize_config_paths(&governance_root_config_paths);
+    raw_manifest.components = overlays_root_components;
+    raw_manifest.exports = overlays_root_exports;
+    if !overlays_root_config_paths.is_empty() {
+        let normalized = normalize_config_paths(&overlays_root_config_paths);
         let root_schema = config_analysis
             .root_schema()
             .cloned()
             .unwrap_or(Value::Bool(true));
-        let schema = governance_root_schema_for_paths(&root_schema, &normalized);
+        let schema = overlays_root_schema_for_paths(&root_schema, &normalized);
         raw_manifest.config_schema = Some(
             ConfigSchema::new(schema)
-                .expect("synthetic governance root config schema should be valid"),
+                .expect("synthetic overlays root config schema should be valid"),
         );
     }
     let root_manifest: Manifest = raw_manifest
         .try_into()
-        .expect("synthetic governance root manifest should be valid");
+        .expect("synthetic overlays root manifest should be valid");
     let root_digest = root_manifest.digest();
     store.put(root_digest, Arc::new(root_manifest));
 
-    let governance_tree = ResolvedTree {
+    let overlays_tree = ResolvedTree {
         root: ResolvedNode {
-            name: "governance".to_string(),
-            declared_ref: governance_root_ref.clone(),
+            name: "overlays".to_string(),
+            declared_ref: overlays_root_ref.clone(),
             digest: root_digest,
-            resolved_url: governance_root_url,
+            resolved_url: overlays_root_url,
             observed_url: None,
             config: None,
-            children: governance_children,
+            children: overlays_children,
             uses: BTreeMap::new(),
             child_templates: BTreeMap::new(),
         },
     };
 
-    // The synthetic governance artifact is linked like an ordinary tree. This does not recurse
-    // because the frontend rejects `use` subtrees that declare nested `use` or `policies`, so
-    // this synthetic tree contains no governed scopes of its own.
-    let (scenario, nested_governance, provenance) = link(governance_tree, store)?;
+    // The synthetic overlays artifact is linked like an ordinary tree. This does not recurse
+    // because the frontend rejects `use` subtrees that declare nested `use` or `overlays`, so
+    // this synthetic tree contains no overlay scopes of its own.
+    let (scenario, nested_overlays, provenance) = link(overlays_tree, store)?;
     debug_assert!(
-        nested_governance.is_none(),
-        "synthetic governance artifact should not contain nested governance"
+        nested_overlays.is_none(),
+        "synthetic overlays artifact should not contain nested overlays"
     );
-    Ok(Some(Governance {
+    Ok(Some(OverlayPlan {
         scenario,
         provenance,
         scopes,
     }))
 }
 
-fn resolve_policy_export(
+fn resolve_overlay_export(
     store: &DigestStore,
     node: &ResolvedNode,
     export_name: &str,
-) -> Result<ResolvedPolicyEndpoint, ()> {
+) -> Result<OverlayExportEndpoint, ()> {
     let manifest = store
         .get(&node.digest)
-        .expect("resolved policy manifest should be in the digest store");
+        .expect("resolved overlay manifest should be in the digest store");
     let Some(target) = manifest.exports().get(export_name) else {
         return Err(());
     };
@@ -1320,7 +1304,7 @@ fn resolve_policy_export(
                 .provides()
                 .get(provide_name)
                 .expect("manifest invariant: exported provide exists");
-            Ok(ResolvedPolicyEndpoint::Provide {
+            Ok(OverlayExportEndpoint::Provide {
                 name: provide_name.to_string(),
                 decl: provide_decl.decl.clone(),
                 resolved_url: node.resolved_url.clone(),
@@ -1331,7 +1315,7 @@ fn resolve_policy_export(
                 .slots()
                 .get(slot_name)
                 .expect("manifest invariant: exported slot exists");
-            Ok(ResolvedPolicyEndpoint::Slot {
+            Ok(OverlayExportEndpoint::Slot {
                 name: slot_name.to_string(),
                 resolved_url: node.resolved_url.clone(),
             })
@@ -1341,60 +1325,64 @@ fn resolve_policy_export(
                 .children
                 .get(child.as_str())
                 .expect("manifest invariant: exported child exists");
-            resolve_policy_export(store, child_node, export.as_str())
+            resolve_overlay_export(store, child_node, export.as_str())
         }
         _ => Err(()),
     }
 }
 
-fn policy_ref_decl_site(
+fn overlay_ref_decl_site(
     store: &DigestStore,
     manifest_url: &Url,
-    policy_index: usize,
+    overlay_index: usize,
 ) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
     store
         .diagnostic_source(manifest_url)
         .map_or((None, None), |(src, spans)| {
             let span = spans
-                .policies
-                .get(policy_index)
+                .overlays
+                .get(overlay_index)
                 .map(|candidate| candidate.whole)
                 .unwrap_or((0usize, 0usize).into());
             (Some(src), Some(span))
         })
 }
 
-fn policy_endpoint_related_spans(
+fn overlay_endpoint_related_spans(
     store: &DigestStore,
-    policy: &PolicyRef,
-    endpoint: &ResolvedPolicyEndpoint,
+    overlay: &OverlayRef,
+    endpoint: &OverlayExportEndpoint,
 ) -> Vec<RelatedSpan> {
     let (resolved_url, name, label) = match endpoint {
-        ResolvedPolicyEndpoint::Provide {
+        OverlayExportEndpoint::Provide {
             resolved_url, name, ..
-        } => (resolved_url, name, "provide resolved from policy reference"),
-        ResolvedPolicyEndpoint::Slot {
+        } => (
+            resolved_url,
+            name,
+            "provide resolved from overlay reference",
+        ),
+        OverlayExportEndpoint::Slot {
             resolved_url, name, ..
-        } => (resolved_url, name, "slot resolved from policy reference"),
+        } => (resolved_url, name, "slot resolved from overlay reference"),
     };
 
     let Some(stored) = store.get_source(resolved_url) else {
         return Vec::new();
     };
     let span = match endpoint {
-        ResolvedPolicyEndpoint::Provide { .. } => stored
+        OverlayExportEndpoint::Provide { .. } => stored
             .spans
             .provides
             .get(name.as_str())
             .map(|provide| provide.capability.name),
-        ResolvedPolicyEndpoint::Slot { .. } => {
+        OverlayExportEndpoint::Slot { .. } => {
             stored.spans.slots.get(name.as_str()).map(|slot| slot.name)
         }
     }
     .unwrap_or((0usize, 0usize).into());
 
     vec![RelatedSpan {
-        message: format!("governance policy reference `{policy}` resolves here"),
+        message: format!("overlay reference `{overlay}` resolves here"),
         src: NamedSource::new(display_url(resolved_url), stored.source).with_language("json5"),
         span,
         label: label.to_string(),
@@ -1423,13 +1411,13 @@ fn flatten(
         .store
         .get(&node.digest)
         .expect("resolved manifest should exist in digest store");
-    if !manifest.policies().is_empty() {
+    if !manifest.overlays().is_empty() {
         state.scope_builds.push(ScopeBuild {
             root_id: id,
             root_moniker: moniker.clone(),
             manifest_url: node.resolved_url.clone(),
             uses: node.uses.clone(),
-            policies: manifest.policies().to_vec(),
+            overlays: manifest.overlays().to_vec(),
         });
     }
 
@@ -1618,7 +1606,7 @@ fn validate_config_tree(
         }
     }
 
-    // 2) Validate config use-sites on authored manifests. Generated policy IR is validated by
+    // 2) Validate config use-sites on authored manifests. Generated overlay IR is validated by
     // the lowered-program verifier because it has no manifest source entry.
 
     fn validate_program_config_refs(

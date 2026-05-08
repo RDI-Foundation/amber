@@ -678,14 +678,14 @@ pub fn lint_manifest(
         }
     }
 
-    let policy_referenced_uses: BTreeSet<_> = manifest
-        .policies()
+    let overlay_referenced_uses: BTreeSet<_> = manifest
+        .overlays()
         .iter()
-        .map(|policy| policy.policy.alias.as_str())
+        .map(|overlay| overlay.overlay.alias.as_str())
         .collect();
 
     for use_name in manifest.uses().keys() {
-        if !policy_referenced_uses.contains(use_name.as_str()) {
+        if !overlay_referenced_uses.contains(use_name.as_str()) {
             let span = spans
                 .uses
                 .get(use_name.as_str())
@@ -963,12 +963,12 @@ mod tests {
             },
           },
           use: {
-            policy: {
-              manifest: "https://example.com/policy",
+            overlay: {
+              manifest: "https://example.com/overlay",
               config: { token: "${config.secret}" },
             },
           },
-          policies: ["#policy.apply"],
+          overlays: ["#overlay.apply"],
         }
         "##;
         let raw = parse_raw(input);
@@ -1414,14 +1414,14 @@ mod tests {
     }
 
     #[test]
-    fn use_referenced_by_policy_is_not_linted() {
+    fn use_referenced_by_overlay_is_not_linted() {
         let input = r##"
         {
           manifest_version: "0.4.0",
           use: {
             wrapper: "./wrapper.json5",
           },
-          policies: ["#wrapper.rewrite"],
+          overlays: ["#wrapper.rewrite"],
         }
         "##;
         let raw = parse_raw(input);

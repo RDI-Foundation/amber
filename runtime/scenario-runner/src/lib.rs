@@ -97,8 +97,8 @@ mod tests {
     #[test]
     fn response_body_preview_trims_without_truncating_short_bodies() {
         assert_eq!(
-            response_body_preview("  policy failed  \n", 64),
-            "policy failed"
+            response_body_preview("  overlay failed  \n", 64),
+            "overlay failed"
         );
     }
 }

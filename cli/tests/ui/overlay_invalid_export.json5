@@ -1,7 +1,7 @@
 {
   manifest_version: "0.4.0",
   use: {
-    wrapper: "./use_requires_root_slot_wrapper.json5",
+    wrapper: "./overlay_invalid_export_wrapper.json5",
   },
   overlays: ["#wrapper.rewrite"],
 }

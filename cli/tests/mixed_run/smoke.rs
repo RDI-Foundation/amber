@@ -1492,12 +1492,12 @@ fn response_json_from(response: (u16, String), context: &str) -> Value {
 
 #[test]
 #[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
-fn mixed_run_governance_redaction_live() {
-    let temp = temp_output_dir("mixed-run-governance-redaction-");
+fn mixed_run_overlay_redaction_live() {
+    let temp = temp_output_dir("mixed-run-overlay-redaction-");
     let storage_root = temp.path().join("state");
     let manifest = workspace_root()
         .join("examples")
-        .join("governance-redaction")
+        .join("overlay-redaction")
         .join("scenario.json5");
     let placement = temp.path().join("placement.json5");
     write_json(
@@ -1535,7 +1535,7 @@ fn mixed_run_governance_redaction_live() {
             "message": "my launch code is [REDACTED]",
             "api_key": "[REDACTED]",
         }),
-        "governance interposer should redact the a2a response path"
+        "overlay interposer should redact the a2a response path"
     );
     assert!(
         status["error"].is_null(),

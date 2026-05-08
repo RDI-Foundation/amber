@@ -74,9 +74,9 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_export_target))]
     InvalidExportTarget { input: String, message: String },
 
-    #[error("invalid policy ref `{input}`: {message}")]
-    #[diagnostic(code(manifest::invalid_policy_ref))]
-    InvalidPolicyRef { input: String, message: String },
+    #[error("invalid overlay ref `{input}`: {message}")]
+    #[diagnostic(code(manifest::invalid_overlay_ref))]
+    InvalidOverlayRef { input: String, message: String },
 
     #[error("invalid {kind} name `{name}`: dots are reserved")]
     #[diagnostic(code(manifest::invalid_name))]
@@ -319,17 +319,17 @@ pub enum Error {
     UnknownUseEnvironment { name: String, environment: String },
 
     #[error(
-        "policy reference points to governance `use` entry `#{alias}`, but this manifest does not \
-         declare that entry"
+        "overlay reference points to `use` entry `#{alias}`, but this manifest does not declare \
+         that entry"
     )]
     #[diagnostic(
-        code(manifest::unknown_policy_use),
+        code(manifest::unknown_overlay_use),
         help(
-            "Add a `use` entry named `{alias}` in this manifest, or change/remove the policy \
+            "Add a `use` entry named `{alias}` in this manifest, or change/remove the overlay \
              reference."
         )
     )]
-    UnknownPolicyUse { alias: String },
+    UnknownOverlayUse { alias: String },
 }
 
 fn manifest_validation_path(diag: &DiagnosticError) -> &str {

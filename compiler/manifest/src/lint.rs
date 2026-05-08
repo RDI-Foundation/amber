@@ -61,7 +61,7 @@ pub enum ManifestLint {
         severity(Warning),
         help(
             "Remove the `use` entry `#{name}` if it is not needed, or reference it from \
-             `policies`."
+             `overlays`."
         )
     )]
     UnusedUse {

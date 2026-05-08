@@ -1,0 +1,22 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      token: { type: "string" },
+    },
+    required: ["token"],
+    additionalProperties: false,
+  },
+  program: {
+    image: "overlay",
+    entrypoint: ["overlay"],
+    network: { endpoints: [{ name: "api", port: 80 }] },
+  },
+  provides: {
+    apply: { kind: "http", profile: "overlay", endpoint: "api" },
+  },
+  exports: {
+    apply: "apply",
+  },
+}

@@ -23,7 +23,7 @@ pub struct ManifestSpans {
     pub resources: HashMap<Arc<str>, ResourceDeclSpans>,
     pub bindings: HashMap<BindingTargetKey, BindingSpans>,
     pub bindings_by_index: Vec<BindingSpans>,
-    pub policies: Vec<PolicyRefSpans>,
+    pub overlays: Vec<OverlayRefSpans>,
     pub exports: HashMap<Arc<str>, ExportSpans>,
 }
 
@@ -65,7 +65,7 @@ pub struct ComponentDeclSpans {
 }
 
 #[derive(Clone, Debug)]
-pub struct PolicyRefSpans {
+pub struct OverlayRefSpans {
     pub whole: SourceSpan,
     pub value: Option<Arc<str>>,
 }
@@ -301,7 +301,7 @@ pub(crate) fn parse_manifest_spans(source: &str) -> Option<ManifestSpans> {
     collect_provides(&root, root_obj, &mut out);
     collect_resources(&root, root_obj, &mut out);
     collect_bindings(&root, root_obj, &mut out);
-    collect_policies(&root, root_obj, &mut out);
+    collect_overlays(&root, root_obj, &mut out);
     collect_exports(&root, root_obj, &mut out);
 
     Some(out)
@@ -582,16 +582,16 @@ fn collect_exports(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &m
     }
 }
 
-fn collect_policies(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &mut ManifestSpans) {
-    let Some((policies, policy_values)) = array_section(root, root_obj, "policies") else {
+fn collect_overlays(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &mut ManifestSpans) {
+    let Some((overlays, overlay_values)) = array_section(root, root_obj, "overlays") else {
         return;
     };
 
-    for (idx, policy_value) in policy_values.iter().enumerate() {
-        let whole = span_or_default(policies.index_span(idx));
-        out.policies.push(PolicyRefSpans {
+    for (idx, overlay_value) in overlay_values.iter().enumerate() {
+        let whole = span_or_default(overlays.index_span(idx));
+        out.overlays.push(OverlayRefSpans {
             whole,
-            value: policy_value.as_str().map(Into::into),
+            value: overlay_value.as_str().map(Into::into),
         });
     }
 }

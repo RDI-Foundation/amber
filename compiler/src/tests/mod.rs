@@ -28,7 +28,7 @@ use crate::{
         BUNDLE_INDEX_NAME, BUNDLE_SCHEMA, BUNDLE_VERSION, BundleBuilder, BundleIndex, BundleLoader,
         BundleRequest,
     },
-    policy::PolicyOutput,
+    overlay::InterpositionPlan,
     reporter::{Reporter as _, scenario_ir::ScenarioIrReporter},
 };
 
@@ -58,7 +58,7 @@ fn default_compiler() -> Compiler {
     Compiler::new(Resolver::new(), DigestStore::default())
 }
 
-fn compiler_with_noop_governance() -> Compiler {
+fn compiler_with_noop_overlay_runner() -> Compiler {
     Compiler::new(Resolver::new(), DigestStore::default())
         .with_scenario_runner(Arc::new(TestScenarioRunner))
 }
@@ -148,7 +148,7 @@ impl RunningScenario for TestRunningScenario {
         _request: &'a serde_json::Value,
     ) -> ScenarioRunnerFuture<'a, Result<String, ScenarioRunnerError>> {
         Box::pin(async {
-            serde_json::to_string(&PolicyOutput::default())
+            serde_json::to_string(&InterpositionPlan::default())
                 .map_err(|err| ScenarioRunnerError::message(err.to_string()))
         })
     }

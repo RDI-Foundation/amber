@@ -146,7 +146,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
         ),
     );
 
-    let compiler = compiler_with_noop_governance();
+    let compiler = compiler_with_noop_overlay_runner();
     let root_ref = manifest_ref_for_path(&root_path);
 
     let compilation = compiler
@@ -226,7 +226,7 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
     let root_digest = root_contents.parse::<Manifest>().unwrap().digest();
     let root_ref = ManifestRef::new(file_url(&root_path), Some(root_digest));
 
-    let compiler = compiler_with_noop_governance();
+    let compiler = compiler_with_noop_overlay_runner();
 
     let compilation = compiler
         .compile(root_ref.clone(), standard_compile_options())
@@ -256,7 +256,7 @@ async fn provenance_records_redirect_when_fetched() {
     let digest = contents.parse::<Manifest>().unwrap().digest();
     let (url, server) = spawn_redirecting_manifest_server(contents);
 
-    let compiler = compiler_with_noop_governance();
+    let compiler = compiler_with_noop_overlay_runner();
     let root_ref = ManifestRef::new(url.clone(), Some(digest));
 
     let compilation = compiler
@@ -764,7 +764,7 @@ async fn resolve_tree_keeps_use_entries_out_of_component_tree() {
             entrypoint: ["wrapper"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { rewrite: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { rewrite: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { rewrite: "rewrite" },
         }
         "#,
@@ -778,7 +778,7 @@ async fn resolve_tree_keeps_use_entries_out_of_component_tree() {
               use: {{
                 wrapper: "{wrapper}",
               }},
-              policies: ["#wrapper.rewrite"],
+              overlays: ["#wrapper.rewrite"],
               components: {{
                 child: "{child}",
               }},
@@ -789,7 +789,7 @@ async fn resolve_tree_keeps_use_entries_out_of_component_tree() {
         ),
     );
 
-    let compiler = compiler_with_noop_governance();
+    let compiler = compiler_with_noop_overlay_runner();
     let tree = compiler
         .resolve_tree(
             manifest_ref_for_path(&root_path),
@@ -809,24 +809,24 @@ async fn resolve_tree_keeps_use_entries_out_of_component_tree() {
 }
 
 #[tokio::test]
-async fn check_with_governance_stays_static_by_default() {
-    let dir = tmp_dir("scenario-governance-static-check");
+async fn check_with_overlays_stays_static_by_default() {
+    let dir = tmp_dir("scenario-overlays-static-check");
     let root_path = dir.path().join("root.json5");
     let child_path = dir.path().join("child.json5");
-    let policy_path = dir.path().join("policy.json5");
+    let overlay_path = dir.path().join("overlay.json5");
 
     write_file(&child_path, r#"{ manifest_version: "0.1.0" }"#);
     write_file(
-        &policy_path,
+        &overlay_path,
         r#"
         {
           manifest_version: "0.1.0",
           program: {
-            image: "policy",
-            entrypoint: ["policy"],
+            image: "overlay",
+            entrypoint: ["overlay"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { apply: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { apply: "apply" },
         }
         "#,
@@ -838,15 +838,15 @@ async fn check_with_governance_stays_static_by_default() {
             {{
               manifest_version: "0.4.0",
               use: {{
-                policy: "{policy}",
+                overlay: "{overlay}",
               }},
-              policies: ["#policy.apply"],
+              overlays: ["#overlay.apply"],
               components: {{
                 child: "{child}",
               }},
             }}
             "##,
-            policy = file_url(&policy_path),
+            overlay = file_url(&overlay_path),
             child = file_url(&child_path),
         ),
     );
@@ -857,7 +857,7 @@ async fn check_with_governance_stays_static_by_default() {
             standard_compile_options(),
         )
         .await
-        .expect("static check should not require a policy scenario runner");
+        .expect("static check should not require an overlay scenario runner");
 
     assert!(!output.has_errors);
 }
@@ -866,10 +866,10 @@ async fn check_with_governance_stays_static_by_default() {
 async fn use_config_with_config_interpolation_compiles() {
     let dir = tmp_dir("scenario-use-config-interp");
     let root_path = dir.path().join("root.json5");
-    let policy_path = dir.path().join("policy.json5");
+    let overlay_path = dir.path().join("overlay.json5");
 
     write_file(
-        &policy_path,
+        &overlay_path,
         r#"
         {
           manifest_version: "0.1.0",
@@ -878,11 +878,11 @@ async fn use_config_with_config_interpolation_compiles() {
             properties: { token: { type: "string" } },
           },
           program: {
-            image: "policy",
-            entrypoint: ["policy"],
+            image: "overlay",
+            entrypoint: ["overlay"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { apply: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { apply: "apply" },
         }
         "#,
@@ -898,19 +898,19 @@ async fn use_config_with_config_interpolation_compiles() {
                 properties: {{ api_key: {{ type: "string" }} }},
               }},
               use: {{
-                policy_comp: {{
-                  manifest: "{policy}",
+                overlay_comp: {{
+                  manifest: "{overlay}",
                   config: {{ token: "${{config.api_key}}" }},
                 }},
               }},
-              policies: ["#policy_comp.apply"],
+              overlays: ["#overlay_comp.apply"],
             }}
             "##,
-            policy = file_url(&policy_path),
+            overlay = file_url(&overlay_path),
         ),
     );
 
-    let compiler = compiler_with_noop_governance();
+    let compiler = compiler_with_noop_overlay_runner();
     let output = compiler
         .compile(
             manifest_ref_for_path(&root_path),
@@ -919,27 +919,27 @@ async fn use_config_with_config_interpolation_compiles() {
         .await
         .expect("use config with config interpolation should compile");
 
-    let governance = output
-        .governance
+    let overlays = output
+        .overlays
         .as_ref()
-        .expect("governance should be present");
-    let root_id = governance.scenario.root;
-    let root_digest = governance.scenario.component(root_id).digest;
+        .expect("overlays should be present");
+    let root_id = overlays.scenario.root;
+    let root_digest = overlays.scenario.component(root_id).digest;
     let root_manifest = output
         .store
         .get(&root_digest)
-        .expect("governance root manifest in store");
+        .expect("overlays root manifest in store");
     let config_schema = root_manifest
         .config_schema()
-        .expect("governance root should have config schema");
-    // The governance root schema should expose the api_key path from the outer scenario
+        .expect("overlays root should have config schema");
+    // The overlays root schema should expose the api_key path from the outer scenario
     let schema_value = &config_schema.0;
     let props = schema_value
         .get("properties")
         .expect("schema should have properties");
     assert!(
         props.get("api_key").is_some(),
-        "api_key should appear in governance root schema properties"
+        "api_key should appear in overlays root schema properties"
     );
 }
 
@@ -948,10 +948,10 @@ async fn use_config_with_config_interpolation_in_child_scope_compiles() {
     let dir = tmp_dir("scenario-use-config-interp-child");
     let root_path = dir.path().join("root.json5");
     let scope_path = dir.path().join("scope.json5");
-    let policy_path = dir.path().join("policy.json5");
+    let overlay_path = dir.path().join("overlay.json5");
 
     write_file(
-        &policy_path,
+        &overlay_path,
         r#"
         {
           manifest_version: "0.1.0",
@@ -960,11 +960,11 @@ async fn use_config_with_config_interpolation_in_child_scope_compiles() {
             properties: { token: { type: "string" } },
           },
           program: {
-            image: "policy",
-            entrypoint: ["policy"],
+            image: "overlay",
+            entrypoint: ["overlay"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { apply: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { apply: "apply" },
         }
         "#,
@@ -980,15 +980,15 @@ async fn use_config_with_config_interpolation_in_child_scope_compiles() {
                 properties: {{ api_key: {{ type: "string" }} }},
               }},
               use: {{
-                policy_comp: {{
-                  manifest: "{policy}",
+                overlay_comp: {{
+                  manifest: "{overlay}",
                   config: {{ token: "${{config.api_key}}" }},
                 }},
               }},
-              policies: ["#policy_comp.apply"],
+              overlays: ["#overlay_comp.apply"],
             }}
             "##,
-            policy = file_url(&policy_path),
+            overlay = file_url(&overlay_path),
         ),
     );
     write_file(
@@ -1013,7 +1013,7 @@ async fn use_config_with_config_interpolation_in_child_scope_compiles() {
         ),
     );
 
-    let compiler = compiler_with_noop_governance();
+    let compiler = compiler_with_noop_overlay_runner();
     let output = compiler
         .compile(
             manifest_ref_for_path(&root_path),
@@ -1022,44 +1022,44 @@ async fn use_config_with_config_interpolation_in_child_scope_compiles() {
         .await
         .expect("use config interpolation through child scope template should compile");
 
-    let governance = output
-        .governance
+    let overlays = output
+        .overlays
         .as_ref()
-        .expect("governance should be present");
-    let root_id = governance.scenario.root;
-    let root_digest = governance.scenario.component(root_id).digest;
+        .expect("overlays should be present");
+    let root_id = overlays.scenario.root;
+    let root_digest = overlays.scenario.component(root_id).digest;
     let root_manifest = output
         .store
         .get(&root_digest)
-        .expect("governance root manifest in store");
+        .expect("overlays root manifest in store");
     let config_schema = root_manifest
         .config_schema()
-        .expect("governance root should have config schema");
+        .expect("overlays root should have config schema");
     // The child scope's api_key config is threaded through the outer root_api_key config ref,
-    // so the governance root schema should expose root_api_key (not api_key).
+    // so the overlays root schema should expose root_api_key (not api_key).
     let schema_value = &config_schema.0;
     let props = schema_value
         .get("properties")
         .expect("schema should have properties");
     assert!(
         props.get("root_api_key").is_some(),
-        "root_api_key should appear in governance root schema properties"
+        "root_api_key should appear in overlays root schema properties"
     );
     assert!(
         props.get("api_key").is_none(),
-        "api_key is scoped to the child and should not appear directly in governance root schema"
+        "api_key is scoped to the child and should not appear directly in overlays root schema"
     );
 }
 
 #[tokio::test]
-async fn policy_symbolic_config_is_composed_against_scope_config() {
-    let dir = tmp_dir("scenario-policy-symbolic-config-compose");
+async fn overlay_symbolic_config_is_composed_against_scope_config() {
+    let dir = tmp_dir("scenario-overlay-symbolic-config-compose");
     let root_path = dir.path().join("root.json5");
     let scope_path = dir.path().join("scope.json5");
-    let policy_path = dir.path().join("policy.json5");
+    let overlay_path = dir.path().join("overlay.json5");
 
     write_file(
-        &policy_path,
+        &overlay_path,
         r#"
         {
           manifest_version: "0.1.0",
@@ -1069,11 +1069,11 @@ async fn policy_symbolic_config_is_composed_against_scope_config() {
             required: ["redaction_term"],
           },
           program: {
-            image: "policy",
-            entrypoint: ["policy"],
+            image: "overlay",
+            entrypoint: ["overlay"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { apply: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { apply: "apply" },
         }
         "#,
@@ -1089,15 +1089,15 @@ async fn policy_symbolic_config_is_composed_against_scope_config() {
                 properties: {{ hidden_secret: {{ type: "string" }} }},
               }},
               use: {{
-                policy_comp: {{
-                  manifest: "{policy}",
+                overlay_comp: {{
+                  manifest: "{overlay}",
                   config: {{ redaction_term: "$${{config.hidden_secret}}" }},
                 }},
               }},
-              policies: ["#policy_comp.apply"],
+              overlays: ["#overlay_comp.apply"],
             }}
             "##,
-            policy = file_url(&policy_path),
+            overlay = file_url(&overlay_path),
         ),
     );
     write_file(
@@ -1122,34 +1122,34 @@ async fn policy_symbolic_config_is_composed_against_scope_config() {
         ),
     );
 
-    let compiler = compiler_with_noop_governance();
+    let compiler = compiler_with_noop_overlay_runner();
     let output = compiler
         .compile(
             manifest_ref_for_path(&root_path),
             standard_compile_options(),
         )
         .await
-        .expect("policy symbolic config composition should compile");
+        .expect("overlay symbolic config composition should compile");
 
-    let governance = output
-        .governance
+    let overlays = output
+        .overlays
         .as_ref()
-        .expect("governance should be present");
-    let root_id = governance.scenario.root;
-    let root_digest = governance.scenario.component(root_id).digest;
+        .expect("overlays should be present");
+    let root_id = overlays.scenario.root;
+    let root_digest = overlays.scenario.component(root_id).digest;
     let root_manifest = output
         .store
         .get(&root_digest)
-        .expect("governance root manifest in store");
-    let policy_component = root_manifest
+        .expect("overlays root manifest in store");
+    let overlay_component = root_manifest
         .components()
         .get("use_0_0")
-        .expect("policy component should be present in governance root");
-    let amber_manifest::ComponentDecl::Object(policy_component) = policy_component else {
-        panic!("policy component should be in object form");
+        .expect("overlay component should be present in overlays root");
+    let amber_manifest::ComponentDecl::Object(overlay_component) = overlay_component else {
+        panic!("overlay component should be in object form");
     };
     assert_eq!(
-        policy_component.config.as_ref(),
+        overlay_component.config.as_ref(),
         Some(&serde_json::json!({
             "redaction_term": {
                 "$symbolic_config": "root_secret",
@@ -1159,17 +1159,17 @@ async fn policy_symbolic_config_is_composed_against_scope_config() {
 }
 
 #[tokio::test]
-async fn governance_root_schema_uses_full_root_schema_for_whole_config_ref() {
-    assert_governance_root_schema_for_whole_config_ref("${config}").await;
+async fn overlays_root_schema_uses_full_root_schema_for_whole_config_ref() {
+    assert_overlays_root_schema_for_whole_config_ref("${config}").await;
 }
 
-async fn assert_governance_root_schema_for_whole_config_ref(policy_config_ref: &str) {
-    let dir = tmp_dir("scenario-governance-whole-root-config");
+async fn assert_overlays_root_schema_for_whole_config_ref(overlay_config_ref: &str) {
+    let dir = tmp_dir("scenario-overlays-whole-root-config");
     let root_path = dir.path().join("root.json5");
-    let policy_path = dir.path().join("policy.json5");
+    let overlay_path = dir.path().join("overlay.json5");
 
     write_file(
-        &policy_path,
+        &overlay_path,
         r#"
         {
           manifest_version: "0.1.0",
@@ -1194,11 +1194,11 @@ async fn assert_governance_root_schema_for_whole_config_ref(policy_config_ref: &
             required: ["snapshot"],
           },
           program: {
-            image: "policy",
-            entrypoint: ["policy"],
+            image: "overlay",
+            entrypoint: ["overlay"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { apply: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { apply: "apply" },
         }
         "#,
@@ -1224,40 +1224,40 @@ async fn assert_governance_root_schema_for_whole_config_ref(policy_config_ref: &
                 required: ["key", "nested"],
               }},
               use: {{
-                policy_comp: {{
-                  manifest: "{policy}",
-                  config: {{ snapshot: "{policy_config_ref}" }},
+                overlay_comp: {{
+                  manifest: "{overlay}",
+                  config: {{ snapshot: "{overlay_config_ref}" }},
                 }},
               }},
-              policies: ["#policy_comp.apply"],
+              overlays: ["#overlay_comp.apply"],
             }}
             "##,
-            policy = file_url(&policy_path),
+            overlay = file_url(&overlay_path),
         ),
     );
 
-    let compiler = compiler_with_noop_governance();
+    let compiler = compiler_with_noop_overlay_runner();
     let output = compiler
         .compile(
             manifest_ref_for_path(&root_path),
             standard_compile_options(),
         )
         .await
-        .expect("whole-root governance config should compile");
+        .expect("whole-root overlays config should compile");
 
-    let governance = output
-        .governance
+    let overlays = output
+        .overlays
         .as_ref()
-        .expect("governance should be present");
-    let root_id = governance.scenario.root;
-    let root_digest = governance.scenario.component(root_id).digest;
+        .expect("overlays should be present");
+    let root_id = overlays.scenario.root;
+    let root_digest = overlays.scenario.component(root_id).digest;
     let root_manifest = output
         .store
         .get(&root_digest)
-        .expect("governance root manifest in store");
+        .expect("overlays root manifest in store");
     let config_schema = root_manifest
         .config_schema()
-        .expect("governance root should have config schema");
+        .expect("overlays root should have config schema");
 
     assert_eq!(
         config_schema.0,
@@ -1280,16 +1280,16 @@ async fn assert_governance_root_schema_for_whole_config_ref(policy_config_ref: &
 }
 
 #[tokio::test]
-async fn governance_root_schema_handles_overlapping_config_paths() {
-    let dir = tmp_dir("scenario-governance-overlapping-paths");
+async fn overlays_root_schema_handles_overlapping_config_paths() {
+    let dir = tmp_dir("scenario-overlays-overlapping-paths");
     let root_path = dir.path().join("root.json5");
     let scope_path = dir.path().join("scope.json5");
-    let policy_a_path = dir.path().join("policy_a.json5");
-    let policy_b_path = dir.path().join("policy_b.json5");
+    let overlay_a_path = dir.path().join("overlay_a.json5");
+    let overlay_b_path = dir.path().join("overlay_b.json5");
 
-    // policy_a takes a whole "creds" object
+    // overlay_a takes a whole "creds" object
     write_file(
-        &policy_a_path,
+        &overlay_a_path,
         r#"
         {
           manifest_version: "0.1.0",
@@ -1298,18 +1298,18 @@ async fn governance_root_schema_handles_overlapping_config_paths() {
             properties: { creds: { type: "object", properties: { key: { type: "string" }, url: { type: "string" } } } },
           },
           program: {
-            image: "policy",
-            entrypoint: ["policy"],
+            image: "overlay",
+            entrypoint: ["overlay"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { apply: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { apply: "apply" },
         }
         "#,
     );
-    // policy_b takes only a single key
+    // overlay_b takes only a single key
     write_file(
-        &policy_b_path,
+        &overlay_b_path,
         r#"
         {
           manifest_version: "0.1.0",
@@ -1318,11 +1318,11 @@ async fn governance_root_schema_handles_overlapping_config_paths() {
             properties: { token: { type: "string" } },
           },
           program: {
-            image: "policy",
-            entrypoint: ["policy"],
+            image: "overlay",
+            entrypoint: ["overlay"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { apply: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { apply: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { apply: "apply" },
         }
         "#,
@@ -1344,19 +1344,19 @@ async fn governance_root_schema_handles_overlapping_config_paths() {
               }},
               use: {{
                 audit: {{
-                  manifest: "{policy_a}",
+                  manifest: "{overlay_a}",
                   config: {{ creds: "${{config.whole_creds}}" }},
                 }},
                 redaction: {{
-                  manifest: "{policy_b}",
+                  manifest: "{overlay_b}",
                   config: {{ token: "$${{config.just_key}}" }},
                 }},
               }},
-              policies: ["#audit.apply", "#redaction.apply"],
+              overlays: ["#audit.apply", "#redaction.apply"],
             }}
             "##,
-            policy_a = file_url(&policy_a_path),
-            policy_b = file_url(&policy_b_path),
+            overlay_a = file_url(&overlay_a_path),
+            overlay_b = file_url(&overlay_b_path),
         ),
     );
     // The root maps scope's whole_creds → creds and just_key → creds.key,
@@ -1396,7 +1396,7 @@ async fn governance_root_schema_handles_overlapping_config_paths() {
         ),
     );
 
-    let compiler = compiler_with_noop_governance();
+    let compiler = compiler_with_noop_overlay_runner();
     let output = compiler
         .compile(
             manifest_ref_for_path(&root_path),
@@ -1405,24 +1405,24 @@ async fn governance_root_schema_handles_overlapping_config_paths() {
         .await
         .expect("overlapping config paths should compile");
 
-    let governance = output
-        .governance
+    let overlays = output
+        .overlays
         .as_ref()
-        .expect("governance should be present");
-    let root_id = governance.scenario.root;
-    let root_digest = governance.scenario.component(root_id).digest;
+        .expect("overlays should be present");
+    let root_id = overlays.scenario.root;
+    let root_digest = overlays.scenario.component(root_id).digest;
     let root_manifest = output
         .store
         .get(&root_digest)
-        .expect("governance root manifest in store");
+        .expect("overlays root manifest in store");
     let config_schema = root_manifest
         .config_schema()
-        .expect("governance root should have config schema");
+        .expect("overlays root should have config schema");
     let schema_value = &config_schema.0;
     let creds_schema = schema_value
         .get("properties")
         .and_then(|p| p.get("creds"))
-        .expect("creds should appear in governance root schema");
+        .expect("creds should appear in overlays root schema");
 
     // "creds" subsumes "creds.key", so the full creds object schema should be used
     assert_eq!(
@@ -1444,7 +1444,7 @@ async fn governance_root_schema_handles_overlapping_config_paths() {
         .expect("schema should have required");
     assert!(
         required.iter().any(|r| r == "creds"),
-        "creds should be required in governance root schema"
+        "creds should be required in overlays root schema"
     );
 }
 
@@ -1465,7 +1465,7 @@ async fn used_manifest_must_not_require_root_slots() {
             entrypoint: ["wrapper"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { rewrite: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { rewrite: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { rewrite: "rewrite" },
         }
         "#,
@@ -1479,7 +1479,7 @@ async fn used_manifest_must_not_require_root_slots() {
               use: {{
                 wrapper: "{wrapper}",
               }},
-              policies: ["#wrapper.rewrite"],
+              overlays: ["#wrapper.rewrite"],
             }}
             "##,
             wrapper = file_url(&wrapper_path),
@@ -1508,8 +1508,8 @@ async fn used_manifest_must_not_require_root_slots() {
 }
 
 #[tokio::test]
-async fn compile_resolves_policy_exports_from_use_entries() {
-    let dir = tmp_dir("scenario-policy-resolve");
+async fn compile_resolves_overlay_exports_from_use_entries() {
+    let dir = tmp_dir("scenario-overlay-resolve");
     let root_path = dir.path().join("root.json5");
     let wrapper_path = dir.path().join("wrapper.json5");
 
@@ -1523,7 +1523,7 @@ async fn compile_resolves_policy_exports_from_use_entries() {
             entrypoint: ["wrapper"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { rewrite: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { rewrite: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { rewrite: "rewrite" },
         }
         "#,
@@ -1537,14 +1537,14 @@ async fn compile_resolves_policy_exports_from_use_entries() {
               use: {{
                 wrapper: "{wrapper}",
               }},
-              policies: ["#wrapper.rewrite"],
+              overlays: ["#wrapper.rewrite"],
             }}
             "##,
             wrapper = file_url(&wrapper_path),
         ),
     );
 
-    let output = compiler_with_noop_governance()
+    let output = compiler_with_noop_overlay_runner()
         .compile(
             manifest_ref_for_path(&root_path),
             standard_compile_options(),
@@ -1552,27 +1552,27 @@ async fn compile_resolves_policy_exports_from_use_entries() {
         .await
         .unwrap();
 
-    let governance = output.governance.expect("governance should exist");
-    assert_eq!(governance.scopes.len(), 1);
+    let overlays = output.overlays.expect("overlays should exist");
+    assert_eq!(overlays.scopes.len(), 1);
     assert_eq!(
-        governance.scopes[0].policies[0].export.as_str(),
-        "policy_0_0"
+        overlays.scopes[0].overlays[0].export.as_str(),
+        "overlay_0_0"
     );
-    assert_eq!(governance.scopes[0].policies[0].display_name, "/wrapper");
-    assert_eq!(governance.scenario.exports.len(), 1);
+    assert_eq!(overlays.scopes[0].overlays[0].display_name, "/wrapper");
+    assert_eq!(overlays.scenario.exports.len(), 1);
     assert_eq!(
-        governance.scenario.exports[0].capability.kind,
+        overlays.scenario.exports[0].capability.kind,
         amber_manifest::CapabilityKind::Http
     );
     assert_eq!(
-        governance.scenario.exports[0].capability.profile.as_deref(),
-        Some("policy")
+        overlays.scenario.exports[0].capability.profile.as_deref(),
+        Some("overlay")
     );
 }
 
 #[tokio::test]
-async fn compile_follows_child_exports_for_policies() {
-    let dir = tmp_dir("scenario-policy-child-export");
+async fn compile_follows_child_exports_for_overlays() {
+    let dir = tmp_dir("scenario-overlay-child-export");
     let root_path = dir.path().join("root.json5");
     let wrapper_path = dir.path().join("wrapper.json5");
     let leaf_path = dir.path().join("leaf.json5");
@@ -1587,7 +1587,7 @@ async fn compile_follows_child_exports_for_policies() {
             entrypoint: ["leaf"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { rewrite: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { rewrite: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { rewrite: "rewrite" },
         }
         "#,
@@ -1616,14 +1616,14 @@ async fn compile_follows_child_exports_for_policies() {
               use: {{
                 wrapper: "{wrapper}",
               }},
-              policies: ["#wrapper.rewrite"],
+              overlays: ["#wrapper.rewrite"],
             }}
             "##,
             wrapper = file_url(&wrapper_path),
         ),
     );
 
-    let output = compiler_with_noop_governance()
+    let output = compiler_with_noop_overlay_runner()
         .compile(
             manifest_ref_for_path(&root_path),
             standard_compile_options(),
@@ -1631,26 +1631,26 @@ async fn compile_follows_child_exports_for_policies() {
         .await
         .unwrap();
 
-    let governance = output.governance.expect("governance should exist");
+    let overlays = output.overlays.expect("overlays should exist");
     assert_eq!(
-        governance.scopes[0].policies[0].export.as_str(),
-        "policy_0_0"
+        overlays.scopes[0].overlays[0].export.as_str(),
+        "overlay_0_0"
     );
-    assert_eq!(governance.scopes[0].policies[0].display_name, "/wrapper");
-    assert_eq!(governance.scenario.exports.len(), 1);
+    assert_eq!(overlays.scopes[0].overlays[0].display_name, "/wrapper");
+    assert_eq!(overlays.scenario.exports.len(), 1);
     assert_eq!(
-        governance.scenario.exports[0].capability.kind,
+        overlays.scenario.exports[0].capability.kind,
         amber_manifest::CapabilityKind::Http
     );
     assert_eq!(
-        governance.scenario.exports[0].capability.profile.as_deref(),
-        Some("policy")
+        overlays.scenario.exports[0].capability.profile.as_deref(),
+        Some("overlay")
     );
 }
 
 #[tokio::test]
-async fn policy_ref_requires_resolvable_export() {
-    let dir = tmp_dir("scenario-policy-missing-export");
+async fn overlay_ref_requires_resolvable_export() {
+    let dir = tmp_dir("scenario-overlay-missing-export");
     let root_path = dir.path().join("root.json5");
     let wrapper_path = dir.path().join("wrapper.json5");
 
@@ -1664,7 +1664,7 @@ async fn policy_ref_requires_resolvable_export() {
               use: {{
                 wrapper: "{wrapper}",
               }},
-              policies: ["#wrapper.rewrite"],
+              overlays: ["#wrapper.rewrite"],
             }}
             "##,
             wrapper = file_url(&wrapper_path),
@@ -1680,23 +1680,23 @@ async fn policy_ref_requires_resolvable_export() {
         .unwrap_err();
 
     match err {
-        crate::Error::Linker(crate::linker::Error::PolicyExportUnresolved {
-            policy,
+        crate::Error::Linker(crate::linker::Error::OverlayExportUnresolved {
+            overlay,
             use_name,
             export,
             ..
         }) => {
-            assert_eq!(policy.as_ref(), "#wrapper.rewrite");
+            assert_eq!(overlay.as_ref(), "#wrapper.rewrite");
             assert_eq!(use_name.as_ref(), "wrapper");
             assert_eq!(export.as_ref(), "rewrite");
         }
-        other => panic!("expected PolicyExportUnresolved error, got: {other}"),
+        other => panic!("expected OverlayExportUnresolved error, got: {other}"),
     }
 }
 
 #[tokio::test]
-async fn policy_ref_requires_http_policy_provide() {
-    let dir = tmp_dir("scenario-policy-invalid-capability");
+async fn overlay_ref_requires_http_overlay_provide() {
+    let dir = tmp_dir("scenario-overlay-invalid-capability");
     let root_path = dir.path().join("root.json5");
     let wrapper_path = dir.path().join("wrapper.json5");
 
@@ -1724,7 +1724,7 @@ async fn policy_ref_requires_http_policy_provide() {
               use: {{
                 wrapper: "{wrapper}",
               }},
-              policies: ["#wrapper.rewrite"],
+              overlays: ["#wrapper.rewrite"],
             }}
             "##,
             wrapper = file_url(&wrapper_path),
@@ -1740,23 +1740,25 @@ async fn policy_ref_requires_http_policy_provide() {
         .unwrap_err();
 
     match err {
-        crate::Error::Linker(crate::linker::Error::InvalidPolicyExport {
-            policy, message, ..
+        crate::Error::Linker(crate::linker::Error::InvalidOverlayExport {
+            overlay,
+            message,
+            ..
         }) => {
-            assert_eq!(policy.as_ref(), "#wrapper.rewrite");
+            assert_eq!(overlay.as_ref(), "#wrapper.rewrite");
             assert_eq!(
                 message.as_ref(),
                 "export `rewrite` resolves to provide `rewrite` with capability `http`; expected \
-                 `kind: \"http\"` and `profile: \"policy\"`"
+                 `kind: \"http\"` and `profile: \"overlay\"`"
             );
         }
-        other => panic!("expected InvalidPolicyExport error, got: {other}"),
+        other => panic!("expected InvalidOverlayExport error, got: {other}"),
     }
 }
 
 #[tokio::test]
-async fn policy_ref_rejects_slot_exports() {
-    let dir = tmp_dir("scenario-policy-slot-export");
+async fn overlay_ref_rejects_slot_exports() {
+    let dir = tmp_dir("scenario-overlay-slot-export");
     let root_path = dir.path().join("root.json5");
     let wrapper_path = dir.path().join("wrapper.json5");
 
@@ -1765,7 +1767,7 @@ async fn policy_ref_rejects_slot_exports() {
         r#"
         {
           manifest_version: "0.1.0",
-          slots: { rewrite: { kind: "http", profile: "policy", optional: true } },
+          slots: { rewrite: { kind: "http", profile: "overlay", optional: true } },
           exports: { rewrite: "rewrite" },
         }
         "#,
@@ -1779,7 +1781,7 @@ async fn policy_ref_rejects_slot_exports() {
               use: {{
                 wrapper: "{wrapper}",
               }},
-              policies: ["#wrapper.rewrite"],
+              overlays: ["#wrapper.rewrite"],
             }}
             "##,
             wrapper = file_url(&wrapper_path),
@@ -1795,22 +1797,24 @@ async fn policy_ref_rejects_slot_exports() {
         .unwrap_err();
 
     match err {
-        crate::Error::Linker(crate::linker::Error::InvalidPolicyExport {
-            policy, message, ..
+        crate::Error::Linker(crate::linker::Error::InvalidOverlayExport {
+            overlay,
+            message,
+            ..
         }) => {
-            assert_eq!(policy.as_ref(), "#wrapper.rewrite");
+            assert_eq!(overlay.as_ref(), "#wrapper.rewrite");
             assert_eq!(
                 message.as_ref(),
                 "export `rewrite` resolves to slot `rewrite`; expected an exported provide"
             );
         }
-        other => panic!("expected InvalidPolicyExport error, got: {other}"),
+        other => panic!("expected InvalidOverlayExport error, got: {other}"),
     }
 }
 
 #[tokio::test]
-async fn compile_attaches_governance_artifact_for_policy_uses() {
-    let dir = tmp_dir("compile-governance-artifact");
+async fn compile_attaches_overlays_artifact_for_overlay_uses() {
+    let dir = tmp_dir("compile-overlays-artifact");
     let root_path = dir.path().join("root.json5");
     let child_path = dir.path().join("child.json5");
     let wrapper_path = dir.path().join("wrapper.json5");
@@ -1826,7 +1830,7 @@ async fn compile_attaches_governance_artifact_for_policy_uses() {
             entrypoint: ["wrapper"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { rewrite: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { rewrite: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { rewrite: "rewrite" },
         }
         "#,
@@ -1840,7 +1844,7 @@ async fn compile_attaches_governance_artifact_for_policy_uses() {
               use: {{
                 wrapper: "{wrapper}",
               }},
-              policies: ["#wrapper.rewrite"],
+              overlays: ["#wrapper.rewrite"],
               components: {{
                 child: "{child}",
               }},
@@ -1851,7 +1855,7 @@ async fn compile_attaches_governance_artifact_for_policy_uses() {
         ),
     );
 
-    let output = compiler_with_noop_governance()
+    let output = compiler_with_noop_overlay_runner()
         .compile(
             manifest_ref_for_path(&root_path),
             standard_compile_options(),
@@ -1859,25 +1863,25 @@ async fn compile_attaches_governance_artifact_for_policy_uses() {
         .await
         .unwrap();
 
-    let governance = output
-        .governance
+    let overlays = output
+        .overlays
         .as_ref()
-        .expect("governance artifact should be attached");
-    assert_eq!(governance.scopes.len(), 1);
-    assert_eq!(governance.scopes[0].root_moniker.as_str(), "/");
-    assert_eq!(governance.scopes[0].policies.len(), 1);
+        .expect("overlays artifact should be attached");
+    assert_eq!(overlays.scopes.len(), 1);
+    assert_eq!(overlays.scopes[0].root_moniker.as_str(), "/");
+    assert_eq!(overlays.scopes[0].overlays.len(), 1);
     assert_eq!(
-        governance.scopes[0].policies[0].export.as_str(),
-        "policy_0_0"
+        overlays.scopes[0].overlays[0].export.as_str(),
+        "overlay_0_0"
     );
-    assert_eq!(governance.scopes[0].policies[0].display_name, "/wrapper");
-    assert_eq!(governance.scenario.exports[0].name, "policy_0_0");
-    assert_eq!(governance.scenario.components.iter().flatten().count(), 2);
+    assert_eq!(overlays.scopes[0].overlays[0].display_name, "/wrapper");
+    assert_eq!(overlays.scenario.exports[0].name, "overlay_0_0");
+    assert_eq!(overlays.scenario.components.iter().flatten().count(), 2);
 }
 
 #[tokio::test]
-async fn compile_governance_artifact_ignores_unreferenced_use_entries() {
-    let dir = tmp_dir("compile-governance-referenced-uses-only");
+async fn compile_overlays_artifact_ignores_unreferenced_use_entries() {
+    let dir = tmp_dir("compile-overlays-referenced-uses-only");
     let root_path = dir.path().join("root.json5");
     let wrapper_path = dir.path().join("wrapper.json5");
     let unused_path = dir.path().join("unused.json5");
@@ -1892,7 +1896,7 @@ async fn compile_governance_artifact_ignores_unreferenced_use_entries() {
             entrypoint: ["wrapper"],
             network: { endpoints: [{ name: "api", port: 80 }] },
           },
-          provides: { rewrite: { kind: "http", profile: "policy", endpoint: "api" } },
+          provides: { rewrite: { kind: "http", profile: "overlay", endpoint: "api" } },
           exports: { rewrite: "rewrite" },
         }
         "#,
@@ -1911,7 +1915,7 @@ async fn compile_governance_artifact_ignores_unreferenced_use_entries() {
                   config: {{ broken: "${{config.missing}}" }},
                 }},
               }},
-              policies: ["#wrapper.rewrite"],
+              overlays: ["#wrapper.rewrite"],
             }}
             "##,
             wrapper = file_url(&wrapper_path),
@@ -1919,33 +1923,33 @@ async fn compile_governance_artifact_ignores_unreferenced_use_entries() {
         ),
     );
 
-    let output = compiler_with_noop_governance()
+    let output = compiler_with_noop_overlay_runner()
         .compile(
             manifest_ref_for_path(&root_path),
             standard_compile_options(),
         )
         .await
-        .expect("unreferenced governance uses should not block compilation");
+        .expect("unreferenced overlay uses should not block compilation");
 
-    let governance = output
-        .governance
+    let overlays = output
+        .overlays
         .as_ref()
-        .expect("governance artifact should be attached");
-    assert_eq!(governance.scenario.components.iter().flatten().count(), 2);
+        .expect("overlays artifact should be attached");
+    assert_eq!(overlays.scenario.components.iter().flatten().count(), 2);
 
-    let root_id = governance.scenario.root;
-    let root_digest = governance.scenario.component(root_id).digest;
+    let root_id = overlays.scenario.root;
+    let root_digest = overlays.scenario.component(root_id).digest;
     let root_manifest = output
         .store
         .get(&root_digest)
-        .expect("governance root manifest in store");
+        .expect("overlays root manifest in store");
     assert!(root_manifest.components().contains_key("use_0_0"));
     assert!(!root_manifest.components().contains_key("use_0_1"));
 }
 
 #[tokio::test]
-async fn used_manifest_rejects_nested_governance() {
-    let dir = tmp_dir("scenario-use-nested-governance");
+async fn used_manifest_rejects_nested_overlays() {
+    let dir = tmp_dir("scenario-use-nested-overlays");
     let root_path = dir.path().join("root.json5");
     let wrapper_path = dir.path().join("wrapper.json5");
     let nested_path = dir.path().join("nested.json5");
@@ -1965,7 +1969,7 @@ async fn used_manifest_rejects_nested_governance() {
                 entrypoint: ["wrapper"],
                 network: {{ endpoints: [{{ name: "api", port: 80 }}] }},
               }},
-              provides: {{ rewrite: {{ kind: "http", profile: "policy", endpoint: "api" }} }},
+              provides: {{ rewrite: {{ kind: "http", profile: "overlay", endpoint: "api" }} }},
               exports: {{ rewrite: "rewrite" }},
             }}
             "#,
@@ -1981,7 +1985,7 @@ async fn used_manifest_rejects_nested_governance() {
               use: {{
                 wrapper: "{wrapper}",
               }},
-              policies: ["#wrapper.rewrite"],
+              overlays: ["#wrapper.rewrite"],
             }}
             "##,
             wrapper = file_url(&wrapper_path),
@@ -1997,7 +2001,7 @@ async fn used_manifest_rejects_nested_governance() {
         .unwrap_err();
 
     match err {
-        crate::Error::Frontend(crate::frontend::Error::UseContainsGovernance {
+        crate::Error::Frontend(crate::frontend::Error::UseContainsOverlay {
             name,
             message,
             ..
@@ -2005,6 +2009,6 @@ async fn used_manifest_rejects_nested_governance() {
             assert_eq!(name.as_ref(), "wrapper");
             assert_eq!(message.as_ref(), "nested `use` is not supported");
         }
-        other => panic!("expected UseContainsGovernance error, got: {other}"),
+        other => panic!("expected UseContainsOverlay error, got: {other}"),
     }
 }

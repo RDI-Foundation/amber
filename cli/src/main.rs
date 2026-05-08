@@ -205,13 +205,13 @@ const CHECK_LONG_ABOUT: &str = "\
 Resolve a root manifest or bundle, run static validation and lint passes, print diagnostics, and \
                                 stop before emitting artifacts.
 
-By default, this command does not execute governance policy programs. Use `--apply-policies` when \
-                                you need to run policies and validate the policy-rewritten graph.";
+By default, this command does not execute scenario overlay programs. Use `--apply-overlays` when \
+                                you need to run overlays and validate the overlay-rewritten graph.";
 
 const CHECK_AFTER_HELP: &str = "\
 Examples:
   amber check path/to/root.json5
-  amber check --apply-policies path/to/root.json5
+  amber check --apply-overlays path/to/root.json5
   amber check -D warnings path/to/root.json5
 
 Use `amber compile --help` when you are ready to write outputs.";
@@ -508,9 +508,9 @@ struct CheckArgs {
     #[arg(short = 'D', long = "deny", value_name = "LINT")]
     deny: Vec<String>,
 
-    /// Execute governance policy programs and validate the policy-rewritten graph.
-    #[arg(long = "apply-policies")]
-    apply_policies: bool,
+    /// Execute scenario overlay programs and validate the overlay-rewritten graph.
+    #[arg(long = "apply-overlays")]
+    apply_overlays: bool,
 
     /// Root manifest or bundle to check (URL or local path).
     #[arg(value_name = "MANIFEST")]
@@ -1218,7 +1218,7 @@ async fn check(args: CheckArgs) -> Result<()> {
     let resolved = resolve_input(&args.manifest).await?;
     let mut compiler =
         Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
-    if args.apply_policies {
+    if args.apply_overlays {
         compiler =
             compiler.with_scenario_runner(Arc::new(scenario_runner::CliScenarioRunner::default()));
     }
@@ -1227,7 +1227,7 @@ async fn check(args: CheckArgs) -> Result<()> {
         .check_with_options(
             resolved.manifest,
             CheckOptions {
-                apply_policies: args.apply_policies,
+                apply_overlays: args.apply_overlays,
                 ..CheckOptions::default()
             },
         )

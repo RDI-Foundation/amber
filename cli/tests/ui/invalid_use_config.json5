@@ -1,12 +1,12 @@
 {
   manifest_version: "0.4.0",
   use: {
-    policy: {
-      manifest: "./invalid_use_config_policy.json5",
+    overlay: {
+      manifest: "./invalid_use_config_overlay.json5",
       config: {
         token: "${config.missing}",
       },
     },
   },
-  policies: ["#policy.apply"],
+  overlays: ["#overlay.apply"],
 }

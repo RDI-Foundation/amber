@@ -9,5 +9,5 @@ manifest::unused_use
  5 |   },
    `----
   help: warning treated as error because it was denied via `-D warnings`
-        Remove the `use` entry `#wrapper` if it is not needed, or reference it from `policies`.
+        Remove the `use` entry `#wrapper` if it is not needed, or reference it from `overlays`.
 Error:   × check failed

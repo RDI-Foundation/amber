@@ -122,7 +122,7 @@ Top-level object:
   resources: { /* ... */ },    // optional; default {}
   provides: { /* ... */ },      // optional; default {}
   bindings: [ /* ... */ ],      // optional; default []
-  policies: [ /* ... */ ],      // optional; default []
+  overlays: [ /* ... */ ],      // optional; default []
   exports: { /* ... */ },       // optional; default {}
   metadata: { /* ... */ },      // optional
 }
@@ -137,8 +137,8 @@ Current values:
 * `"docker"`
 * `"kvm"`
 
-For governance policy request/response semantics and interposer behavior, see
-[`../GOVERNANCE.md`](../GOVERNANCE.md).
+For scenario overlay request/response semantics and interposer behavior, see
+[`../OVERLAYS.md`](../OVERLAYS.md).
 
 Rules:
 
@@ -493,23 +493,23 @@ Notes:
 
 ---
 
-## `use` (governance helper components)
+## `use` (helper components)
 
 `use` is a map: **instance name → component declaration**.
 
 It uses the same declaration forms as [`components`](#components-child-components), but is only
 available in `manifest_version: "0.4.0"` or newer.
 
-`use` entries declare governance-only helper manifests. They are referenced by `policies` and are
-kept out of the main compiled scenario.
+`use` entries declare helper manifests that overlays may reference. They are kept out of the main
+compiled scenario.
 
 ---
 
-## `policies`
+## `overlays`
 
-`policies` is an ordered list of policy capability refs in `#use_name.export` form.
+`overlays` is an ordered list of overlay refs in `#use_name.export` form.
 
-`policies` is available in `manifest_version: "0.4.0"` or newer.
+`overlays` is available in `manifest_version: "0.4.0"` or newer.
 
 Each entry refers to an exported capability from the local `use` set. Link-time validation of
 those refs is handled by the compiler rather than this crate.

@@ -702,12 +702,12 @@ impl FromStr for RawExportTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
 #[non_exhaustive]
-pub struct PolicyRef {
+pub struct OverlayRef {
     pub alias: String,
     pub export: String,
 }
 
-impl fmt::Display for PolicyRef {
+impl fmt::Display for OverlayRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("#")?;
         f.write_str(&self.alias)?;
@@ -716,24 +716,24 @@ impl fmt::Display for PolicyRef {
     }
 }
 
-impl FromStr for PolicyRef {
+impl FromStr for OverlayRef {
     type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        parse_policy_ref(input)
+        parse_overlay_ref(input)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 #[non_exhaustive]
-pub struct RawPolicyDecl(pub String);
+pub struct RawOverlayDecl(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
-pub struct PolicyDecl {
-    pub policy: PolicyRef,
+pub struct OverlayDecl {
+    pub overlay: OverlayRef,
 }
 
 #[derive(
@@ -1199,21 +1199,21 @@ fn split_binding_source(input: &str) -> Result<(BindingSourceRef, String), Error
     Ok((source, right.to_string()))
 }
 
-fn parse_policy_ref(input: &str) -> Result<PolicyRef, Error> {
+fn parse_overlay_ref(input: &str) -> Result<OverlayRef, Error> {
     let Some(rest) = input.strip_prefix('#') else {
-        return Err(Error::InvalidPolicyRef {
+        return Err(Error::InvalidOverlayRef {
             input: input.to_string(),
             message: "expected `#<use>.<export>`".to_string(),
         });
     };
     let Some((alias, export)) = rest.split_once('.') else {
-        return Err(Error::InvalidPolicyRef {
+        return Err(Error::InvalidOverlayRef {
             input: input.to_string(),
             message: "expected `#<use>.<export>`".to_string(),
         });
     };
     if alias.is_empty() || export.is_empty() || export.contains('.') {
-        return Err(Error::InvalidPolicyRef {
+        return Err(Error::InvalidOverlayRef {
             input: input.to_string(),
             message: "expected `#<use>.<export>`".to_string(),
         });
@@ -1222,7 +1222,7 @@ fn parse_policy_ref(input: &str) -> Result<PolicyRef, Error> {
     crate::names::ensure_name_no_dot(alias, "use")?;
     crate::names::ensure_name_no_dot(export, "export")?;
 
-    Ok(PolicyRef {
+    Ok(OverlayRef {
         alias: alias.to_string(),
         export: export.to_string(),
     })

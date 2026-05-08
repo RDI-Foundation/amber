@@ -38,9 +38,9 @@ pub use schema::{
     CapabilityTransport, ChildTemplateDecl, ChildTemplateLimitsDecl, ChildTemplateManifestDecl,
     ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EndpointPort, EnvironmentDecl,
     ExportTarget, LocalComponentRef, ManifestBinding, MountSource, Network, NetworkProtocol,
-    PolicyDecl, PolicyRef, Program, ProgramCommandKind, ProgramCommon, ProgramConfigUseSite,
+    OverlayDecl, OverlayRef, Program, ProgramCommandKind, ProgramCommon, ProgramConfigUseSite,
     ProgramImage, ProgramMount, ProgramNetworkRef, ProgramPath, ProgramVmField, ProvideDecl,
-    RawBinding, RawExportTarget, RawPolicyDecl, RawProgram, RawProgramCommon, RawProgramImage,
+    RawBinding, RawExportTarget, RawOverlayDecl, RawProgram, RawProgramCommon, RawProgramImage,
     RawProgramPath, RawProgramVmField, RawVmCloudInit, RawVmProgram, RealmSelector, ResourceDecl,
     RuntimeBackend, SlotDecl, VmCloudInit, VmEgress, VmNetwork, VmProgram, VmScalarU32,
 };
@@ -50,6 +50,6 @@ pub use slot_query::{
 };
 pub use spans::{
     BindingSpans, BindingTargetKey, CapabilityDeclSpans, ComponentDeclSpans, EndpointSpans,
-    EnvironmentSpans, ExportSpans, ManifestSpans, PolicyRefSpans, ProgramSpans, ProvideDeclSpans,
+    EnvironmentSpans, ExportSpans, ManifestSpans, OverlayRefSpans, ProgramSpans, ProvideDeclSpans,
     ResourceDeclSpans, ResourceParamsSpans, span_for_json_pointer,
 };

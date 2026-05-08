@@ -633,7 +633,7 @@ mod tests {
         )
         .await;
         let session = test_running_scenario(url);
-        let export = ExportName::try_from("policy").expect("valid export name");
+        let export = ExportName::try_from("overlay").expect("valid export name");
 
         let err = session
             .post_json_export(&export, &serde_json::json!({}))
@@ -644,7 +644,7 @@ mod tests {
             ScenarioRunnerError::ResponseTooLarge {
                 export, max_bytes, ..
             } => {
-                assert_eq!(export, "policy");
+                assert_eq!(export, "overlay");
                 assert_eq!(max_bytes, JSON_EXPORT_RESPONSE_MAX_BYTES);
             }
             other => panic!("unexpected error: {other:?}"),
@@ -653,14 +653,14 @@ mod tests {
 
     #[tokio::test]
     async fn post_json_export_truncates_non_success_response_body() {
-        let hidden = "DO_NOT_LOG_POLICY_RESPONSE_TAIL";
+        let hidden = "DO_NOT_LOG_OVERLAY_RESPONSE_TAIL";
         let body = format!(
             "{}{hidden}",
             "x".repeat(JSON_EXPORT_RESPONSE_PREVIEW_BYTES + 100)
         );
         let url = spawn_http_response("HTTP/1.1 500 Internal Server Error", body.len(), body).await;
         let session = test_running_scenario(url);
-        let export = ExportName::try_from("policy").expect("valid export name");
+        let export = ExportName::try_from("overlay").expect("valid export name");
 
         let err = session
             .post_json_export(&export, &serde_json::json!({}))
@@ -678,7 +678,7 @@ mod tests {
             client: Client::builder()
                 .build()
                 .expect("test HTTP client should build"),
-            export_urls: BTreeMap::from([("policy".to_string(), url)]),
+            export_urls: BTreeMap::from([("overlay".to_string(), url)]),
             options: ScenarioRunOptions::default(),
             cleanup: Mutex::new(None),
         }

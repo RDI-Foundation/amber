@@ -235,7 +235,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
         .expect("config analysis");
     let output = CompileOutput {
         scenario,
-        governance: None,
+        overlays: None,
         store,
         provenance,
         diagnostics: Vec::new(),
@@ -249,7 +249,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
 }
 
 #[test]
-fn flatten_keeps_policy_declaring_nodes() {
+fn flatten_keeps_overlay_declaring_nodes() {
     let root_manifest: Manifest = r##"
         {
           manifest_version: "0.3.0",
@@ -264,9 +264,9 @@ fn flatten_keeps_policy_declaring_nodes() {
         {
           manifest_version: "0.4.0",
           use: {
-            policy: { manifest: "file:///policy.json5" },
+            overlay: { manifest: "file:///overlay.json5" },
           },
-          policies: ["#policy.apply"],
+          overlays: ["#overlay.apply"],
           components: { child: "file:///child.json5" },
           exports: { cap: "#child.cap" },
         }

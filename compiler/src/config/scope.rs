@@ -730,7 +730,7 @@ mod tests {
         let used_component_paths = BTreeSet::from(["redaction_terms".to_string()]);
 
         let view = build_runtime_config_view(
-            "/policy",
+            "/overlay",
             &root_schema,
             &root_leaves,
             &component_template,

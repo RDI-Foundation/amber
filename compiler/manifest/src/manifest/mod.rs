@@ -24,8 +24,8 @@ use crate::{
     schema::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ChildTemplateDecl,
         ChildTemplateManifestDecl, ComponentDecl, ConfigSchema, EnvironmentDecl, ExportTarget,
-        LocalCapabilityRefKind, LocalComponentRef, ManifestBinding, MountSource, PolicyDecl,
-        PolicyRef, Program, ProvideDecl, RawBinding, RawExportTarget, RawPolicyDecl, RawProgram,
+        LocalCapabilityRefKind, LocalComponentRef, ManifestBinding, MountSource, OverlayDecl,
+        OverlayRef, Program, ProvideDecl, RawBinding, RawExportTarget, RawOverlayDecl, RawProgram,
         ResourceDecl, SlotDecl, VmScalarU32,
     },
 };
@@ -70,7 +70,7 @@ pub struct RawManifest {
     #[serde(default)]
     pub bindings: Vec<RawBinding>,
     #[serde(default)]
-    pub policies: Vec<RawPolicyDecl>,
+    pub overlays: Vec<RawOverlayDecl>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub exports: BTreeMap<String, RawExportTarget>,
@@ -96,8 +96,8 @@ impl fmt::Display for ExperimentalFeature {
 }
 
 const LATEST_MANIFEST_VERSION: Version = Version::new(0, 4, 0);
-const GOVERNANCE_MANIFEST_VERSION: Version = Version::new(0, 4, 0);
-const GOVERNANCE_MANIFEST_VERSION_STR: &str = "0.4.0";
+const OVERLAYS_MANIFEST_VERSION: Version = Version::new(0, 4, 0);
+const OVERLAYS_MANIFEST_VERSION_STR: &str = "0.4.0";
 const SUPPORTED_MANIFEST_VERSION_REQ: &str = ">=0.1.0, <1.0.0";
 
 fn supported_manifest_version_req() -> &'static VersionReq {
@@ -135,30 +135,30 @@ fn validate_program_syntax_manifest_version(
     })
 }
 
-fn validate_governance_manifest_version(
+fn validate_overlays_manifest_version(
     manifest_version: &Version,
     uses: &BTreeMap<String, ComponentDecl>,
-    policies: &[RawPolicyDecl],
+    overlays: &[RawOverlayDecl],
 ) -> Result<(), Error> {
-    if manifest_version >= &GOVERNANCE_MANIFEST_VERSION {
+    if manifest_version >= &OVERLAYS_MANIFEST_VERSION {
         return Ok(());
     }
 
     if !uses.is_empty() {
         return Err(Error::UnsupportedManifestFeatureForManifestVersion {
             manifest_version: Box::new(manifest_version.clone()),
-            required_version: GOVERNANCE_MANIFEST_VERSION_STR,
-            feature: "governance `use` section",
+            required_version: OVERLAYS_MANIFEST_VERSION_STR,
+            feature: "`use` section",
             pointer: "/use".to_string(),
         });
     }
 
-    if !policies.is_empty() {
+    if !overlays.is_empty() {
         return Err(Error::UnsupportedManifestFeatureForManifestVersion {
             manifest_version: Box::new(manifest_version.clone()),
-            required_version: GOVERNANCE_MANIFEST_VERSION_STR,
-            feature: "governance `policies` section",
-            pointer: "/policies/0".to_string(),
+            required_version: OVERLAYS_MANIFEST_VERSION_STR,
+            feature: "`overlays` section",
+            pointer: "/overlays/0".to_string(),
         });
     }
 
@@ -222,14 +222,14 @@ fn validate_component_manifest_refs(
     Ok(())
 }
 
-fn validate_policy_refs(
+fn validate_overlay_refs(
     uses: &BTreeMap<String, ComponentDecl>,
-    policies: &[PolicyDecl],
+    overlays: &[OverlayDecl],
 ) -> Result<(), Error> {
-    for policy in policies {
-        if !uses.contains_key(policy.policy.alias.as_str()) {
-            return Err(Error::UnknownPolicyUse {
-                alias: policy.policy.alias.clone(),
+    for overlay in overlays {
+        if !uses.contains_key(overlay.overlay.alias.as_str()) {
+            return Err(Error::UnknownOverlayUse {
+                alias: overlay.overlay.alias.clone(),
             });
         }
     }
@@ -917,7 +917,7 @@ impl RawManifest {
             resources,
             child_templates,
             bindings,
-            policies,
+            overlays,
             exports,
             metadata,
         } = self;
@@ -928,7 +928,7 @@ impl RawManifest {
             .map_or((None, false), |(program, used)| (Some(program), used));
 
         validate_program_syntax_manifest_version(&manifest_version, program.as_ref())?;
-        validate_governance_manifest_version(&manifest_version, &r#use, &policies)?;
+        validate_overlays_manifest_version(&manifest_version, &r#use, &overlays)?;
 
         if let Some(schema) = config_schema.as_ref() {
             ConfigSchema::validate_value(&schema.0)?;
@@ -937,15 +937,15 @@ impl RawManifest {
         validate_component_manifest_refs(&r#use)?;
         validate_use_names(&r#use)?;
         validate_environment_names(&environments)?;
-        let policies = policies
+        let overlays = overlays
             .into_iter()
-            .map(|policy| -> Result<PolicyDecl, Error> {
-                Ok(PolicyDecl {
-                    policy: PolicyRef::from_str(&policy.0)?,
+            .map(|overlay| -> Result<OverlayDecl, Error> {
+                Ok(OverlayDecl {
+                    overlay: OverlayRef::from_str(&overlay.0)?,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        validate_policy_refs(&r#use, &policies)?;
+        validate_overlay_refs(&r#use, &overlays)?;
 
         let components = convert_components(components)?;
         let slots = convert_slots(slots)?;
@@ -1013,7 +1013,7 @@ impl RawManifest {
             resources,
             child_templates,
             bindings: bindings_out,
-            policies,
+            overlays,
             exports: exports_out,
             metadata,
             digest: ManifestDigest::new([0; 32]),
@@ -1038,7 +1038,7 @@ pub struct Manifest {
     resources: BTreeMap<ResourceName, ResourceDecl>,
     child_templates: BTreeMap<TemplateName, ChildTemplateDecl>,
     bindings: Vec<ManifestBinding>,
-    policies: Vec<PolicyDecl>,
+    overlays: Vec<OverlayDecl>,
     exports: BTreeMap<ExportName, ExportTarget>,
     metadata: Option<Value>,
     digest: ManifestDigest,
@@ -1097,8 +1097,8 @@ impl Manifest {
         &self.bindings
     }
 
-    pub fn policies(&self) -> &[PolicyDecl] {
-        &self.policies
+    pub fn overlays(&self) -> &[OverlayDecl] {
+        &self.overlays
     }
 
     pub fn exports(&self) -> &BTreeMap<ExportName, ExportTarget> {
@@ -1119,7 +1119,7 @@ impl Manifest {
             resources: BTreeMap::new(),
             child_templates: BTreeMap::new(),
             bindings: Vec::new(),
-            policies: Vec::new(),
+            overlays: Vec::new(),
             exports: BTreeMap::new(),
             metadata: None,
         }
@@ -1152,7 +1152,7 @@ impl Manifest {
         #[builder(default)] resources: BTreeMap<String, ResourceDecl>,
         #[builder(default)] child_templates: BTreeMap<String, ChildTemplateDecl>,
         #[builder(default)] bindings: Vec<RawBinding>,
-        #[builder(default)] policies: Vec<PolicyDecl>,
+        #[builder(default)] overlays: Vec<OverlayDecl>,
         #[builder(default)] exports: BTreeMap<String, RawExportTarget>,
         metadata: Option<Value>,
     ) -> Result<Self, Error> {
@@ -1171,9 +1171,9 @@ impl Manifest {
             resources,
             child_templates,
             bindings,
-            policies: policies
+            overlays: overlays
                 .into_iter()
-                .map(|policy| RawPolicyDecl(policy.policy.to_string()))
+                .map(|overlay| RawOverlayDecl(overlay.overlay.to_string()))
                 .collect(),
             exports,
             metadata,
@@ -1311,10 +1311,10 @@ impl From<&Manifest> for RawManifest {
             resources,
             child_templates,
             bindings,
-            policies: manifest
-                .policies
+            overlays: manifest
+                .overlays
                 .iter()
-                .map(|policy| RawPolicyDecl(policy.policy.to_string()))
+                .map(|overlay| RawOverlayDecl(overlay.overlay.to_string()))
                 .collect(),
             exports,
             metadata: manifest.metadata.clone(),

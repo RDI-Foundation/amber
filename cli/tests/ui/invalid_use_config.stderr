@@ -1,6 +1,6 @@
 compiler::invalid_use_config
 
-  x invalid config for governance `use` entry `policy` in /: normal config interpolation ${config.missing} is not allowed because the parent component has no `config_schema`
+  x invalid config for `use` entry `overlay` in /: normal config interpolation ${config.missing} is not allowed because the parent component has no `config_schema`
    ,-[<CARGO_MANIFEST_DIR>/tests/ui/invalid_use_config.json5:7:16]
  6 |       config: {
  7 |         token: "${config.missing}",

@@ -181,11 +181,11 @@ fn labels_for_manifest_error(
                 Some("export target here".to_string()),
             )]
         }
-        ManifestError::InvalidPolicyRef { input, .. } => labels_for_policy_ref(spans, input),
+        ManifestError::InvalidOverlayRef { input, .. } => labels_for_overlay_ref(spans, input),
         ManifestError::AmbiguousCapabilityName { name } => {
             labels_for_ambiguous_capability_name(spans, name)
         }
-        ManifestError::UnknownPolicyUse { alias } => labels_for_policy_use(spans, alias),
+        ManifestError::UnknownOverlayUse { alias } => labels_for_overlay_use(spans, alias),
         ManifestError::DuplicateBindingTarget { to, slot } => {
             labels_for_duplicate_binding_target(spans, to, slot)
         }
@@ -817,34 +817,34 @@ fn labels_for_unknown_use_environment(spans: &ManifestSpans, name: &str) -> Vec<
     )]
 }
 
-fn labels_for_policy_ref(spans: &ManifestSpans, input: &str) -> Vec<LabeledSpan> {
+fn labels_for_overlay_ref(spans: &ManifestSpans, input: &str) -> Vec<LabeledSpan> {
     let span = spans
-        .policies
+        .overlays
         .iter()
-        .find(|policy| policy.value.as_deref() == Some(input))
-        .map(|policy| policy.whole);
+        .find(|overlay| overlay.value.as_deref() == Some(input))
+        .map(|overlay| overlay.whole);
     vec![primary(
         span_or_default(span),
-        Some("policy ref here".to_string()),
+        Some("overlay ref here".to_string()),
     )]
 }
 
-fn labels_for_policy_use(spans: &ManifestSpans, alias: &str) -> Vec<LabeledSpan> {
+fn labels_for_overlay_use(spans: &ManifestSpans, alias: &str) -> Vec<LabeledSpan> {
     let prefix = format!("#{alias}.");
     let span = spans
-        .policies
+        .overlays
         .iter()
-        .find(|policy| {
-            policy
+        .find(|overlay| {
+            overlay
                 .value
                 .as_deref()
                 .is_some_and(|value| value.starts_with(prefix.as_str()))
         })
-        .map(|policy| policy.whole);
+        .map(|overlay| overlay.whole);
     vec![primary(
         span_or_default(span),
         Some(format!(
-            "policy reference expects a matching `use.{alias}` entry"
+            "overlay reference expects a matching `use.{alias}` entry"
         )),
     )]
 }

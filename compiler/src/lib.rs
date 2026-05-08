@@ -15,13 +15,13 @@ use thiserror::Error;
 
 mod config;
 mod frontend;
-mod governance;
 mod linker;
 mod lint;
 pub mod mesh;
 mod mir;
-pub mod policy;
-mod policy_pass;
+pub mod overlay;
+mod overlay_pass;
+mod overlays;
 pub mod run_plan;
 mod runtime_interface;
 mod slots;
@@ -34,8 +34,8 @@ pub use amber_scenario_runner::{
     RunningScenario, ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError, ScenarioRunnerFuture,
 };
 pub use frontend::{DigestStore, ResolveOptions, ResolvedNode, ResolvedTree, ResolverRegistry};
-pub use governance::{Governance, GovernedScope};
 pub use linker::{ComponentProvenance, Provenance};
+pub use overlays::{OverlayExport, OverlayPlan, OverlayScopePlan};
 
 #[derive(Clone, Debug, Default)]
 pub struct CompileOptions {
@@ -68,7 +68,7 @@ impl Default for OptimizeOptions {
 pub struct CheckOptions {
     pub resolve: ResolveOptions,
     pub optimize: OptimizeOptions,
-    pub apply_policies: bool,
+    pub apply_overlays: bool,
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -88,7 +88,7 @@ pub enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    PolicyPass(#[from] policy_pass::Error),
+    OverlayPass(#[from] overlay_pass::Error),
 }
 
 #[derive(Clone)]
@@ -157,22 +157,22 @@ impl Compiler {
     ) -> Result<CompileOutput, Error> {
         let mut diagnostics =
             slots::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
-        let (scenario, governance, provenance) = linker::link(tree, &self.store)?;
+        let (scenario, overlays, provenance) = linker::link(tree, &self.store)?;
         diagnostics.extend(collect_manifest_diagnostics(
             &scenario,
             &provenance,
             &self.store,
         ));
 
-        let (scenario, governance, provenance) = self
-            .finalize_linked_scenario(scenario, governance, provenance, opts)
+        let (scenario, overlays, provenance) = self
+            .finalize_linked_scenario(scenario, overlays, provenance, opts)
             .await?;
         let config_analysis = config::analysis::ScenarioConfigAnalysis::from_scenario(&scenario)
             .expect("linked scenario should produce valid config analysis");
 
         Ok(CompileOutput {
             scenario,
-            governance,
+            overlays,
             store: self.store.clone(),
             provenance,
             diagnostics,
@@ -198,18 +198,18 @@ impl Compiler {
         let tree_for_manifest_lints = tree.clone();
 
         match linker::link(tree, &self.store) {
-            Ok((scenario, governance, provenance)) => {
+            Ok((scenario, overlays, provenance)) => {
                 diagnostics.extend(collect_manifest_diagnostics(
                     &scenario,
                     &provenance,
                     &self.store,
                 ));
-                let finalization = if opts.apply_policies {
-                    self.finalize_linked_scenario(scenario, governance, provenance, opts.optimize)
+                let finalization = if opts.apply_overlays {
+                    self.finalize_linked_scenario(scenario, overlays, provenance, opts.optimize)
                         .await
                         .map(|_| ())
                 } else {
-                    self.optimize_linked_scenario(scenario, governance, provenance, opts.optimize)
+                    self.optimize_linked_scenario(scenario, overlays, provenance, opts.optimize)
                         .map(|_| ())
                 };
                 if let Err(err) = finalization {
@@ -261,13 +261,13 @@ impl Compiler {
             tree,
             CheckFinalizeOptions {
                 optimize: opts.optimize,
-                apply_policies: false,
+                apply_overlays: false,
             },
         )
         .await
     }
 
-    /// Resolve manifests, optionally apply governance policies, and report diagnostics without
+    /// Resolve manifests, optionally apply scenario overlays, and report diagnostics without
     /// emitting artifacts.
     pub async fn check_with_options(
         &self,
@@ -279,7 +279,7 @@ impl Compiler {
             tree,
             CheckFinalizeOptions {
                 optimize: opts.optimize,
-                apply_policies: opts.apply_policies,
+                apply_overlays: opts.apply_overlays,
             },
         )
         .await
@@ -289,58 +289,58 @@ impl Compiler {
     fn optimize_linked_scenario(
         &self,
         scenario: Scenario,
-        governance: Option<Governance>,
+        overlays: Option<OverlayPlan>,
         provenance: Provenance,
         opts: OptimizeOptions,
-    ) -> Result<(Scenario, Option<Governance>, Provenance), Error> {
+    ) -> Result<(Scenario, Option<OverlayPlan>, Provenance), Error> {
         let (scenario, provenance) = mir::optimize_linked_scenario(
             scenario,
             provenance,
             &self.store,
             mir::OptimizeOptions { dce: opts.dce },
         )?;
-        let governance = governance
-            .map(|governance| -> Result<Governance, mir::Error> {
+        let overlays = overlays
+            .map(|overlays| -> Result<OverlayPlan, mir::Error> {
                 let (scenario, provenance) = mir::optimize_linked_scenario(
-                    governance.scenario,
-                    governance.provenance,
+                    overlays.scenario,
+                    overlays.provenance,
                     &self.store,
                     mir::OptimizeOptions { dce: opts.dce },
                 )?;
-                Ok(Governance {
+                Ok(OverlayPlan {
                     scenario,
                     provenance,
-                    scopes: governance.scopes,
+                    scopes: overlays.scopes,
                 })
             })
             .transpose()?;
-        Ok((scenario, governance, provenance))
+        Ok((scenario, overlays, provenance))
     }
 
     #[allow(clippy::result_large_err)]
     async fn finalize_linked_scenario(
         &self,
         scenario: Scenario,
-        governance: Option<Governance>,
+        overlays: Option<OverlayPlan>,
         provenance: Provenance,
         opts: OptimizeOptions,
-    ) -> Result<(Scenario, Option<Governance>, Provenance), Error> {
-        let (scenario, governance, provenance) =
-            self.optimize_linked_scenario(scenario, governance, provenance, opts)?;
-        let scenario = policy_pass::apply_policies(
+    ) -> Result<(Scenario, Option<OverlayPlan>, Provenance), Error> {
+        let (scenario, overlays, provenance) =
+            self.optimize_linked_scenario(scenario, overlays, provenance, opts)?;
+        let scenario = overlay_pass::apply_overlays(
             scenario,
-            governance.as_ref(),
+            overlays.as_ref(),
             self.scenario_runner.as_deref(),
         )
         .await?;
-        Ok((scenario, governance, provenance))
+        Ok((scenario, overlays, provenance))
     }
 }
 
 #[derive(Debug)]
 pub struct CompileOutput {
     pub scenario: Scenario,
-    pub governance: Option<Governance>,
+    pub overlays: Option<OverlayPlan>,
     pub store: DigestStore,
     pub provenance: Provenance,
     pub diagnostics: Vec<Report>,
@@ -376,7 +376,7 @@ pub struct CheckOutput {
 #[derive(Clone, Debug, Default)]
 struct CheckFinalizeOptions {
     optimize: OptimizeOptions,
-    apply_policies: bool,
+    apply_overlays: bool,
 }
 
 fn collect_manifest_diagnostics(
