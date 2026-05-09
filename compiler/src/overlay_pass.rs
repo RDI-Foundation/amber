@@ -826,12 +826,12 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     use amber_manifest::{
-        CapabilityDecl, CapabilityKind, ExportName, ManifestDigest, ProvideDecl, ProvideName,
-        SlotDecl, SlotName,
+        CapabilityDecl, CapabilityKind, ExportName, ManifestDigest, NetworkProtocol, ProvideDecl,
+        ProvideName, SlotDecl, SlotName,
     };
     use amber_scenario::{
-        BindingEdge, Component, Moniker, Program, ProgramCommon, ProgramPath, ProvideRef,
-        ScenarioExport,
+        BindingEdge, Component, Endpoint, Moniker, Program, ProgramCommon, ProgramNetwork,
+        ProgramPath, ProvideRef, ScenarioExport,
     };
     use amber_scenario_runner::{
         RunningScenario, ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError,
@@ -1068,6 +1068,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_overlays_rejects_interposer_provide_without_endpoint() {
+        let scenario = fixture_scenario();
+        let overlays = fixture_overlays();
+        let mut plan = valid_plan(AttachmentId(0));
+        plan.interpositions[0].interposer.provides.insert(
+            ProvideName::try_from("out").expect("valid provide name"),
+            ProvideDecl::builder().decl(http_capability()).build(),
+        );
+
+        let runner = MockRunner {
+            plans: BTreeMap::from([("overlay_0_0".to_string(), plan)]),
+        };
+
+        let err = apply_overlays(scenario, Some(&overlays), Some(&runner))
+            .await
+            .expect_err("generated interposer provide without endpoint must be rejected");
+
+        let Error::InvalidInterpositionPlan { source, .. } = err else {
+            panic!("unexpected overlay pass error: {err:?}");
+        };
+        assert_eq!(
+            *source,
+            ValidationError::MissingInterposerProvideEndpoint {
+                provide: ProvideName::try_from("out").expect("valid provide name"),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_overlays_rejects_interposer_provide_with_unknown_endpoint() {
+        let scenario = fixture_scenario();
+        let overlays = fixture_overlays();
+        let mut plan = valid_plan(AttachmentId(0));
+        plan.interpositions[0].interposer.provides.insert(
+            ProvideName::try_from("out").expect("valid provide name"),
+            ProvideDecl::builder()
+                .decl(http_capability())
+                .endpoint("missing")
+                .build(),
+        );
+
+        let runner = MockRunner {
+            plans: BTreeMap::from([("overlay_0_0".to_string(), plan)]),
+        };
+
+        let err = apply_overlays(scenario, Some(&overlays), Some(&runner))
+            .await
+            .expect_err("generated interposer provide with unknown endpoint must be rejected");
+
+        let Error::InvalidInterpositionPlan { source, .. } = err else {
+            panic!("unexpected overlay pass error: {err:?}");
+        };
+        assert_eq!(
+            *source,
+            ValidationError::UnknownInterposerProvideEndpoint {
+                provide: ProvideName::try_from("out").expect("valid provide name"),
+                endpoint: "missing".to_string(),
+                available: "available endpoints: `out`".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn apply_overlays_rewrites_import_binding_chain_for_non_empty_plans() {
         let scenario = fixture_scenario();
         let overlays = fixture_overlays();
@@ -1175,7 +1238,7 @@ mod tests {
                             program: Some(Program::Path(ProgramPath {
                                 path: "./interposer".to_string(),
                                 args: amber_manifest::ProgramEntrypoint::default(),
-                                common: ProgramCommon::default(),
+                                common: interposer_program_common(),
                             })),
                             slots: BTreeMap::from([(
                                 SlotName::try_from("in").expect("valid slot name"),
@@ -1187,7 +1250,7 @@ mod tests {
                             )]),
                             provides: BTreeMap::from([(
                                 ProvideName::try_from("out").expect("valid provide name"),
-                                ProvideDecl::builder().decl(http_capability()).build(),
+                                interposer_http_provide(),
                             )]),
                             resources: BTreeMap::new(),
                             metadata: None,
@@ -1253,7 +1316,7 @@ mod tests {
                             program: Some(Program::Path(ProgramPath {
                                 path: "./interposer".to_string(),
                                 args: amber_manifest::ProgramEntrypoint::default(),
-                                common: ProgramCommon::default(),
+                                common: interposer_program_common(),
                             })),
                             slots: BTreeMap::from([(
                                 SlotName::try_from("in").expect("valid slot name"),
@@ -1265,7 +1328,7 @@ mod tests {
                             )]),
                             provides: BTreeMap::from([(
                                 ProvideName::try_from("out").expect("valid provide name"),
-                                ProvideDecl::builder().decl(http_capability()).build(),
+                                interposer_http_provide(),
                             )]),
                             resources: BTreeMap::new(),
                             metadata: None,
@@ -1558,7 +1621,7 @@ mod tests {
                     program: Some(Program::Path(ProgramPath {
                         path: "./interposer".to_string(),
                         args: amber_manifest::ProgramEntrypoint::default(),
-                        common: ProgramCommon::default(),
+                        common: interposer_program_common(),
                     })),
                     slots: BTreeMap::from([(
                         SlotName::try_from("in").expect("valid slot name"),
@@ -1570,7 +1633,7 @@ mod tests {
                     )]),
                     provides: BTreeMap::from([(
                         ProvideName::try_from("out").expect("valid provide name"),
-                        ProvideDecl::builder().decl(http_capability()).build(),
+                        interposer_http_provide(),
                     )]),
                     resources: BTreeMap::new(),
                     metadata: None,
@@ -1582,6 +1645,27 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    fn interposer_program_common() -> ProgramCommon {
+        ProgramCommon {
+            env: BTreeMap::new(),
+            network: Some(ProgramNetwork {
+                endpoints: vec![Endpoint {
+                    name: "out".to_string(),
+                    port: 8080,
+                    protocol: NetworkProtocol::Http,
+                }],
+            }),
+            mounts: Vec::new(),
+        }
+    }
+
+    fn interposer_http_provide() -> ProvideDecl {
+        ProvideDecl::builder()
+            .decl(http_capability())
+            .endpoint("out")
+            .build()
     }
 
     fn component_binding(from: (usize, &str), to: (usize, &str)) -> BindingEdge {

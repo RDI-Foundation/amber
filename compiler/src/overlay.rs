@@ -135,6 +135,19 @@ pub enum ValidationError {
     #[error("attachment references unknown interposer provide `{provide}`")]
     UnknownInterposerProvide { provide: ProvideName },
 
+    #[error("interposer provide `{provide}` must declare an endpoint")]
+    MissingInterposerProvideEndpoint { provide: ProvideName },
+
+    #[error(
+        "interposer provide `{provide}` references endpoint `{endpoint}`, but the interposer \
+         program does not declare that endpoint ({available})"
+    )]
+    UnknownInterposerProvideEndpoint {
+        provide: ProvideName,
+        endpoint: String,
+        available: String,
+    },
+
     #[error("required interposer slot `{slot}` is not attached")]
     UnattachedRequiredInterposerSlot { slot: SlotName },
 
@@ -411,7 +424,56 @@ fn validate_interposer_program_ir_with_schema(
             .next()
             .expect("program validation returned at least one error")
             .message,
-    })
+    })?;
+
+    validate_interposer_provide_endpoints(component, program)
+}
+
+fn validate_interposer_provide_endpoints(
+    component: &InterposerComponent,
+    program: &Program,
+) -> Result<(), ValidationError> {
+    let endpoints = program
+        .network()
+        .map(|network| network.endpoints.as_slice())
+        .unwrap_or_default();
+
+    for (provide, provide_decl) in &component.provides {
+        if provide_decl.decl.kind == CapabilityKind::Storage {
+            continue;
+        }
+
+        let endpoint = provide_decl.endpoint.as_deref().ok_or_else(|| {
+            ValidationError::MissingInterposerProvideEndpoint {
+                provide: provide.clone(),
+            }
+        })?;
+
+        if !endpoints.iter().any(|candidate| candidate.name == endpoint) {
+            return Err(ValidationError::UnknownInterposerProvideEndpoint {
+                provide: provide.clone(),
+                endpoint: endpoint.to_string(),
+                available: available_endpoints(endpoints),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn available_endpoints(endpoints: &[amber_scenario::Endpoint]) -> String {
+    if endpoints.is_empty() {
+        return "no endpoints are declared".to_string();
+    }
+
+    format!(
+        "available endpoints: {}",
+        endpoints
+            .iter()
+            .map(|endpoint| format!("`{}`", endpoint.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn target_capability(input: &ScenarioScope, target: AttachmentId) -> Option<&CapabilityDecl> {
@@ -438,8 +500,11 @@ fn target_capability(input: &ScenarioScope, target: AttachmentId) -> Option<&Cap
 
 #[cfg(test)]
 mod tests {
-    use amber_manifest::{CapabilityKind, ProgramEnvValue};
-    use amber_scenario::{FileMount, FileMountSource, ProgramCommon, ProgramMount, ProgramPath};
+    use amber_manifest::{CapabilityKind, NetworkProtocol, ProgramEnvValue};
+    use amber_scenario::{
+        Endpoint, FileMount, FileMountSource, ProgramCommon, ProgramMount, ProgramNetwork,
+        ProgramPath,
+    };
     use amber_template::TemplatePart;
     use serde_json::json;
 
@@ -458,7 +523,10 @@ mod tests {
     }
 
     fn http_provide() -> ProvideDecl {
-        ProvideDecl::builder().decl(http_capability()).build()
+        ProvideDecl::builder()
+            .decl(http_capability())
+            .endpoint("out")
+            .build()
     }
 
     fn storage_slot(optional: bool) -> SlotDecl {
@@ -511,7 +579,7 @@ mod tests {
                     program: Some(Program::Path(ProgramPath {
                         path: "./interposer".to_string(),
                         args: amber_manifest::ProgramEntrypoint::default(),
-                        common: ProgramCommon::default(),
+                        common: interposer_program_common(),
                     })),
                     slots: BTreeMap::from([(SlotName::try_from("in").unwrap(), http_slot(false))]),
                     provides: BTreeMap::from([(
@@ -536,6 +604,85 @@ mod tests {
         let scope = scope_with_binding(http_capability());
 
         validate_interposition_plan(&plan, &scope, &BTreeSet::new()).expect("plan should validate");
+    }
+
+    #[test]
+    fn validation_rejects_interposer_provide_without_endpoint() {
+        let mut plan = valid_plan();
+        plan.interpositions[0].interposer.provides.insert(
+            ProvideName::try_from("out").unwrap(),
+            ProvideDecl::builder().decl(http_capability()).build(),
+        );
+
+        let err = validate_interposition_plan(
+            &plan,
+            &scope_with_binding(http_capability()),
+            &BTreeSet::new(),
+        )
+        .expect_err("attached provide without endpoint must be rejected");
+
+        assert_eq!(
+            err,
+            ValidationError::MissingInterposerProvideEndpoint {
+                provide: ProvideName::try_from("out").unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn validation_rejects_interposer_provide_with_unknown_endpoint() {
+        let mut plan = valid_plan();
+        plan.interpositions[0].interposer.provides.insert(
+            ProvideName::try_from("out").unwrap(),
+            ProvideDecl::builder()
+                .decl(http_capability())
+                .endpoint("missing")
+                .build(),
+        );
+
+        let err = validate_interposition_plan(
+            &plan,
+            &scope_with_binding(http_capability()),
+            &BTreeSet::new(),
+        )
+        .expect_err("attached provide with unknown endpoint must be rejected");
+
+        assert_eq!(
+            err,
+            ValidationError::UnknownInterposerProvideEndpoint {
+                provide: ProvideName::try_from("out").unwrap(),
+                endpoint: "missing".to_string(),
+                available: "available endpoints: `out`".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn validation_rejects_unused_interposer_provide_with_unknown_endpoint() {
+        let mut plan = valid_plan();
+        plan.interpositions[0].interposer.provides.insert(
+            ProvideName::try_from("unused").unwrap(),
+            ProvideDecl::builder()
+                .decl(http_capability())
+                .endpoint("missing")
+                .build(),
+        );
+
+        let err = validate_interposition_plan(
+            &plan,
+            &scope_with_binding(http_capability()),
+            &BTreeSet::new(),
+        )
+        .expect_err("unused interposer provide with unknown endpoint must be rejected");
+
+        assert_eq!(
+            err,
+            ValidationError::UnknownInterposerProvideEndpoint {
+                provide: ProvideName::try_from("unused").unwrap(),
+                endpoint: "missing".to_string(),
+                available: "available endpoints: `out`".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -748,7 +895,13 @@ mod tests {
             args: amber_manifest::ProgramEntrypoint::default(),
             common: ProgramCommon {
                 env: BTreeMap::new(),
-                network: None,
+                network: Some(ProgramNetwork {
+                    endpoints: vec![Endpoint {
+                        name: "out".to_string(),
+                        port: 8080,
+                        protocol: NetworkProtocol::Http,
+                    }],
+                }),
                 mounts: vec![ProgramMount::File(FileMount {
                     when: None,
                     each: None,
@@ -766,6 +919,20 @@ mod tests {
             &BTreeSet::new(),
         )
         .expect("config file mount with interposer schema should validate");
+    }
+
+    fn interposer_program_common() -> ProgramCommon {
+        ProgramCommon {
+            env: BTreeMap::new(),
+            network: Some(ProgramNetwork {
+                endpoints: vec![Endpoint {
+                    name: "out".to_string(),
+                    port: 8080,
+                    protocol: NetworkProtocol::Http,
+                }],
+            }),
+            mounts: Vec::new(),
+        }
     }
 
     #[test]
