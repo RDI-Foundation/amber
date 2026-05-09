@@ -4,6 +4,10 @@ A scenario overlay is an interposition layer produced by helper components at co
 components receive a scoped view of the scenario graph and return plans for inserting interposers.
 Amber validates, orders, and applies those plans to the base scenario.
 
+Overlays are useful for adding cross-cutting concerns across selected edges in a scope, including
+redaction, filtering, observability, threat monitoring, compromised-component containment, and
+similar controls.
+
 This document defines the overlay authoring contract:
 
 - how a manifest declares overlays
