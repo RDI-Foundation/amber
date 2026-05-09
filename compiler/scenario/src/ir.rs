@@ -72,152 +72,166 @@ impl TryFrom<ScenarioIr> for Scenario {
             });
         }
 
-        let max_id = ir
-            .components
-            .iter()
-            .map(|component| component.id)
-            .chain(std::iter::once(ir.root))
-            .max()
-            .expect("root id should be present");
-        let mut component_irs = vec![None; max_id + 1];
-        let mut components = vec![None; max_id + 1];
-
-        for component in ir.components {
-            let id = component.id;
-            if components[id].is_some() {
-                return Err(ScenarioIrError::DuplicateComponentId { id });
-            }
-            for name in component.slots.keys() {
-                ensure_name_no_dot(name)?;
-            }
-            for name in component.provides.keys() {
-                ensure_name_no_dot(name)?;
-            }
-            for name in component.exports.keys() {
-                ensure_name_no_dot(name)?;
-            }
-            for name in component.resources.keys() {
-                ensure_name_no_dot(name)?;
-            }
-            for name in component.child_templates.keys() {
-                ensure_name_no_dot(name)?;
-            }
-            for (name, template) in &component.child_templates {
-                if template
-                    .manifests
-                    .as_ref()
-                    .is_some_and(|manifests| manifests.is_empty())
-                {
-                    return Err(invalid_scenario(format!(
-                        "child template `{name}` must not have an empty `manifests` list"
-                    )));
-                }
-            }
-            component_irs[id] = Some(component.clone());
-            components[id] = Some(component.into_component());
-        }
-
-        ensure_component(&components, ir.root, || "root".to_string())?;
-
-        for component in components.iter().flatten() {
-            if let Some(parent) = component.parent {
-                ensure_component(&components, parent.0, || {
-                    format!("parent of component {}", component.id.0)
-                })?;
-            }
-            for child in &component.children {
-                ensure_component(&components, child.0, || {
-                    format!("child of component {}", component.id.0)
-                })?;
-            }
-        }
-
-        validate_component_exports(&component_irs, &components)?;
-
-        for binding in &ir.bindings {
-            if let Some(name) = binding.name.as_deref() {
-                ensure_name_no_dot(name)?;
-            }
-            ensure_name_no_dot(&binding.to.slot)?;
-            match &binding.from {
-                BindingFromIr::Component { provide, .. } => {
-                    ensure_name_no_dot(provide)?;
-                }
-                BindingFromIr::Resource { resource, .. } => {
-                    ensure_name_no_dot(resource)?;
-                }
-                BindingFromIr::Framework {
-                    capability,
-                    authority_realm,
-                } => {
-                    ensure_name_no_dot(capability)?;
-                    ensure_component(&components, *authority_realm, || {
-                        format!("framework authority realm for {}", binding.to.slot)
-                    })?;
-                }
-                BindingFromIr::External { slot } => {
-                    ensure_name_no_dot(&slot.slot)?;
-                    ensure_component(&components, slot.component, || {
-                        format!("external slot source for {}", binding.to.slot)
-                    })?;
-                }
-            }
-            if let BindingFromIr::Component { component, .. } = &binding.from {
-                ensure_component(&components, *component, || {
-                    format!("binding source for {}", binding.to.slot)
-                })?;
-            }
-            if let BindingFromIr::Resource {
-                component,
-                resource,
-                ..
-            } = &binding.from
-            {
-                ensure_component(&components, *component, || {
-                    format!("binding resource source for {}", binding.to.slot)
-                })?;
-                let owner = components[*component]
-                    .as_ref()
-                    .expect("resource owner component should exist");
-                if !owner.resources.contains_key(resource) {
-                    return Err(ScenarioIrError::MissingResource {
-                        component: *component,
-                        component_moniker: owner.moniker.to_string(),
-                        resource: resource.clone(),
-                        context: format!("binding source for {}", binding.to.slot),
-                    });
-                }
-            }
-            ensure_component(&components, binding.to.component, || {
-                format!("binding target for {}", binding.to.slot)
-            })?;
-        }
-        for export in &ir.exports {
-            ensure_name_no_dot(&export.name)?;
-            ensure_name_no_dot(&export.from.provide)?;
-            ensure_component(&components, export.from.component, || {
-                format!("export source for {}", export.name)
-            })?;
-        }
-        let mut scenario = Scenario {
-            root: ComponentId(ir.root),
-            components,
-            bindings: ir
-                .bindings
-                .into_iter()
-                .map(BindingIr::into_binding)
-                .collect::<Result<Vec<_>, _>>()?,
-            exports: ir.exports.into_iter().map(ExportIr::into_export).collect(),
-            manifest_catalog: ir
-                .manifest_catalog
-                .into_iter()
-                .map(|(key, entry)| (key, entry.into_entry()))
-                .collect(),
-        };
+        let mut scenario = scenario_from_ir_parts(
+            ir.root,
+            ir.components,
+            ir.bindings,
+            ir.exports,
+            ir.manifest_catalog,
+        )?;
         validate_scenario(&scenario)?;
         scenario.normalize_order();
         Ok(scenario)
     }
+}
+
+fn scenario_from_ir_parts(
+    root: usize,
+    components_ir: Vec<ComponentIr>,
+    bindings_ir: Vec<BindingIr>,
+    exports_ir: Vec<ExportIr>,
+    manifest_catalog_ir: BTreeMap<String, ManifestCatalogEntryIr>,
+) -> Result<Scenario, ScenarioIrError> {
+    let max_id = components_ir
+        .iter()
+        .map(|component| component.id)
+        .chain(std::iter::once(root))
+        .max()
+        .expect("root id should be present");
+    let mut component_irs = vec![None; max_id + 1];
+    let mut components = vec![None; max_id + 1];
+
+    for component in components_ir {
+        let id = component.id;
+        if components[id].is_some() {
+            return Err(ScenarioIrError::DuplicateComponentId { id });
+        }
+        for name in component.slots.keys() {
+            ensure_name_no_dot(name)?;
+        }
+        for name in component.provides.keys() {
+            ensure_name_no_dot(name)?;
+        }
+        for name in component.exports.keys() {
+            ensure_name_no_dot(name)?;
+        }
+        for name in component.resources.keys() {
+            ensure_name_no_dot(name)?;
+        }
+        for name in component.child_templates.keys() {
+            ensure_name_no_dot(name)?;
+        }
+        for (name, template) in &component.child_templates {
+            if template
+                .manifests
+                .as_ref()
+                .is_some_and(|manifests| manifests.is_empty())
+            {
+                return Err(invalid_scenario(format!(
+                    "child template `{name}` must not have an empty `manifests` list"
+                )));
+            }
+        }
+        component_irs[id] = Some(component.clone());
+        components[id] = Some(component.into_component());
+    }
+
+    ensure_component(&components, root, || "root".to_string())?;
+
+    for component in components.iter().flatten() {
+        if let Some(parent) = component.parent {
+            ensure_component(&components, parent.0, || {
+                format!("parent of component {}", component.id.0)
+            })?;
+        }
+        for child in &component.children {
+            ensure_component(&components, child.0, || {
+                format!("child of component {}", component.id.0)
+            })?;
+        }
+    }
+
+    validate_component_exports(&component_irs, &components)?;
+
+    for binding in &bindings_ir {
+        if let Some(name) = binding.name.as_deref() {
+            ensure_name_no_dot(name)?;
+        }
+        ensure_name_no_dot(&binding.to.slot)?;
+        match &binding.from {
+            BindingFromIr::Component { provide, .. } => {
+                ensure_name_no_dot(provide)?;
+            }
+            BindingFromIr::Resource { resource, .. } => {
+                ensure_name_no_dot(resource)?;
+            }
+            BindingFromIr::Framework {
+                capability,
+                authority_realm,
+            } => {
+                ensure_name_no_dot(capability)?;
+                ensure_component(&components, *authority_realm, || {
+                    format!("framework authority realm for {}", binding.to.slot)
+                })?;
+            }
+            BindingFromIr::External { slot } => {
+                ensure_name_no_dot(&slot.slot)?;
+                ensure_component(&components, slot.component, || {
+                    format!("external slot source for {}", binding.to.slot)
+                })?;
+            }
+        }
+        if let BindingFromIr::Component { component, .. } = &binding.from {
+            ensure_component(&components, *component, || {
+                format!("binding source for {}", binding.to.slot)
+            })?;
+        }
+        if let BindingFromIr::Resource {
+            component,
+            resource,
+            ..
+        } = &binding.from
+        {
+            ensure_component(&components, *component, || {
+                format!("binding resource source for {}", binding.to.slot)
+            })?;
+            let owner = components[*component]
+                .as_ref()
+                .expect("resource owner component should exist");
+            if !owner.resources.contains_key(resource) {
+                return Err(ScenarioIrError::MissingResource {
+                    component: *component,
+                    component_moniker: owner.moniker.to_string(),
+                    resource: resource.clone(),
+                    context: format!("binding source for {}", binding.to.slot),
+                });
+            }
+        }
+        ensure_component(&components, binding.to.component, || {
+            format!("binding target for {}", binding.to.slot)
+        })?;
+    }
+    for export in &exports_ir {
+        ensure_name_no_dot(&export.name)?;
+        ensure_name_no_dot(&export.from.provide)?;
+        ensure_component(&components, export.from.component, || {
+            format!("export source for {}", export.name)
+        })?;
+    }
+
+    Ok(Scenario {
+        root: ComponentId(root),
+        components,
+        bindings: bindings_ir
+            .into_iter()
+            .map(BindingIr::into_binding)
+            .collect::<Result<Vec<_>, _>>()?,
+        exports: exports_ir.into_iter().map(ExportIr::into_export).collect(),
+        manifest_catalog: manifest_catalog_ir
+            .into_iter()
+            .map(|(key, entry)| (key, entry.into_entry()))
+            .collect(),
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

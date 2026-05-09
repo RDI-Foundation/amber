@@ -4,7 +4,7 @@ use amber_config as rc;
 use amber_scenario::{Component, ComponentId};
 use serde_json::Value;
 
-use super::template;
+use super::validation;
 
 #[derive(Clone, Debug)]
 pub struct TemplateError {
@@ -57,47 +57,20 @@ pub fn compose_root_config_templates(
         } else if schema.is_none() {
             rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
         } else {
-            let initial =
-                match template::parse_instance_config_template(c.config.as_ref(), parent_schema) {
-                    Ok(t) => t,
-                    Err(err) => {
-                        errors.push(TemplateError {
-                            component: id,
-                            message: err.to_string(),
-                        });
-                        rc::ConfigNode::empty_object()
-                    }
-                };
-
-            let mut composed = match rc::compose_config_template(initial, parent_template) {
-                Ok(t) => t.simplify(),
-                Err(err) => {
+            match validation::compose_component_config_template(
+                c.config.as_ref(),
+                parent_schema,
+                parent_template,
+                schema.expect("component schema should exist in this branch"),
+            ) {
+                Ok(composed) => rc::RootConfigTemplate::Node(composed),
+                Err(message) => {
                     errors.push(TemplateError {
                         component: id,
-                        message: err.to_string(),
+                        message,
                     });
-                    rc::ConfigNode::empty_object()
+                    rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
                 }
-            };
-
-            if !composed.is_object() {
-                errors.push(TemplateError {
-                    component: id,
-                    message: "component config must be an object (non-object config templates are \
-                              unsupported)"
-                        .to_string(),
-                });
-                rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
-            } else {
-                if let Some(schema) = schema
-                    && let Err(err) = rc::apply_schema_defaults_to_node(schema, &mut composed)
-                {
-                    errors.push(TemplateError {
-                        component: id,
-                        message: err.to_string(),
-                    });
-                }
-                rc::RootConfigTemplate::Node(composed)
             }
         };
 

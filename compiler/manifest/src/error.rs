@@ -74,6 +74,10 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_export_target))]
     InvalidExportTarget { input: String, message: String },
 
+    #[error("invalid overlay ref `{input}`: {message}")]
+    #[diagnostic(code(manifest::invalid_overlay_ref))]
+    InvalidOverlayRef { input: String, message: String },
+
     #[error("invalid {kind} name `{name}`: dots are reserved")]
     #[diagnostic(code(manifest::invalid_name))]
     InvalidName { kind: &'static str, name: String },
@@ -285,6 +289,18 @@ pub enum Error {
         pointer: String,
     },
 
+    #[error(
+        "using {feature} requires manifest_version >= {required_version}, but found \
+         {manifest_version}"
+    )]
+    #[diagnostic(code(manifest::feature_requires_manifest_version))]
+    UnsupportedManifestFeatureForManifestVersion {
+        manifest_version: Box<Version>,
+        required_version: &'static str,
+        feature: &'static str,
+        pointer: String,
+    },
+
     // --- Environments (resolution environments) ---
     #[error("environment `{name}` extends unknown environment `{extends}`")]
     #[diagnostic(code(manifest::unknown_environment_extends))]
@@ -297,6 +313,23 @@ pub enum Error {
     #[error("component `#{child}` references unknown environment `{environment}`")]
     #[diagnostic(code(manifest::unknown_component_environment))]
     UnknownComponentEnvironment { child: String, environment: String },
+
+    #[error("use `#{name}` references unknown environment `{environment}`")]
+    #[diagnostic(code(manifest::unknown_use_environment))]
+    UnknownUseEnvironment { name: String, environment: String },
+
+    #[error(
+        "overlay reference points to `use` entry `#{alias}`, but this manifest does not declare \
+         that entry"
+    )]
+    #[diagnostic(
+        code(manifest::unknown_overlay_use),
+        help(
+            "Add a `use` entry named `{alias}` in this manifest, or change/remove the overlay \
+             reference."
+        )
+    )]
+    UnknownOverlayUse { alias: String },
 }
 
 fn manifest_validation_path(diag: &DiagnosticError) -> &str {

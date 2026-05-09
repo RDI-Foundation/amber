@@ -158,6 +158,18 @@ fn labels_for_manifest_error(
                 Some("unsupported program syntax used here".to_string()),
             )]
         }
+        ManifestError::UnsupportedManifestFeatureForManifestVersion { pointer, .. } => {
+            let root_span: SourceSpan = (0usize, source.len()).into();
+            let span = match pointer.as_str() {
+                "/use" => spans.use_section_key.or(spans.use_section),
+                _ => crate::span_for_json_pointer(source, root_span, pointer),
+            }
+            .or(spans.manifest_version);
+            vec![primary(
+                span_or_default(span),
+                Some("unsupported manifest feature used here".to_string()),
+            )]
+        }
         ManifestError::InvalidName { kind, name } => labels_for_invalid_name(spans, kind, name),
         ManifestError::MixedBindingForm { to, from } => {
             labels_for_mixed_binding_form(spans, to, from)
@@ -169,9 +181,11 @@ fn labels_for_manifest_error(
                 Some("export target here".to_string()),
             )]
         }
+        ManifestError::InvalidOverlayRef { input, .. } => labels_for_overlay_ref(spans, input),
         ManifestError::AmbiguousCapabilityName { name } => {
             labels_for_ambiguous_capability_name(spans, name)
         }
+        ManifestError::UnknownOverlayUse { alias } => labels_for_overlay_use(spans, alias),
         ManifestError::DuplicateBindingTarget { to, slot } => {
             labels_for_duplicate_binding_target(spans, to, slot)
         }
@@ -252,6 +266,9 @@ fn labels_for_manifest_error(
         ManifestError::UnknownComponentEnvironment { child, .. } => {
             labels_for_unknown_component_environment(spans, child)
         }
+        ManifestError::UnknownUseEnvironment { name, .. } => {
+            labels_for_unknown_use_environment(spans, name)
+        }
         _ => Vec::new(),
     }
 }
@@ -297,9 +314,16 @@ fn help_for_manifest_error(err: &ManifestError) -> Option<String> {
     match err {
         ManifestError::Json5Path(de) => {
             (de.label().starts_with("missing field `manifest_version`"))
-                .then(|| "add `manifest_version: \"0.2.0\"` to the root object".to_string())
+                .then(|| "add `manifest_version: \"0.4.0\"` to the root object".to_string())
         }
         ManifestError::UnsupportedProgramSyntaxForManifestVersion {
+            required_version,
+            feature,
+            ..
+        } => Some(format!(
+            "set `manifest_version` to \"{required_version}\" or remove {feature}"
+        )),
+        ManifestError::UnsupportedManifestFeatureForManifestVersion {
             required_version,
             feature,
             ..
@@ -383,6 +407,7 @@ fn labels_for_invalid_name(
     let span = match kind {
         "environment" => spans.environments.get(name).map(|s| s.name),
         "child" => spans.components.get(name).map(|s| s.name),
+        "use" => spans.uses.get(name).map(|s| s.name),
         "slot" => spans.slots.get(name).map(|s| s.name),
         "provide" => spans.provides.get(name).map(|s| s.capability.name),
         "export" => spans.exports.get(name).map(|s| s.name),
@@ -781,6 +806,49 @@ fn labels_for_unknown_component_environment(
     )]
 }
 
+fn labels_for_unknown_use_environment(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
+    let span = spans
+        .uses
+        .get(name)
+        .and_then(|component| component.environment.or(Some(component.name)));
+    vec![primary(
+        span_or_default(span),
+        Some("unknown environment referenced here".to_string()),
+    )]
+}
+
+fn labels_for_overlay_ref(spans: &ManifestSpans, input: &str) -> Vec<LabeledSpan> {
+    let span = spans
+        .overlays
+        .iter()
+        .find(|overlay| overlay.value.as_deref() == Some(input))
+        .map(|overlay| overlay.whole);
+    vec![primary(
+        span_or_default(span),
+        Some("overlay ref here".to_string()),
+    )]
+}
+
+fn labels_for_overlay_use(spans: &ManifestSpans, alias: &str) -> Vec<LabeledSpan> {
+    let prefix = format!("#{alias}.");
+    let span = spans
+        .overlays
+        .iter()
+        .find(|overlay| {
+            overlay
+                .value
+                .as_deref()
+                .is_some_and(|value| value.starts_with(prefix.as_str()))
+        })
+        .map(|overlay| overlay.whole);
+    vec![primary(
+        span_or_default(span),
+        Some(format!(
+            "overlay reference expects a matching `use.{alias}` entry"
+        )),
+    )]
+}
+
 fn binding_target_key_for_span(span: &crate::BindingSpans) -> Option<crate::BindingTargetKey> {
     let to = span.to_value.as_deref()?;
     crate::binding_target_key_for_binding(to, span.slot_value.as_deref())
@@ -992,7 +1060,7 @@ mod tests {
         let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
         let help = err.help().unwrap().to_string();
         assert!(help.contains("manifest_version"));
-        assert!(help.contains("\"0.2.0\""));
+        assert!(help.contains("\"0.4.0\""));
     }
 
     #[test]

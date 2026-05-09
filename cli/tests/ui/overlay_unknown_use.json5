@@ -1,0 +1,4 @@
+{
+  manifest_version: "0.4.0",
+  overlays: ["#missing.rewrite"],
+}

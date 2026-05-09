@@ -339,16 +339,66 @@ pub(super) async fn wait_for_site_ready(
                 ));
             }
             return Err(miette::miette!(
-                "site supervisor for `{site_id}` exited before becoming ready with status {status}"
+                "site supervisor for `{site_id}` exited before becoming ready with status \
+                 {status}{}",
+                site_startup_context(site_state_root, &state_path)
             ));
         }
         if Instant::now() >= deadline {
             return Err(miette::miette!(
-                "timed out waiting for site `{site_id}` to become ready"
+                "timed out waiting for site `{site_id}` to become ready{}",
+                site_startup_context(site_state_root, &state_path)
             ));
         }
         sleep(Duration::from_millis(200)).await;
     }
+}
+
+fn site_startup_context(site_state_root: &Path, state_path: &Path) -> String {
+    let mut sections = Vec::new();
+    if state_path.is_file()
+        && let Ok(state) = read_json::<SiteManagerState>(state_path, "site manager state")
+    {
+        let status = format!("{:?}", state.status).to_ascii_lowercase();
+        let mut state_summary = format!("last state: {status}");
+        if let Some(last_error) = state.last_error {
+            state_summary.push_str("\nlast error: ");
+            state_summary.push_str(&last_error);
+        }
+        sections.push(state_summary);
+    }
+
+    append_log_tail(
+        &mut sections,
+        "supervisor.log",
+        &site_state_root.join("supervisor.log"),
+    );
+    append_log_tail(&mut sections, "site.log", &site_state_root.join("site.log"));
+
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nstartup context:\n{}", sections.join("\n\n"))
+    }
+}
+
+fn append_log_tail(sections: &mut Vec<String>, label: &str, path: &Path) {
+    const LOG_TAIL_LINES: usize = 20;
+
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    let lines: Vec<&str> = raw.lines().collect();
+    if lines.is_empty() {
+        return;
+    }
+    let start = lines.len().saturating_sub(LOG_TAIL_LINES);
+    let mut section = format!("{label} tail:");
+    for line in &lines[start..] {
+        section.push('\n');
+        section.push_str(line);
+    }
+    sections.push(section);
 }
 
 pub(super) fn site_ready_timeout(site_plan: &RunSitePlan) -> Duration {

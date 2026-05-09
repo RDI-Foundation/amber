@@ -207,8 +207,9 @@ fn config_site_for_component(
     id: ComponentId,
 ) -> Option<ConfigSite> {
     let component = component(components, id);
-    if let Some(parent) = component.parent {
-        let (src, spans) = source_for_component(provenance, store, parent)?;
+    if let Some(parent) = component.parent
+        && let Some((src, spans)) = source_for_component(provenance, store, parent)
+    {
         let component_spans = spans.components.get(component_local_name(component))?;
         if component.config.is_some() {
             let span = component_spans
@@ -459,6 +460,20 @@ pub(super) fn endpoint_site(
             )
         })
         .or_else(|| stored.spans.program.as_ref().map(|program| program.whole))
+        .unwrap_or((0usize, 0usize).into());
+    Some((src, span))
+}
+
+pub(super) fn program_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    id: ComponentId,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    let (src, spans) = source_for_component(provenance, store, id)?;
+    let span = spans
+        .program
+        .as_ref()
+        .map(|program| program.whole)
         .unwrap_or((0usize, 0usize).into());
     Some((src, span))
 }

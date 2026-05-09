@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn create_empty_manifest() {
     let manifest = Manifest::empty();
-    assert_eq!(manifest.manifest_version, Version::new(0, 2, 0));
+    assert_eq!(manifest.manifest_version, Version::new(0, 4, 0));
     assert!(manifest.experimental_features.is_empty());
     assert!(manifest.program.is_none());
     assert!(manifest.components.is_empty());

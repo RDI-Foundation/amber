@@ -1,0 +1,8 @@
+[package]
+name = "amber-scenario-runner"
+edition = "2024"
+
+[dependencies]
+amber-manifest = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

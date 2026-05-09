@@ -1,0 +1,29 @@
+{
+  manifest_version: "0.1.0",
+
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "python3",
+      "-u",
+      "-c",
+      { file: "./a2a_responder.py" },
+    ],
+    env: {
+      PORT: "8111",
+    },
+    network: {
+      endpoints: [
+        { name: "endpoint", port: 8111 },
+      ],
+    },
+  },
+
+  provides: {
+    a2a: { kind: "a2a", endpoint: "endpoint" },
+  },
+
+  exports: {
+    a2a: "a2a",
+  },
+}

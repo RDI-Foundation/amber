@@ -76,6 +76,15 @@ impl CompiledScenario {
         })
     }
 
+    pub fn from_scenario_with_provenance(
+        scenario: &Scenario,
+        provenance: &Provenance,
+    ) -> Result<Self, CompiledScenarioError> {
+        Self::from_ir(scenario_ir::scenario_ir_from_scenario_and_provenance(
+            scenario, provenance,
+        ))
+    }
+
     pub fn scenario(&self) -> &Scenario {
         &self.scenario
     }

@@ -84,10 +84,10 @@ pub enum Error {
     #[diagnostic(code(compiler::relative_manifest_ref))]
     RelativeManifestRef { reference: Box<str> },
 
-    #[error("invalid manifest reference `{reference}` in {realm_url}: {message}")]
+    #[error("invalid manifest reference `{reference}` in {manifest_url}: {message}")]
     #[diagnostic(code(compiler::invalid_manifest_ref))]
     InvalidManifestRef {
-        realm_url: Box<Url>,
+        manifest_url: Box<Url>,
         reference: Box<str>,
         message: Box<str>,
         #[source_code]
@@ -98,11 +98,11 @@ pub enum Error {
 
     #[error(
         "failed to resolve manifest reference `{reference}` for component `#{child}` in \
-         {realm_path}: {message}"
+         {manifest_path}: {message}"
     )]
     #[diagnostic(code(compiler::manifest_ref_resolution))]
     ManifestRefResolution {
-        realm_path: Box<str>,
+        manifest_path: Box<str>,
         child: Box<str>,
         reference: Box<str>,
         message: Box<str>,
@@ -113,11 +113,11 @@ pub enum Error {
     },
 
     #[error(
-        "unknown resolver `{resolver}` referenced by environment `{environment}` in {realm_url}"
+        "unknown resolver `{resolver}` referenced by environment `{environment}` in {manifest_url}"
     )]
     #[diagnostic(code(compiler::unknown_resolver))]
     UnknownResolver {
-        realm_url: Box<Url>,
+        manifest_url: Box<Url>,
         environment: Box<str>,
         resolver: Box<str>,
         #[source_code]
@@ -147,6 +147,38 @@ pub enum Error {
         #[related]
         related: Vec<RelatedManifestSpan>,
     },
+
+    #[error("use `#{name}` requires root slot(s) that the main scenario cannot bind: {slots}")]
+    #[diagnostic(
+        code(compiler::use_requires_root_slots),
+        help("Make these slots optional or move the required inputs inside the used manifest.")
+    )]
+    UseRequiresRootSlots {
+        name: Box<str>,
+        slots: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "use declared here")]
+        span: Option<SourceSpan>,
+        #[related]
+        related: Vec<RelatedManifestSpan>,
+    },
+
+    #[error("use `#{name}` contains overlay declarations in its subtree: {message}")]
+    #[diagnostic(
+        code(compiler::use_contains_overlay),
+        help("`use` components referenced by overlays must be self-contained.")
+    )]
+    UseContainsOverlay {
+        name: Box<str>,
+        message: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "use declared here")]
+        span: Option<SourceSpan>,
+        #[related]
+        related: Vec<RelatedManifestSpan>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +195,7 @@ pub struct ResolvedNode {
     pub observed_url: Option<Url>,
     pub config: Option<serde_json::Value>,
     pub children: BTreeMap<String, ResolvedNode>,
+    pub uses: BTreeMap<String, ResolvedNode>,
     pub child_templates: BTreeMap<String, ResolvedChildTemplate>,
 }
 
@@ -289,13 +322,14 @@ async fn resolve_component(
                         let span = spans
                             .components
                             .get(name.as_str())
+                            .or_else(|| spans.uses.get(name.as_str()))
                             .and_then(|c| c.manifest)
                             .unwrap_or((0usize, 0usize).into());
                         (Some(src), Some(span))
                     });
 
             Error::InvalidManifestRef {
-                realm_url: Box::new(base.clone()),
+                manifest_url: Box::new(base.clone()),
                 reference: declared_ref.url.as_str().into(),
                 message: err.to_string().into(),
                 src,
@@ -333,15 +367,23 @@ async fn resolve_component(
     let referenced_envs: HashSet<String> = manifest
         .components()
         .values()
+        .chain(manifest.uses().values())
         .filter_map(component_decl_environment)
         .collect();
 
-    let realm_url = observed_url.clone().unwrap_or_else(|| resolved_url.clone());
+    let manifest_url = observed_url.clone().unwrap_or_else(|| resolved_url.clone());
     let parent_features = manifest.experimental_features().clone();
 
     let mut env_cache: HashMap<String, Arc<ResolveEnv>> = HashMap::new();
     for env_name in &referenced_envs {
-        let _ = compute_environment(&svc, &env, &manifest, &realm_url, env_name, &mut env_cache)?;
+        let _ = compute_environment(
+            &svc,
+            &env,
+            &manifest,
+            &manifest_url,
+            env_name,
+            &mut env_cache,
+        )?;
     }
 
     let children_futs: Vec<_> = manifest
@@ -354,7 +396,7 @@ async fn resolve_component(
             let parent_features = parent_features.clone();
             let child_stack = stack.clone();
             let child_path_set = path_set.clone();
-            let realm_url = realm_url.clone();
+            let manifest_url = manifest_url.clone();
 
             let child_env = match child_env_name {
                 None => Arc::clone(&env),
@@ -368,7 +410,7 @@ async fn resolve_component(
                 let child_ctx = ResolveContext {
                     svc: Arc::clone(&svc),
                     env: child_env,
-                    base_url: Some(realm_url.clone()),
+                    base_url: Some(manifest_url.clone()),
                     stack: child_stack,
                     path_set: child_path_set,
                 };
@@ -376,7 +418,7 @@ async fn resolve_component(
                     resolve_component(child_ctx, child_name.clone(), child_ref, child_cfg).await?;
                 validate_child_experimental_features(
                     &svc,
-                    &realm_url,
+                    &manifest_url,
                     child_name.as_str(),
                     &parent_features,
                     child_node.digest,
@@ -396,11 +438,75 @@ async fn resolve_component(
         children.insert(child_name, child_node);
     }
 
+    let uses_futs: Vec<_> = manifest
+        .uses()
+        .iter()
+        .map(|(use_name, decl)| {
+            let use_name = use_name.clone();
+            let (use_ref, use_cfg, use_env_name) = extract_component_decl(decl);
+            let svc = Arc::clone(&svc);
+            let parent_features = parent_features.clone();
+            let use_stack = stack.clone();
+            let use_path_set = path_set.clone();
+            let manifest_url = manifest_url.clone();
+
+            let use_env = match use_env_name {
+                None => Arc::clone(&env),
+                Some(env_name) => env_cache
+                    .get(&env_name)
+                    .cloned()
+                    .expect("referenced environment should be precomputed"),
+            };
+
+            async move {
+                let use_ctx = ResolveContext {
+                    svc: Arc::clone(&svc),
+                    env: use_env,
+                    base_url: Some(manifest_url.clone()),
+                    stack: use_stack,
+                    path_set: use_path_set,
+                };
+                let use_node =
+                    resolve_component(use_ctx, use_name.clone(), use_ref, use_cfg).await?;
+                validate_child_experimental_features(
+                    &svc,
+                    &manifest_url,
+                    use_name.as_str(),
+                    &parent_features,
+                    use_node.digest,
+                    &use_node.resolved_url,
+                )?;
+                validate_use_root_slots(
+                    &svc,
+                    &manifest_url,
+                    use_name.as_str(),
+                    use_node.digest,
+                    &use_node.resolved_url,
+                )?;
+                validate_use_subtree_has_no_overlays(
+                    &svc,
+                    &manifest_url,
+                    use_name.as_str(),
+                    &use_node,
+                )?;
+                Ok::<(String, ResolvedNode), Error>((use_name, use_node))
+            }
+        })
+        .collect();
+
+    let mut uses_stream = futures::stream::iter(uses_futs).buffer_unordered(svc.max_concurrency);
+
+    let mut uses = BTreeMap::new();
+    while let Some(res) = uses_stream.next().await {
+        let (use_name, use_node) = res?;
+        uses.insert(use_name, use_node);
+    }
+
     let child_templates = resolve_child_templates(
         &svc,
         &env,
         &manifest,
-        &realm_url,
+        &manifest_url,
         &parent_features,
         &stack,
         &path_set,
@@ -415,6 +521,7 @@ async fn resolve_component(
         observed_url,
         config,
         children,
+        uses,
         child_templates,
     })
 }
@@ -429,15 +536,33 @@ fn component_decl_environment(decl: &ComponentDecl) -> Option<String> {
 
 fn child_manifest_decl_site(
     svc: &ResolveService,
-    realm_url: &Url,
+    manifest_url: &Url,
     child_name: &str,
 ) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
     svc.store
-        .diagnostic_source(realm_url)
+        .diagnostic_source(manifest_url)
         .map_or((None, None), |(src, spans)| {
             let span = spans
                 .components
                 .get(child_name)
+                .or_else(|| spans.uses.get(child_name))
+                .and_then(|component| component.manifest.or(Some(component.whole)))
+                .unwrap_or((0usize, 0usize).into());
+            (Some(src), Some(span))
+        })
+}
+
+fn use_manifest_decl_site(
+    svc: &ResolveService,
+    manifest_url: &Url,
+    use_name: &str,
+) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
+    svc.store
+        .diagnostic_source(manifest_url)
+        .map_or((None, None), |(src, spans)| {
+            let span = spans
+                .uses
+                .get(use_name)
                 .and_then(|component| component.manifest.or(Some(component.whole)))
                 .unwrap_or((0usize, 0usize).into());
             (Some(src), Some(span))
@@ -446,7 +571,7 @@ fn child_manifest_decl_site(
 
 fn wrap_child_manifest_resolution_error(
     svc: &ResolveService,
-    realm_url: Option<&Url>,
+    manifest_url: Option<&Url>,
     child_name: &str,
     declared_ref: &ManifestRef,
     err: Error,
@@ -458,13 +583,13 @@ fn wrap_child_manifest_resolution_error(
         return Error::Resolver(resolver_err);
     }
 
-    let Some(realm_url) = realm_url else {
+    let Some(manifest_url) = manifest_url else {
         return Error::Resolver(resolver_err);
     };
-    let (src, span) = child_manifest_decl_site(svc, realm_url, child_name);
+    let (src, span) = child_manifest_decl_site(svc, manifest_url, child_name);
 
     Error::ManifestRefResolution {
-        realm_path: display_url(realm_url).into(),
+        manifest_path: display_url(manifest_url).into(),
         child: child_name.into(),
         reference: declared_ref.url.as_str().into(),
         message: resolver_error_message(&resolver_err).into(),
@@ -495,7 +620,7 @@ async fn resolve_child_templates(
     svc: &Arc<ResolveService>,
     env: &Arc<ResolveEnv>,
     manifest: &Manifest,
-    realm_url: &Url,
+    manifest_url: &Url,
     parent_features: &BTreeSet<ExperimentalFeature>,
     stack: &[Url],
     path_set: &HashSet<ManifestDigest>,
@@ -503,13 +628,14 @@ async fn resolve_child_templates(
     let mut out = BTreeMap::new();
 
     for (template_name, decl) in manifest.child_templates() {
-        let refs = resolve_child_template_manifest_refs(realm_url, template_name.as_str(), decl)?;
+        let refs =
+            resolve_child_template_manifest_refs(manifest_url, template_name.as_str(), decl)?;
         let mut manifests = Vec::with_capacity(refs.len());
         for reference in refs {
             let child_ctx = ResolveContext {
                 svc: Arc::clone(svc),
                 env: Arc::clone(env),
-                base_url: Some(realm_url.clone()),
+                base_url: Some(manifest_url.clone()),
                 stack: stack.to_vec(),
                 path_set: path_set.clone(),
             };
@@ -522,7 +648,7 @@ async fn resolve_child_templates(
             .await?;
             validate_child_experimental_features(
                 svc,
-                realm_url,
+                manifest_url,
                 template_name.as_str(),
                 parent_features,
                 root.digest,
@@ -548,7 +674,7 @@ async fn resolve_child_templates(
 }
 
 fn resolve_child_template_manifest_refs(
-    realm_url: &Url,
+    manifest_url: &Url,
     template_name: &str,
     decl: &ChildTemplateDecl,
 ) -> Result<Vec<ManifestRef>, Error> {
@@ -556,14 +682,16 @@ fn resolve_child_template_manifest_refs(
         None => Ok(Vec::new()),
         Some(ChildTemplateManifestDecl::One(reference)) => {
             Ok(vec![resolve_manifest_ref_for_template(
-                realm_url,
+                manifest_url,
                 template_name,
                 reference,
             )?])
         }
         Some(ChildTemplateManifestDecl::Many(refs)) => refs
             .iter()
-            .map(|reference| resolve_manifest_ref_for_template(realm_url, template_name, reference))
+            .map(|reference| {
+                resolve_manifest_ref_for_template(manifest_url, template_name, reference)
+            })
             .collect(),
         Some(_) => {
             unreachable!("manifest validation handles unknown child-template manifest forms")
@@ -572,7 +700,7 @@ fn resolve_child_template_manifest_refs(
 }
 
 fn resolve_manifest_ref_for_template(
-    realm_url: &Url,
+    manifest_url: &Url,
     template_name: &str,
     reference: &ManifestRef,
 ) -> Result<ManifestRef, Error> {
@@ -580,9 +708,9 @@ fn resolve_manifest_ref_for_template(
         return Ok(reference.clone());
     }
     reference
-        .resolve_against(realm_url)
+        .resolve_against(manifest_url)
         .map_err(|err| Error::ManifestRefResolution {
-            realm_path: display_url(realm_url).into(),
+            manifest_path: display_url(manifest_url).into(),
             child: template_name.into(),
             reference: reference.url.as_str().into(),
             message: err.to_string().into(),
@@ -591,9 +719,147 @@ fn resolve_manifest_ref_for_template(
         })
 }
 
+fn validate_use_root_slots(
+    svc: &ResolveService,
+    manifest_url: &Url,
+    use_name: &str,
+    digest: ManifestDigest,
+    use_url: &Url,
+) -> Result<(), Error> {
+    let manifest = svc
+        .store
+        .get(&digest)
+        .expect("used manifest should be in the digest store after resolution");
+    let required_slots: Vec<_> = manifest
+        .slots()
+        .iter()
+        .filter(|(_, slot)| !slot.optional)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    if required_slots.is_empty() {
+        return Ok(());
+    }
+
+    let (src, span) = use_manifest_decl_site(svc, manifest_url, use_name);
+    let mut related = Vec::new();
+    if let Some(stored) = svc.store.get_source(use_url) {
+        for slot_name in &required_slots {
+            let span = stored
+                .spans
+                .slots
+                .get(slot_name.as_str())
+                .map(|slot| slot.name)
+                .unwrap_or((0usize, 0usize).into());
+            related.push(RelatedManifestSpan {
+                message: format!("use `#{use_name}` requires slot `{slot_name}` here"),
+                src: NamedSource::new(display_url(use_url), stored.source.clone())
+                    .with_language("json5"),
+                span,
+                label: "required slot declared here".to_string(),
+            });
+        }
+    }
+
+    Err(Error::UseRequiresRootSlots {
+        name: use_name.into(),
+        slots: required_slots.join(", ").into(),
+        src,
+        span,
+        related,
+    })
+}
+
+fn validate_use_subtree_has_no_overlays(
+    svc: &ResolveService,
+    manifest_url: &Url,
+    use_name: &str,
+    use_node: &ResolvedNode,
+) -> Result<(), Error> {
+    let Some((offending_url, span, message, label)) = first_overlay_in_use_subtree(svc, use_node)
+    else {
+        return Ok(());
+    };
+
+    let (src, use_span) = use_manifest_decl_site(svc, manifest_url, use_name);
+    let related = svc
+        .store
+        .get_source(&offending_url)
+        .map(|stored| {
+            vec![RelatedManifestSpan {
+                message: format!("use `#{use_name}` resolves to an overlay declaration here"),
+                src: NamedSource::new(display_url(&offending_url), stored.source)
+                    .with_language("json5"),
+                span,
+                label: label.to_string(),
+            }]
+        })
+        .unwrap_or_default();
+
+    Err(Error::UseContainsOverlay {
+        name: use_name.into(),
+        message: message.into(),
+        src,
+        span: use_span,
+        related,
+    })
+}
+
+fn first_overlay_in_use_subtree(
+    svc: &ResolveService,
+    node: &ResolvedNode,
+) -> Option<(Url, SourceSpan, &'static str, &'static str)> {
+    let manifest = svc.store.get(&node.digest)?;
+    let stored = svc.store.get_source(&node.resolved_url);
+
+    if !manifest.uses().is_empty() {
+        let span = stored
+            .as_ref()
+            .and_then(|stored| {
+                stored
+                    .spans
+                    .uses
+                    .values()
+                    .next()
+                    .map(|component| component.name)
+            })
+            .unwrap_or((0usize, 0usize).into());
+        return Some((
+            node.resolved_url.clone(),
+            span,
+            "nested `use` is not supported",
+            "nested `use` declared here",
+        ));
+    }
+    if !manifest.overlays().is_empty() {
+        let span = stored
+            .as_ref()
+            .and_then(|stored| stored.spans.overlays.first().map(|overlay| overlay.whole))
+            .unwrap_or((0usize, 0usize).into());
+        return Some((
+            node.resolved_url.clone(),
+            span,
+            "`overlays` is not supported",
+            "`overlays` declared here",
+        ));
+    }
+
+    for child in node.children.values() {
+        if let Some(found) = first_overlay_in_use_subtree(svc, child) {
+            return Some(found);
+        }
+    }
+    for used in node.uses.values() {
+        if let Some(found) = first_overlay_in_use_subtree(svc, used) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
 fn validate_child_experimental_features(
     svc: &ResolveService,
-    realm_url: &Url,
+    manifest_url: &Url,
     child_name: &str,
     parent_features: &BTreeSet<ExperimentalFeature>,
     child_digest: ManifestDigest,
@@ -615,11 +881,12 @@ fn validate_child_experimental_features(
 
     let (src, span) =
         svc.store
-            .diagnostic_source(realm_url)
+            .diagnostic_source(manifest_url)
             .map_or((None, None), |(src, spans)| {
                 let span = spans
                     .components
                     .get(child_name)
+                    .or_else(|| spans.uses.get(child_name))
                     .and_then(|component| component.manifest.or(Some(component.whole)))
                     .unwrap_or((0usize, 0usize).into());
                 (Some(src), Some(span))
@@ -653,7 +920,7 @@ fn compute_environment(
     svc: &ResolveService,
     base_env: &Arc<ResolveEnv>,
     manifest: &Manifest,
-    realm_url: &Url,
+    manifest_url: &Url,
     env_name: &str,
     env_cache: &mut HashMap<String, Arc<ResolveEnv>>,
 ) -> Result<Arc<ResolveEnv>, Error> {
@@ -667,7 +934,7 @@ fn compute_environment(
         .expect("environment names are validated in Manifest");
 
     let parent_env = if let Some(ext) = env_decl.extends.as_deref() {
-        compute_environment(svc, base_env, manifest, realm_url, ext, env_cache)?
+        compute_environment(svc, base_env, manifest, manifest_url, ext, env_cache)?
     } else {
         Arc::clone(base_env)
     };
@@ -677,7 +944,7 @@ fn compute_environment(
         let Some(r) = svc.registry.get(resolver_name.as_str()) else {
             let (src, span) =
                 svc.store
-                    .diagnostic_source(realm_url)
+                    .diagnostic_source(manifest_url)
                     .map_or((None, None), |(src, spans)| {
                         let env = spans.environments.get(env_name);
                         let span = env
@@ -692,7 +959,7 @@ fn compute_environment(
                         (Some(src), Some(span))
                     });
             return Err(Error::UnknownResolver {
-                realm_url: Box::new(realm_url.clone()),
+                manifest_url: Box::new(manifest_url.clone()),
                 environment: env_name.into(),
                 resolver: resolver_name.as_str().into(),
                 src,

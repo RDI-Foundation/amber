@@ -221,19 +221,7 @@ pub fn resolve_runtime_component_config(
         ));
     }
 
-    crate::apply_schema_defaults(component_schema, &mut component_config)?;
-
-    {
-        let validator = jsonschema::validator_for(component_schema).map_err(|err| {
-            ConfigError::schema(format!("failed to compile component schema: {err}"))
-        })?;
-        let mut errors = validator.iter_errors(&component_config);
-        if let Some(first) = errors.next() {
-            let mut messages = vec![first.to_string()];
-            messages.extend(errors.take(7).map(|err| err.to_string()));
-            return Err(ConfigError::validation(messages.join("; ")));
-        }
-    }
+    crate::validate_config_value(component_schema, &mut component_config)?;
 
     Ok(component_config)
 }
@@ -253,6 +241,10 @@ fn eval_config_node_with_behavior(
                 "config.{path} not found (missing key in runtime config)"
             ))),
         },
+        ConfigTemplate::SymbolicConfigRef { path } => {
+            Ok(Some(Value::String(format!("${{config.{path}}}"))))
+        }
+        ConfigTemplate::SymbolicString { value } => Ok(Some(Value::String(value.clone()))),
         ConfigTemplate::TemplateString { parts } => render_template_string_with_behavior(
             parts,
             root_config,

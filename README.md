@@ -26,14 +26,14 @@ runtimes.
 Install from npm if you want `amber run` locally:
 
 ```sh
-npm install -g @rdif/amber@^0.3
+npm install -g @rdif/amber@^0.4
 amber --help
 ```
 
 For zero-install `check`, `compile`, or `docs`, use the Dockerized CLI:
 
 ```sh
-docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.3 --help
+docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.4 --help
 ```
 
 If you are working on Amber itself:
@@ -244,10 +244,17 @@ amber logs <run-id>
 amber stop <run-id>
 ```
 
-Use `amber check` when you want validation without starting anything:
+Use `amber check` when you want static validation without starting anything:
 
 ```sh
 amber check path/to/root
+```
+
+If the scenario uses overlays and you want to execute them and validate the rewritten graph,
+opt in explicitly:
+
+```sh
+amber check --apply-overlays path/to/root
 ```
 
 Use `amber compile` when you want explicit artifacts:

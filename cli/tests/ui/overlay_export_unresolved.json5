@@ -1,0 +1,7 @@
+{
+  manifest_version: "0.4.0",
+  use: {
+    wrapper: "./overlay_export_unresolved_wrapper.json5",
+  },
+  overlays: ["#wrapper.rewrite"],
+}

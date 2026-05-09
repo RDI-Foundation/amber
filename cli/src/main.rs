@@ -5,6 +5,7 @@ mod framework_component;
 mod mixed_run;
 mod run_inputs;
 mod run_logs;
+mod scenario_runner;
 mod site_proxy_metadata;
 mod tcp_readiness;
 mod vm_runtime;
@@ -24,10 +25,11 @@ use std::{
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Stdio},
+    sync::Arc,
 };
 
 use amber_compiler::{
-    CompileOptions, Compiler, ResolverRegistry,
+    CheckOptions, CompileOptions, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
     reporter::{
         CompiledScenario, Reporter as _,
@@ -200,12 +202,16 @@ Examples:
   amber compile path/to/root.json5 --vm /tmp/amber-vm";
 
 const CHECK_LONG_ABOUT: &str = "\
-Resolve a root manifest or bundle, run the same validation and lint passes as `amber compile`, \
-                                print diagnostics, and stop before emitting artifacts.";
+Resolve a root manifest or bundle, run static validation and lint passes, print diagnostics, and \
+                                stop before emitting artifacts.
+
+By default, this command does not execute scenario overlay programs. Use `--apply-overlays` when \
+                                you need to run overlays and validate the overlay-rewritten graph.";
 
 const CHECK_AFTER_HELP: &str = "\
 Examples:
   amber check path/to/root.json5
+  amber check --apply-overlays path/to/root.json5
   amber check -D warnings path/to/root.json5
 
 Use `amber compile --help` when you are ready to write outputs.";
@@ -501,6 +507,10 @@ struct CheckArgs {
     /// Treat the given lints as errors (e.g. `warnings`, `manifest::unused_slot`).
     #[arg(short = 'D', long = "deny", value_name = "LINT")]
     deny: Vec<String>,
+
+    /// Execute scenario overlay programs and validate the overlay-rewritten graph.
+    #[arg(long = "apply-overlays")]
+    apply_overlays: bool,
 
     /// Root manifest or bundle to check (URL or local path).
     #[arg(value_name = "MANIFEST")]
@@ -1072,7 +1082,8 @@ async fn compile(args: CompileArgs) -> Result<()> {
     let compiled = match resolve_compile_input(&args.manifest).await? {
         CompileInput::Manifest(resolved) => {
             let compiler = Compiler::new(resolved.resolver, Default::default())
-                .with_registry(resolved.registry);
+                .with_registry(resolved.registry)
+                .with_scenario_runner(Arc::new(scenario_runner::CliScenarioRunner::default()));
             let mut opts = CompileOptions::default();
             if args.no_opt {
                 opts.optimize.dce = false;
@@ -1089,6 +1100,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
 
             let output = compiler
                 .compile_from_tree(tree, opts.optimize)
+                .await
                 .wrap_err("compile failed")?;
 
             let deny = DenySet::new(&args.deny);
@@ -1204,11 +1216,21 @@ async fn compile(args: CompileArgs) -> Result<()> {
 
 async fn check(args: CheckArgs) -> Result<()> {
     let resolved = resolve_input(&args.manifest).await?;
-    let compiler =
+    let mut compiler =
         Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
+    if args.apply_overlays {
+        compiler =
+            compiler.with_scenario_runner(Arc::new(scenario_runner::CliScenarioRunner::default()));
+    }
 
     let output = compiler
-        .check(resolved.manifest, CompileOptions::default())
+        .check_with_options(
+            resolved.manifest,
+            CheckOptions {
+                apply_overlays: args.apply_overlays,
+                ..CheckOptions::default()
+            },
+        )
         .await
         .wrap_err("check failed")?;
 
@@ -1993,17 +2015,6 @@ async fn stop_run_with_cleanup_notice(
     }
 }
 
-fn cleanup_temporary_run_outside_proxy(
-    run_root: &Path,
-    proxy_child: &mut Option<Child>,
-) -> Result<()> {
-    if let Some(mut proxy_child) = proxy_child.take() {
-        let _ = proxy_child.kill();
-        let _ = proxy_child.wait();
-    }
-    mixed_run::clear_run_outside_proxy_state(run_root)
-}
-
 enum AttachedRunStorage {
     Persistent(PathBuf),
     Managed(PathBuf),
@@ -2050,16 +2061,6 @@ async fn run_attached_mixed_run(
     let attached_storage = AttachedRunStorage::new(storage_root_override)?;
     let storage_root_override = Some(attached_storage.storage_root());
     let startup = async {
-        let receipt = mixed_run::run_run_plan(
-            source_plan_path,
-            run_plan,
-            storage_root_override,
-            observability,
-            &prepared.root_env,
-        )
-        .await?;
-        let run_root = PathBuf::from(&receipt.run_root);
-
         let export_bindings = auto_export_bindings(&prepared.interface)?;
         let slot_bindings = prepared
             .interface
@@ -2072,24 +2073,23 @@ async fn run_attached_mixed_run(
                     .map(|value| (slot.name.clone(), value.clone()))
             })
             .collect::<BTreeMap<_, _>>();
-        let mut proxy_child = if slot_bindings.is_empty() && export_bindings.is_empty() {
-            None
-        } else {
-            Some(mixed_run::spawn_run_outside_proxy(
-                &run_root,
-                &slot_bindings,
-                &export_bindings,
-            )?)
-        };
-        if proxy_child.is_some()
-            && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
-        {
-            cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child)?;
-            let _ = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
-            return Err(err);
-        }
+        let started = scenario_runner::start_run_with_outside_proxy(
+            source_plan_path,
+            run_plan,
+            storage_root_override,
+            observability,
+            &prepared.root_env,
+            &slot_bindings,
+            export_bindings,
+        )
+        .await?;
 
-        Ok((receipt, run_root, export_bindings, proxy_child))
+        Ok::<_, miette::Report>((
+            started.receipt,
+            started.run_root,
+            started.export_bindings,
+            started.proxy_child,
+        ))
     };
 
     let ((receipt, run_root, export_bindings, mut proxy_child), startup_status_shown) =
@@ -2130,7 +2130,8 @@ async fn run_attached_mixed_run(
         },
     )
     .await;
-    let proxy_cleanup_result = cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
+    let proxy_cleanup_result =
+        scenario_runner::cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
     let stop_result = stop_run_with_cleanup_notice(&receipt.run_id, storage_root_override).await;
     result?;
     proxy_cleanup_result?;
@@ -2161,7 +2162,7 @@ async fn attach(args: AttachArgs) -> Result<()> {
     if proxy_child.is_some()
         && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
     {
-        cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child)?;
+        scenario_runner::cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child)?;
         return Err(err);
     }
 
@@ -2183,7 +2184,8 @@ async fn attach(args: AttachArgs) -> Result<()> {
         },
     )
     .await;
-    let cleanup_result = cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
+    let cleanup_result =
+        scenario_runner::cleanup_temporary_run_outside_proxy(&run_root, &mut proxy_child);
     result?;
     cleanup_result?;
     Ok(())
@@ -2318,7 +2320,8 @@ async fn compile_for_run(input: &str) -> Result<CompiledScenario> {
         CompileInput::ScenarioIr(compiled) => Ok(compiled),
         CompileInput::Manifest(resolved) => {
             let compiler = Compiler::new(resolved.resolver, Default::default())
-                .with_registry(resolved.registry);
+                .with_registry(resolved.registry)
+                .with_scenario_runner(Arc::new(scenario_runner::CliScenarioRunner::default()));
             let output = compiler
                 .compile_from_tree(
                     compiler
@@ -2327,6 +2330,7 @@ async fn compile_for_run(input: &str) -> Result<CompiledScenario> {
                         .wrap_err("compile failed")?,
                     CompileOptions::default().optimize,
                 )
+                .await
                 .wrap_err("compile failed")?;
             let has_error = print_diagnostics(&output.diagnostics, &DenySet::default())?;
             if has_error {

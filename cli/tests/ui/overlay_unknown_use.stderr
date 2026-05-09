@@ -1,0 +1,14 @@
+Error: manifest::unknown_overlay_use
+
+  × check failed
+  ╰─▶ overlay reference points to `use` entry `#missing`, but this manifest
+      does not declare that entry
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/overlay_unknown_use.json5:3:14]
+ 2 │   manifest_version: "0.4.0",
+ 3 │   overlays: ["#missing.rewrite"],
+   ·              ─────────┬────────
+   ·                       ╰── overlay reference expects a matching `use.missing` entry
+ 4 │ }
+   ╰────
+  help: Add a `use` entry named `missing` in this manifest, or change/remove
+        the overlay reference.

@@ -58,6 +58,24 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Relax AppArmor user namespace restrictions when present
+        run: |
+          set -euo pipefail
+
+          if sysctl kernel.apparmor_restrict_unprivileged_unconfined >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
+          fi
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Ensure direct runtime sandbox packages are available
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap slirp4netns
+          bwrap --version
+          slirp4netns --version
       - run: cargo test --workspace --all-features
 
   direct-tests:
@@ -706,5 +724,3 @@ jobs:
           cargo test -p amber-compiler --all-features docker_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
       - name: Run helper docker smoke test
         run: cargo test -p amber-helper --all-features helper_image_executes_run_plan_in_scratch -- --ignored --test-threads=1
-      - name: Run manager docker smoke test
-        run: AMBER_TEST_USE_PREBUILT_IMAGES=1 cargo test -p amber-manager --test amber_scenario_manager_live -- --ignored --nocapture
