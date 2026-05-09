@@ -328,6 +328,10 @@ pub enum InboundTarget {
     Local {
         port: u16,
     },
+    DockerGateway {
+        docker_sock: PathBuf,
+        compose_project_env: String,
+    },
     External {
         url_env: String,
         #[serde(default, skip_serializing_if = "is_false")]

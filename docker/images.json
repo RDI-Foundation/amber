@@ -20,12 +20,6 @@
       "version": "v0.2.x"
     },
     {
-      "name": "amber-docker-gateway",
-      "context": ".",
-      "dockerfile": "docker/amber-docker-gateway/Dockerfile",
-      "version": "v0.1.x"
-    },
-    {
       "name": "amber-provisioner",
       "context": ".",
       "dockerfile": "docker/amber-provisioner/Dockerfile",

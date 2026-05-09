@@ -235,6 +235,35 @@ fn build_inbound_routes_rejects_http_plugins_on_non_local_target() {
 }
 
 #[test]
+fn build_inbound_routes_rejects_non_tcp_docker_gateway_route() {
+    let config = MeshConfig {
+        inbound: vec![InboundRoute {
+            route_id: "docker-route".to_string(),
+            capability: "docker".to_string(),
+            capability_kind: Some("docker".to_string()),
+            capability_profile: None,
+            protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
+            target: InboundTarget::DockerGateway {
+                docker_sock: "/var/run/docker.sock".into(),
+                compose_project_env: "COMPOSE_PROJECT_NAME".to_string(),
+            },
+            allowed_issuers: vec!["peer-a".to_string()],
+        }],
+        ..test_mesh_config()
+    };
+
+    let err = build_inbound_routes(&config)
+        .expect_err("docker gateway routes must stay on the tcp mesh path");
+    match err {
+        RouterError::InvalidConfig(message) => {
+            assert!(message.contains("targets the docker gateway but uses http protocol"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn validate_outbound_routes_rejects_http_plugins_on_non_http_route() {
     let config = MeshConfig {
         outbound: vec![OutboundRoute {

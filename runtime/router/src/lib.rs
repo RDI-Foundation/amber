@@ -9,6 +9,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use amber_docker_gateway::{DockerGatewayConfig, DockerGatewayRuntime};
 use amber_mesh::{
     HttpRoutePlugin, InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity,
     MeshIdentityPublic, MeshIdentitySecret, MeshPeer, MeshProtocol, OutboundRoute,
@@ -208,6 +209,29 @@ impl HttpExchangeLabels {
                     )
                 }
             }
+            InboundTarget::DockerGateway { .. } => {
+                if router_forwarded_export {
+                    (
+                        HttpEdgeKind::Export,
+                        false,
+                        None,
+                        source_from_open
+                            .clone()
+                            .unwrap_or_else(|| capability.clone()),
+                        Some(local_id.clone()),
+                        capability.clone(),
+                    )
+                } else {
+                    (
+                        HttpEdgeKind::Binding,
+                        true,
+                        Some(remote_id.clone()),
+                        source_from_open.unwrap_or_else(|| capability.clone()),
+                        Some(local_id.clone()),
+                        capability.clone(),
+                    )
+                }
+            }
             InboundTarget::External { .. } => (
                 HttpEdgeKind::ExternalSlot,
                 true,
@@ -314,6 +338,7 @@ struct OutboundHttpProxyState {
 }
 
 type HttpClient = Client<HttpsConnector<HttpConnector<ExternalHttpResolver>>, BoxBody>;
+type DockerGatewayRuntimes = Arc<HashMap<String, Arc<DockerGatewayRuntime>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BodyMode {

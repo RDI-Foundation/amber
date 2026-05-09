@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use amber_images::AMBER_ROUTER;
 use amber_manifest::{ProvideDecl, SlotDecl};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, Program, ProgramMount, ProvideRef,
@@ -12,8 +13,6 @@ use crate::targets::common::TargetError as MeshError;
 pub(crate) const FRAMEWORK_DOCKER_GATEWAY_INTERNAL_SLOT: &str = "__amber_internal_framework_docker";
 pub(crate) const FRAMEWORK_DOCKER_GATEWAY_ENDPOINT: &str = "docker";
 pub(crate) const FRAMEWORK_DOCKER_GATEWAY_PROVIDE: &str = "__amber_internal_framework_docker";
-pub(crate) const FRAMEWORK_DOCKER_GATEWAY_IMAGE: &str = "amber-internal://docker-gateway";
-pub(crate) const FRAMEWORK_DOCKER_GATEWAY_ENTRYPOINT: &str = "/amber-docker-gateway";
 pub(crate) const FRAMEWORK_DOCKER_GATEWAY_PORT: u16 = 23750;
 const FRAMEWORK_DOCKER_GATEWAY_MONIKER_BASE: &str = "/__amber_internal_framework_docker_gateway";
 
@@ -145,9 +144,11 @@ pub(crate) fn rewrite_framework_docker_as_injected_component(
 }
 
 fn injected_gateway_program() -> Result<Program, MeshError> {
+    // The injected component is a mesh identity/provide marker. Docker Compose renders only its
+    // router sidecar, whose router process owns the gateway runtime.
     serde_json::from_value(json!({
-        "image": FRAMEWORK_DOCKER_GATEWAY_IMAGE,
-        "entrypoint": [FRAMEWORK_DOCKER_GATEWAY_ENTRYPOINT],
+        "image": AMBER_ROUTER.reference,
+        "entrypoint": ["/amber-router"],
         "network": {
             "endpoints": [
                 {

@@ -13,7 +13,9 @@ use amber_manifest::{
     CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef,
     Program as ManifestProgram, ProvideDecl, SlotDecl,
 };
-use amber_mesh::{InboundTarget, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget};
+use amber_mesh::{
+    InboundTarget, MeshProtocol, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget,
+};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl, Scenario,
     ScenarioExport, SlotRef,
@@ -458,16 +460,17 @@ fn assert_internal_service_rootfs_hardened(service: &super::Service, yaml: &str)
     assert_eq!(service.read_only, Some(true), "{yaml}");
 }
 
-fn injected_docker_gateway_service(compose: &super::DockerComposeFile) -> (&str, &super::Service) {
+fn injected_docker_gateway_sidecar(compose: &super::DockerComposeFile) -> (&str, &super::Service) {
     compose
         .services
         .iter()
         .find_map(|(name, svc)| {
-            env_value(svc, super::DOCKER_GATEWAY_CONFIG_ENV)
-                .is_some()
+            svc.volumes
+                .iter()
+                .any(|volume| volume.ends_with(super::DOCKER_GATEWAY_CONTAINER_SOCK))
                 .then_some((name.as_str(), svc))
         })
-        .expect("injected docker gateway service missing")
+        .expect("injected docker gateway sidecar missing")
 }
 
 fn assert_depends_on(service: &super::Service, name: &str, condition: &str) {

@@ -193,44 +193,16 @@ fn parse_container_create_references_extracts_resources() {
 }
 
 #[test]
-fn validate_rejects_empty_caller_host() {
+fn validate_rejects_empty_compose_project() {
     let config = DockerGatewayConfig {
-        listen: "127.0.0.1:23750".parse().expect("valid listen addr"),
         docker_sock: PathBuf::from("/tmp/docker.sock"),
-        compose_project: TEST_PROJECT.to_string(),
-        callers: vec![CallerConfig {
-            host: "   ".to_string(),
-            port: None,
-            component: TEST_COMPONENT.to_string(),
-            compose_service: TEST_COMPONENT.to_string(),
-        }],
+        compose_project: "   ".to_string(),
     };
 
-    let err = DockerGatewayConfig::validate(config).expect_err("empty host should fail");
-    assert!(
-        err.to_string().contains("caller host must not be empty"),
-        "{err}"
-    );
-}
-
-#[test]
-fn validate_rejects_empty_caller_component() {
-    let config = DockerGatewayConfig {
-        listen: "127.0.0.1:23750".parse().expect("valid listen addr"),
-        docker_sock: PathBuf::from("/tmp/docker.sock"),
-        compose_project: TEST_PROJECT.to_string(),
-        callers: vec![CallerConfig {
-            host: "localhost".to_string(),
-            port: None,
-            component: "   ".to_string(),
-            compose_service: TEST_COMPONENT.to_string(),
-        }],
-    };
-
-    let err = DockerGatewayConfig::validate(config).expect_err("empty component should fail");
+    let err = DockerGatewayConfig::validate(config).expect_err("empty compose project should fail");
     assert!(
         err.to_string()
-            .contains("caller component must not be empty"),
+            .contains("compose_project must not be empty"),
         "{err}"
     );
 }

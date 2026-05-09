@@ -184,7 +184,6 @@ dependencies = [
 name = "amber-docker-gateway"
 version = "0.0.0"
 dependencies = [
- "base64",
  "bytes",
  "dashmap",
  "http-body-util",
@@ -377,6 +376,7 @@ name = "amber-router"
 version = "0.0.0"
 dependencies = [
  "aho-corasick",
+ "amber-docker-gateway",
  "amber-mesh",
  "base64",
  "bytes",

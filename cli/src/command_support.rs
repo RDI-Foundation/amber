@@ -295,10 +295,37 @@ pub(crate) fn load_compiled_scenario_ir(path: &Path) -> Result<Option<CompiledSc
     let ir: ScenarioIr = serde_json::from_value(value)
         .into_diagnostic()
         .wrap_err_with(|| format!("invalid Scenario IR input `{}`", path.display()))?;
+    validate_user_scenario_ir_provides(path, &ir)?;
     CompiledScenario::from_ir(ir)
         .into_diagnostic()
         .wrap_err_with(|| format!("invalid Scenario IR input `{}`", path.display()))
         .map(Some)
+}
+
+fn validate_user_scenario_ir_provides(path: &Path, ir: &ScenarioIr) -> Result<()> {
+    for component in &ir.components {
+        for (provide_name, provide) in &component.provides {
+            let kind = provide.decl.kind;
+            if matches!(
+                kind,
+                amber_manifest::CapabilityKind::Component
+                    | amber_manifest::CapabilityKind::Docker
+                    | amber_manifest::CapabilityKind::Kvm
+            ) {
+                return Err(miette::miette!(
+                    "Scenario IR input `{}` component `{}` provide `{}` declares framework-owned \
+                     capability kind `{}`; use `framework.{}` as the source instead of declaring \
+                     a provider",
+                    path.display(),
+                    component.moniker,
+                    provide_name,
+                    kind,
+                    kind.as_str()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn is_run_plan_file(path: &Path) -> Result<bool> {

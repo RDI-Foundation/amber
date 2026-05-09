@@ -102,6 +102,50 @@ fn top_level_help_groups_authoring_and_runtime_workflows() {
 }
 
 #[test]
+fn scenario_ir_input_rejects_framework_owned_provide_kinds() {
+    for kind in ["component", "docker", "kvm"] {
+        let temp = tempfile::tempdir().expect("tempdir should exist");
+        let path = temp.path().join(format!("{kind}.json"));
+        let ir = serde_json::json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": amber_scenario::SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [],
+                    "digest": amber_manifest::ManifestDigest::new([0u8; 32]).to_string(),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {
+                        "api": {
+                            "kind": kind,
+                            "endpoint": "api"
+                        }
+                    }
+                }
+            ],
+            "bindings": [],
+            "exports": []
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&ir).expect("IR should serialize"),
+        )
+        .expect("IR should be written");
+
+        let err = load_compiled_scenario_ir(&path)
+            .expect_err("framework-owned provide kind should be rejected");
+        let rendered = err.to_string();
+        assert!(rendered.contains("framework-owned"), "{rendered}");
+        assert!(rendered.contains(kind), "{rendered}");
+    }
+}
+
+#[test]
 fn attached_run_overview_stays_focused_on_identity_and_exports() {
     let mut output = Vec::new();
     print_run_session_overview(

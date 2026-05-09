@@ -281,6 +281,114 @@ fn kubernetes_emits_router_for_external_slots() {
 }
 
 #[test]
+fn kubernetes_network_policy_only_exposes_component_mesh_port() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let server_path = dir.path().join("server.json5");
+    let client_path = dir.path().join("client.json5");
+
+    fs::write(
+        &root_path,
+        format!(
+            r##"
+        {{
+          manifest_version: "0.1.0",
+          components: {{
+            server: "{}",
+            client: "{}"
+          }},
+          bindings: [
+            {{ to: "#client.api", from: "#server.api" }}
+          ]
+        }}
+        "##,
+            file_url(&server_path),
+            file_url(&client_path),
+        ),
+    )
+    .expect("write root manifest");
+
+    fs::write(
+        &server_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "server",
+            entrypoint: ["server"],
+            network: {
+              endpoints: [{ name: "api", port: 8080, protocol: "http" }]
+            }
+          },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" }
+        }
+        "#,
+    )
+    .expect("write server manifest");
+    fs::write(
+        &client_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "client",
+            entrypoint: ["client"],
+            env: { API_URL: "${slots.api.url}" }
+          },
+          slots: { api: { kind: "http" } }
+        }
+        "#,
+    )
+    .expect("write client manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+        .expect("compile scenario");
+    let artifact = render_artifact(&output);
+
+    let service_yaml = artifact
+        .files
+        .get(&PathBuf::from("04-services/c2-server.yaml"))
+        .expect("server service");
+    let service_doc: serde_yaml::Value =
+        serde_yaml::from_str(service_yaml).expect("parse server service");
+    let service_ports = service_doc["spec"]["ports"]
+        .as_sequence()
+        .expect("service ports")
+        .iter()
+        .map(|port| port["port"].as_u64().expect("service port"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(service_ports, BTreeSet::from([23000]));
+
+    let netpol_yaml = artifact
+        .files
+        .get(&PathBuf::from("05-networkpolicies/c2-server-netpol.yaml"))
+        .expect("server network policy");
+    let netpol_doc: serde_yaml::Value =
+        serde_yaml::from_str(netpol_yaml).expect("parse server network policy");
+    let ingress_ports = netpol_doc["spec"]["ingress"]
+        .as_sequence()
+        .expect("ingress rules")
+        .iter()
+        .flat_map(|rule| rule["ports"].as_sequence().into_iter().flatten())
+        .map(|port| port["port"].as_u64().expect("network policy port"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(ingress_ports, BTreeSet::from([23000]));
+    assert!(
+        !netpol_yaml.contains("8080"),
+        "program endpoint port must not be directly reachable through \
+         NetworkPolicy:\n{netpol_yaml}"
+    );
+}
+
+#[test]
 fn kubernetes_storage_mounts_emit_pvc_and_recreate_deployment() {
     let fixture_dir = tempdir().expect("fixture dir");
     let scenario_path = write_kubernetes_counter_storage_fixture(fixture_dir.path(), "v1");

@@ -49,7 +49,7 @@ COPY compiler/template/Cargo.toml compiler/template/
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     mkdir -p cli/src compiler/config/src compiler/src runtime/docker-gateway/src runtime/helper/src images/src manager/src compiler/json5/src compiler/manifest/src runtime/mesh/src runtime/proxy/src runtime/provisioner/src runtime/router/src runtime/site-controller/src runtime/site-controller/src/bin compiler/resolver/src compiler/scenario/src compiler/template/src && \
-    touch cli/src/main.rs compiler/config/src/lib.rs compiler/src/lib.rs runtime/docker-gateway/src/main.rs runtime/helper/src/main.rs images/src/lib.rs manager/src/lib.rs manager/src/main.rs compiler/json5/src/lib.rs compiler/manifest/src/lib.rs runtime/mesh/src/lib.rs runtime/proxy/src/lib.rs runtime/provisioner/src/main.rs runtime/router/src/main.rs runtime/site-controller/src/lib.rs runtime/site-controller/src/bin/amber-site-controller.rs compiler/resolver/src/lib.rs compiler/scenario/src/lib.rs compiler/template/src/lib.rs && \
+    touch cli/src/main.rs compiler/config/src/lib.rs compiler/src/lib.rs runtime/docker-gateway/src/lib.rs runtime/helper/src/main.rs images/src/lib.rs manager/src/lib.rs manager/src/main.rs compiler/json5/src/lib.rs compiler/manifest/src/lib.rs runtime/mesh/src/lib.rs runtime/proxy/src/lib.rs runtime/provisioner/src/main.rs runtime/router/src/main.rs runtime/site-controller/src/lib.rs runtime/site-controller/src/bin/amber-site-controller.rs compiler/resolver/src/lib.rs compiler/scenario/src/lib.rs compiler/template/src/lib.rs && \
     cargo fetch --locked
 
 COPY compiler ./compiler

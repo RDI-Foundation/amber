@@ -15,7 +15,8 @@ use std::{
 };
 
 use amber_helper::{
-    HelperError, RunPlan, build_run_plan, install_default_egress_guard, wait_for_mesh_config_scope,
+    HelperError, RunPlan, build_run_plan, install_default_egress_guard,
+    install_default_network_guard, wait_for_mesh_config_scope,
 };
 use amber_mesh::telemetry::{
     COMPONENT_MONIKER_ENV, OtlpIdentity, OtlpInstallMode, SCENARIO_SCOPE_ENV, SubscriberFormat,
@@ -148,6 +149,20 @@ fn run_main() -> Result<ExitCode, HelperError> {
             install_default_egress_guard()?;
             Ok(ExitCode::SUCCESS)
         }
+        "install-network-guard" => {
+            let allowed_ingress_tcp_ports = args
+                .map(|value| {
+                    value.parse::<u16>().map_err(|err| {
+                        HelperError::Msg(format!(
+                            "install-network-guard allowed ingress port must be a TCP port \
+                             number: {err}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            install_default_network_guard(&allowed_ingress_tcp_ports)?;
+            Ok(ExitCode::SUCCESS)
+        }
         _ => Err(usage_error()),
     }
 }
@@ -155,7 +170,7 @@ fn run_main() -> Result<ExitCode, HelperError> {
 fn usage_error() -> HelperError {
     HelperError::Msg(
         "usage: amber-helper <install DEST|run|wait-mesh-config CONFIG EXPECTED_SCOPE \
-         [TIMEOUT_SECONDS]|install-default-egress-guard>"
+         [TIMEOUT_SECONDS]|install-default-egress-guard|install-network-guard [TCP_PORT...]>"
             .to_string(),
     )
 }

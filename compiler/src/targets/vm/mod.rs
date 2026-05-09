@@ -31,7 +31,7 @@ use crate::{
             },
             mesh_config::{
                 MeshAddressing, MeshConfigBuildInput, MeshConfigBuildOptions, RouterPorts,
-                build_mesh_config_plan,
+                build_mesh_config_plan, default_mesh_config_build_options,
             },
             plan::{MeshOptions, MeshPlan, build_mesh_plan, map_program_components},
             ports::placeholder_local_route_ports,
@@ -331,6 +331,7 @@ pub(crate) fn emit_vm_artifact_with_options(
             router_mesh_listen_addr: "127.0.0.1",
             router_control_listen_addr: "127.0.0.1",
             force_router: options.force_router,
+            ..default_mesh_config_build_options()
         },
     })?;
 

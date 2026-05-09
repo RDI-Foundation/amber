@@ -6,13 +6,8 @@ use std::{
 pub mod versioning;
 
 pub const DEV_IMAGE_TAGS_ENV: &str = "AMBER_DEV_IMAGE_TAGS";
-pub const INTERNAL_IMAGE_OVERRIDE_KEYS: &[&str] = &[
-    "router",
-    "helper",
-    "provisioner",
-    "docker_gateway",
-    "site_controller",
-];
+pub const INTERNAL_IMAGE_OVERRIDE_KEYS: &[&str] =
+    &["router", "helper", "provisioner", "site_controller"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ImageRef {

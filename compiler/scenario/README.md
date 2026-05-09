@@ -10,6 +10,11 @@ Data model for the fully linked scenario produced by the compiler.
 - `ScenarioIr`: serde-friendly JSON IR wrapper with schema/version headers and conversions to/from `Scenario`.
 - `ScenarioIrError`: validation errors when loading IR into a `Scenario`.
 
+User-loaded Scenario IR follows the same framework capability ownership rules as manifests:
+component, Docker, and KVM capability providers are framework-owned. User-authored IR should
+represent those sources as framework bindings (`framework.component`, `framework.docker`, or
+`framework.kvm`), not as component `provides` entries.
+
 ## Graph utilities
 - `graph::topo_order`: dependency ordering by non-weak component bindings with cycle detection (framework and external bindings do not introduce component dependencies).
 - `graph::component_path[_for]`: stable path strings for diagnostics.

@@ -30,9 +30,8 @@ use std::{
 };
 
 use amber_images::{
-    AMBER_DOCKER_GATEWAY, AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER, AMBER_SITE_CONTROLLER,
-    DEV_IMAGE_TAGS_ENV, INTERNAL_IMAGE_OVERRIDE_KEYS, ImageRef, override_reference,
-    parse_dev_image_tag_overrides,
+    AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER, AMBER_SITE_CONTROLLER, DEV_IMAGE_TAGS_ENV,
+    INTERNAL_IMAGE_OVERRIDE_KEYS, ImageRef, override_reference, parse_dev_image_tag_overrides,
 };
 use cloud_image_support::default_host_arch_cloud_image_filename;
 use outputs_root_support::cli_test_outputs_root;
@@ -1251,10 +1250,6 @@ pub(crate) fn ensure_amber_internal_images() {
             &images.site_controller,
             &root.join("docker/amber-site-controller/Dockerfile"),
         );
-        ensure_docker_image(
-            &images.docker_gateway,
-            &root.join("docker/amber-docker-gateway/Dockerfile"),
-        );
     });
 }
 
@@ -1271,7 +1266,6 @@ struct AmberInternalImageRefs {
     router: String,
     helper: String,
     provisioner: String,
-    docker_gateway: String,
     site_controller: String,
 }
 
@@ -1288,7 +1282,6 @@ fn amber_internal_image_refs() -> AmberInternalImageRefs {
         router: resolve(&AMBER_ROUTER, "router"),
         helper: resolve(&AMBER_HELPER, "helper"),
         provisioner: resolve(&AMBER_PROVISIONER, "provisioner"),
-        docker_gateway: resolve(&AMBER_DOCKER_GATEWAY, "docker_gateway"),
         site_controller: resolve(&AMBER_SITE_CONTROLLER, "site_controller"),
     }
 }

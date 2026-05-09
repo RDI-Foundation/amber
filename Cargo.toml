@@ -23,6 +23,7 @@ resolver = "2"
 [workspace.dependencies]
 amber-compiler = { path = "compiler" }
 amber-config = { path = "compiler/config" }
+amber-docker-gateway = { path = "runtime/docker-gateway" }
 amber-images = { path = "images" }
 amber-json5 = { path = "compiler/json5" }
 amber-manifest = { path = "compiler/manifest" }

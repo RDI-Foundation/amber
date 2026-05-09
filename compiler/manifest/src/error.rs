@@ -211,6 +211,14 @@ pub enum Error {
         kind: crate::CapabilityKind,
     },
 
+    #[error("provide `{name}` cannot declare framework-owned capability kind `{kind}`")]
+    #[diagnostic(code(manifest::framework_owned_provide_kind), help("{help}"))]
+    FrameworkOwnedProvideKind {
+        name: String,
+        kind: crate::CapabilityKind,
+        help: String,
+    },
+
     #[error("duplicate mount name `{name}`")]
     #[diagnostic(code(manifest::duplicate_mount_name))]
     DuplicateMountName { name: String },

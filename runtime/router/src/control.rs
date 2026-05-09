@@ -24,6 +24,7 @@ pub(super) struct InboundRuntime {
     client: Arc<HttpClient>,
     a2a_url_rewrite_table: Arc<a2a::UrlRewriteTable>,
     dynamic_caps: Option<Arc<DynamicCapsRuntime>>,
+    docker_gateways: DockerGatewayRuntimes,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +159,7 @@ pub async fn run_with_listeners(
     let trust = Arc::new(TrustBundle::new(&config)?);
     let inbound_routes = Arc::new(build_inbound_routes(&config)?);
     validate_outbound_routes(&config)?;
+    let docker_gateways = Arc::new(build_docker_gateway_runtimes(&config)?);
     let a2a_url_rewrite_table = Arc::new(a2a::UrlRewriteTable::from_routes(
         &config.inbound,
         &config.outbound,
@@ -193,6 +195,7 @@ pub async fn run_with_listeners(
                 client: client.clone(),
                 a2a_url_rewrite_table: a2a_url_rewrite_table.clone(),
                 dynamic_caps: dynamic_caps.clone(),
+                docker_gateways: docker_gateways.clone(),
             },
             listeners_by_route.mesh.take(),
         ));
@@ -379,6 +382,7 @@ pub(super) async fn handle_inbound(
         client,
         a2a_url_rewrite_table,
         dynamic_caps,
+        docker_gateways,
     } = state;
     let noise_keys = noise_keys_for_identity(&config.identity)?;
     let mut session = accept_noise(stream, &noise_keys, &trust).await?;
@@ -424,6 +428,24 @@ pub(super) async fn handle_inbound(
                 let target = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
                 proxy_noise_to_plain(&mut session, target).await?;
             }
+        }
+        InboundTarget::DockerGateway { .. } => {
+            if route.protocol != MeshProtocol::Tcp {
+                return Err(RouterError::InvalidConfig(format!(
+                    "docker gateway route {} must use tcp protocol",
+                    route.route_id
+                )));
+            }
+            let gateway = docker_gateways
+                .get(&route.route_id)
+                .cloned()
+                .ok_or_else(|| {
+                    RouterError::InvalidConfig(format!(
+                        "missing docker gateway runtime for route {}",
+                        route.route_id
+                    ))
+                })?;
+            proxy_noise_to_docker_gateway(&mut session, remote_id, gateway).await?;
         }
         InboundTarget::External {
             ref url_env,
@@ -1477,6 +1499,15 @@ pub(super) fn control_protocol(value: &str) -> Result<MeshProtocol, String> {
 pub(super) fn build_inbound_routes(config: &MeshConfig) -> Result<InboundRoutes, RouterError> {
     let mut map = HashMap::new();
     for route in &config.inbound {
+        if matches!(route.target, InboundTarget::DockerGateway { .. })
+            && route.protocol != MeshProtocol::Tcp
+        {
+            return Err(RouterError::InvalidConfig(format!(
+                "inbound route {} targets the docker gateway but uses {} protocol",
+                route.route_id,
+                protocol_string(route.protocol)
+            )));
+        }
         if route.protocol != MeshProtocol::Http && !route.http_plugins.is_empty() {
             return Err(RouterError::InvalidConfig(format!(
                 "inbound route {} has http plugins but uses {} protocol",
@@ -1498,6 +1529,38 @@ pub(super) fn build_inbound_routes(config: &MeshConfig) -> Result<InboundRoutes,
         }
     }
     Ok(map)
+}
+
+pub(super) fn build_docker_gateway_runtimes(
+    config: &MeshConfig,
+) -> Result<HashMap<String, Arc<DockerGatewayRuntime>>, RouterError> {
+    let mut runtimes = HashMap::new();
+    for route in &config.inbound {
+        let InboundTarget::DockerGateway {
+            docker_sock,
+            compose_project_env,
+        } = &route.target
+        else {
+            continue;
+        };
+        let compose_project = env::var(compose_project_env)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                RouterError::InvalidConfig(format!(
+                    "docker gateway route {} requires non-empty {compose_project_env}",
+                    route.route_id
+                ))
+            })?;
+        let runtime = DockerGatewayRuntime::new(DockerGatewayConfig {
+            docker_sock: docker_sock.clone(),
+            compose_project,
+        })
+        .map_err(|err| RouterError::InvalidConfig(err.to_string()))?;
+        runtimes.insert(route.route_id.clone(), Arc::new(runtime));
+    }
+    Ok(runtimes)
 }
 
 pub(super) fn validate_outbound_routes(config: &MeshConfig) -> Result<(), RouterError> {

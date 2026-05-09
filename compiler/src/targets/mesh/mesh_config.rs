@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
-use amber_manifest::NetworkProtocol;
+use amber_manifest::{CapabilityKind, NetworkProtocol};
 use amber_mesh::{
     InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate, MeshPeerTemplate,
     MeshProtocol, OutboundRoute, component_route_id, http_route_plugins_for_capability_kind,
@@ -31,6 +31,13 @@ pub(crate) struct MeshConfigBuildOptions<'a> {
     pub(crate) router_mesh_listen_addr: &'a str,
     pub(crate) router_control_listen_addr: &'a str,
     pub(crate) force_router: bool,
+    pub(crate) docker_gateway: Option<DockerGatewayMeshConfig<'a>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DockerGatewayMeshConfig<'a> {
+    pub(crate) docker_sock: &'a str,
+    pub(crate) compose_project_env: &'a str,
 }
 
 pub(crate) fn default_mesh_config_build_options() -> MeshConfigBuildOptions<'static> {
@@ -41,6 +48,7 @@ pub(crate) fn default_mesh_config_build_options() -> MeshConfigBuildOptions<'sta
         router_mesh_listen_addr: "0.0.0.0",
         router_control_listen_addr: "0.0.0.0",
         force_router: false,
+        docker_gateway: None,
     }
 }
 
@@ -251,6 +259,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             let Some(endpoint) = endpoint else {
                 continue;
             };
+            let capability_kind = provide_decl.decl.kind.as_str();
             let protocol = mesh_protocol(endpoint.protocol)?;
 
             let mut issuers: BTreeSet<String> = BTreeSet::new();
@@ -294,6 +303,24 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 continue;
             }
 
+            let target = if capability_kind == CapabilityKind::Docker.as_str() {
+                let docker_gateway = input.options.docker_gateway.ok_or_else(|| {
+                    MeshError::new(format!(
+                        "mesh config for {}.{} requires docker gateway runtime configuration",
+                        component_label(scenario, id),
+                        provide_name
+                    ))
+                })?;
+                InboundTarget::DockerGateway {
+                    docker_sock: docker_gateway.docker_sock.into(),
+                    compose_project_env: docker_gateway.compose_project_env.to_string(),
+                }
+            } else {
+                InboundTarget::Local {
+                    port: endpoint.port,
+                }
+            };
+
             inbound.push(InboundRoute {
                 route_id: component_route_id(&identity.id, provide_name, protocol),
                 capability: provide_name.clone(),
@@ -304,9 +331,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                     Some(provide_decl.decl.kind.as_str()),
                     protocol,
                 ),
-                target: InboundTarget::Local {
-                    port: endpoint.port,
-                },
+                target,
                 allowed_issuers: issuers.into_iter().collect(),
             });
         }
@@ -329,12 +354,12 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 .expect("provider identity missing")
                 .id
                 .clone();
-            let protocol = mesh_protocol(binding.endpoint.protocol)?;
             let provide_decl = scenario
                 .component(binding.provider)
                 .provides
                 .get(&binding.provide)
                 .expect("binding provide should exist");
+            let protocol = mesh_protocol(binding.endpoint.protocol)?;
             outbound.push(OutboundRoute {
                 route_id: component_route_id(&peer_id, &binding.provide, protocol),
                 rewrite_route_id: None,
@@ -517,12 +542,12 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 .expect("export provider identity missing")
                 .id
                 .clone();
-            let protocol = mesh_protocol(export.endpoint.protocol)?;
             let provide_decl = scenario
                 .component(export.provider)
                 .provides
                 .get(&export.provide)
                 .expect("export provide should exist");
+            let protocol = mesh_protocol(export.endpoint.protocol)?;
             let provider_route_id = component_route_id(&peer_id, &export.provide, protocol);
             inbound.push(InboundRoute {
                 route_id: router_export_route_id(&export.name, protocol),

@@ -396,31 +396,66 @@ fn endpoint_validation_still_rejects_unknown_provide_with_conditional_literal_en
 }
 
 #[test]
-fn docker_capability_kind_parses_for_slots_and_provides() {
+fn framework_owned_capability_kinds_parse_for_slots() {
     let m: Manifest = r#"
         {
           manifest_version: "0.1.0",
-          program: {
-            image: "x",
-            entrypoint: ["x"],
-            network: { endpoints: [ { name: "endpoint", port: 80 } ] }
-          },
           slots: {
-            worker: { kind: "docker" }
+            component: { kind: "component" },
+            docker: { kind: "docker" },
+            kvm: { kind: "kvm", optional: true },
           },
-          provides: {
-            api: { kind: "docker", endpoint: "endpoint" }
-          },
-          exports: { api: "api" },
         }
         "#
     .parse()
     .unwrap();
 
-    let worker = m.slots.get("worker").expect("worker slot");
-    assert_eq!(worker.decl.kind, CapabilityKind::Docker);
+    let component = m.slots.get("component").expect("component slot");
+    assert_eq!(component.decl.kind, CapabilityKind::Component);
 
-    let api = m.provides.get("api").expect("api provide");
-    assert_eq!(api.decl.kind, CapabilityKind::Docker);
-    assert_eq!(api.endpoint.as_deref(), Some("endpoint"));
+    let docker = m.slots.get("docker").expect("docker slot");
+    assert_eq!(docker.decl.kind, CapabilityKind::Docker);
+
+    let kvm = m.slots.get("kvm").expect("kvm slot");
+    assert_eq!(kvm.decl.kind, CapabilityKind::Kvm);
+}
+
+#[test]
+fn framework_owned_capability_kinds_cannot_be_provided_by_manifests() {
+    for (kind, expected) in [
+        ("component", CapabilityKind::Component),
+        ("docker", CapabilityKind::Docker),
+        ("kvm", CapabilityKind::Kvm),
+    ] {
+        let raw = parse_raw(&format!(
+            r#"
+            {{
+              manifest_version: "0.1.0",
+              program: {{
+                image: "x",
+                entrypoint: ["x"],
+                network: {{ endpoints: [ {{ name: "endpoint", port: 80 }} ] }}
+              }},
+              provides: {{
+                api: {{ kind: "{kind}", endpoint: "endpoint" }}
+              }},
+              exports: {{ api: "api" }},
+            }}
+            "#
+        ));
+
+        let err = match raw.validate() {
+            Ok(_) => panic!("{kind} provide should be rejected"),
+            Err(err) => err,
+        };
+        match err {
+            Error::FrameworkOwnedProvideKind {
+                name, kind: actual, ..
+            } => {
+                assert_eq!(name, "api");
+                assert_eq!(actual, expected);
+            }
+            other => panic!("expected FrameworkOwnedProvideKind for {kind}, got: {other}"),
+        }
+    }
 }
