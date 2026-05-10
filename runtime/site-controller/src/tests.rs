@@ -10153,13 +10153,26 @@ volumes:
         command[1].as_str(),
         Some("/amber/site/state/site-controller-plan.json")
     );
+    #[cfg(unix)]
+    {
+        let expected_user = format!("{}:{}", unsafe { libc::getuid() }, unsafe {
+            libc::getgid()
+        });
+        assert_eq!(
+            service
+                .get(serde_yaml::Value::String("user".to_string()))
+                .and_then(serde_yaml::Value::as_str),
+            Some(expected_user.as_str()),
+            "compose site controller should run as the launching user so its host bind-mounted \
+             state directory can stay private"
+        );
+    }
+    #[cfg(not(unix))]
     assert_eq!(
         service
             .get(serde_yaml::Value::String("user".to_string()))
             .and_then(serde_yaml::Value::as_str),
-        Some("0:0"),
-        "compose site controller must stay root so it can access the router-control volume, which \
-         compose initializes as a root-owned mount point for the router runtime"
+        Some("0:0")
     );
     let volumes = service
         .get(serde_yaml::Value::String("volumes".to_string()))
@@ -10208,8 +10221,8 @@ volumes:
         group_add
             .iter()
             .any(|value| value.as_str() == Some("65532")),
-        "compose site controller runs with dropped capabilities, so it needs the router runtime \
-         group to access the router-control socket"
+        "compose site controller runs as the launching user, so it needs the router runtime group \
+         to access the router-control socket"
     );
     assert!(
         extra_hosts
@@ -10400,7 +10413,8 @@ spec:
 
     let kustomization = fs::read_to_string(artifact_root.join("kustomization.yaml"))
         .expect("kustomization should read");
-    assert!(kustomization.contains("01-configmaps/amber-site-controller-seed.yaml"));
+    assert!(kustomization.contains("01-secrets/amber-site-controller-seed.yaml"));
+    assert!(kustomization.contains("03-persistentvolumeclaims/amber-site-controller-state.yaml"));
     assert!(kustomization.contains("03-deployments/amber-site-controller.yaml"));
     assert!(kustomization.contains("04-services/amber-site-controller.yaml"));
 
@@ -10458,9 +10472,10 @@ spec:
         Some("/amber/site/state/site-controller-plan.json")
     );
 
-    let seed =
-        fs::read_to_string(artifact_root.join("01-configmaps/amber-site-controller-seed.yaml"))
-            .expect("seed configmap should read");
+    let seed = fs::read_to_string(artifact_root.join("01-secrets/amber-site-controller-seed.yaml"))
+        .expect("seed secret should read");
+    assert!(seed.contains("kind: Secret"));
+    assert!(seed.contains("stringData:"));
     assert!(seed.contains("site-controller-plan.json"));
     assert!(
         !seed.contains("artifact.tar.b64"),
@@ -10469,6 +10484,14 @@ spec:
     assert!(
         deployment_raw.contains("cp -R /amber/seed/artifact/. /amber/site/artifact"),
         "kubernetes controller bootstrap should copy seeded artifact files directly"
+    );
+    assert!(
+        deployment_raw.contains("seed_if_missing"),
+        "kubernetes controller bootstrap should not overwrite mutable state on pod recreation"
+    );
+    assert!(
+        deployment_raw.contains("persistentVolumeClaim"),
+        "kubernetes controller state should be backed by a PVC"
     );
     assert!(seed.contains(&format!("http://amber-site-controller:{controller_port}")));
     assert!(deployment_raw.contains("EXISTING_ENV"));

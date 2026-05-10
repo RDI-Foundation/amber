@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 use std::{fs, path::Path};
 
 use serde_json::json;
@@ -9,7 +11,7 @@ const COMPOSE_ROUTER_SERVICE_NAME: &str = "amber-router";
 const COMPOSE_ROUTER_CONTROL_INIT_SERVICE_NAME: &str = "amber-router-control-init";
 const COMPOSE_ROUTER_CONTROL_SOCKET_DIR: &str = "/amber/control";
 const COMPOSE_ROUTER_CONTROL_VOLUME_NAME: &str = "amber-router-control";
-const COMPOSE_ROUTER_RUNTIME_GID: &str = "65532";
+const COMPOSE_ROUTER_RUNTIME_GID: u32 = 65532;
 const DOCKER_SOCK_PATH: &str = "/var/run/docker.sock";
 const COMPOSE_CONTROLLER_PLAN_PATH: &str = "/amber/site/state/site-controller-plan.json";
 
@@ -28,6 +30,50 @@ fn uses_service_network_mode(service: &serde_yaml::Mapping) -> bool {
         .get(yaml_string("network_mode"))
         .and_then(serde_yaml::Value::as_str)
         .is_some_and(|mode| mode.starts_with("service:"))
+}
+
+fn compose_controller_user() -> String {
+    #[cfg(unix)]
+    {
+        format!("{}:{}", unsafe { libc::getuid() }, unsafe {
+            libc::getgid()
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        "0:0".to_string()
+    }
+}
+
+#[cfg(unix)]
+fn compose_controller_group_add() -> Vec<String> {
+    compose_controller_group_add_for(
+        unsafe { libc::getgid() },
+        fs::metadata(DOCKER_SOCK_PATH)
+            .ok()
+            .map(|metadata| metadata.gid()),
+    )
+}
+
+#[cfg(unix)]
+fn compose_controller_group_add_for(
+    runtime_gid: u32,
+    docker_socket_gid: Option<u32>,
+) -> Vec<String> {
+    let mut groups = vec![COMPOSE_ROUTER_RUNTIME_GID];
+    if let Some(docker_socket_gid) = docker_socket_gid
+        && docker_socket_gid != runtime_gid
+        && !groups.contains(&docker_socket_gid)
+    {
+        groups.push(docker_socket_gid);
+    }
+    groups.into_iter().map(|gid| gid.to_string()).collect()
+}
+
+#[cfg(not(unix))]
+fn compose_controller_group_add() -> Vec<String> {
+    vec![COMPOSE_ROUTER_RUNTIME_GID.to_string()]
 }
 
 fn ensure_controller_environment(
@@ -174,10 +220,15 @@ pub fn inject_compose_site_controller_with_mount_sources(
         })?;
 
     service.insert(yaml_string("image"), yaml_string(controller_image));
-    service.insert(yaml_string("user"), yaml_string("0:0"));
+    service.insert(yaml_string("user"), yaml_string(&compose_controller_user()));
     service.insert(
         yaml_string("group_add"),
-        serde_yaml::Value::Sequence(vec![yaml_string(COMPOSE_ROUTER_RUNTIME_GID)]),
+        serde_yaml::Value::Sequence(
+            compose_controller_group_add()
+                .into_iter()
+                .map(|gid| yaml_string(&gid))
+                .collect(),
+        ),
     );
     service.insert(
         yaml_string("healthcheck"),
@@ -248,6 +299,26 @@ mod tests {
     use amber_compiler::run_plan::SiteKind;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_controller_groups_include_router_and_docker_socket_groups() {
+        assert_eq!(
+            compose_controller_group_add_for(1000, Some(1000)),
+            vec!["65532"],
+            "the controller already has its primary runtime group"
+        );
+        assert_eq!(
+            compose_controller_group_add_for(1000, Some(998)),
+            vec!["65532", "998"],
+            "the controller should join the Docker socket group without becoming root"
+        );
+        assert_eq!(
+            compose_controller_group_add_for(1000, Some(COMPOSE_ROUTER_RUNTIME_GID)),
+            vec!["65532"],
+            "router runtime group should not be duplicated"
+        );
+    }
 
     fn test_plan(run_root: &Path) -> SiteControllerPlan {
         SiteControllerPlan {

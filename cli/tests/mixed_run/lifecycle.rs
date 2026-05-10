@@ -665,3 +665,146 @@ fn mixed_run_recovers_when_kubernetes_site_is_temporarily_unreachable() {
     stop_proxy(&mut proxy);
     run.stop();
 }
+
+#[test]
+#[ignore = "requires docker + kind + kubectl; run manually or in CI"]
+fn mixed_run_kubernetes_site_controller_state_survives_pod_recreation() {
+    let temp = temp_output_dir("mixed-run-kind-controller-pvc-");
+    let kubeconfig = temp.path().join("kubeconfig");
+    let kind_cluster = KindCluster::from_env_or_create(&kubeconfig);
+    ensure_kind_internal_images(&kind_cluster);
+    let kubeconfig_env = kind_cluster.kubeconfig.display().to_string();
+    let fixture = write_single_site_kind_fixture(temp.path(), &kind_cluster);
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest_with_env(
+        &fixture.manifest,
+        &fixture.placement,
+        &storage_root,
+        &[("KUBECONFIG", &kubeconfig_env)],
+    );
+
+    let kind_state = wait_for_state_status(
+        &run.run_root,
+        "kind_local",
+        "running",
+        Duration::from_secs(120),
+    );
+    let namespace = kind_state["kubernetes_namespace"]
+        .as_str()
+        .expect("kubernetes site should publish namespace");
+    let pod = kubernetes_site_controller_pod_name(&kind_state, namespace);
+
+    let pvc_phase = kubectl_for_manager_state(&kind_state)
+        .arg("-n")
+        .arg(namespace)
+        .arg("get")
+        .arg("pvc")
+        .arg("amber-site-controller-state")
+        .arg("-o")
+        .arg("jsonpath={.status.phase}")
+        .output()
+        .expect("failed to query site-controller state PVC");
+    assert!(
+        pvc_phase.status.success(),
+        "failed to query site-controller state PVC:\n{}",
+        String::from_utf8_lossy(&pvc_phase.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&pvc_phase.stdout).trim(),
+        "Bound",
+        "running kubernetes site-controller should have a bound state PVC"
+    );
+
+    let secret_status = kubectl_for_manager_state(&kind_state)
+        .arg("-n")
+        .arg(namespace)
+        .arg("get")
+        .arg("secret")
+        .arg("amber-site-controller-seed")
+        .status()
+        .expect("failed to query site-controller seed Secret");
+    assert!(
+        secret_status.success(),
+        "kubernetes site-controller seed should be stored as a Secret"
+    );
+
+    let sentinel_path = "/amber/site/state/pvc-restart-sentinel";
+    let write_status = kubectl_for_manager_state(&kind_state)
+        .arg("-n")
+        .arg(namespace)
+        .arg("exec")
+        .arg(&pod)
+        .arg("-c")
+        .arg(KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER)
+        .arg("--")
+        .arg("sh")
+        .arg("-lc")
+        .arg(format!("printf preserved > {sentinel_path}"))
+        .status()
+        .expect("failed to write state sentinel in site-controller pod");
+    assert!(write_status.success(), "failed to write state sentinel");
+
+    let delete_status = kubectl_for_manager_state(&kind_state)
+        .arg("-n")
+        .arg(namespace)
+        .arg("delete")
+        .arg("pod")
+        .arg(&pod)
+        .arg("--wait=true")
+        .status()
+        .expect("failed to delete site-controller pod");
+    assert!(
+        delete_status.success(),
+        "failed to delete site-controller pod"
+    );
+
+    let mut replacement_ready = false;
+    for _ in 0..240 {
+        let status = kubectl_for_manager_state(&kind_state)
+            .arg("-n")
+            .arg(namespace)
+            .arg("wait")
+            .arg("pod")
+            .arg("-l")
+            .arg("amber.io/component=amber-site-controller")
+            .arg("--for=condition=Ready")
+            .arg("--timeout=1s")
+            .status()
+            .expect("failed to wait for replacement site-controller pod");
+        if status.success() {
+            replacement_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        replacement_ready,
+        "replacement site-controller pod did not become ready"
+    );
+
+    let replacement_pod = kubernetes_site_controller_pod_name(&kind_state, namespace);
+    assert_ne!(
+        replacement_pod, pod,
+        "deployment should recreate the site-controller pod after deletion"
+    );
+    let sentinel = kubectl_for_manager_state(&kind_state)
+        .arg("-n")
+        .arg(namespace)
+        .arg("exec")
+        .arg(&replacement_pod)
+        .arg("-c")
+        .arg(KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER)
+        .arg("--")
+        .arg("cat")
+        .arg(sentinel_path)
+        .output()
+        .expect("failed to read state sentinel after pod recreation");
+    assert!(
+        sentinel.status.success(),
+        "state sentinel missing after pod recreation:\n{}",
+        String::from_utf8_lossy(&sentinel.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&sentinel.stdout), "preserved");
+
+    run.stop();
+}

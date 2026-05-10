@@ -139,7 +139,7 @@ ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 const TEST_APP_SOURCE_IMAGE: &str = "python:3.13-alpine";
 const TEST_APP_LOCAL_IMAGE_REPOSITORY: &str = "amber-mixed-run-test-app";
-const KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER: &str = "main";
+pub(crate) const KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER: &str = "main";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DockerImageMeta {
@@ -1795,7 +1795,10 @@ fn materialize_kubernetes_control_state(manager_state: &Value, state_path: &Path
     });
 }
 
-fn kubernetes_site_controller_pod_name(manager_state: &Value, namespace: &str) -> String {
+pub(crate) fn kubernetes_site_controller_pod_name(
+    manager_state: &Value,
+    namespace: &str,
+) -> String {
     let mut command = kubectl_for_manager_state(manager_state);
     let output = command
         .arg("-n")
@@ -1823,7 +1826,7 @@ fn kubernetes_site_controller_pod_name(manager_state: &Value, namespace: &str) -
     pod
 }
 
-fn kubectl_for_manager_state(manager_state: &Value) -> Command {
+pub(crate) fn kubectl_for_manager_state(manager_state: &Value) -> Command {
     let mut command = Command::new("kubectl");
     if let Some(kubeconfig) = env::var_os("AMBER_TEST_KIND_KUBECONFIG") {
         command.env("KUBECONFIG", kubeconfig);

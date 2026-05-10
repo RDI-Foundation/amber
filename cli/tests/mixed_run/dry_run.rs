@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 
 use amber_compiler::run_plan::FrameworkComponentControllerMoniker;
 
@@ -177,6 +179,42 @@ fn mixed_run_dry_run_emits_launch_bundle_without_starting_sites() {
             .is_empty(),
         "dry-run should record compose launch commands"
     );
+    #[cfg(unix)]
+    {
+        let compose_state_mode = fs::metadata(bundle_root.join("state").join("compose_local"))
+            .expect("compose site state root should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            compose_state_mode, 0o700,
+            "compose controller state should be private in the materialized launch bundle"
+        );
+
+        let compose_yaml_path = Path::new(
+            compose_site["artifact_dir"]
+                .as_str()
+                .expect("launch bundle should record compose artifact dir"),
+        )
+        .join("compose.yaml");
+        let compose_yaml: serde_yaml::Value = serde_yaml::from_str(
+            &fs::read_to_string(&compose_yaml_path).expect("compose yaml should read"),
+        )
+        .expect("compose yaml should parse");
+        let controller = compose_yaml["services"]["amber-site-controller"]
+            .as_mapping()
+            .expect("compose yaml should include the site controller service");
+        let expected_user = format!("{}:{}", unsafe { libc::getuid() }, unsafe {
+            libc::getgid()
+        });
+        assert_eq!(
+            controller
+                .get(serde_yaml::Value::String("user".to_string()))
+                .and_then(serde_yaml::Value::as_str),
+            Some(expected_user.as_str()),
+            "compose site controller should run as the launching user"
+        );
+    }
     let stitching = launch_bundle["stitching"]
         .as_array()
         .expect("launch bundle stitching should serialize as an array");

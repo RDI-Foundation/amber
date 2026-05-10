@@ -145,12 +145,12 @@ pub(crate) fn prepare_site_state_root(site_state_root: &Path, kind: SiteKind) ->
                 )
             })?
             .permissions();
-        permissions.set_mode(0o777);
+        permissions.set_mode(0o700);
         fs::set_permissions(site_state_root, permissions)
             .into_diagnostic()
             .wrap_err_with(|| {
                 format!(
-                    "failed to make compose site state directory writable {}",
+                    "failed to restrict compose site state directory {}",
                     site_state_root.display()
                 )
             })?;

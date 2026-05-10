@@ -38,7 +38,7 @@ fn site_state_paths_are_site_scoped() {
 
 #[cfg(unix)]
 #[test]
-fn compose_site_state_root_is_writable_by_container_uid_mappings() {
+fn compose_site_state_root_is_private_to_the_launching_user() {
     let temp = TempDir::new().expect("temp dir should create");
     let site_state_root = temp.path().join("state").join("compose-local");
 
@@ -51,9 +51,9 @@ fn compose_site_state_root_is_writable_by_container_uid_mappings() {
         .mode()
         & 0o777;
     assert_eq!(
-        mode, 0o777,
-        "compose site controllers run in Docker and must be able to persist state through Linux \
-         bind mounts even when the daemon remaps container uid 0"
+        mode, 0o700,
+        "compose site controller state contains control-plane data and must not be writable by \
+         unrelated local users"
     );
 }
 
