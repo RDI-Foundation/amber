@@ -713,8 +713,6 @@ fn materialize_standalone_site_controller_export(
     );
     let local_router_control =
         crate::mixed_run::site_controller_local_router_control(export.kind, &artifact_root);
-    let control_state_auth_token =
-        standalone_control_state_auth_token(&run_plan.mesh_scope, run_id, "site-controller");
     let router_mesh_port = Some(24000);
     if let Some(port) = router_mesh_port
         && export.kind == SiteKind::Compose
@@ -747,7 +745,6 @@ fn materialize_standalone_site_controller_export(
         &plan_state_root,
         &plan_site_state_root,
         &plan_artifact_root,
-        &control_state_auth_token,
         controller_identity_path.as_deref(),
         None,
         None,
@@ -804,17 +801,6 @@ fn compose_mount_source_relative_to_artifact(artifact_root: &Path, path: &Path) 
         .collect::<Vec<_>>()
         .join("/");
     Ok(format!("./{relative}"))
-}
-
-fn standalone_control_state_auth_token(mesh_scope: &str, run_id: &str, purpose: &str) -> String {
-    base64::engine::general_purpose::STANDARD.encode(
-        amber_mesh::MeshIdentity::derive(
-            format!("/framework/{purpose}"),
-            Some(mesh_scope.to_string()),
-            &format!("standalone-control-state:{run_id}"),
-        )
-        .public_key,
-    )
 }
 
 fn standalone_controller_temp_state_root(site_id: &str) -> Result<PathBuf> {

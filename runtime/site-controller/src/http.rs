@@ -8,25 +8,10 @@ use std::{
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    orchestration::ProtocolApiError, planner::ControlStateApp, state::CONTROL_STATE_AUTH_HEADER, *,
-};
+use super::{orchestration::ProtocolApiError, planner::ControlStateApp, *};
 
 pub(super) async fn cleanup_dynamic_bridge_proxies(app: &ControlStateApp) -> Result<()> {
     app.runtime.cleanup().await
-}
-
-pub(super) fn authorize_control_state_auth_header(
-    headers: &HeaderMap,
-    expected: &str,
-) -> std::result::Result<(), ProtocolApiError> {
-    let actual = required_header(headers, CONTROL_STATE_AUTH_HEADER)?;
-    if actual != expected {
-        return Err(ProtocolApiError::unauthorized(
-            "invalid authenticated control-state request header",
-        ));
-    }
-    Ok(())
 }
 
 pub(super) fn required_header(

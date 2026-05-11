@@ -75,7 +75,6 @@ pub(crate) async fn run_site_controller(
         run_root: PathBuf::from(&plan.run_root),
         state_root: PathBuf::from(&plan.state_root),
         mesh_scope: Arc::<str>::from(plan.mesh_scope.clone()),
-        control_state_auth_token: Arc::<str>::from(plan.control_state_auth_token.clone()),
         controller_plan: Arc::new(plan.clone()),
         authority_locks: Arc::new(Mutex::new(BTreeMap::new())),
         runtime,
@@ -489,6 +488,32 @@ pub(super) async fn authorize_dynamic_caps_request(
     }
     authorize_remote_controller_request(app, headers).await?;
     Ok(DynamicCapsRequestAuth::RemoteController)
+}
+
+pub(super) async fn authorize_dynamic_caps_mcp_session_request(
+    app: &SiteControllerApp,
+    headers: &HeaderMap,
+) -> std::result::Result<(), ProtocolApiError> {
+    let _route_id = required_header(headers, FRAMEWORK_ROUTE_ID_HEADER)?;
+    let peer_id = required_header(headers, FRAMEWORK_PEER_ID_HEADER)?;
+    if authorize_remote_controller_request(app, headers)
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    let component_id = dynamic_caps::logical_component_id(&peer_id);
+    let state = app.control.control_state.lock().await.clone();
+    if !dynamic_caps::live_component_ids(&state)
+        .map_err(ProtocolApiError::from)?
+        .contains(&component_id)
+    {
+        return Err(ProtocolApiError::unauthorized(format!(
+            "dynamic capability MCP request came from non-component peer `{peer_id}`"
+        )));
+    }
+    authorize_dynamic_caps_sidecar_request(headers, &component_id)
 }
 
 fn ensure_controller_ready(app: &SiteControllerApp) -> std::result::Result<(), ProtocolApiError> {

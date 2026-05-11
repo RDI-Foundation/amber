@@ -935,7 +935,6 @@ mod tests {
             state_root: root.join("state-root").display().to_string(),
             site_state_root: root.join("site-state").display().to_string(),
             artifact_dir: root.join("artifact").display().to_string(),
-            control_state_auth_token: "token".to_string(),
             controller_identity_path: None,
             storage_root: None,
             runtime_root: None,

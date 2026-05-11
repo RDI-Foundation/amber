@@ -3550,7 +3550,6 @@ pub(super) struct ControlStateApp {
     pub(super) run_root: PathBuf,
     pub(super) state_root: PathBuf,
     pub(super) mesh_scope: Arc<str>,
-    pub(super) control_state_auth_token: Arc<str>,
     pub(super) controller_plan: Arc<SiteControllerPlan>,
     pub(super) authority_locks: Arc<Mutex<BTreeMap<usize, Arc<Mutex<()>>>>>,
     pub(super) runtime: SharedSiteControllerRuntime,

@@ -213,10 +213,6 @@ pub(super) fn materialize_launch_bundle(
     write_json(&run_plan_path, run_plan)?;
     let site_controller_image = site_controller_image_reference()?;
 
-    let control_state_auth_token = amber_site_controller::generate_control_state_auth_token(
-        &run_plan.mesh_scope,
-        "site-controller",
-    );
     let observability =
         materialize_observability(bundle_root, run_id, &run_plan.mesh_scope, observability)?;
     let observability_endpoint = observability
@@ -460,7 +456,6 @@ pub(super) fn materialize_launch_bundle(
                 &state_root,
                 &site.site_state_root,
                 &site.artifact_dir,
-                &control_state_auth_token,
                 site_controller_identity_path(
                     site.site_plan.site.kind,
                     &site.artifact_dir,

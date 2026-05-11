@@ -8,7 +8,6 @@ pub(super) const SITE_CONTROLLER_PLAN_VERSION: u32 = 1;
 pub(super) const SITE_CONTROLLER_STATE_PATH: &str = "/v1/controller/state";
 pub(super) const FRAMEWORK_ROUTE_ID_HEADER: &str = "x-amber-route-id";
 pub(super) const FRAMEWORK_PEER_ID_HEADER: &str = "x-amber-peer-id";
-pub(super) const CONTROL_STATE_AUTH_HEADER: &str = "x-amber-control-state-auth";
 pub const SITE_CONTROLLER_INTERNAL_CAPABILITY: &str =
     amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME;
 pub const SITE_CONTROLLER_SERVICE_NAME: &str = "amber-site-controller";
@@ -274,7 +273,6 @@ pub struct SiteControllerPlan {
     pub state_root: String,
     pub site_state_root: String,
     pub artifact_dir: String,
-    pub control_state_auth_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller_identity_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1062,16 +1060,6 @@ fn remap_output_handle_for_snapshot(
     })
 }
 
-pub fn generate_control_state_auth_token(mesh_scope: &str, purpose: &str) -> String {
-    base64::engine::general_purpose::STANDARD.encode(
-        MeshIdentity::generate(
-            format!("/framework/{purpose}"),
-            Some(mesh_scope.to_string()),
-        )
-        .public_key,
-    )
-}
-
 pub fn authority_url_for_listen_addr(listen_addr: SocketAddr) -> String {
     let dial_addr = if listen_addr.ip().is_unspecified() {
         SocketAddr::from(([127, 0, 0, 1], listen_addr.port()))
@@ -1238,7 +1226,6 @@ pub fn write_site_controller_plan(
     state_root: &Path,
     site_state_root: &Path,
     artifact_dir: &Path,
-    control_state_auth_token: &str,
     controller_identity_path: Option<&str>,
     storage_root: Option<&str>,
     runtime_root: Option<&str>,
@@ -1272,7 +1259,6 @@ pub fn write_site_controller_plan(
         state_root: state_root.display().to_string(),
         site_state_root: site_state_root.display().to_string(),
         artifact_dir: artifact_dir.display().to_string(),
-        control_state_auth_token: control_state_auth_token.to_string(),
         controller_identity_path: controller_identity_path.map(str::to_string),
         storage_root: storage_root.map(str::to_string),
         runtime_root: runtime_root.map(str::to_string),

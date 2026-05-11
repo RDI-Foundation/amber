@@ -836,7 +836,6 @@ fn with_runtime(app: &ControlStateApp, runtime: SharedSiteControllerRuntime) -> 
         run_root: app.run_root.clone(),
         state_root: app.state_root.clone(),
         mesh_scope: app.mesh_scope.clone(),
-        control_state_auth_token: app.control_state_auth_token.clone(),
         controller_plan: app.controller_plan.clone(),
         authority_locks: app.authority_locks.clone(),
         runtime,
@@ -2723,7 +2722,6 @@ fn test_control_state_app(
         run_root: run_root.clone(),
         state_root: state_root.clone(),
         mesh_scope: Arc::<str>::from("test-mesh"),
-        control_state_auth_token: Arc::<str>::from("test-control-state-auth"),
         controller_plan: Arc::new(SiteControllerPlan {
             schema: "amber.framework_component.site_controller_plan".to_string(),
             version: 1,
@@ -2746,7 +2744,6 @@ fn test_control_state_app(
             state_root: state_root.display().to_string(),
             site_state_root: site_state_root.display().to_string(),
             artifact_dir: artifact_dir.display().to_string(),
-            control_state_auth_token: "test-control-state-auth".to_string(),
             controller_identity_path: None,
             storage_root: Some(storage_root.display().to_string()),
             runtime_root: Some(runtime_root.display().to_string()),
@@ -2780,6 +2777,10 @@ fn sse_json_rpc_message(body: &str) -> Value {
         .unwrap_or_else(|| panic!("SSE response did not contain JSON-RPC data: {body}"));
     serde_json::from_str(&payload)
         .unwrap_or_else(|err| panic!("parse JSON-RPC payload from SSE: {err}; {payload}"))
+}
+
+fn json_rpc_message(body: &str) -> Value {
+    serde_json::from_str(body).unwrap_or_else(|_| sse_json_rpc_message(body))
 }
 
 async fn spawn_test_router(router: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -2939,7 +2940,6 @@ fn with_controller_endpoint(
         run_root: app.run_root.clone(),
         state_root: app.state_root.clone(),
         mesh_scope: app.mesh_scope.clone(),
-        control_state_auth_token: app.control_state_auth_token.clone(),
         controller_plan: Arc::new(controller_plan),
         authority_locks: app.authority_locks.clone(),
         runtime: app.runtime.clone(),
@@ -3202,37 +3202,8 @@ impl TestMcpClient {
         headers: Vec<(String, String)>,
     ) -> Self {
         let client = Client::new();
-        let initialize = json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": client_name,
-                    "version": "0.0.0",
-                },
-            },
-        });
-        let response = with_test_timeout(
-            format!("MCP initialize request to {endpoint}"),
-            apply_headers(client.post(endpoint), &headers)
-                .header("content-type", "application/json")
-                .header("accept", "application/json, text/event-stream")
-                .json(&initialize)
-                .send(),
-        )
-        .await
-        .expect("send initialize request");
-        let status = response.status();
-        let response_headers = response.headers().clone();
-        let body = with_test_timeout(
-            format!("read MCP initialize response from {endpoint}"),
-            response.text(),
-        )
-        .await
-        .expect("read initialize response");
+        let (status, response_headers, payload, body) =
+            Self::initialize_response(&client, endpoint, client_name, &headers).await;
         assert_eq!(status, StatusCode::OK, "initialize failed: {body}");
         let session_id = response_headers
             .get("mcp-session-id")
@@ -3240,7 +3211,6 @@ impl TestMcpClient {
             .to_str()
             .expect("session ID should be valid UTF-8")
             .to_string();
-        let payload = sse_json_rpc_message(&body);
         assert!(
             payload.get("error").is_none(),
             "initialize returned error: {payload:#?}"
@@ -3273,6 +3243,47 @@ impl TestMcpClient {
             headers,
             next_id: 1,
         }
+    }
+
+    async fn initialize_response(
+        client: &Client,
+        endpoint: &str,
+        client_name: &str,
+        headers: &[(String, String)],
+    ) -> (StatusCode, HeaderMap, Value, String) {
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": client_name,
+                    "version": "0.0.0",
+                },
+            },
+        });
+        let response = with_test_timeout(
+            format!("MCP initialize request to {endpoint}"),
+            apply_headers(client.post(endpoint), headers)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .json(&initialize)
+                .send(),
+        )
+        .await
+        .expect("send initialize request");
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let body = with_test_timeout(
+            format!("read MCP initialize response from {endpoint}"),
+            response.text(),
+        )
+        .await
+        .expect("read initialize response");
+        let payload = json_rpc_message(&body);
+        (status, response_headers, payload, body)
     }
 
     async fn tools_list(&mut self) -> Vec<Value> {
@@ -3329,7 +3340,35 @@ impl TestMcpClient {
         .unwrap_or_else(|err| panic!("deserialize tool result for {name}: {err}; {result:#?}"))
     }
 
+    async fn call_tool_error(&mut self, name: &str, arguments: Value) -> Value {
+        let payload = self
+            .request_payload(
+                "tools/call",
+                json!({
+                    "name": name,
+                    "arguments": arguments,
+                }),
+            )
+            .await;
+        payload
+            .get("error")
+            .cloned()
+            .unwrap_or_else(|| panic!("tool {name} unexpectedly succeeded: {payload:#?}"))
+    }
+
     async fn request(&mut self, method: &str, params: Value) -> Value {
+        let payload = self.request_payload(method, params).await;
+        assert!(
+            payload.get("error").is_none(),
+            "MCP request {method} returned error: {payload:#?}"
+        );
+        payload
+            .get("result")
+            .cloned()
+            .expect("MCP response should include result")
+    }
+
+    async fn request_payload(&mut self, method: &str, params: Value) -> Value {
         let id = self.next_id;
         self.next_id += 1;
         let response = apply_headers(
@@ -3367,14 +3406,7 @@ impl TestMcpClient {
         );
         let payload = sse_json_rpc_message(&body);
         assert_eq!(payload["id"].as_u64(), Some(id));
-        assert!(
-            payload.get("error").is_none(),
-            "MCP request {method} returned error: {payload:#?}"
-        );
         payload
-            .get("result")
-            .cloned()
-            .expect("MCP response should include result")
     }
 }
 
@@ -3689,7 +3721,6 @@ async fn framework_component_rejects_stale_nonlocal_controller_delivery() {
             run_root: app.run_root.clone(),
             state_root: app.state_root.clone(),
             mesh_scope: app.mesh_scope.clone(),
-            control_state_auth_token: app.control_state_auth_token.clone(),
             controller_plan: Arc::new(controller_plan),
             authority_locks: app.authority_locks.clone(),
             runtime: app.runtime.clone(),
@@ -3973,7 +4004,7 @@ struct DynamicCapsMcpHarness {
     _dir: TempDir,
     client: Client,
     base_url: String,
-    control_state_auth_token: String,
+    controller_route_id: String,
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -3993,6 +4024,25 @@ impl DynamicCapsMcpHarness {
             &base_url,
             listen_addr,
         );
+        let controller_route_id = {
+            let state = app.control_state.lock().await;
+            let scenario = Scenario::try_from(state.base_scenario.clone()).expect("base scenario");
+            let controller = scenario
+                .components_iter()
+                .find(|(_, component)| {
+                    amber_compiler::run_plan::framework_component_controller_metadata(
+                        component.metadata.as_ref(),
+                    )
+                    .is_some_and(|metadata| metadata.execution_site == app.controller_plan.site_id)
+                })
+                .map(|(_, component)| component)
+                .expect("site controller component should be injected");
+            amber_mesh::component_route_id(
+                controller.moniker.as_str(),
+                amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+                amber_mesh::MeshProtocol::Http,
+            )
+        };
         let mut handles = vec![install_dynamic_caps_origin_fixture(&app).await];
         let controller_app = SiteControllerApp {
             control: app,
@@ -4010,16 +4060,22 @@ impl DynamicCapsMcpHarness {
             _dir: dir,
             client: Client::new(),
             base_url,
-            control_state_auth_token: "test-control-state-auth".to_string(),
+            controller_route_id,
             handles,
         }
     }
 
-    fn mcp_headers(&self) -> Vec<(String, String)> {
-        vec![(
-            CONTROL_STATE_AUTH_HEADER.to_string(),
-            self.control_state_auth_token.clone(),
-        )]
+    fn dynamic_caps_headers_for_component(&self, component_id: &str) -> Vec<(String, String)> {
+        let peer_id = dynamic_caps::moniker_from_logical_component_id(component_id)
+            .expect("logical component id should map to a moniker")
+            .to_string();
+        vec![
+            (
+                FRAMEWORK_ROUTE_ID_HEADER.to_string(),
+                self.controller_route_id.clone(),
+            ),
+            (FRAMEWORK_PEER_ID_HEADER.to_string(), peer_id),
+        ]
     }
 
     fn dynamic_caps_http_headers<Req: Serialize>(&self, body: &Req) -> Vec<(String, String)> {
@@ -4029,27 +4085,36 @@ impl DynamicCapsMcpHarness {
             .or_else(|| body.get("caller_component_id"))
             .and_then(Value::as_str)
             .expect("dynamic caps control requests should identify the caller component");
-        let peer_id = dynamic_caps::moniker_from_logical_component_id(component_id)
-            .expect("logical component id should map to a moniker")
-            .to_string();
-        let route_id = amber_mesh::component_route_id(
-            peer_id.as_str(),
-            amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
-            amber_mesh::MeshProtocol::Http,
-        );
-        vec![
-            (FRAMEWORK_ROUTE_ID_HEADER.to_string(), route_id),
-            (FRAMEWORK_PEER_ID_HEADER.to_string(), peer_id),
-        ]
+        self.dynamic_caps_headers_for_component(component_id)
     }
 
-    async fn connect(&self) -> TestMcpClient {
+    async fn connect_as(&self, component_id: &str) -> TestMcpClient {
         TestMcpClient::connect_endpoint(
             &format!("{}/v1/controller/dynamic-caps/mcp", self.base_url),
             "framework-dynamic-caps-test",
-            self.mcp_headers(),
+            self.dynamic_caps_headers_for_component(component_id),
         )
         .await
+    }
+
+    async fn connect(&self) -> TestMcpClient {
+        self.connect_as("components./alice").await
+    }
+
+    async fn initialize_with_headers(&self, headers: Vec<(String, String)>) -> (StatusCode, Value) {
+        let client = Client::new();
+        let (status, _response_headers, payload, body) = TestMcpClient::initialize_response(
+            &client,
+            &format!("{}/v1/controller/dynamic-caps/mcp", self.base_url),
+            "framework-dynamic-caps-test",
+            &headers,
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "initialize returned transport failure {status}: {body}"
+        );
+        (status, payload)
     }
 
     async fn post_json<Req: Serialize, T: DeserializeOwned>(&self, path: &str, body: &Req) -> T {
@@ -4891,10 +4956,62 @@ async fn dynamic_caps_mcp_discovers_compact_surface() {
 }
 
 #[tokio::test]
+async fn dynamic_caps_mcp_rejects_control_state_auth_without_route_identity() {
+    let harness = DynamicCapsMcpHarness::start().await;
+    let (_status, payload) = harness
+        .initialize_with_headers(vec![(
+            "x-amber-control-state-auth".to_string(),
+            "test-control-state-auth".to_string(),
+        )])
+        .await;
+
+    let error = payload
+        .get("error")
+        .unwrap_or_else(|| panic!("initialize unexpectedly succeeded: {payload:#?}"));
+    assert!(
+        error.to_string().contains(FRAMEWORK_ROUTE_ID_HEADER),
+        "dynamic-caps MCP must require router-injected route identity, got {error:#?}"
+    );
+}
+
+#[tokio::test]
+async fn dynamic_caps_mcp_rejects_tool_calls_for_a_different_component_identity() {
+    let harness = DynamicCapsMcpHarness::start().await;
+    let mut alice_mcp = harness.connect_as("components./alice").await;
+
+    let error = alice_mcp
+        .call_tool_error(
+            "amber.v1.framework_dynamic_caps.inspect",
+            json!({
+                "op": "held_list",
+                "holder_component_id": "components./carol",
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        error
+            .get("data")
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str),
+        Some("unauthorized"),
+        "dynamic-caps MCP must reject cross-component tool arguments, got {error:#?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("unknown framework capability instance")
+            || error.to_string().contains("components./carol"),
+        "dynamic-caps MCP should fail before executing a cross-component operation, got {error:#?}"
+    );
+}
+
+#[tokio::test]
 async fn dynamic_caps_mcp_matches_http_surface() {
     let http = DynamicCapsMcpHarness::start().await;
     let mcp_harness = DynamicCapsMcpHarness::start().await;
-    let mut mcp = mcp_harness.connect().await;
+    let mut alice_mcp = mcp_harness.connect_as("components./alice").await;
+    let mut carol_mcp = mcp_harness.connect_as("components./carol").await;
 
     let held_list_request = dynamic_caps::ControlDynamicHeldListRequest {
         holder_component_id: "components./alice".to_string(),
@@ -4902,7 +5019,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
     let http_held: amber_mesh::dynamic_caps::HeldListResponse = http
         .post_json("/v1/controller/dynamic-caps/held", &held_list_request)
         .await;
-    let mcp_held: Value = mcp
+    let mcp_held: Value = alice_mcp
         .call_tool(
             "amber.v1.framework_dynamic_caps.inspect",
             json!({
@@ -4932,7 +5049,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
             &held_detail_request,
         )
         .await;
-    let mcp_detail: Value = mcp
+    let mcp_detail: Value = alice_mcp
         .call_tool(
             "amber.v1.framework_dynamic_caps.inspect",
             json!({
@@ -4964,7 +5081,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
     let http_share: amber_mesh::dynamic_caps::ShareResponse = http
         .post_json("/v1/controller/dynamic-caps/share", &share_request)
         .await;
-    let mcp_share: Value = mcp
+    let mcp_share: Value = alice_mcp
         .call_tool(
             "amber.v1.framework_dynamic_caps.mutate",
             json!({
@@ -5005,7 +5122,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
     let http_carol_held: amber_mesh::dynamic_caps::HeldListResponse = http
         .post_json("/v1/controller/dynamic-caps/held", &carol_held_request)
         .await;
-    let mcp_carol_held: Value = mcp
+    let mcp_carol_held: Value = carol_mcp
         .call_tool(
             "amber.v1.framework_dynamic_caps.inspect",
             json!({
@@ -5029,7 +5146,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
             &inspect_ref_request,
         )
         .await;
-    let mcp_inspect_ref: Value = mcp
+    let mcp_inspect_ref: Value = carol_mcp
         .call_tool(
             "amber.v1.framework_dynamic_caps.inspect",
             json!({
@@ -5056,7 +5173,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
             &resolve_origin_request,
         )
         .await;
-    let mcp_resolve_origin: Value = mcp
+    let mcp_resolve_origin: Value = alice_mcp
         .call_tool(
             "amber.v1.framework_dynamic_caps.inspect",
             json!({
@@ -5084,7 +5201,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
     let http_revoke: amber_mesh::dynamic_caps::RevokeResponse = http
         .post_json("/v1/controller/dynamic-caps/revoke", &revoke_request)
         .await;
-    let mcp_revoke: Value = mcp
+    let mcp_revoke: Value = alice_mcp
         .call_tool(
             "amber.v1.framework_dynamic_caps.mutate",
             json!({
@@ -5112,7 +5229,7 @@ async fn dynamic_caps_mcp_matches_http_surface() {
             &revoked_detail_request,
         )
         .await;
-    let mcp_revoked_detail: Value = mcp
+    let mcp_revoked_detail: Value = carol_mcp
         .call_tool(
             "amber.v1.framework_dynamic_caps.inspect",
             json!({
@@ -6959,29 +7076,6 @@ async fn destroy_and_recreate_same_child_name_revokes_then_restores_stable_frame
         .expect("recreated child should regain framework authorization");
 }
 
-#[test]
-fn control_state_auth_header_must_match_expected_token() {
-    let mut headers = HeaderMap::new();
-    let missing = authorize_control_state_auth_header(&headers, "expected")
-        .expect_err("missing auth header should be rejected");
-    assert_eq!(missing.0.code, ProtocolErrorCode::Unauthorized);
-
-    headers.insert(
-        CONTROL_STATE_AUTH_HEADER,
-        "wrong".parse().expect("header should parse"),
-    );
-    let wrong = authorize_control_state_auth_header(&headers, "expected")
-        .expect_err("mismatched auth header should be rejected");
-    assert_eq!(wrong.0.code, ProtocolErrorCode::Unauthorized);
-
-    headers.insert(
-        CONTROL_STATE_AUTH_HEADER,
-        "expected".parse().expect("header should parse"),
-    );
-    authorize_control_state_auth_header(&headers, "expected")
-        .expect("matching auth header should succeed");
-}
-
 #[tokio::test]
 async fn local_controller_requests_require_internal_route_headers_not_framework_auth() {
     let (dir, state, state_path, _) = compile_framework_binding_control_state().await;
@@ -7149,30 +7243,15 @@ async fn local_controller_requests_select_the_controller_for_the_current_site() 
     assert_eq!(err.0.code, ProtocolErrorCode::Unauthorized);
 }
 
-#[tokio::test]
-async fn dynamic_caps_sidecar_requests_reject_ambient_control_state_auth_without_internal_route() {
-    let dir = TempDir::new().expect("temp dir");
-    let state = compile_dynamic_caps_binding_state().await;
-    let state_path = dir.path().join("control-state.json");
-    write_control_state(&state_path, &state).expect("state should write");
-    let app = SiteControllerApp {
-        control: test_control_state_app(&dir, state, state_path),
-        ready: ready_site_controller_flag(),
-    };
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        CONTROL_STATE_AUTH_HEADER,
-        app.control
-            .control_state_auth_token
-            .parse()
-            .expect("auth header should parse"),
-    );
+#[test]
+fn dynamic_caps_sidecar_requests_require_internal_route_headers() {
+    let headers = HeaderMap::new();
 
     let err = super::site_controller::authorize_dynamic_caps_sidecar_request(
         &headers,
         "components./alice",
     )
-    .expect_err("ambient control-state auth must not bypass the controller internal route");
+    .expect_err("dynamic-caps sidecar auth must require the router-injected internal route");
     assert_eq!(err.0.code, ProtocolErrorCode::Unauthorized);
 }
 
@@ -10110,7 +10189,6 @@ volumes:
         &temp.path().join("state"),
         &site_state_root,
         &artifact_root,
-        "test-auth",
         Some(SITE_CONTROLLER_MESH_IDENTITY_PATH),
         None,
         None,
@@ -10391,7 +10469,6 @@ spec:
         &temp.path().join("state"),
         &site_state_root,
         &artifact_root,
-        "test-auth",
         Some(SITE_CONTROLLER_MESH_IDENTITY_PATH),
         None,
         None,

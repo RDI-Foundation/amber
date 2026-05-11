@@ -22,7 +22,7 @@ use amber_manifest::{
     Manifest, ManifestRef, ManifestSpans, NetworkProtocol, RawBinding, RawExportTarget, SlotDecl,
 };
 use amber_mesh::{
-    MeshIdentity, MeshProtocol,
+    MeshProtocol,
     component_protocol::{
         BindingInputDescription, ChildDescribeResponse, ChildHandle, ChildListResponse, ChildState,
         ChildSummary, ConfigFieldDescription, CreateChildRequest, CreateChildResponse, InputState,
@@ -100,8 +100,8 @@ pub use self::{
         DynamicInputDirectRecord, DynamicInputRouteTarget, DynamicProxyExportRecord,
         SITE_CONTROLLER_INTERNAL_CAPABILITY, SITE_CONTROLLER_MESH_IDENTITY_PATH,
         SITE_CONTROLLER_SERVICE_NAME, SiteControllerPlan, authority_url_for_listen_addr,
-        build_site_controller_state, generate_control_state_auth_token,
-        site_controller_internal_route_id, write_control_state, write_site_controller_plan,
+        build_site_controller_state, site_controller_internal_route_id, write_control_state,
+        write_site_controller_plan,
     },
 };
 

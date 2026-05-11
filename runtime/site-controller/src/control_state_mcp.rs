@@ -27,7 +27,9 @@ use super::{
     mcp_common::{McpOperationResponse, json_response, map_protocol_api_error},
     planner::SiteControllerApp,
     site_controller::{
-        execute_site_controller_dynamic_caps_inspect, execute_site_controller_dynamic_caps_mutate,
+        DynamicCapsRequestAuth, authorize_dynamic_caps_mcp_session_request,
+        authorize_dynamic_caps_request, execute_site_controller_dynamic_caps_inspect,
+        execute_site_controller_dynamic_caps_mutate,
     },
 };
 
@@ -58,16 +60,35 @@ impl FrameworkDynamicCapsMcp {
         }
     }
 
-    fn authorize(&self, context: &RequestContext<RoleServer>) -> Result<(), McpError> {
-        let parts = context
+    fn http_parts<'a>(
+        &self,
+        context: &'a RequestContext<RoleServer>,
+    ) -> Result<&'a Parts, McpError> {
+        context
             .extensions
             .get::<Parts>()
-            .ok_or_else(|| McpError::invalid_request("missing HTTP request context", None))?;
-        super::http::authorize_control_state_auth_header(
-            &parts.headers,
-            self.app.control.control_state_auth_token.as_ref(),
-        )
-        .map_err(map_protocol_api_error)
+            .ok_or_else(|| McpError::invalid_request("missing HTTP request context", None))
+    }
+
+    async fn authorize_session(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        let parts = self.http_parts(context)?;
+        authorize_dynamic_caps_mcp_session_request(&self.app, &parts.headers)
+            .await
+            .map_err(map_protocol_api_error)
+    }
+
+    async fn authorize_operation(
+        &self,
+        context: &RequestContext<RoleServer>,
+        expected_component_id: &str,
+    ) -> Result<DynamicCapsRequestAuth, McpError> {
+        let parts = self.http_parts(context)?;
+        authorize_dynamic_caps_request(&self.app, &parts.headers, expected_component_id)
+            .await
+            .map_err(map_protocol_api_error)
     }
 
     fn help_resource(&self) -> String {
@@ -251,46 +272,56 @@ impl FrameworkDynamicCapsMcp {
         Parameters(args): Parameters<InspectArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<Json<McpOperationResponse>, McpError> {
-        self.authorize(&context)?;
-        let response = execute_site_controller_dynamic_caps_inspect(
-            &self.app,
-            match args {
-                InspectArgs::HeldList {
-                    holder_component_id,
-                } => DynamicCapsInspectRequest::HeldList(
-                    dynamic_caps::ControlDynamicHeldListRequest {
-                        holder_component_id,
-                    },
-                ),
-                InspectArgs::HeldDetail {
+        let request = match args {
+            InspectArgs::HeldList {
+                holder_component_id,
+            } => DynamicCapsInspectRequest::HeldList(dynamic_caps::ControlDynamicHeldListRequest {
+                holder_component_id,
+            }),
+            InspectArgs::HeldDetail {
+                holder_component_id,
+                held_id,
+            } => DynamicCapsInspectRequest::HeldDetail(
+                dynamic_caps::ControlDynamicHeldDetailRequest {
                     holder_component_id,
                     held_id,
-                } => DynamicCapsInspectRequest::HeldDetail(
-                    dynamic_caps::ControlDynamicHeldDetailRequest {
-                        holder_component_id,
-                        held_id,
-                    },
-                ),
-                InspectArgs::InspectRef {
+                },
+            ),
+            InspectArgs::InspectRef {
+                holder_component_id,
+                r#ref,
+            } => DynamicCapsInspectRequest::InspectRef(
+                dynamic_caps::ControlDynamicInspectRefRequest {
                     holder_component_id,
                     r#ref,
-                } => DynamicCapsInspectRequest::InspectRef(
-                    dynamic_caps::ControlDynamicInspectRefRequest {
-                        holder_component_id,
-                        r#ref,
-                    },
-                ),
-                InspectArgs::ResolveOrigin {
+                },
+            ),
+            InspectArgs::ResolveOrigin {
+                holder_component_id,
+                source,
+            } => DynamicCapsInspectRequest::ResolveOrigin(
+                dynamic_caps::ControlDynamicResolveOriginRequest {
                     holder_component_id,
-                    source,
-                } => DynamicCapsInspectRequest::ResolveOrigin(
-                    dynamic_caps::ControlDynamicResolveOriginRequest {
-                        holder_component_id,
-                        source: source.into(),
-                    },
-                ),
-            },
-            false,
+                    source: source.into(),
+                },
+            ),
+        };
+        let expected_component_id = match &request {
+            DynamicCapsInspectRequest::HeldList(request) => request.holder_component_id.as_str(),
+            DynamicCapsInspectRequest::HeldDetail(request) => request.holder_component_id.as_str(),
+            DynamicCapsInspectRequest::InspectRef(request) => request.holder_component_id.as_str(),
+            DynamicCapsInspectRequest::ResolveOrigin(request) => {
+                request.holder_component_id.as_str()
+            }
+        }
+        .to_string();
+        let auth = self
+            .authorize_operation(&context, &expected_component_id)
+            .await?;
+        let response = execute_site_controller_dynamic_caps_inspect(
+            &self.app,
+            request,
+            matches!(auth, DynamicCapsRequestAuth::RemoteController),
         )
         .await
         .map_err(map_protocol_api_error)?;
@@ -313,32 +344,40 @@ impl FrameworkDynamicCapsMcp {
         Parameters(args): Parameters<MutateArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<Json<McpOperationResponse>, McpError> {
-        self.authorize(&context)?;
+        let request = match args {
+            MutateArgs::Share {
+                caller_component_id,
+                source,
+                recipient_component_id,
+                idempotency_key,
+                options,
+            } => DynamicCapsMutateRequest::Share(dynamic_caps::ControlDynamicShareRequest {
+                caller_component_id,
+                source: source.into(),
+                recipient_component_id,
+                idempotency_key,
+                options,
+            }),
+            MutateArgs::Revoke {
+                caller_component_id,
+                target,
+            } => DynamicCapsMutateRequest::Revoke(dynamic_caps::ControlDynamicRevokeRequest {
+                caller_component_id,
+                target: target.into(),
+            }),
+        };
+        let expected_component_id = match &request {
+            DynamicCapsMutateRequest::Share(request) => request.caller_component_id.as_str(),
+            DynamicCapsMutateRequest::Revoke(request) => request.caller_component_id.as_str(),
+        }
+        .to_string();
+        let auth = self
+            .authorize_operation(&context, &expected_component_id)
+            .await?;
         let response = execute_site_controller_dynamic_caps_mutate(
             &self.app,
-            match args {
-                MutateArgs::Share {
-                    caller_component_id,
-                    source,
-                    recipient_component_id,
-                    idempotency_key,
-                    options,
-                } => DynamicCapsMutateRequest::Share(dynamic_caps::ControlDynamicShareRequest {
-                    caller_component_id,
-                    source: source.into(),
-                    recipient_component_id,
-                    idempotency_key,
-                    options,
-                }),
-                MutateArgs::Revoke {
-                    caller_component_id,
-                    target,
-                } => DynamicCapsMutateRequest::Revoke(dynamic_caps::ControlDynamicRevokeRequest {
-                    caller_component_id,
-                    target: target.into(),
-                }),
-            },
-            false,
+            request,
+            matches!(auth, DynamicCapsRequestAuth::RemoteController),
         )
         .await
         .map_err(map_protocol_api_error)?;
@@ -372,7 +411,7 @@ impl ServerHandler for FrameworkDynamicCapsMcp {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ServerInfo, McpError> {
-        self.authorize(&context)?;
+        self.authorize_session(&context).await?;
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
         }
@@ -384,7 +423,7 @@ impl ServerHandler for FrameworkDynamicCapsMcp {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        self.authorize(&context)?;
+        self.authorize_session(&context).await?;
         Ok(ListResourcesResult {
             resources: vec![
                 RawResource::new(HELP_RESOURCE_URI, "framework dynamic caps MCP").no_annotation(),
@@ -399,7 +438,7 @@ impl ServerHandler for FrameworkDynamicCapsMcp {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
-        self.authorize(&context)?;
+        self.authorize_session(&context).await?;
         Ok(ListResourceTemplatesResult {
             resource_templates: vec![
                 RawResourceTemplate::new(
@@ -418,7 +457,7 @@ impl ServerHandler for FrameworkDynamicCapsMcp {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        self.authorize(&context)?;
+        self.authorize_session(&context).await?;
         let uri = request.uri;
         let text = if uri.as_str() == HELP_RESOURCE_URI {
             self.help_resource()

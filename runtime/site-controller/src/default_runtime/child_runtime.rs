@@ -1442,7 +1442,6 @@ mod tests {
             state_root: state_root.display().to_string(),
             site_state_root: compose_state_root.display().to_string(),
             artifact_dir: compose_artifact.display().to_string(),
-            control_state_auth_token: "test-auth".to_string(),
             controller_identity_path: None,
             storage_root: None,
             runtime_root: None,
@@ -1572,7 +1571,6 @@ mod tests {
             state_root: state_root.display().to_string(),
             site_state_root: direct_state_root.display().to_string(),
             artifact_dir: direct_artifact.display().to_string(),
-            control_state_auth_token: "test-auth".to_string(),
             controller_identity_path: None,
             storage_root: Some(
                 temp.path()
