@@ -41,7 +41,7 @@ export default {
     {
       name: "amber",
       description: "Amber CLI plus the local runtime binaries required by amber run",
-      version: "v0.3.x",
+      version: "v0.4.x",
       entry_binary_package: "amber-cli",
       runtime_binaries: ["amber-cli", "amber-router", "amber-helper"],
     },
