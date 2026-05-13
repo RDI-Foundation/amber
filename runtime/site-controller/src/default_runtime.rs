@@ -98,7 +98,6 @@ const COMPONENT_CONTROL_SOCKET_PATH_IN_VOLUME: &str = "/router-control.sock";
 const COMPOSE_PROVISIONER_SERVICE_NAME: &str = "amber-provisioner";
 const COMPOSE_ROUTER_SERVICE_NAME: &str = "amber-router";
 const KUBERNETES_MESH_PROVISION_CONFIGMAP_PATH: &str = "01-configmaps/amber-mesh-provision.yaml";
-const KUBERNETES_PROVISIONER_JOB_PATH: &str = "02-rbac/amber-provisioner-job.yaml";
 const KUBERNETES_PROVISIONER_ROLE_PATH: &str = "02-rbac/amber-provisioner-role.yaml";
 const KUBERNETES_PROVISIONER_ROLEBINDING_PATH: &str = "02-rbac/amber-provisioner-rolebinding.yaml";
 const KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_PATH: &str = "02-rbac/amber-provisioner-sa.yaml";

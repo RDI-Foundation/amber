@@ -40,6 +40,12 @@ const KUBERNETES_CONTROLLER_PLAN_PATH: &str = "/amber/site/state/site-controller
 const KUBERNETES_CONTROLLER_STATE_PATH: &str = "/amber/site/state/site-controller-state.json";
 const KUBERNETES_CONTROLLER_DESIRED_LINKS_PATH: &str = "/amber/site/state/desired-links.json";
 const KUBERNETES_CONTROLLER_SEED_ROOT: &str = "/amber/seed";
+const KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_NAME: &str = "amber-provisioner";
+const KUBERNETES_DYNAMIC_PROVISIONER_ROLE_NAME: &str = "amber-provisioner-dynamic";
+const KUBERNETES_DYNAMIC_PROVISIONER_ROLE_PATH: &str =
+    "02-rbac/amber-provisioner-dynamic-role.yaml";
+const KUBERNETES_DYNAMIC_PROVISIONER_ROLE_BINDING_PATH: &str =
+    "02-rbac/amber-provisioner-dynamic-rolebinding.yaml";
 
 #[derive(Clone, Debug)]
 struct KubernetesControllerSeedSecret {
@@ -92,6 +98,7 @@ pub fn inject_kubernetes_site_controller(
             }
         }),
     )?;
+    write_kubernetes_dynamic_provisioner_rbac(artifact_root)?;
     write_yaml_artifact(
         artifact_root.join(KUBERNETES_CONTROLLER_ROLE_PATH),
         &json!({
@@ -108,7 +115,6 @@ pub fn inject_kubernetes_site_controller(
                         "configmaps",
                         "persistentvolumeclaims",
                         "secrets",
-                        "serviceaccounts",
                         "services"
                     ],
                     "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"],
@@ -126,11 +132,6 @@ pub fn inject_kubernetes_site_controller(
                 {
                     "apiGroups": ["networking.k8s.io"],
                     "resources": ["networkpolicies"],
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"],
-                },
-                {
-                    "apiGroups": ["rbac.authorization.k8s.io"],
-                    "resources": ["roles", "rolebindings"],
                     "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"],
                 }
             ]
@@ -168,6 +169,9 @@ pub fn inject_kubernetes_site_controller(
         .collect::<Vec<_>>();
     resource_paths.extend([
         KUBERNETES_CONTROLLER_STATE_PVC_PATH,
+        KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_PATH,
+        KUBERNETES_DYNAMIC_PROVISIONER_ROLE_PATH,
+        KUBERNETES_DYNAMIC_PROVISIONER_ROLE_BINDING_PATH,
         KUBERNETES_CONTROLLER_SERVICE_ACCOUNT_PATH,
         KUBERNETES_CONTROLLER_ROLE_PATH,
         KUBERNETES_CONTROLLER_ROLE_BINDING_PATH,
@@ -549,6 +553,57 @@ fn render_kubernetes_controller_seed_secret(
     })
 }
 
+fn write_kubernetes_dynamic_provisioner_rbac(artifact_root: &Path) -> Result<()> {
+    let labels = kubernetes_provisioner_labels();
+    write_yaml_artifact_if_missing(
+        artifact_root.join(KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_PATH),
+        &json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {
+                "name": KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_NAME,
+                "labels": labels,
+            }
+        }),
+    )?;
+    write_yaml_artifact(
+        artifact_root.join(KUBERNETES_DYNAMIC_PROVISIONER_ROLE_PATH),
+        &json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": {
+                "name": KUBERNETES_DYNAMIC_PROVISIONER_ROLE_NAME,
+                "labels": kubernetes_provisioner_labels(),
+            },
+            "rules": [{
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "verbs": ["create", "get", "update"],
+            }]
+        }),
+    )?;
+    write_yaml_artifact(
+        artifact_root.join(KUBERNETES_DYNAMIC_PROVISIONER_ROLE_BINDING_PATH),
+        &json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {
+                "name": KUBERNETES_DYNAMIC_PROVISIONER_ROLE_NAME,
+                "labels": kubernetes_provisioner_labels(),
+            },
+            "subjects": [{
+                "kind": "ServiceAccount",
+                "name": KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_NAME,
+            }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": KUBERNETES_DYNAMIC_PROVISIONER_ROLE_NAME,
+            }
+        }),
+    )
+}
+
 fn add_kubernetes_resource_paths(artifact_root: &Path, paths: &[&str]) -> Result<()> {
     let kustomization_path = artifact_root.join("kustomization.yaml");
     let raw = fs::read_to_string(&kustomization_path)
@@ -682,7 +737,8 @@ fn ensure_kubernetes_router_allows_site_controller_ingress(
     let controller_component = controller_selector
         .get("amber.io/component")
         .expect("selector must contain component");
-    let mut required_ports = BTreeSet::from([KUBERNETES_ROUTER_CONTROL_PORT]);
+    let mut required_ports =
+        BTreeSet::from([KUBERNETES_ROUTER_CONTROL_PORT, KUBERNETES_ROUTER_MESH_PORT]);
     required_ports.extend(route_ports.iter().copied());
     if let Some(rule) = ingress.iter_mut().find(|rule| {
         rule.as_mapping()
@@ -763,9 +819,9 @@ fn ensure_kubernetes_site_controller_allows_router_egress(
     artifact_root: &Path,
     route_ports: &BTreeSet<u16>,
 ) -> Result<()> {
-    if route_ports.is_empty() {
-        return Ok(());
-    }
+    let mut required_ports = route_ports.clone();
+    required_ports.insert(KUBERNETES_ROUTER_CONTROL_PORT);
+    required_ports.insert(KUBERNETES_ROUTER_MESH_PORT);
     let path = artifact_root.join(KUBERNETES_CONTROLLER_NETPOL_PATH);
     let raw = fs::read_to_string(&path)
         .into_diagnostic()
@@ -826,7 +882,7 @@ fn ensure_kubernetes_site_controller_allows_router_egress(
                     .and_then(|port| u16::try_from(port).ok())
             })
             .collect::<BTreeSet<_>>();
-        for port in route_ports {
+        for port in &required_ports {
             if existing_ports.contains(port) {
                 continue;
             }
@@ -847,7 +903,7 @@ fn ensure_kubernetes_site_controller_allows_router_egress(
                         "matchLabels": router_selector,
                     }
                 }],
-                "ports": route_ports.iter().map(|port| json!({
+                "ports": required_ports.iter().map(|port| json!({
                     "protocol": "TCP",
                     "port": port,
                 })).collect::<Vec<_>>()
@@ -878,6 +934,20 @@ fn kubernetes_controller_labels() -> BTreeMap<String, String> {
     ])
 }
 
+fn kubernetes_provisioner_labels() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "app.kubernetes.io/managed-by".to_string(),
+            "amber".to_string(),
+        ),
+        (
+            "amber.io/component".to_string(),
+            KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_NAME.to_string(),
+        ),
+        ("amber.io/type".to_string(), "provisioner".to_string()),
+    ])
+}
+
 fn kubernetes_controller_selector() -> BTreeMap<String, String> {
     BTreeMap::from([(
         "amber.io/component".to_string(),
@@ -901,6 +971,13 @@ fn write_yaml_artifact(path: PathBuf, value: &impl serde::Serialize) -> Result<(
     file.write_all(rendered.as_bytes())
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write {}", path.display()))
+}
+
+fn write_yaml_artifact_if_missing(path: PathBuf, value: &impl serde::Serialize) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    write_yaml_artifact(path, value)
 }
 
 #[cfg(test)]
@@ -990,8 +1067,6 @@ spec:
           amber.io/component: amber-router
     ports:
     - protocol: TCP
-      port: 24000
-    - protocol: TCP
       port: 24100
 "#,
         )
@@ -1065,6 +1140,16 @@ spec:
             .and_then(|template| template.get(yaml_string("spec")))
             .and_then(serde_yaml::Value::as_mapping)
             .expect("controller deployment should include a pod spec")
+    }
+
+    fn rule_values<'a>(rule: &'a serde_yaml::Value, key: &str) -> Vec<&'a str> {
+        rule.as_mapping()
+            .and_then(|mapping| mapping.get(yaml_string(key)))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("rule sequence should exist")
+            .iter()
+            .map(|value| value.as_str().expect("rule value should be a string"))
+            .collect()
     }
 
     #[test]
@@ -1230,6 +1315,111 @@ spec:
                 .any(|path| path.file_name().and_then(|name| name.to_str())
                     == Some("amber-site-controller-seed.yaml")),
             "kustomization should include the primary controller seed secret"
+        );
+    }
+
+    #[test]
+    fn inject_kubernetes_site_controller_bootstraps_dynamic_provisioner_rbac() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let artifact_root = temp.path();
+        write_kubernetes_controller_fixture(artifact_root);
+
+        let plan = test_plan(artifact_root);
+        write_controller_state(&plan);
+
+        inject_kubernetes_site_controller(
+            artifact_root,
+            &plan,
+            "ghcr.io/rdi-foundation/amber-site-controller:test",
+        )
+        .expect("kubernetes site controller injection should succeed");
+
+        let kustomization =
+            fs::read_to_string(artifact_root.join("kustomization.yaml")).expect("kustomization");
+        assert!(kustomization.contains(KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_PATH));
+        assert!(kustomization.contains(KUBERNETES_DYNAMIC_PROVISIONER_ROLE_PATH));
+        assert!(kustomization.contains(KUBERNETES_DYNAMIC_PROVISIONER_ROLE_BINDING_PATH));
+
+        let controller_role_raw =
+            fs::read_to_string(artifact_root.join(KUBERNETES_CONTROLLER_ROLE_PATH))
+                .expect("controller role should exist");
+        let controller_role: serde_yaml::Value =
+            serde_yaml::from_str(&controller_role_raw).expect("controller role should parse");
+        let controller_rules = controller_role["rules"]
+            .as_sequence()
+            .expect("controller role should have rules");
+        assert!(
+            controller_rules.iter().all(|rule| {
+                !rule_values(rule, "apiGroups").contains(&"rbac.authorization.k8s.io")
+                    && !rule_values(rule, "resources").contains(&"serviceaccounts")
+                    && !rule_values(rule, "resources").contains(&"roles")
+                    && !rule_values(rule, "resources").contains(&"rolebindings")
+            }),
+            "site-controller Role must not be able to rewrite Kubernetes RBAC objects"
+        );
+
+        let provisioner_role_raw =
+            fs::read_to_string(artifact_root.join(KUBERNETES_DYNAMIC_PROVISIONER_ROLE_PATH))
+                .expect("dynamic provisioner role should exist");
+        let provisioner_role: serde_yaml::Value =
+            serde_yaml::from_str(&provisioner_role_raw).expect("provisioner role should parse");
+        assert_eq!(
+            provisioner_role["metadata"]["name"].as_str(),
+            Some(KUBERNETES_DYNAMIC_PROVISIONER_ROLE_NAME)
+        );
+        let provisioner_rules = provisioner_role["rules"]
+            .as_sequence()
+            .expect("provisioner role should have rules");
+        assert_eq!(provisioner_rules.len(), 1);
+        let rule = &provisioner_rules[0];
+        assert_eq!(rule_values(rule, "apiGroups"), vec![""]);
+        assert_eq!(rule_values(rule, "resources"), vec!["secrets"]);
+        let verbs = rule_values(rule, "verbs");
+        assert!(verbs.contains(&"create"));
+        assert!(verbs.contains(&"get"));
+        assert!(verbs.contains(&"update"));
+        assert!(
+            !rule
+                .as_mapping()
+                .expect("provisioner rule should be a mapping")
+                .contains_key(yaml_string("resourceNames")),
+            "dynamic provisioner secret names are not all known at site bootstrap time"
+        );
+
+        let role_binding_raw = fs::read_to_string(
+            artifact_root.join(KUBERNETES_DYNAMIC_PROVISIONER_ROLE_BINDING_PATH),
+        )
+        .expect("dynamic provisioner rolebinding should exist");
+        let role_binding: serde_yaml::Value =
+            serde_yaml::from_str(&role_binding_raw).expect("rolebinding should parse");
+        assert_eq!(
+            role_binding["subjects"][0]["name"].as_str(),
+            Some(KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_NAME)
+        );
+        assert_eq!(
+            role_binding["roleRef"]["name"].as_str(),
+            Some(KUBERNETES_DYNAMIC_PROVISIONER_ROLE_NAME)
+        );
+
+        let router_netpol_raw =
+            fs::read_to_string(artifact_root.join(KUBERNETES_ROUTER_NETPOL_PATH))
+                .expect("router network policy should exist");
+        let router_netpol: serde_yaml::Value =
+            serde_yaml::from_str(&router_netpol_raw).expect("router network policy should parse");
+        let router_ingress_ports = router_netpol["spec"]["ingress"]
+            .as_sequence()
+            .expect("router network policy should include ingress")
+            .iter()
+            .flat_map(|rule| rule["ports"].as_sequence().into_iter().flatten())
+            .filter_map(|port| port["port"].as_u64())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            router_ingress_ports.contains(&u64::from(KUBERNETES_ROUTER_MESH_PORT)),
+            "site-controller must be allowed to probe the router mesh listener"
+        );
+        assert!(
+            router_ingress_ports.contains(&u64::from(KUBERNETES_ROUTER_CONTROL_PORT)),
+            "site-controller must be allowed to probe the router control listener"
         );
     }
 

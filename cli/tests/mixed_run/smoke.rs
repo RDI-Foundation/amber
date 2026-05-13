@@ -911,6 +911,95 @@ fn wait_for_live_child(control_state_path: &Path, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("dynamic child `{name}` should have an id"))
 }
 
+fn rule_contains(rule: &Value, key: &str, expected: &str) -> bool {
+    rule.get(key)
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(expected)))
+}
+
+fn kubernetes_role(kind_state: &Value, name: &str) -> Value {
+    let namespace = kind_state["kubernetes_namespace"]
+        .as_str()
+        .expect("kubernetes site should publish namespace");
+    let output = kubectl_for_manager_state(kind_state)
+        .arg("-n")
+        .arg(namespace)
+        .arg("get")
+        .arg("role")
+        .arg(name)
+        .arg("-o")
+        .arg("json")
+        .output()
+        .unwrap_or_else(|err| panic!("failed to query Kubernetes Role {name}: {err}"));
+    assert!(
+        output.status.success(),
+        "failed to query Kubernetes Role {name}:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("Kubernetes Role {name} should parse: {err}"))
+}
+
+fn assert_kubernetes_site_controller_role_cannot_write_rbac(kind_state: &Value) {
+    let role = kubernetes_role(kind_state, "amber-site-controller");
+    let rules = role["rules"]
+        .as_array()
+        .expect("site-controller Role should include rules");
+    assert!(
+        rules.iter().all(|rule| {
+            !rule_contains(rule, "apiGroups", "rbac.authorization.k8s.io")
+                && !rule_contains(rule, "resources", "serviceaccounts")
+                && !rule_contains(rule, "resources", "roles")
+                && !rule_contains(rule, "resources", "rolebindings")
+        }),
+        "site-controller Role should not be able to create or update Kubernetes RBAC objects"
+    );
+}
+
+fn assert_kubernetes_dynamic_provisioner_role_is_secret_only(kind_state: &Value) {
+    let role = kubernetes_role(kind_state, "amber-provisioner-dynamic");
+    let rules = role["rules"]
+        .as_array()
+        .expect("dynamic provisioner Role should include rules");
+    assert_eq!(
+        rules.len(),
+        1,
+        "dynamic provisioner Role should contain only the mesh-secret write rule"
+    );
+    let rule = &rules[0];
+    assert_string_array_members(
+        &rule["resources"],
+        &["secrets"],
+        "dynamic provisioner Role should be limited to Kubernetes Secrets",
+    );
+    assert_string_array_members(
+        &rule["verbs"],
+        &["create", "get", "update"],
+        "dynamic provisioner Role should only cover the verbs required for generated secrets",
+    );
+}
+
+fn assert_kubernetes_dynamic_child_artifact_omits_provisioner_rbac(artifact: &Path) {
+    let kustomization = fs::read_to_string(artifact.join("kustomization.yaml"))
+        .expect("kubernetes dynamic child kustomization should read");
+    assert!(kustomization.contains("01-configmaps/amber-mesh-provision.yaml"));
+    assert!(kustomization.contains("02-rbac/amber-provisioner-job.yaml"));
+    assert!(!kustomization.contains("02-rbac/amber-provisioner-sa.yaml"));
+    assert!(!kustomization.contains("02-rbac/amber-provisioner-role.yaml"));
+    assert!(!kustomization.contains("02-rbac/amber-provisioner-rolebinding.yaml"));
+    assert!(!artifact.join("02-rbac/amber-provisioner-sa.yaml").exists());
+    assert!(
+        !artifact
+            .join("02-rbac/amber-provisioner-role.yaml")
+            .exists()
+    );
+    assert!(
+        !artifact
+            .join("02-rbac/amber-provisioner-rolebinding.yaml")
+            .exists()
+    );
+}
+
 fn framework_child_artifact(run: &RunHandle, site_id: &str, child_id: u64) -> PathBuf {
     framework_child_artifact_dir(&run.run_root, site_id, child_id)
 }
@@ -1106,6 +1195,67 @@ fn write_framework_dynamic_child_manifest(
             "exports": exports
         }),
     );
+}
+
+fn write_framework_kubernetes_dynamic_child_fixture(
+    root: &Path,
+    kind_cluster: &KindCluster,
+) -> ScenarioFixture {
+    fs::write(root.join("admin.py"), FRAMEWORK_ADMIN_APP).expect("failed to write admin.py");
+    fs::write(root.join("worker.py"), FRAMEWORK_WORKER_APP).expect("failed to write worker.py");
+    write_framework_admin_component(root, "admin.json5", true, 8080);
+    write_framework_worker_component(root, "child-kind-root.json5", true, "child-kind-root", 8080);
+    write_framework_dynamic_child_manifest(root, "child-kind.json5", "child-kind-root.json5", &[]);
+
+    let manifest = root.join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true }
+            },
+            "components": {
+                "admin": "./admin.json5"
+            },
+            "child_templates": {
+                "child_kind": { "manifest": "./child-kind.json5" }
+            },
+            "bindings": [
+                { "to": "#admin.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "admin_http": "#admin.http"
+            }
+        }),
+    );
+
+    let placement = root.join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "kind_local": {
+                    "kind": "kubernetes",
+                    "context": kind_cluster.context_name()
+                }
+            },
+            "defaults": {
+                "image": "kind_local"
+            },
+            "components": {
+                "/admin": "kind_local",
+                "/job-kind/root": "kind_local"
+            }
+        }),
+    );
+
+    ScenarioFixture {
+        manifest,
+        placement,
+    }
 }
 
 fn write_framework_matrix_fixture(root: &Path, kind_cluster: &KindCluster) -> ScenarioFixture {
@@ -3786,6 +3936,91 @@ fn framework_component_destroy_of_provider_keeps_consumer_live() {
 
     stop_proxy(&mut sink_proxy);
     stop_proxy(&mut admin_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires docker + kind + kubectl + qemu + an Ubuntu 24.04 cloud image matching the \
+            host architecture; run manually or in CI"]
+fn framework_component_kubernetes_dynamic_child_rbac_live() {
+    ensure_internal_images();
+    let temp = temp_output_dir("framework-component-kubernetes-rbac-");
+    let kubeconfig = temp.path().join("kubeconfig");
+    let kind_cluster = KindCluster::from_env_or_create(&kubeconfig);
+    ensure_kind_internal_images(&kind_cluster);
+    let kubeconfig_env = kind_cluster.kubeconfig.display().to_string();
+
+    let fixture = write_framework_kubernetes_dynamic_child_fixture(temp.path(), &kind_cluster);
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest_with_env(
+        &fixture.manifest,
+        &fixture.placement,
+        &storage_root,
+        &[("KUBECONFIG", &kubeconfig_env)],
+    );
+
+    let kind_state = wait_for_state_status(
+        &run.run_root,
+        "kind_local",
+        "running",
+        Duration::from_secs(120),
+    );
+    assert_kubernetes_site_controller_role_cannot_write_rbac(&kind_state);
+    assert_kubernetes_dynamic_provisioner_role_is_secret_only(&kind_state);
+
+    let control_state_path = framework_control_state_path(&run);
+    let creator_port = pick_free_port();
+    let mut creator_proxy = spawn_framework_proxy_for_site(
+        &run.site_artifact_dir("kind_local"),
+        "admin_http",
+        creator_port,
+        &kind_state,
+    );
+    wait_for_path(
+        &mut creator_proxy,
+        creator_port,
+        "/id",
+        framework_mutation_request_timeout(),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut creator_proxy,
+            creator_port,
+            "/id",
+            Duration::from_secs(30),
+        ),
+        "admin"
+    );
+
+    let (create_status, create_response) = framework_admin_get(
+        creator_port,
+        "/create/child_kind/job-kind",
+        "create request should return an HTTP response",
+    );
+    assert_eq!(
+        create_status, 200,
+        "create request should succeed; response: {create_response}"
+    );
+    let child_id = wait_for_live_child(&control_state_path, "job-kind");
+
+    let root_artifact = framework_child_artifact(&run, "kind_local", child_id);
+    assert_kubernetes_dynamic_child_artifact_omits_provisioner_rbac(&root_artifact);
+    let root_port = pick_free_port();
+    let mut root_proxy =
+        spawn_framework_proxy_for_site(&root_artifact, "http", root_port, &kind_state);
+    wait_for_path(
+        &mut root_proxy,
+        root_port,
+        "/id",
+        framework_mutation_request_timeout(),
+    );
+    assert_eq!(
+        wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
+        "child-kind-root"
+    );
+
+    stop_proxy(&mut root_proxy);
+    stop_proxy(&mut creator_proxy);
     run.stop();
 }
 

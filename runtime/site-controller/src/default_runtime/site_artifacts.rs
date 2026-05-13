@@ -1765,148 +1765,6 @@ pub fn set_site_artifact_mesh_identity_seed(
     ))
 }
 
-fn kubernetes_resource_name(document: &serde_yaml::Value) -> Option<&str> {
-    document
-        .as_mapping()
-        .and_then(|root| root.get(yaml_string("metadata")))
-        .and_then(serde_yaml::Value::as_mapping)
-        .and_then(|metadata| metadata.get(yaml_string("name")))
-        .and_then(serde_yaml::Value::as_str)
-}
-
-fn kubernetes_dynamic_apply_resource_kept_from_contents(
-    resource: &str,
-    raw: &str,
-    child_component_labels: &BTreeSet<String>,
-) -> Result<bool> {
-    if matches!(
-        resource,
-        KUBERNETES_MESH_PROVISION_CONFIGMAP_PATH
-            | KUBERNETES_PROVISIONER_JOB_PATH
-            | KUBERNETES_PROVISIONER_ROLE_PATH
-            | KUBERNETES_PROVISIONER_ROLEBINDING_PATH
-            | KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_PATH
-    ) || resource.starts_with("03-persistentvolumeclaims/")
-    {
-        return Ok(true);
-    }
-
-    let document: serde_yaml::Value = serde_yaml::from_str(raw)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("invalid kubernetes resource {resource}"))?;
-    Ok(document
-        .as_mapping()
-        .and_then(|root| root.get(yaml_string("metadata")))
-        .and_then(serde_yaml::Value::as_mapping)
-        .and_then(|metadata| metadata.get(yaml_string("labels")))
-        .and_then(serde_yaml::Value::as_mapping)
-        .and_then(|labels| labels.get(yaml_string("amber.io/component-id")))
-        .and_then(serde_yaml::Value::as_str)
-        .is_some_and(|component_id| child_component_labels.contains(component_id)))
-}
-
-pub(crate) fn project_kubernetes_dynamic_child_artifact_files(
-    artifact_files: &BTreeMap<String, String>,
-    component_ids: &[usize],
-) -> Result<BTreeMap<String, String>> {
-    let child_component_labels = component_ids
-        .iter()
-        .map(|component_id| format!("c{component_id}"))
-        .collect::<BTreeSet<_>>();
-    let kustomization_path = "kustomization.yaml";
-    let raw = artifact_files.get(kustomization_path).ok_or_else(|| {
-        miette::miette!("dynamic kubernetes artifact snapshot is missing {kustomization_path}")
-    })?;
-    let mut document: serde_yaml::Value = serde_yaml::from_str(raw)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("invalid kustomization {kustomization_path}"))?;
-    let root = document.as_mapping_mut().ok_or_else(|| {
-        miette::miette!("kustomization {kustomization_path} is not a YAML mapping")
-    })?;
-    let resources = root
-        .get_mut(yaml_string("resources"))
-        .and_then(serde_yaml::Value::as_sequence_mut)
-        .ok_or_else(|| {
-            miette::miette!("kustomization {kustomization_path} is missing a resources sequence")
-        })?;
-    let mut projected = artifact_files
-        .iter()
-        .filter(|(path, _)| !path.ends_with(".yaml") && path.as_str() != kustomization_path)
-        .map(|(path, contents)| (path.clone(), contents.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let mut kept_resources = Vec::new();
-    let mut kept_resource_names = BTreeSet::new();
-    for resource in resources
-        .iter()
-        .filter_map(serde_yaml::Value::as_str)
-        .map(str::to_owned)
-    {
-        let raw = artifact_files
-            .get(&resource)
-            .ok_or_else(|| miette::miette!("dynamic kubernetes artifact is missing {resource}"))?;
-        if !kubernetes_dynamic_apply_resource_kept_from_contents(
-            &resource,
-            raw,
-            &child_component_labels,
-        )? {
-            continue;
-        }
-        let document: serde_yaml::Value = serde_yaml::from_str(raw)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("invalid kubernetes resource {resource}"))?;
-        if let Some(name) = kubernetes_resource_name(&document) {
-            kept_resource_names.insert(name.to_string());
-        }
-        projected.insert(resource.clone(), raw.clone());
-        kept_resources.push(serde_yaml::Value::String(resource));
-    }
-    *resources = kept_resources;
-
-    if let Some(generators) = root
-        .get_mut(yaml_string("secretGenerator"))
-        .and_then(serde_yaml::Value::as_sequence_mut)
-    {
-        generators.retain(|generator| {
-            generator
-                .as_mapping()
-                .and_then(|mapping| mapping.get(yaml_string("name")))
-                .and_then(serde_yaml::Value::as_str)
-                != Some(KUBERNETES_ROUTER_EXTERNAL_SECRET_NAME)
-        });
-    }
-
-    if let Some(replacements) = root
-        .get_mut(yaml_string("replacements"))
-        .and_then(serde_yaml::Value::as_sequence_mut)
-    {
-        replacements.retain_mut(|replacement| {
-            let Some(targets) = replacement
-                .as_mapping_mut()
-                .and_then(|mapping| mapping.get_mut(yaml_string("targets")))
-                .and_then(serde_yaml::Value::as_sequence_mut)
-            else {
-                return false;
-            };
-            targets.retain(|target| {
-                target
-                    .as_mapping()
-                    .and_then(|mapping| mapping.get(yaml_string("select")))
-                    .and_then(serde_yaml::Value::as_mapping)
-                    .and_then(|select| select.get(yaml_string("name")))
-                    .and_then(serde_yaml::Value::as_str)
-                    .is_some_and(|name| kept_resource_names.contains(name))
-            });
-            !targets.is_empty()
-        });
-    }
-
-    let rendered = serde_yaml::to_string(&document)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to serialize {kustomization_path}"))?;
-    projected.insert(kustomization_path.to_string(), rendered);
-    Ok(projected)
-}
-
 pub(super) fn project_kubernetes_dynamic_child_destroy_artifact_files(
     artifact_files: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>> {
@@ -2005,7 +1863,8 @@ fn rewrite_dynamic_kubernetes_apply_bundle(
     component_ids: &[usize],
 ) -> Result<()> {
     let files = read_artifact_snapshot(artifact_root)?;
-    let projected = project_kubernetes_dynamic_child_artifact_files(&files, component_ids)?;
+    let projected =
+        crate::runtime_api::project_kubernetes_dynamic_child_artifact_files(&files, component_ids)?;
     replace_artifact_snapshot(artifact_root, &projected)
 }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -18,9 +18,6 @@ use super::state::{FrameworkControlState, LiveChildRecord, SiteControllerPlan};
 
 const KUBERNETES_MESH_PROVISION_CONFIGMAP_PATH: &str = "01-configmaps/amber-mesh-provision.yaml";
 const KUBERNETES_PROVISIONER_JOB_PATH: &str = "02-rbac/amber-provisioner-job.yaml";
-const KUBERNETES_PROVISIONER_ROLE_PATH: &str = "02-rbac/amber-provisioner-role.yaml";
-const KUBERNETES_PROVISIONER_ROLEBINDING_PATH: &str = "02-rbac/amber-provisioner-rolebinding.yaml";
-const KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_PATH: &str = "02-rbac/amber-provisioner-sa.yaml";
 const KUBERNETES_ROUTER_EXTERNAL_SECRET_NAME: &str = "amber-router-external";
 const SITE_CONTROLLER_RUNTIME_PLAN_SCHEMA: &str = "amber.run.site_controller_runtime_plan";
 const SITE_CONTROLLER_RUNTIME_PLAN_VERSION: u32 = 1;
@@ -294,15 +291,11 @@ fn kubernetes_resource_name(document: &serde_yaml::Value) -> Option<&str> {
 fn kubernetes_dynamic_apply_resource_kept_from_contents(
     resource: &str,
     raw: &str,
-    child_component_labels: &std::collections::BTreeSet<String>,
+    child_component_labels: &BTreeSet<String>,
 ) -> Result<bool> {
     if matches!(
         resource,
-        KUBERNETES_MESH_PROVISION_CONFIGMAP_PATH
-            | KUBERNETES_PROVISIONER_JOB_PATH
-            | KUBERNETES_PROVISIONER_ROLE_PATH
-            | KUBERNETES_PROVISIONER_ROLEBINDING_PATH
-            | KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_PATH
+        KUBERNETES_MESH_PROVISION_CONFIGMAP_PATH | KUBERNETES_PROVISIONER_JOB_PATH
     ) || resource.starts_with("03-persistentvolumeclaims/")
     {
         return Ok(true);
@@ -329,7 +322,7 @@ pub fn project_kubernetes_dynamic_child_artifact_files(
     let child_component_labels = component_ids
         .iter()
         .map(|component_id| format!("c{component_id}"))
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<BTreeSet<_>>();
     let kustomization_path = "kustomization.yaml";
     let raw = artifact_files.get(kustomization_path).ok_or_else(|| {
         miette::miette!("dynamic kubernetes artifact snapshot is missing {kustomization_path}")
@@ -352,7 +345,7 @@ pub fn project_kubernetes_dynamic_child_artifact_files(
         .map(|(path, contents)| (path.clone(), contents.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut kept_resources = Vec::new();
-    let mut kept_resource_names = std::collections::BTreeSet::new();
+    let mut kept_resource_names = BTreeSet::new();
     for resource in resources
         .iter()
         .filter_map(serde_yaml::Value::as_str)
@@ -496,5 +489,160 @@ pub fn published_router_mesh_addr_for_consumer_kind(
         SiteKind::Compose => site_receipt.compose_consumer_router_mesh_addr.as_deref(),
         SiteKind::Kubernetes => site_receipt.kubernetes_consumer_router_mesh_addr.as_deref(),
         SiteKind::Direct | SiteKind::Vm => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn yaml_sequence_strings<'a>(document: &'a serde_yaml::Value, key: &str) -> Vec<&'a str> {
+        document
+            .as_mapping()
+            .and_then(|root| root.get(yaml_string(key)))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("sequence should exist")
+            .iter()
+            .map(|value| value.as_str().expect("sequence entry should be a string"))
+            .collect()
+    }
+
+    #[test]
+    fn dynamic_kubernetes_child_projection_drops_provisioner_rbac() {
+        let files = BTreeMap::from([
+            (
+                "kustomization.yaml".to_string(),
+                r#"
+resources:
+  - 01-configmaps/amber-mesh-provision.yaml
+  - 02-rbac/amber-provisioner-sa.yaml
+  - 02-rbac/amber-provisioner-role.yaml
+  - 02-rbac/amber-provisioner-rolebinding.yaml
+  - 02-rbac/amber-provisioner-job.yaml
+  - 03-persistentvolumeclaims/child-state.yaml
+  - 03-deployments/child.yaml
+  - 03-deployments/other.yaml
+secretGenerator:
+  - name: amber-router-external
+  - name: child-secret
+replacements:
+  - source:
+      kind: ConfigMap
+      name: amber-mesh-provision
+    targets:
+      - select:
+          name: child
+      - select:
+          name: other
+"#
+                .to_string(),
+            ),
+            (
+                "01-configmaps/amber-mesh-provision.yaml".to_string(),
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: amber-mesh-provision\n"
+                    .to_string(),
+            ),
+            (
+                "02-rbac/amber-provisioner-sa.yaml".to_string(),
+                "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: amber-provisioner\n"
+                    .to_string(),
+            ),
+            (
+                "02-rbac/amber-provisioner-role.yaml".to_string(),
+                "apiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: \
+                 amber-provisioner\n"
+                    .to_string(),
+            ),
+            (
+                "02-rbac/amber-provisioner-rolebinding.yaml".to_string(),
+                "apiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: \
+                 amber-provisioner\n"
+                    .to_string(),
+            ),
+            (
+                "02-rbac/amber-provisioner-job.yaml".to_string(),
+                "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: amber-provisioner\n"
+                    .to_string(),
+            ),
+            (
+                "03-persistentvolumeclaims/child-state.yaml".to_string(),
+                "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: child-state\n"
+                    .to_string(),
+            ),
+            (
+                "03-deployments/child.yaml".to_string(),
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: child\n  labels:\n    \
+                 amber.io/component-id: c1\n"
+                    .to_string(),
+            ),
+            (
+                "03-deployments/other.yaml".to_string(),
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: other\n  labels:\n    \
+                 amber.io/component-id: c2\n"
+                    .to_string(),
+            ),
+            ("README.md".to_string(), "operator notes".to_string()),
+        ]);
+
+        let projected = project_kubernetes_dynamic_child_artifact_files(&files, &[1])
+            .expect("dynamic child projection should succeed");
+
+        assert!(projected.contains_key("01-configmaps/amber-mesh-provision.yaml"));
+        assert!(projected.contains_key("02-rbac/amber-provisioner-job.yaml"));
+        assert!(projected.contains_key("03-persistentvolumeclaims/child-state.yaml"));
+        assert!(projected.contains_key("03-deployments/child.yaml"));
+        assert_eq!(
+            projected.get("README.md").map(String::as_str),
+            Some("operator notes")
+        );
+        assert!(!projected.contains_key("02-rbac/amber-provisioner-sa.yaml"));
+        assert!(!projected.contains_key("02-rbac/amber-provisioner-role.yaml"));
+        assert!(!projected.contains_key("02-rbac/amber-provisioner-rolebinding.yaml"));
+        assert!(!projected.contains_key("03-deployments/other.yaml"));
+
+        let kustomization: serde_yaml::Value =
+            serde_yaml::from_str(&projected["kustomization.yaml"])
+                .expect("projected kustomization should parse");
+        assert_eq!(
+            yaml_sequence_strings(&kustomization, "resources"),
+            vec![
+                "01-configmaps/amber-mesh-provision.yaml",
+                "02-rbac/amber-provisioner-job.yaml",
+                "03-persistentvolumeclaims/child-state.yaml",
+                "03-deployments/child.yaml",
+            ]
+        );
+        let generators = kustomization
+            .as_mapping()
+            .and_then(|root| root.get(yaml_string("secretGenerator")))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("secret generators should remain");
+        assert_eq!(generators.len(), 1);
+        assert_eq!(
+            generators[0]
+                .as_mapping()
+                .and_then(|mapping| mapping.get(yaml_string("name")))
+                .and_then(serde_yaml::Value::as_str),
+            Some("child-secret")
+        );
+        let replacement_targets = kustomization
+            .as_mapping()
+            .and_then(|root| root.get(yaml_string("replacements")))
+            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(|replacements| replacements.first())
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|replacement| replacement.get(yaml_string("targets")))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("kept replacement should have targets");
+        assert_eq!(replacement_targets.len(), 1);
+        assert_eq!(
+            replacement_targets[0]
+                .as_mapping()
+                .and_then(|target| target.get(yaml_string("select")))
+                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(|select| select.get(yaml_string("name")))
+                .and_then(serde_yaml::Value::as_str),
+            Some("child")
+        );
     }
 }

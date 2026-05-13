@@ -10289,7 +10289,7 @@ volumes:
     assert!(
         volumes
             .iter()
-            .any(|value| { value.as_str() == Some("/var/run/docker.sock:/var/run/docker.sock") })
+            .any(|value| value.as_str() == Some("/var/run/docker.sock:/var/run/docker.sock"))
     );
     let group_add = service
         .get(serde_yaml::Value::String("group_add".to_string()))
@@ -10383,8 +10383,6 @@ spec:
         matchLabels:
           amber.io/component: amber-router
     ports:
-    - protocol: TCP
-      port: 24000
     - protocol: TCP
       port: 24100
 "#,
@@ -10492,8 +10490,52 @@ spec:
         .expect("kustomization should read");
     assert!(kustomization.contains("01-secrets/amber-site-controller-seed.yaml"));
     assert!(kustomization.contains("03-persistentvolumeclaims/amber-site-controller-state.yaml"));
+    assert!(kustomization.contains("02-rbac/amber-provisioner-sa.yaml"));
+    assert!(kustomization.contains("02-rbac/amber-provisioner-dynamic-role.yaml"));
+    assert!(kustomization.contains("02-rbac/amber-provisioner-dynamic-rolebinding.yaml"));
     assert!(kustomization.contains("03-deployments/amber-site-controller.yaml"));
     assert!(kustomization.contains("04-services/amber-site-controller.yaml"));
+
+    fn rule_contains(rule: &serde_yaml::Value, key: &str, expected: &str) -> bool {
+        rule.as_mapping()
+            .and_then(|mapping| mapping.get(serde_yaml::Value::String(key.to_string())))
+            .and_then(serde_yaml::Value::as_sequence)
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(expected)))
+    }
+
+    let controller_role_raw =
+        fs::read_to_string(artifact_root.join("02-rbac/amber-site-controller-role.yaml"))
+            .expect("controller role should read");
+    let controller_role: serde_yaml::Value =
+        serde_yaml::from_str(&controller_role_raw).expect("controller role should parse");
+    let controller_role_rules = controller_role["rules"]
+        .as_sequence()
+        .expect("controller role should include rules");
+    assert!(
+        controller_role_rules.iter().all(|rule| {
+            !rule_contains(rule, "apiGroups", "rbac.authorization.k8s.io")
+                && !rule_contains(rule, "resources", "serviceaccounts")
+                && !rule_contains(rule, "resources", "roles")
+                && !rule_contains(rule, "resources", "rolebindings")
+        }),
+        "site-controller Role should not be able to create or update Kubernetes RBAC objects"
+    );
+
+    let dynamic_provisioner_role_raw =
+        fs::read_to_string(artifact_root.join("02-rbac/amber-provisioner-dynamic-role.yaml"))
+            .expect("dynamic provisioner role should read");
+    let dynamic_provisioner_role: serde_yaml::Value =
+        serde_yaml::from_str(&dynamic_provisioner_role_raw)
+            .expect("dynamic provisioner role should parse");
+    let provisioner_rules = dynamic_provisioner_role["rules"]
+        .as_sequence()
+        .expect("dynamic provisioner role should include rules");
+    assert_eq!(provisioner_rules.len(), 1);
+    let rule = &provisioner_rules[0];
+    assert!(rule_contains(rule, "resources", "secrets"));
+    assert!(rule_contains(rule, "verbs", "create"));
+    assert!(rule_contains(rule, "verbs", "get"));
+    assert!(rule_contains(rule, "verbs", "update"));
 
     let deployment_path = artifact_root.join("03-deployments/amber-site-controller.yaml");
     let deployment_raw = fs::read_to_string(&deployment_path).expect("deployment should read");
@@ -10577,6 +10619,7 @@ spec:
         fs::read_to_string(artifact_root.join("05-networkpolicies/amber-router-netpol.yaml"))
             .expect("router netpol should read");
     assert!(router_netpol.contains("amber-site-controller"));
+    assert!(router_netpol.contains("24000"));
     assert!(router_netpol.contains("24100"));
     assert!(router_netpol.contains("37046"));
     let router_service = fs::read_to_string(artifact_root.join("04-services/amber-router.yaml"))
@@ -10587,6 +10630,11 @@ spec:
         artifact_root.join("05-networkpolicies/amber-site-controller-netpol.yaml"),
     )
     .expect("site controller netpol should read");
+    assert!(
+        controller_netpol.contains("24000"),
+        "site controller needs router mesh egress for in-cluster router readiness probes"
+    );
+    assert!(controller_netpol.contains("24100"));
     assert!(controller_netpol.contains("37046"));
 }
 
