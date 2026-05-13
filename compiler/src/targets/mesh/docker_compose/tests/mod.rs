@@ -227,6 +227,7 @@ fn compile_output_with_manifest_overrides(
         .expect("config analysis");
     crate::CompileOutput {
         scenario,
+        overlays: None,
         store,
         provenance,
         diagnostics: Vec::new(),

@@ -9,19 +9,20 @@ mod sites;
 mod provenance;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
 use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
-    ExportName, ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, ProgramConfigUseSite, framework_capability, span_for_json_pointer,
+    ComponentDecl, ComponentRef, ConfigSchema, ExportName, ExportTarget, InterpolatedPart,
+    InterpolatedString, InterpolationSource, Manifest, ManifestDigest, ManifestRef, OverlayDecl,
+    OverlayRef, ProgramConfigUseSite, RawManifest, framework_capability, span_for_json_pointer,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
-    FrameworkRef, ManifestCatalogEntry, ProgramMount, ProvideRef,
+    FrameworkRef, ManifestCatalogEntry, Moniker, ProgramMount, ProvideRef,
     ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
     StorageResourceParams as ScenarioStorageResourceParams, TemplateBinding, TemplateConfigField,
     graph::component_path_for,
@@ -31,19 +32,21 @@ use miette::{Diagnostic, NamedSource, SourceSpan};
 pub use provenance::{ComponentProvenance, Provenance};
 use serde_json::Value;
 use thiserror::Error;
+use url::Url;
 
 use self::{
     bindings::*,
     program_lowering::{
-        ProgramLoweringError, ProgramLoweringSite, lower_program_with_config_analysis,
-        validate_lowered_program_mounts,
+        LoweredProgramValidation, ProgramLoweringError, ProgramLoweringSite,
+        lower_program_with_config_analysis, validate_lowered_program,
     },
     sites::*,
 };
 use crate::{
     DigestStore,
-    config::analysis::ScenarioConfigAnalysis,
+    config::{analysis::ScenarioConfigAnalysis, validation},
     frontend::{ResolvedNode, ResolvedTree, store::display_url},
+    overlays::{OverlayExport, OverlayPlan, OverlayScopePlan},
 };
 
 #[allow(unused_assignments)]
@@ -89,6 +92,28 @@ fn component_local_name(component: &Component) -> &str {
         .expect("component should have a local name")
 }
 
+#[derive(Clone, Debug)]
+struct ScopeBuild {
+    root_id: ComponentId,
+    root_moniker: amber_scenario::Moniker,
+    manifest_url: Url,
+    uses: BTreeMap<String, ResolvedNode>,
+    overlays: Vec<OverlayDecl>,
+}
+
+#[derive(Clone, Debug)]
+enum OverlayExportEndpoint {
+    Provide {
+        name: String,
+        decl: CapabilityDecl,
+        resolved_url: Url,
+    },
+    Slot {
+        name: String,
+        resolved_url: Url,
+    },
+}
+
 #[allow(unused_assignments)]
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
@@ -106,6 +131,43 @@ pub enum Error {
     MissingManifest {
         component_path: String,
         digest: ManifestDigest,
+    },
+
+    #[error("overlay `{overlay}` could not resolve export `{export}` from use `#{use_name}`")]
+    #[diagnostic(
+        code(compiler::overlay_export_unresolved),
+        help(
+            "Ensure the used manifest exports this capability and that any child export chain \
+             resolves to a real export."
+        )
+    )]
+    OverlayExportUnresolved {
+        overlay: Box<str>,
+        use_name: Box<str>,
+        export: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "overlay referenced here")]
+        span: Option<SourceSpan>,
+    },
+
+    #[error("overlay reference `{overlay}` is invalid: {message}")]
+    #[diagnostic(
+        code(compiler::invalid_overlay_export),
+        help(
+            "An overlay reference must target an exported `http` provide with `profile: \
+             \"overlay\"`. Update the exported provide or reference a different export."
+        )
+    )]
+    InvalidOverlayExport {
+        overlay: Box<str>,
+        message: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "overlay reference here")]
+        span: Option<SourceSpan>,
+        #[related]
+        related: Vec<RelatedSpan>,
     },
 
     #[error("unknown slot `{slot}` on {to_component_path}")]
@@ -294,6 +356,17 @@ pub enum Error {
         span: SourceSpan,
     },
 
+    #[error("unsupported program on {component_path}: {message}")]
+    #[diagnostic(code(linker::unsupported_program))]
+    UnsupportedProgram {
+        component_path: String,
+        message: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "program declared here")]
+        span: SourceSpan,
+    },
+
     #[error("slot `{slot}` on {component_path} is not bound (non-optional slots must be filled)")]
     #[diagnostic(code(linker::unbound_slot))]
     UnboundSlot {
@@ -362,6 +435,19 @@ pub enum Error {
         related: Vec<RelatedSpan>,
     },
 
+    #[error("invalid config for `use` entry `{use_name}` in {component_path}: {message}")]
+    #[diagnostic(code(compiler::invalid_use_config))]
+    InvalidUseConfig {
+        component_path: String,
+        use_name: String,
+        message: String,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "{label}")]
+        span: Option<SourceSpan>,
+        label: String,
+    },
+
     #[error("unsupported manifest feature `{feature}` in {component_path}")]
     #[diagnostic(code(linker::unsupported_feature))]
     UnsupportedManifestFeature {
@@ -410,13 +496,18 @@ struct FlattenState<'a> {
     out: &'a mut Vec<Option<Component>>,
     provenance: &'a mut Provenance,
     link_index: &'a mut Vec<LinkIndex>,
+    scope_builds: &'a mut Vec<ScopeBuild>,
 }
 
-pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Provenance), Error> {
+pub fn link(
+    tree: ResolvedTree,
+    store: &DigestStore,
+) -> Result<(Scenario, Option<OverlayPlan>, Provenance), Error> {
     let mut components = Vec::new();
     let mut link_index = Vec::new();
     let mut provenance = Provenance::default();
     let mut manifest_catalog = BTreeMap::new();
+    let mut scope_builds = Vec::new();
     let root = flatten(
         &tree.root,
         None,
@@ -427,6 +518,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             out: &mut components,
             provenance: &mut provenance,
             link_index: &mut link_index,
+            scope_builds: &mut scope_builds,
         },
     );
 
@@ -505,14 +597,16 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         let component_config = config_analysis.expect_component(id);
         match lower_program_with_config_analysis(id, program, component_config) {
             Ok(lowered) => {
-                if let Err(program_errors) = validate_lowered_program_mounts(
-                    &lowered.program,
-                    &lowered.mount_source_indices,
-                    manifest.config_schema(),
-                    manifest.resources(),
-                    manifest.slots(),
-                    manifest.experimental_features(),
-                ) {
+                if let Err(program_errors) = validate_lowered_program(LoweredProgramValidation {
+                    program: &lowered.program,
+                    mount_source_indices: &lowered.mount_source_indices,
+                    component_id: Some(id),
+                    config_schema: manifest.config_schema(),
+                    resources: manifest.resources(),
+                    slots: manifest.slots(),
+                    enabled_features: manifest.experimental_features(),
+                    validate_source_interpolations: false,
+                }) {
                     record_program_lowering_errors(
                         id,
                         &component_path_for(&components, id),
@@ -771,6 +865,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         exports,
         manifest_catalog,
     };
+    let overlays = build_overlays(&scope_builds, &config_analysis, store)?;
     scenario.normalize_order();
 
     if !errors.is_empty() {
@@ -784,8 +879,514 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         return Err(err);
     }
     scenario.assert_invariants();
+    if let Some(overlays) = &overlays {
+        overlays.scenario.assert_invariants();
+    }
 
-    Ok((scenario, provenance))
+    Ok((scenario, overlays, provenance))
+}
+
+struct UseConfigError {
+    message: String,
+    pointer: Option<String>,
+}
+
+fn compose_use_config(
+    use_config: &Value,
+    scope_template: &rc::RootConfigTemplate,
+    scope_schema: Option<&serde_json::Value>,
+) -> Result<rc::ConfigNode, UseConfigError> {
+    let parsed = crate::config::template::parse_instance_config_template_located(
+        Some(use_config),
+        scope_schema,
+    )
+    .map_err(|err| UseConfigError {
+        message: err.error().to_string(),
+        pointer: Some(err.pointer().to_string()),
+    })?;
+    rc::compose_config_template(parsed, scope_template).map_err(|err| UseConfigError {
+        message: err.to_string(),
+        pointer: None,
+    })
+}
+
+fn use_config_error_site(
+    store: &DigestStore,
+    manifest_url: &Url,
+    use_name: &str,
+    pointer: Option<&str>,
+) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>, String) {
+    let Some(stored) = store.get_source(manifest_url) else {
+        return (None, None, "`use` config declared here".to_string());
+    };
+
+    let src = NamedSource::new(display_url(manifest_url), Arc::clone(&stored.source))
+        .with_language("json5");
+    let Some(use_spans) = stored.spans.uses.get(use_name) else {
+        return (Some(src), None, "`use` config declared here".to_string());
+    };
+
+    if let (Some(pointer), Some(config_span)) = (pointer, use_spans.config)
+        && !pointer.is_empty()
+        && let Some(span) = span_for_json_pointer(stored.source.as_ref(), config_span, pointer)
+    {
+        return (
+            Some(src),
+            Some(span),
+            "invalid config value here".to_string(),
+        );
+    }
+
+    let span = use_spans
+        .config_key
+        .or(use_spans.config)
+        .or(Some(use_spans.whole));
+    (Some(src), span, "`use` config declared here".to_string())
+}
+
+fn collect_config_ref_paths(node: &rc::ConfigNode) -> BTreeSet<String> {
+    fn go(node: &rc::ConfigNode, out: &mut BTreeSet<String>) {
+        use amber_template::TemplatePart;
+        match node {
+            rc::ConfigNode::ConfigRef(path) => {
+                out.insert(path.clone());
+            }
+            rc::ConfigNode::SymbolicConfigRef(path) => {
+                out.insert(path.clone());
+            }
+            rc::ConfigNode::SymbolicString(value) => {
+                let parsed = value.parse::<amber_manifest::InterpolatedString>().ok();
+                if let Some(parsed) = parsed {
+                    parsed.visit_config_uses(|path| {
+                        out.insert(path.to_string());
+                    });
+                }
+            }
+            rc::ConfigNode::StringTemplate(parts) => {
+                for part in parts {
+                    if let TemplatePart::Config { config } = part {
+                        out.insert(config.clone());
+                    }
+                }
+            }
+            rc::ConfigNode::Array(items) => items.iter().for_each(|n| go(n, out)),
+            rc::ConfigNode::Object(map) => map.values().for_each(|n| go(n, out)),
+            _ => {}
+        }
+    }
+    let mut paths = BTreeSet::new();
+    go(node, &mut paths);
+    paths
+}
+
+/// Drop paths subsumed by a shorter prefix (e.g. "api.key" when "api" is present).
+fn normalize_config_paths(paths: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut result = BTreeSet::new();
+    let mut last_prefix: Option<&str> = None;
+    for path in paths {
+        if let Some(prefix) = last_prefix
+            && path.starts_with(prefix)
+            && path.as_bytes().get(prefix.len()) == Some(&b'.')
+        {
+            continue;
+        }
+        last_prefix = Some(path.as_str());
+        result.insert(path.clone());
+    }
+    result
+}
+
+fn overlay_display_name(scope_root: &Moniker, alias: &str) -> String {
+    if scope_root.as_str() == "/" {
+        format!("/{alias}")
+    } else {
+        format!("{}/{alias}", scope_root.as_str())
+    }
+}
+
+fn overlays_root_schema_for_paths(root_schema: &Value, paths: &BTreeSet<String>) -> Value {
+    // An empty path is the internal sentinel for `${config}` / `$${config}`, meaning the overlay
+    // needs the whole root object rather than a property literally named `""`.
+    if paths.contains("") {
+        return root_schema.clone();
+    }
+
+    fn insert_path(
+        props: &mut serde_json::Map<String, Value>,
+        required: &mut Vec<Value>,
+        path: &str,
+        leaf_schema: &Value,
+        is_required: bool,
+    ) {
+        match path.split_once('.') {
+            Some((head, tail)) => {
+                let entry = props
+                    .entry(head.to_string())
+                    .or_insert_with(|| serde_json::json!({ "type": "object", "properties": {} }));
+                if let Value::Object(obj) = entry {
+                    obj.entry("properties")
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    let mut nested_required: Vec<Value> = match obj.get("required") {
+                        Some(Value::Array(arr)) => arr.clone(),
+                        _ => Vec::new(),
+                    };
+                    if let Some(Value::Object(nested_props)) = obj.get_mut("properties") {
+                        insert_path(
+                            nested_props,
+                            &mut nested_required,
+                            tail,
+                            leaf_schema,
+                            is_required,
+                        );
+                    }
+                    if !nested_required.is_empty() {
+                        obj.insert("required".to_string(), Value::Array(nested_required));
+                    }
+                }
+                if is_required && !required.iter().any(|r| r == head) {
+                    required.push(Value::String(head.to_string()));
+                }
+            }
+            None => {
+                props
+                    .entry(path.to_string())
+                    .or_insert_with(|| leaf_schema.clone());
+                if is_required && !required.iter().any(|r| r == path) {
+                    required.push(Value::String(path.to_string()));
+                }
+            }
+        }
+    }
+
+    let mut properties = serde_json::Map::new();
+    let mut required: Vec<Value> = Vec::new();
+    for path in paths {
+        let leaf = rc::schema_lookup_ref(root_schema, path)
+            .ok()
+            .cloned()
+            .unwrap_or(Value::Bool(true));
+        let is_required = rc::schema_path_is_required(root_schema, path)
+            .ok()
+            .unwrap_or(false);
+        insert_path(&mut properties, &mut required, path, &leaf, is_required);
+    }
+    let mut schema = serde_json::json!({ "type": "object", "properties": properties });
+    if !required.is_empty() {
+        schema["required"] = Value::Array(required);
+    }
+    schema
+}
+
+fn build_overlays(
+    scope_builds: &[ScopeBuild],
+    config_analysis: &ScenarioConfigAnalysis,
+    store: &DigestStore,
+) -> Result<Option<OverlayPlan>, Error> {
+    if scope_builds.is_empty() {
+        return Ok(None);
+    }
+
+    let overlays_root_url = Url::parse("overlays://root").expect("valid overlays root url");
+    let overlays_root_ref = ManifestRef::new(overlays_root_url.clone(), None);
+
+    let mut overlays_children = BTreeMap::new();
+    let mut overlays_root_components = BTreeMap::new();
+    let mut overlays_root_exports = BTreeMap::new();
+    let mut overlays_root_config_paths: BTreeSet<String> = BTreeSet::new();
+    let mut scopes = Vec::with_capacity(scope_builds.len());
+
+    for (scope_index, scope) in scope_builds.iter().enumerate() {
+        let scope_ca = config_analysis.component(scope.root_id);
+        let referenced_uses: BTreeSet<&str> = scope
+            .overlays
+            .iter()
+            .map(|overlay| overlay.overlay.alias.as_str())
+            .collect();
+
+        let mut use_child_names = BTreeMap::new();
+        for (use_index, (use_name, use_node)) in scope
+            .uses
+            .iter()
+            .filter(|(use_name, _)| referenced_uses.contains(use_name.as_str()))
+            .enumerate()
+        {
+            let child_name = format!("use_{scope_index}_{use_index}");
+            let composed_config = match (use_node.config.as_ref(), scope_ca) {
+                (Some(raw_config), Some(sa)) => {
+                    let composed =
+                        compose_use_config(raw_config, sa.template(), sa.component_schema())
+                            .map_err(|err| {
+                                let (src, span, label) = use_config_error_site(
+                                    store,
+                                    &scope.manifest_url,
+                                    use_name,
+                                    err.pointer.as_deref(),
+                                );
+                                Error::InvalidUseConfig {
+                                    component_path: scope.root_moniker.to_string(),
+                                    use_name: use_name.clone(),
+                                    message: err.message,
+                                    src,
+                                    span,
+                                    label,
+                                }
+                            })?;
+                    overlays_root_config_paths.extend(collect_config_ref_paths(&composed));
+                    Some(composed.to_manifest_value())
+                }
+                _ => use_node.config.clone(),
+            };
+
+            let mut child_node = use_node.clone();
+            child_node.name = child_name.clone();
+            child_node.config = composed_config.clone();
+            overlays_children.insert(child_name.clone(), child_node.clone());
+
+            let manifest_ref =
+                ManifestRef::new(child_node.resolved_url.clone(), Some(child_node.digest));
+            let component_ref = match composed_config {
+                Some(config) => ComponentRef::builder()
+                    .manifest(manifest_ref)
+                    .config(config)
+                    .build(),
+                None => ComponentRef::builder().manifest(manifest_ref).build(),
+            };
+            overlays_root_components
+                .insert(child_name.clone(), ComponentDecl::Object(component_ref));
+            use_child_names.insert(use_name.clone(), child_name);
+        }
+
+        let mut overlays = Vec::with_capacity(scope.overlays.len());
+        for (overlay_index, overlay) in scope.overlays.iter().enumerate() {
+            let overlay_ref = &overlay.overlay;
+            let use_node = scope
+                .uses
+                .get(overlay_ref.alias.as_str())
+                .expect("overlay aliases are validated before resolution");
+            let endpoint = resolve_overlay_export(store, use_node, overlay_ref.export.as_str())
+                .map_err(|()| {
+                    let (src, span) =
+                        overlay_ref_decl_site(store, &scope.manifest_url, overlay_index);
+                    Error::OverlayExportUnresolved {
+                        overlay: overlay_ref.to_string().into(),
+                        use_name: overlay_ref.alias.clone().into(),
+                        export: overlay_ref.export.clone().into(),
+                        src,
+                        span,
+                    }
+                })?;
+            match &endpoint {
+                OverlayExportEndpoint::Provide { decl, .. }
+                    if decl.kind == CapabilityKind::Http
+                        && decl.profile.as_deref() == Some("overlay") => {}
+                OverlayExportEndpoint::Provide { name, decl, .. } => {
+                    let (src, span) =
+                        overlay_ref_decl_site(store, &scope.manifest_url, overlay_index);
+                    return Err(Error::InvalidOverlayExport {
+                        overlay: overlay_ref.to_string().into(),
+                        message: format!(
+                            "export `{}` resolves to provide `{name}` with capability `{decl}`; \
+                             expected `kind: \"http\"` and `profile: \"overlay\"`",
+                            overlay_ref.export
+                        )
+                        .into(),
+                        src,
+                        span,
+                        related: overlay_endpoint_related_spans(store, overlay_ref, &endpoint),
+                    });
+                }
+                OverlayExportEndpoint::Slot { name, .. } => {
+                    let (src, span) =
+                        overlay_ref_decl_site(store, &scope.manifest_url, overlay_index);
+                    return Err(Error::InvalidOverlayExport {
+                        overlay: overlay_ref.to_string().into(),
+                        message: format!(
+                            "export `{}` resolves to slot `{name}`; expected an exported provide",
+                            overlay_ref.export
+                        )
+                        .into(),
+                        src,
+                        span,
+                        related: overlay_endpoint_related_spans(store, overlay_ref, &endpoint),
+                    });
+                }
+            }
+
+            let child_name = use_child_names
+                .get(overlay_ref.alias.as_str())
+                .expect("resolved overlay alias should match a resolved use");
+            let export_name =
+                ExportName::try_from(format!("overlay_{scope_index}_{overlay_index}"))
+                    .expect("synthetic overlay export names are valid");
+            overlays_root_exports.insert(
+                export_name.to_string(),
+                format!("#{child_name}.{}", overlay_ref.export)
+                    .parse()
+                    .expect("synthetic overlay exports should be valid"),
+            );
+            overlays.push(OverlayExport {
+                export: export_name,
+                display_name: overlay_display_name(&scope.root_moniker, &overlay_ref.alias),
+            });
+        }
+
+        scopes.push(OverlayScopePlan {
+            root_moniker: scope.root_moniker.clone(),
+            overlays,
+        });
+    }
+
+    let mut raw_manifest = RawManifest::from(&Manifest::empty());
+    raw_manifest.components = overlays_root_components;
+    raw_manifest.exports = overlays_root_exports;
+    if !overlays_root_config_paths.is_empty() {
+        let normalized = normalize_config_paths(&overlays_root_config_paths);
+        let root_schema = config_analysis
+            .root_schema()
+            .cloned()
+            .unwrap_or(Value::Bool(true));
+        let schema = overlays_root_schema_for_paths(&root_schema, &normalized);
+        raw_manifest.config_schema = Some(
+            ConfigSchema::new(schema)
+                .expect("synthetic overlays root config schema should be valid"),
+        );
+    }
+    let root_manifest: Manifest = raw_manifest
+        .try_into()
+        .expect("synthetic overlays root manifest should be valid");
+    let root_digest = root_manifest.digest();
+    store.put(root_digest, Arc::new(root_manifest));
+
+    let overlays_tree = ResolvedTree {
+        root: ResolvedNode {
+            name: "overlays".to_string(),
+            declared_ref: overlays_root_ref.clone(),
+            digest: root_digest,
+            resolved_url: overlays_root_url,
+            observed_url: None,
+            config: None,
+            children: overlays_children,
+            uses: BTreeMap::new(),
+            child_templates: BTreeMap::new(),
+        },
+    };
+
+    // The synthetic overlays artifact is linked like an ordinary tree. This does not recurse
+    // because the frontend rejects `use` subtrees that declare nested `use` or `overlays`, so
+    // this synthetic tree contains no overlay scopes of its own.
+    let (scenario, nested_overlays, provenance) = link(overlays_tree, store)?;
+    debug_assert!(
+        nested_overlays.is_none(),
+        "synthetic overlays artifact should not contain nested overlays"
+    );
+    Ok(Some(OverlayPlan {
+        scenario,
+        provenance,
+        scopes,
+    }))
+}
+
+fn resolve_overlay_export(
+    store: &DigestStore,
+    node: &ResolvedNode,
+    export_name: &str,
+) -> Result<OverlayExportEndpoint, ()> {
+    let manifest = store
+        .get(&node.digest)
+        .expect("resolved overlay manifest should be in the digest store");
+    let Some(target) = manifest.exports().get(export_name) else {
+        return Err(());
+    };
+
+    match target {
+        ExportTarget::SelfProvide(provide_name) => {
+            let provide_decl = manifest
+                .provides()
+                .get(provide_name)
+                .expect("manifest invariant: exported provide exists");
+            Ok(OverlayExportEndpoint::Provide {
+                name: provide_name.to_string(),
+                decl: provide_decl.decl.clone(),
+                resolved_url: node.resolved_url.clone(),
+            })
+        }
+        ExportTarget::SelfSlot(slot_name) => {
+            manifest
+                .slots()
+                .get(slot_name)
+                .expect("manifest invariant: exported slot exists");
+            Ok(OverlayExportEndpoint::Slot {
+                name: slot_name.to_string(),
+                resolved_url: node.resolved_url.clone(),
+            })
+        }
+        ExportTarget::ChildExport { child, export } => {
+            let child_node = node
+                .children
+                .get(child.as_str())
+                .expect("manifest invariant: exported child exists");
+            resolve_overlay_export(store, child_node, export.as_str())
+        }
+        _ => Err(()),
+    }
+}
+
+fn overlay_ref_decl_site(
+    store: &DigestStore,
+    manifest_url: &Url,
+    overlay_index: usize,
+) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
+    store
+        .diagnostic_source(manifest_url)
+        .map_or((None, None), |(src, spans)| {
+            let span = spans
+                .overlays
+                .get(overlay_index)
+                .map(|candidate| candidate.whole)
+                .unwrap_or((0usize, 0usize).into());
+            (Some(src), Some(span))
+        })
+}
+
+fn overlay_endpoint_related_spans(
+    store: &DigestStore,
+    overlay: &OverlayRef,
+    endpoint: &OverlayExportEndpoint,
+) -> Vec<RelatedSpan> {
+    let (resolved_url, name, label) = match endpoint {
+        OverlayExportEndpoint::Provide {
+            resolved_url, name, ..
+        } => (
+            resolved_url,
+            name,
+            "provide resolved from overlay reference",
+        ),
+        OverlayExportEndpoint::Slot {
+            resolved_url, name, ..
+        } => (resolved_url, name, "slot resolved from overlay reference"),
+    };
+
+    let Some(stored) = store.get_source(resolved_url) else {
+        return Vec::new();
+    };
+    let span = match endpoint {
+        OverlayExportEndpoint::Provide { .. } => stored
+            .spans
+            .provides
+            .get(name.as_str())
+            .map(|provide| provide.capability.name),
+        OverlayExportEndpoint::Slot { .. } => {
+            stored.spans.slots.get(name.as_str()).map(|slot| slot.name)
+        }
+    }
+    .unwrap_or((0usize, 0usize).into());
+
+    vec![RelatedSpan {
+        message: format!("overlay reference `{overlay}` resolves here"),
+        src: NamedSource::new(display_url(resolved_url), stored.source).with_language("json5"),
+        span,
+        label: label.to_string(),
+    }]
 }
 
 fn flatten(
@@ -804,8 +1405,21 @@ fn flatten(
         Arc::from(format!("{parent_path}/{}", node.name))
     };
 
-    let moniker = Arc::clone(&authored_moniker).into();
+    let moniker: amber_scenario::Moniker = Arc::clone(&authored_moniker).into();
     let child_templates = lower_child_templates(node, state.store, state.manifest_catalog);
+    let manifest = state
+        .store
+        .get(&node.digest)
+        .expect("resolved manifest should exist in digest store");
+    if !manifest.overlays().is_empty() {
+        state.scope_builds.push(ScopeBuild {
+            root_id: id,
+            root_moniker: moniker.clone(),
+            manifest_url: node.resolved_url.clone(),
+            uses: node.uses.clone(),
+            overlays: manifest.overlays().to_vec(),
+        });
+    }
 
     state.out.push(Some(Component {
         id,
@@ -992,7 +1606,8 @@ fn validate_config_tree(
         }
     }
 
-    // 2) Validate config use-sites and program `${config.*}` references.
+    // 2) Validate config use-sites on authored manifests. Generated overlay IR is validated by
+    // the lowered-program verifier because it has no manifest source entry.
 
     fn validate_program_config_refs(
         id: ComponentId,
@@ -1032,11 +1647,13 @@ fn validate_config_tree(
             };
             match rc::schema_lookup(schema, query) {
                 Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => {}
-                Err(e) => {
+                Err(err) => {
                     errors.push(invalid_config_error(
                         component_path.clone(),
                         &site,
-                        format!("invalid ${{config{interp_suffix}}} reference in {location}: {e}"),
+                        format!(
+                            "invalid ${{config{interp_suffix}}} reference in {location}: {err}"
+                        ),
                         Some("invalid config reference".to_string()),
                         Vec::new(),
                     ));
@@ -1153,171 +1770,6 @@ fn validate_config_tree(
         }
     }
 
-    fn required_strings(schema: &Value) -> Vec<String> {
-        schema
-            .get("required")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect()
-    }
-
-    fn properties_map(schema: &Value) -> Option<&serde_json::Map<String, Value>> {
-        schema.get("properties")?.as_object()
-    }
-
-    fn ensure_required_keys_present(
-        schema: &Value,
-        template: &rc::ConfigNode,
-        at: &str,
-    ) -> Result<(), String> {
-        let Some(props) = properties_map(schema) else {
-            return Ok(());
-        };
-        let rc::ConfigNode::Object(map) = template else {
-            return Ok(());
-        };
-
-        for req in required_strings(schema) {
-            if !map.contains_key(req.as_str()) {
-                let full = if at.is_empty() {
-                    format!("config.{req}")
-                } else {
-                    format!("config.{at}.{req}")
-                };
-                return Err(format!("missing required field {full}"));
-            }
-        }
-
-        // Recurse only when both schema and template have an object node; runtime inserts (ConfigRef)
-        // have unknown structure until runtime, so we do not check deeper.
-        for (k, v) in map {
-            let Some(child_schema) = props.get(k) else {
-                continue;
-            };
-            let child_at = if at.is_empty() {
-                k.clone()
-            } else {
-                format!("{at}.{k}")
-            };
-            if child_schema.get("properties").is_some() && matches!(v, rc::ConfigNode::Object(_)) {
-                ensure_required_keys_present(child_schema, v, &child_at)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn project_schema_for_partial(schema: &Value, partial: &Value) -> Value {
-        match (schema, partial) {
-            (Value::Object(schema_map), Value::Object(partial_map)) => {
-                let mut out = schema_map.clone();
-
-                // Prune `required` to keys that exist in the partial object.
-                if let Some(Value::Array(req)) = schema_map.get("required") {
-                    let filtered = req
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .filter(|k| partial_map.contains_key(*k))
-                        .map(|k| Value::String(k.to_string()))
-                        .collect::<Vec<_>>();
-                    out.insert("required".to_string(), Value::Array(filtered));
-                }
-
-                // Recurse into properties that exist in the partial object.
-                if let Some(Value::Object(props)) = schema_map.get("properties") {
-                    let mut new_props = props.clone();
-                    for (k, child_schema) in props {
-                        if let Some(child_partial) = partial_map.get(k) {
-                            new_props.insert(
-                                k.clone(),
-                                project_schema_for_partial(child_schema, child_partial),
-                            );
-                        }
-                    }
-                    out.insert("properties".to_string(), Value::Object(new_props));
-                }
-
-                Value::Object(out)
-            }
-            _ => schema.clone(),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn validate_jsonschema(
-        id: ComponentId,
-        components: &[Option<Component>],
-        manifests: &[Option<Arc<Manifest>>],
-        provenance: &Provenance,
-        store: &DigestStore,
-        schema_cache: &mut HashMap<ManifestDigest, Arc<Validator>>,
-        schema_value: &Value,
-        instance: &Value,
-        context: &str,
-    ) -> Result<(), Error> {
-        let c = component(components, id);
-        let error_site = ConfigErrorSite::new(components, provenance, store, id);
-        let component_path = component_path_for(components, id);
-        let mut site = error_site.config_site();
-        let mut related = Vec::new();
-        if let Some(schema) = error_site.schema_related_site(&component_path) {
-            related.push(schema);
-        }
-
-        // Cache only the full (declared) schema validator.
-        let validator = if let Some(schema_decl) = manifests[id.0]
-            .as_ref()
-            .expect("manifest should exist")
-            .config_schema()
-            && std::ptr::eq(schema_value, &schema_decl.0)
-        {
-            if let Some(v) = schema_cache.get(&c.digest) {
-                Arc::clone(v)
-            } else {
-                let v = Arc::new(jsonschema::validator_for(schema_value).map_err(|e| {
-                    invalid_config_error(
-                        component_path.clone(),
-                        &site,
-                        format!("{context}: failed to compile schema: {e}"),
-                        None,
-                        Vec::new(),
-                    )
-                })?);
-                schema_cache.insert(c.digest, Arc::clone(&v));
-                v
-            }
-        } else {
-            Arc::new(jsonschema::validator_for(schema_value).map_err(|e| {
-                invalid_config_error(
-                    component_path.clone(),
-                    &site,
-                    format!("{context}: failed to compile projected schema: {e}"),
-                    None,
-                    Vec::new(),
-                )
-            })?)
-        };
-
-        let mut errs = validator.iter_errors(instance);
-        let Some(first) = errs.next() else {
-            return Ok(());
-        };
-        let instance_path = first.instance_path().to_string();
-        let mut msgs = vec![first.to_string()];
-        msgs.extend(errs.take(7).map(|e| e.to_string()));
-        if let Some(value_site) = error_site.invalid_value_site(&instance_path) {
-            site = value_site;
-        }
-        Err(invalid_config_error(
-            component_path,
-            &site,
-            format!("{context}: {}", msgs.join("; ")),
-            None,
-            related,
-        ))
-    }
-
     for id in (0..components.len()).map(ComponentId) {
         let m = manifests[id.0].as_ref().expect("manifest should exist");
         let schema = m.config_schema().map(|s| &s.0);
@@ -1346,89 +1798,58 @@ fn validate_config_tree(
         let schema = m.config_schema().map(|s| &s.0);
 
         let component_path = component_path_for(components, id);
-        let site = ConfigErrorSite::new(components, provenance, store, id).config_site();
-
-        let Some(schema) = schema else {
-            if c.config.is_some() {
-                errors.push(invalid_config_error(
-                    component_path.clone(),
-                    &site,
-                    "config was provided for a component that does not declare `config_schema`",
-                    None,
-                    Vec::new(),
-                ));
-            }
-            continue;
-        };
-
+        let error_site = ConfigErrorSite::new(components, provenance, store, id);
         let template = analysis.expect_component(id).template();
-        let rc::RootConfigTemplate::Node(composed) = template else {
-            // Root config is a runtime input when schema exists.
-            continue;
+        let digest = c.digest;
+
+        let mut validate_jsonschema = |schema_value: &Value, instance: &Value, context: &str| {
+            let validator = if schema.is_some_and(|declared| std::ptr::eq(schema_value, declared)) {
+                if let Some(validator) = schema_cache.get(&digest) {
+                    Arc::clone(validator)
+                } else {
+                    let validator =
+                        Arc::new(jsonschema::validator_for(schema_value).map_err(|err| {
+                            validation::ConfigValidationError::new(format!(
+                                "{context}: failed to compile schema: {err}"
+                            ))
+                        })?);
+                    schema_cache.insert(digest, Arc::clone(&validator));
+                    validator
+                }
+            } else {
+                Arc::new(jsonschema::validator_for(schema_value).map_err(|err| {
+                    validation::ConfigValidationError::new(format!(
+                        "{context}: failed to compile schema: {err}"
+                    ))
+                })?)
+            };
+
+            validation::validate_jsonschema_instance(&validator, instance, context)
         };
 
-        if !composed.is_object() {
-            errors.push(invalid_config_error(
-                component_path.clone(),
-                &site,
-                "component config must be an object (non-object config templates are unsupported)",
-                None,
-                Vec::new(),
-            ));
-            continue;
-        }
-
-        if let Err(msg) = ensure_required_keys_present(schema, composed, "") {
-            errors.push(invalid_config_error(
-                component_path.clone(),
-                &site,
-                msg,
-                None,
-                Vec::new(),
-            ));
-        }
-
-        // Validate static values at compile time.
-        if !composed.contains_runtime() {
-            match composed.evaluate_static() {
-                Ok(v) => {
-                    if let Err(e) = validate_jsonschema(
-                        id,
-                        components,
-                        manifests,
-                        provenance,
-                        store,
-                        schema_cache,
-                        schema,
-                        &v,
-                        "invalid config",
-                    ) {
-                        errors.push(e);
-                    }
+        for err in validation::validate_component_config_template_with_validator(
+            schema,
+            template,
+            c.config.is_some(),
+            &mut validate_jsonschema,
+        ) {
+            let mut site = error_site.config_site();
+            let mut related = Vec::new();
+            if let Some(instance_path) = err.instance_path.as_deref() {
+                if let Some(value_site) = error_site.invalid_value_site(instance_path) {
+                    site = value_site;
                 }
-                Err(err) => errors.push(invalid_config_error(
-                    component_path.clone(),
-                    &site,
-                    err.to_string(),
-                    None,
-                    Vec::new(),
-                )),
+                if let Some(schema_site) = error_site.schema_related_site(&component_path) {
+                    related.push(schema_site);
+                }
             }
-        } else if let Some(partial) = composed.static_subset() {
-            let projected = project_schema_for_partial(schema, &partial);
-            if let Err(e) = validate_jsonschema(
-                id,
-                components,
-                manifests,
-                provenance,
-                store,
-                schema_cache,
-                &projected,
-                &partial,
-                "invalid static config values",
-            ) {
-                errors.push(e);
-            }
+            errors.push(invalid_config_error(
+                component_path.clone(),
+                &site,
+                err.message,
+                None,
+                related,
+            ));
         }
     }
     analysis
@@ -1623,6 +2044,16 @@ fn record_program_lowering_errors(
 ) {
     for program_error in program_errors {
         match program_error.site {
+            ProgramLoweringSite::Program => {
+                let (src, span) = program_site(provenance, store, component)
+                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                errors.push(Error::UnsupportedProgram {
+                    component_path: component_path.to_string(),
+                    message: program_error.message.clone(),
+                    src,
+                    span,
+                });
+            }
             ProgramLoweringSite::Mount(mount_index) => {
                 let (src, span) = mount_source_site(provenance, store, component, mount_index)
                     .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));

@@ -24,8 +24,9 @@ use crate::{
     schema::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ChildTemplateDecl,
         ChildTemplateManifestDecl, ComponentDecl, ConfigSchema, EnvironmentDecl, ExportTarget,
-        LocalCapabilityRefKind, LocalComponentRef, ManifestBinding, MountSource, Program,
-        ProvideDecl, RawBinding, RawExportTarget, RawProgram, ResourceDecl, SlotDecl, VmScalarU32,
+        LocalCapabilityRefKind, LocalComponentRef, ManifestBinding, MountSource, OverlayDecl,
+        OverlayRef, Program, ProvideDecl, RawBinding, RawExportTarget, RawOverlayDecl, RawProgram,
+        ResourceDecl, SlotDecl, VmScalarU32,
     },
 };
 
@@ -43,6 +44,9 @@ pub struct RawManifest {
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub components: BTreeMap<String, ComponentDecl>,
+    #[serde_as(as = "MapPreventDuplicates<_, _>")]
+    #[serde(default)]
+    pub r#use: BTreeMap<String, ComponentDecl>,
 
     /// Optional named resolution environments for resolving child manifests.
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
@@ -65,6 +69,8 @@ pub struct RawManifest {
     pub child_templates: BTreeMap<String, ChildTemplateDecl>,
     #[serde(default)]
     pub bindings: Vec<RawBinding>,
+    #[serde(default)]
+    pub overlays: Vec<RawOverlayDecl>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub exports: BTreeMap<String, RawExportTarget>,
@@ -89,6 +95,9 @@ impl fmt::Display for ExperimentalFeature {
     }
 }
 
+const LATEST_MANIFEST_VERSION: Version = Version::new(0, 4, 0);
+const OVERLAYS_MANIFEST_VERSION: Version = Version::new(0, 4, 0);
+const OVERLAYS_MANIFEST_VERSION_STR: &str = "0.4.0";
 const SUPPORTED_MANIFEST_VERSION_REQ: &str = ">=0.1.0, <1.0.0";
 
 fn supported_manifest_version_req() -> &'static VersionReq {
@@ -124,6 +133,36 @@ fn validate_program_syntax_manifest_version(
         feature: unsupported.feature,
         pointer: unsupported.pointer,
     })
+}
+
+fn validate_overlays_manifest_version(
+    manifest_version: &Version,
+    uses: &BTreeMap<String, ComponentDecl>,
+    overlays: &[RawOverlayDecl],
+) -> Result<(), Error> {
+    if manifest_version >= &OVERLAYS_MANIFEST_VERSION {
+        return Ok(());
+    }
+
+    if !uses.is_empty() {
+        return Err(Error::UnsupportedManifestFeatureForManifestVersion {
+            manifest_version: Box::new(manifest_version.clone()),
+            required_version: OVERLAYS_MANIFEST_VERSION_STR,
+            feature: "`use` section",
+            pointer: "/use".to_string(),
+        });
+    }
+
+    if !overlays.is_empty() {
+        return Err(Error::UnsupportedManifestFeatureForManifestVersion {
+            manifest_version: Box::new(manifest_version.clone()),
+            required_version: OVERLAYS_MANIFEST_VERSION_STR,
+            feature: "`overlays` section",
+            pointer: "/overlays/0".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn find_unsupported_program_syntax(
@@ -179,6 +218,28 @@ fn validate_component_manifest_refs(
             ComponentDecl::Reference(reference) => validate_manifest_ref(reference)?,
             ComponentDecl::Object(obj) => validate_manifest_ref(&obj.manifest)?,
         }
+    }
+    Ok(())
+}
+
+fn validate_overlay_refs(
+    uses: &BTreeMap<String, ComponentDecl>,
+    overlays: &[OverlayDecl],
+) -> Result<(), Error> {
+    for overlay in overlays {
+        if !uses.contains_key(overlay.overlay.alias.as_str()) {
+            return Err(Error::UnknownOverlayUse {
+                alias: overlay.overlay.alias.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_use_names(uses: &BTreeMap<String, ComponentDecl>) -> Result<(), Error> {
+    for name in uses.keys() {
+        ensure_name_no_dot(name, "use")?;
     }
     Ok(())
 }
@@ -333,6 +394,24 @@ fn validate_component_environments(
         {
             return Err(Error::UnknownComponentEnvironment {
                 child: child_name.to_string(),
+                environment: env.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_use_environments(
+    uses: &BTreeMap<String, ComponentDecl>,
+    environments: &BTreeMap<String, EnvironmentDecl>,
+) -> Result<(), Error> {
+    for (use_name, decl) in uses {
+        if let ComponentDecl::Object(obj) = decl
+            && let Some(env) = obj.environment.as_deref()
+            && !environments.contains_key(env)
+        {
+            return Err(Error::UnknownUseEnvironment {
+                name: use_name.to_string(),
                 environment: env.to_string(),
             });
         }
@@ -863,6 +942,7 @@ impl RawManifest {
             experimental_features,
             program,
             components,
+            r#use,
             environments,
             config_schema,
             slots,
@@ -870,6 +950,7 @@ impl RawManifest {
             resources,
             child_templates,
             bindings,
+            overlays,
             exports,
             metadata,
         } = self;
@@ -880,12 +961,24 @@ impl RawManifest {
             .map_or((None, false), |(program, used)| (Some(program), used));
 
         validate_program_syntax_manifest_version(&manifest_version, program.as_ref())?;
+        validate_overlays_manifest_version(&manifest_version, &r#use, &overlays)?;
 
         if let Some(schema) = config_schema.as_ref() {
             ConfigSchema::validate_value(&schema.0)?;
         }
         validate_component_manifest_refs(&components)?;
+        validate_component_manifest_refs(&r#use)?;
+        validate_use_names(&r#use)?;
         validate_environment_names(&environments)?;
+        let overlays = overlays
+            .into_iter()
+            .map(|overlay| -> Result<OverlayDecl, Error> {
+                Ok(OverlayDecl {
+                    overlay: OverlayRef::from_str(&overlay.0)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_overlay_refs(&r#use, &overlays)?;
 
         let components = convert_components(components)?;
         let slots = convert_slots(slots)?;
@@ -896,6 +989,7 @@ impl RawManifest {
         validate_environment_extends(&environments)?;
         validate_environment_cycles(&environments)?;
         validate_component_environments(&components, &environments)?;
+        validate_use_environments(&r#use, &environments)?;
         validate_no_ambiguous_capability(&slots, &provides)?;
         validate_resource_decls(&resources)?;
         validate_child_templates(&child_templates, &slots, &bindings)?;
@@ -944,6 +1038,7 @@ impl RawManifest {
             experimental_features,
             program,
             components,
+            r#use,
             environments,
             config_schema,
             slots,
@@ -951,6 +1046,7 @@ impl RawManifest {
             resources,
             child_templates,
             bindings: bindings_out,
+            overlays,
             exports: exports_out,
             metadata,
             digest: ManifestDigest::new([0; 32]),
@@ -967,6 +1063,7 @@ pub struct Manifest {
     experimental_features: BTreeSet<ExperimentalFeature>,
     program: Option<Program>,
     components: BTreeMap<ChildName, ComponentDecl>,
+    r#use: BTreeMap<String, ComponentDecl>,
     environments: BTreeMap<String, EnvironmentDecl>,
     config_schema: Option<ConfigSchema>,
     slots: BTreeMap<SlotName, SlotDecl>,
@@ -974,6 +1071,7 @@ pub struct Manifest {
     resources: BTreeMap<ResourceName, ResourceDecl>,
     child_templates: BTreeMap<TemplateName, ChildTemplateDecl>,
     bindings: Vec<ManifestBinding>,
+    overlays: Vec<OverlayDecl>,
     exports: BTreeMap<ExportName, ExportTarget>,
     metadata: Option<Value>,
     digest: ManifestDigest,
@@ -998,6 +1096,10 @@ impl Manifest {
 
     pub fn components(&self) -> &BTreeMap<ChildName, ComponentDecl> {
         &self.components
+    }
+
+    pub fn uses(&self) -> &BTreeMap<String, ComponentDecl> {
+        &self.r#use
     }
 
     pub fn environments(&self) -> &BTreeMap<String, EnvironmentDecl> {
@@ -1028,16 +1130,21 @@ impl Manifest {
         &self.bindings
     }
 
+    pub fn overlays(&self) -> &[OverlayDecl] {
+        &self.overlays
+    }
+
     pub fn exports(&self) -> &BTreeMap<ExportName, ExportTarget> {
         &self.exports
     }
 
     pub fn empty() -> Self {
         RawManifest {
-            manifest_version: Version::new(0, 2, 0),
+            manifest_version: LATEST_MANIFEST_VERSION,
             experimental_features: BTreeSet::new(),
             program: None,
             components: BTreeMap::new(),
+            r#use: BTreeMap::new(),
             environments: BTreeMap::new(),
             config_schema: None,
             slots: BTreeMap::new(),
@@ -1045,6 +1152,7 @@ impl Manifest {
             resources: BTreeMap::new(),
             child_templates: BTreeMap::new(),
             bindings: Vec::new(),
+            overlays: Vec::new(),
             exports: BTreeMap::new(),
             metadata: None,
         }
@@ -1065,10 +1173,11 @@ impl Manifest {
 impl Manifest {
     #[builder]
     pub fn new(
-        #[builder(default = Version::new(0, 2, 0))] manifest_version: Version,
+        #[builder(default = LATEST_MANIFEST_VERSION)] manifest_version: Version,
         #[builder(default)] experimental_features: BTreeSet<ExperimentalFeature>,
         program: Option<Program>,
         #[builder(default)] components: BTreeMap<String, ComponentDecl>,
+        #[builder(default)] r#use: BTreeMap<String, ComponentDecl>,
         #[builder(default)] environments: BTreeMap<String, EnvironmentDecl>,
         config_schema: Option<Value>,
         #[builder(default)] slots: BTreeMap<String, SlotDecl>,
@@ -1076,6 +1185,7 @@ impl Manifest {
         #[builder(default)] resources: BTreeMap<String, ResourceDecl>,
         #[builder(default)] child_templates: BTreeMap<String, ChildTemplateDecl>,
         #[builder(default)] bindings: Vec<RawBinding>,
+        #[builder(default)] overlays: Vec<OverlayDecl>,
         #[builder(default)] exports: BTreeMap<String, RawExportTarget>,
         metadata: Option<Value>,
     ) -> Result<Self, Error> {
@@ -1086,6 +1196,7 @@ impl Manifest {
             experimental_features,
             program: program.map(RawProgram::from),
             components,
+            r#use,
             environments,
             config_schema,
             slots,
@@ -1093,6 +1204,10 @@ impl Manifest {
             resources,
             child_templates,
             bindings,
+            overlays: overlays
+                .into_iter()
+                .map(|overlay| RawOverlayDecl(overlay.overlay.to_string()))
+                .collect(),
             exports,
             metadata,
         }
@@ -1121,6 +1236,8 @@ impl From<&Manifest> for RawManifest {
             .iter()
             .map(|(name, decl)| (name.to_string(), decl.clone()))
             .collect();
+
+        let uses = manifest.r#use.clone();
 
         let slots = manifest
             .slots
@@ -1219,6 +1336,7 @@ impl From<&Manifest> for RawManifest {
             experimental_features: manifest.experimental_features.clone(),
             program: manifest.program.as_ref().map(RawProgram::from),
             components,
+            r#use: uses,
             environments: manifest.environments.clone(),
             config_schema: manifest.config_schema.clone(),
             slots,
@@ -1226,6 +1344,11 @@ impl From<&Manifest> for RawManifest {
             resources,
             child_templates,
             bindings,
+            overlays: manifest
+                .overlays
+                .iter()
+                .map(|overlay| RawOverlayDecl(overlay.overlay.to_string()))
+                .collect(),
             exports,
             metadata: manifest.metadata.clone(),
         }

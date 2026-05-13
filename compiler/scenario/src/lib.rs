@@ -207,7 +207,7 @@ impl Scenario {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Component {
     pub id: ComponentId,
     pub parent: Option<ComponentId>,
@@ -316,19 +316,19 @@ pub struct ResourceDecl {
     pub params: StorageResourceParams,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProvideRef {
     pub component: ComponentId,
     pub name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResourceRef {
     pub component: ComponentId,
     pub name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FrameworkRef {
     pub authority: ComponentId,
     pub capability: FrameworkCapabilityName,
@@ -346,7 +346,7 @@ impl std::fmt::Display for FrameworkRef {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BindingFrom {
     Component(ProvideRef),
     Resource(ResourceRef),
@@ -354,13 +354,13 @@ pub enum BindingFrom {
     External(SlotRef),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SlotRef {
     pub component: ComponentId,
     pub name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindingEdge {
     pub from: BindingFrom,
     pub to: SlotRef,
@@ -368,7 +368,7 @@ pub struct BindingEdge {
     pub weak: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScenarioExport {
     pub name: String,
     pub capability: CapabilityDecl,

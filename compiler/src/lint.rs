@@ -451,7 +451,11 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
         program.visit_config_uses(|_, query| uses.add_query(query));
     }
 
-    for decl in manifest.components().values() {
+    for decl in manifest
+        .components()
+        .values()
+        .chain(manifest.uses().values())
+    {
         let ComponentDecl::Object(obj) = decl else {
             continue;
         };
@@ -667,6 +671,28 @@ pub fn lint_manifest(
                 .unwrap_or((0usize, 0usize).into());
             lints.push(ManifestLint::UnusedProvide {
                 name: provide_name.to_string(),
+                component: component.clone(),
+                src: src.clone(),
+                span,
+            });
+        }
+    }
+
+    let overlay_referenced_uses: BTreeSet<_> = manifest
+        .overlays()
+        .iter()
+        .map(|overlay| overlay.overlay.alias.as_str())
+        .collect();
+
+    for use_name in manifest.uses().keys() {
+        if !overlay_referenced_uses.contains(use_name.as_str()) {
+            let span = spans
+                .uses
+                .get(use_name.as_str())
+                .map(|s| s.name)
+                .unwrap_or((0usize, 0usize).into());
+            lints.push(ManifestLint::UnusedUse {
+                name: use_name.clone(),
                 component: component.clone(),
                 src: src.clone(),
                 span,
@@ -922,6 +948,35 @@ mod tests {
         assert!(!lints.iter().any(|lint| matches!(
             lint,
             crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "token"
+        )));
+    }
+
+    #[test]
+    fn config_used_in_use_config_is_not_linted() {
+        let input = r##"
+        {
+          manifest_version: "0.4.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              secret: { type: "string" },
+            },
+          },
+          use: {
+            overlay: {
+              manifest: "https://example.com/overlay",
+              config: { token: "${config.secret}" },
+            },
+          },
+          overlays: ["#overlay.apply"],
+        }
+        "##;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "secret"
         )));
     }
 
@@ -1337,6 +1392,45 @@ mod tests {
                 .iter()
                 .any(|lint| matches!(lint, crate::lint::ManifestLint::UnusedProgram { .. }))
         );
+    }
+
+    #[test]
+    fn unused_use_is_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.4.0",
+          use: {
+            wrapper: "./wrapper.json5",
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedUse { name, .. } if name == "wrapper"
+        )));
+    }
+
+    #[test]
+    fn use_referenced_by_overlay_is_not_linted() {
+        let input = r##"
+        {
+          manifest_version: "0.4.0",
+          use: {
+            wrapper: "./wrapper.json5",
+          },
+          overlays: ["#wrapper.rewrite"],
+        }
+        "##;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedUse { name, .. } if name == "wrapper"
+        )));
     }
 
     #[test]

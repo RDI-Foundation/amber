@@ -182,7 +182,7 @@ fn cleanup_temporary_run_outside_proxy_removes_state_file() {
             .expect("proxy child should spawn"),
     );
 
-    cleanup_temporary_run_outside_proxy(run_root, &mut proxy_child)
+    scenario_runner::cleanup_temporary_run_outside_proxy(run_root, &mut proxy_child)
         .expect("cleanup should succeed");
 
     assert!(

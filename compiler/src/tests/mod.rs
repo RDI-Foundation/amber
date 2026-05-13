@@ -23,10 +23,12 @@ use url::Url;
 
 use crate::{
     CompileOptions, Compiler, DigestStore, ResolvedNode, ResolvedTree, ResolverRegistry,
+    RunningScenario, ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError, ScenarioRunnerFuture,
     bundle::{
         BUNDLE_INDEX_NAME, BUNDLE_SCHEMA, BUNDLE_VERSION, BundleBuilder, BundleIndex, BundleLoader,
         BundleRequest,
     },
+    overlay::InterpositionPlan,
     reporter::{Reporter as _, scenario_ir::ScenarioIrReporter},
 };
 
@@ -54,6 +56,11 @@ fn file_url(path: &Path) -> Url {
 
 fn default_compiler() -> Compiler {
     Compiler::new(Resolver::new(), DigestStore::default())
+}
+
+fn compiler_with_noop_overlay_runner() -> Compiler {
+    Compiler::new(Resolver::new(), DigestStore::default())
+        .with_scenario_runner(Arc::new(TestScenarioRunner))
 }
 
 fn manifest_ref_for_path(path: &Path) -> ManifestRef {
@@ -118,6 +125,37 @@ fn has_diagnostic_code(diagnostics: &[miette::Report], code: &str) -> bool {
         let diag: &dyn Diagnostic = &**report;
         diag.code().is_some_and(|c| c.to_string() == code)
     })
+}
+
+struct TestScenarioRunner;
+
+impl ScenarioRunner<crate::reporter::CompiledScenario> for TestScenarioRunner {
+    fn start<'a>(
+        &'a self,
+        _compiled: &'a crate::reporter::CompiledScenario,
+        _options: ScenarioRunOptions,
+    ) -> ScenarioRunnerFuture<'a, Result<Box<dyn RunningScenario>, ScenarioRunnerError>> {
+        Box::pin(async { Ok(Box::new(TestRunningScenario) as Box<dyn RunningScenario>) })
+    }
+}
+
+struct TestRunningScenario;
+
+impl RunningScenario for TestRunningScenario {
+    fn post_json_export<'a>(
+        &'a self,
+        _export: &'a amber_manifest::ExportName,
+        _request: &'a serde_json::Value,
+    ) -> ScenarioRunnerFuture<'a, Result<String, ScenarioRunnerError>> {
+        Box::pin(async {
+            serde_json::to_string(&InterpositionPlan::default())
+                .map_err(|err| ScenarioRunnerError::message(err.to_string()))
+        })
+    }
+
+    fn finish(self: Box<Self>) -> ScenarioRunnerFuture<'static, Result<(), ScenarioRunnerError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 fn accept_with_deadline(listener: &TcpListener, deadline: Instant) -> std::net::TcpStream {

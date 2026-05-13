@@ -16,7 +16,7 @@ pub use schema::{
     is_valid_config_key, prune_schema, schema_lookup, schema_lookup_ref, schema_path_accepts_null,
     schema_path_ancestors_must_be_non_null_objects, schema_path_is_required,
     schema_path_may_accept_non_null, schema_path_may_be_object, schema_path_may_be_other_non_null,
-    schema_path_presence, validate_config_schema,
+    schema_path_presence, validate_config_schema, validate_config_value,
 };
 pub use template::{
     RenderedFileMountSource, config_path_is_present, eval_config_template,

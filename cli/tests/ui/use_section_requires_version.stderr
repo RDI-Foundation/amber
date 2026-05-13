@@ -1,0 +1,12 @@
+Error: manifest::feature_requires_manifest_version
+
+  × check failed
+  ╰─▶ using `use` section requires manifest_version >= 0.4.0, but found 0.3.0
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_section_requires_version.json5:3:3]
+ 2 │   manifest_version: "0.3.0",
+ 3 │   use: {
+   ·   ─┬─
+   ·    ╰── unsupported manifest feature used here
+ 4 │     wrapper: "./use_section_requires_version_wrapper.json5",
+   ╰────
+  help: set `manifest_version` to "0.4.0" or remove `use` section

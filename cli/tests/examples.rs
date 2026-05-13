@@ -3,13 +3,17 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Mutex, OnceLock},
 };
 
 #[path = "../src/example_catalog.rs"]
 mod example_catalog;
+#[path = "test_support/runtime_bins.rs"]
+mod runtime_bins_support;
 
 #[test]
 fn examples_check_deny_warnings() {
+    let _guard = example_command_lock();
     let examples_dir = examples_dir();
     let examples = collect_examples();
     for example in &examples {
@@ -52,8 +56,8 @@ fn examples_check_deny_warnings() {
     }
 
     let mut manifests: Vec<PathBuf> = examples
-        .into_iter()
-        .map(|example| example.root_manifest)
+        .iter()
+        .map(|example| example.root_manifest.clone())
         .collect();
     manifests.extend(collect_scenario_variants(&examples_dir));
     manifests.sort();
@@ -66,8 +70,9 @@ fn examples_check_deny_warnings() {
 
     let amber = env!("CARGO_BIN_EXE_amber");
     for manifest in manifests {
-        let output = Command::new(amber)
+        let output = amber_command(amber)
             .arg("check")
+            .arg("--apply-overlays")
             .arg("-D")
             .arg("warnings")
             .arg(&manifest)
@@ -90,6 +95,7 @@ fn examples_check_deny_warnings() {
 
 #[test]
 fn examples_compile_from_ir_matches_manifest_outputs() {
+    let _guard = example_command_lock();
     let amber = env!("CARGO_BIN_EXE_amber");
     let outputs_root = workspace_root().join("target").join("cli-test-outputs");
     fs::create_dir_all(&outputs_root).expect("failed to create outputs root");
@@ -144,6 +150,13 @@ fn examples_compile_from_ir_matches_manifest_outputs() {
     }
 }
 
+fn example_command_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("example command lock should not be poisoned")
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -170,7 +183,7 @@ enum ExampleBackend {
 fn example_backend(example: &example_catalog::Example) -> ExampleBackend {
     if matches!(
         example.name.as_str(),
-        "direct-security" | "framework-component"
+        "direct-security" | "framework-component" | "overlay-redaction"
     ) {
         ExampleBackend::Direct
     } else if example.name == "vm-network-storage" {
@@ -192,7 +205,7 @@ fn compile_example_outputs(
     let dot_output = output_root.join("scenario.dot");
     let metadata_output = output_root.join("metadata.json");
 
-    let mut command = Command::new(amber);
+    let mut command = amber_command(amber);
     command
         .arg("compile")
         .arg("--output")
@@ -238,6 +251,15 @@ fn compile_example_outputs(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+fn amber_command(amber: &str) -> Command {
+    let mut command = Command::new(amber);
+    command.env(
+        "AMBER_RUNTIME_BIN_DIR",
+        runtime_bins_support::runtime_bin_dir(&workspace_root()),
+    );
+    command
 }
 
 fn assert_same_file(left: &Path, right: &Path) {

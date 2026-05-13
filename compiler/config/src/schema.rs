@@ -626,6 +626,20 @@ pub fn apply_schema_defaults(schema: &Value, value: &mut Value) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_config_value(schema: &Value, value: &mut Value) -> Result<()> {
+    apply_schema_defaults(schema, value)?;
+
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|err| ConfigError::schema(format!("failed to compile schema: {err}")))?;
+    let mut errors = validator.iter_errors(value);
+    let Some(first) = errors.next() else {
+        return Ok(());
+    };
+    let mut messages = vec![first.to_string()];
+    messages.extend(errors.take(7).map(|err| err.to_string()));
+    Err(ConfigError::validation(messages.join("; ")))
+}
+
 pub fn apply_schema_defaults_to_node(schema: &Value, node: &mut ConfigNode) -> Result<()> {
     validate_config_schema(schema)?;
 

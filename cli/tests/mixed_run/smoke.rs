@@ -1773,6 +1773,62 @@ fn response_json_from(response: (u16, String), context: &str) -> Value {
 
 #[test]
 #[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
+fn mixed_run_overlay_redaction_live() {
+    let temp = temp_output_dir("mixed-run-overlay-redaction-");
+    let storage_root = temp.path().join("state");
+    let manifest = workspace_root()
+        .join("examples")
+        .join("overlay-redaction")
+        .join("scenario.json5");
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "direct_local": { "kind": "direct" }
+            },
+            "defaults": {
+                "path": "direct_local"
+            }
+        }),
+    );
+
+    let mut run = run_manifest(&manifest, &placement, &storage_root);
+    let export_port = pick_free_port();
+    let direct_artifact = run.site_artifact_dir("direct_local");
+    let mut proxy = spawn_proxy(&direct_artifact, "status", export_port, &[]);
+    let body = wait_for_body(&mut proxy, export_port, "/", Duration::from_secs(120));
+    let status: Value = serde_json::from_str(&body).expect("status export should return JSON");
+
+    assert_eq!(
+        status["sent_payload"],
+        json!({
+            "message": "my launch code is swordfish",
+            "api_key": "hunter2",
+        }),
+        "caller should send the original configured payload"
+    );
+    assert_eq!(
+        status["received_payload"],
+        json!({
+            "message": "my launch code is [REDACTED]",
+            "api_key": "[REDACTED]",
+        }),
+        "overlay interposer should redact the a2a response path"
+    );
+    assert!(
+        status["error"].is_null(),
+        "caller should complete without error: {status}"
+    );
+
+    stop_proxy(&mut proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
 fn framework_component_direct_create_destroy_live() {
     let temp = temp_output_dir("framework-component-direct-");
     let admin_port = pick_free_port();

@@ -6,8 +6,8 @@ mod cloud_image_support;
 mod outputs_root_support;
 #[path = "../test_support/port_allocator.rs"]
 mod port_allocator_support;
-#[path = "../test_support/target_dir.rs"]
-mod target_dir_support;
+#[path = "../test_support/runtime_bins.rs"]
+mod runtime_bins_support;
 #[path = "../test_support/workspace_root.rs"]
 mod workspace_root_support;
 
@@ -37,7 +37,6 @@ use cloud_image_support::default_host_arch_cloud_image_filename;
 use outputs_root_support::cli_test_outputs_root;
 use port_allocator_support::reserve_test_loopback_port;
 use serde_json::{Value, json};
-use target_dir_support::cargo_target_dir;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub(crate) use workspace_root_support::workspace_root;
 
@@ -199,28 +198,7 @@ impl TestTempDir {
 }
 
 pub(crate) fn runtime_bin_dir() -> &'static PathBuf {
-    static BIN_DIR: OnceLock<PathBuf> = OnceLock::new();
-    BIN_DIR.get_or_init(|| {
-        let output = Command::new("cargo")
-            .current_dir(workspace_root())
-            .arg("build")
-            .arg("-q")
-            .arg("-p")
-            .arg("amber-cli")
-            .arg("-p")
-            .arg("amber-router")
-            .arg("-p")
-            .arg("amber-helper")
-            .output()
-            .expect("failed to build amber runtime binaries");
-        assert!(
-            output.status.success(),
-            "failed to build runtime binaries\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        cargo_target_dir(&workspace_root()).join("debug")
-    })
+    runtime_bins_support::runtime_bin_dir(&workspace_root())
 }
 
 pub(crate) fn mixed_run_base_image() -> PathBuf {

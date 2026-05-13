@@ -40,6 +40,7 @@ async fn bundle_compile_matches_direct_ir() {
         .unwrap();
     let direct = compiler
         .compile_from_tree(tree.clone(), opts.optimize)
+        .await
         .unwrap();
     let direct_ir = ScenarioIrReporter
         .emit(&compiled_scenario(&direct))
@@ -305,8 +306,8 @@ fn bundle_loader_from_path_rejects_unsupported_version() {
     }
 }
 
-#[test]
-fn compile_from_tree_handles_malformed_program_image_from_builder() {
+#[tokio::test]
+async fn compile_from_tree_handles_malformed_program_image_from_builder() {
     let manifest = Manifest::builder()
         .program(amber_manifest::Program::image(
             amber_manifest::ProgramImage::builder()
@@ -337,6 +338,7 @@ fn compile_from_tree_handles_malformed_program_image_from_builder() {
             observed_url: None,
             config: None,
             children: BTreeMap::new(),
+            uses: BTreeMap::new(),
             child_templates: BTreeMap::new(),
         },
     };
@@ -344,12 +346,13 @@ fn compile_from_tree_handles_malformed_program_image_from_builder() {
     let compiler = Compiler::new(Resolver::new(), store);
     let out = compiler
         .compile_from_tree(tree, standard_compile_options().optimize)
+        .await
         .expect("builder-provided malformed program.image should remain recoverable");
     assert_eq!(out.scenario.components.len(), 1);
 }
 
-#[test]
-fn check_from_tree_handles_malformed_program_image_from_builder_with_source() {
+#[tokio::test]
+async fn check_from_tree_handles_malformed_program_image_from_builder_with_source() {
     let manifest = Manifest::builder()
         .program(amber_manifest::Program::image(
             amber_manifest::ProgramImage::builder()
@@ -402,6 +405,7 @@ fn check_from_tree_handles_malformed_program_image_from_builder_with_source() {
             observed_url: None,
             config: None,
             children: BTreeMap::new(),
+            uses: BTreeMap::new(),
             child_templates: BTreeMap::new(),
         },
     };
@@ -409,6 +413,7 @@ fn check_from_tree_handles_malformed_program_image_from_builder_with_source() {
     let compiler = Compiler::new(Resolver::new(), store);
     let out = compiler
         .check_from_tree(tree)
+        .await
         .expect("builder-provided malformed program.image should remain recoverable");
     assert!(!out.has_errors);
 }
@@ -439,6 +444,7 @@ async fn bundle_builder_reserializes_when_source_missing() {
             observed_url: None,
             config: None,
             children: BTreeMap::new(),
+            uses: BTreeMap::new(),
             child_templates: BTreeMap::new(),
         },
     };

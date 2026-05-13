@@ -9,13 +9,13 @@ members = [
   "compiler/scenario",
   "compiler/template",
   "images",
-  "manager",
   "runtime/docker-gateway",
   "runtime/helper",
   "runtime/mesh",
   "runtime/proxy",
   "runtime/provisioner",
   "runtime/router",
+  "runtime/scenario-runner",
   "runtime/site-controller",
 ]
 resolver = "2"
@@ -32,6 +32,7 @@ amber-proxy = { path = "runtime/proxy" }
 amber-resolver = { path = "compiler/resolver" }
 amber-router = { path = "runtime/router" }
 amber-scenario = { path = "compiler/scenario" }
+amber-scenario-runner = { path = "runtime/scenario-runner" }
 amber-site-controller = { path = "runtime/site-controller" }
 amber-template = { path = "compiler/template" }
 base64 = "0.22.1"
@@ -42,6 +43,7 @@ jsonschema = { version = "0.38.1", default-features = false }
 miette = "7.4.0"
 serde = "1.0.217"
 serde_json = "1.0.148"
+serde_path_to_error = "0.1.20"
 serde_yaml = "0.9.34"
 serde_with = "3.16.1"
 tempfile = "3.24.0"

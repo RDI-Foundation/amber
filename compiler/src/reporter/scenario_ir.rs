@@ -4,7 +4,7 @@ use amber_manifest::ExportTarget;
 use amber_scenario::{ComponentId, Scenario, ScenarioIr, ir::ComponentExportTargetIr};
 
 use super::{CompiledScenario, Reporter, ReporterError};
-use crate::CompileOutput;
+use crate::{CompileOutput, Provenance};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScenarioIrReporter;
@@ -18,14 +18,23 @@ impl Reporter for ScenarioIrReporter {
 }
 
 pub fn scenario_ir_from_compile_output(output: &CompileOutput) -> ScenarioIr {
-    let mut ir = ScenarioIr::from(&output.scenario);
+    let mut ir = scenario_ir_from_scenario_and_provenance(&output.scenario, &output.provenance);
     for component in &mut ir.components {
-        component.resolved_url = output
-            .provenance
+        component.exports = live_component_exports(output, ComponentId(component.id));
+    }
+    ir
+}
+
+pub(crate) fn scenario_ir_from_scenario_and_provenance(
+    scenario: &Scenario,
+    provenance: &Provenance,
+) -> ScenarioIr {
+    let mut ir = ScenarioIr::from(scenario);
+    for component in &mut ir.components {
+        component.resolved_url = provenance
             .components
             .get(component.id)
             .map(|provenance| provenance.resolved_url.to_string());
-        component.exports = live_component_exports(output, ComponentId(component.id));
     }
     ir
 }

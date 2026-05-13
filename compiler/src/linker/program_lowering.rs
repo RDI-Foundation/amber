@@ -4,8 +4,9 @@ use amber_config as rc;
 use amber_manifest::{
     CapabilityKind, ConfigSchema, Endpoint as ManifestEndpoint, EndpointPort, ExperimentalFeature,
     FrameworkCapabilityName, InterpolatedPart, InterpolatedString, InterpolationSource,
-    MountSource, Program as ManifestProgram, ProgramMount as ManifestMount, ResourceDecl,
-    ResourceName, SlotDecl, SlotName, WhenPath, framework_capability,
+    MountSource, Program as ManifestProgram, ProgramArgValue, ProgramMount as ManifestMount,
+    ResourceDecl, ResourceName, SlotDecl, SlotName, SlotTarget, VmScalarU32, WhenPath,
+    framework_capability, parse_slot_query, validate_slot_query_for_slot,
 };
 use amber_scenario::{
     ComponentId, Endpoint, FileMount, FileMountSource, Program, ProgramCommon, ProgramCondition,
@@ -21,6 +22,7 @@ use crate::config::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProgramLoweringSite {
+    Program,
     Endpoint(usize),
     Mount(usize),
 }
@@ -57,6 +59,17 @@ enum LoweredWhen {
 pub(crate) struct LoweredProgram {
     pub(crate) program: Program,
     pub(crate) mount_source_indices: Vec<usize>,
+}
+
+pub(crate) struct LoweredProgramValidation<'a> {
+    pub(crate) program: &'a Program,
+    pub(crate) mount_source_indices: &'a [usize],
+    pub(crate) component_id: Option<ComponentId>,
+    pub(crate) config_schema: Option<&'a ConfigSchema>,
+    pub(crate) resources: &'a BTreeMap<ResourceName, ResourceDecl>,
+    pub(crate) slots: &'a BTreeMap<SlotName, SlotDecl>,
+    pub(crate) enabled_features: &'a BTreeSet<ExperimentalFeature>,
+    pub(crate) validate_source_interpolations: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +194,40 @@ pub(crate) fn lower_program_with_config_analysis(
     }
 }
 
+pub(crate) fn validate_lowered_program(
+    validation: LoweredProgramValidation<'_>,
+) -> Result<(), Vec<ProgramLoweringError>> {
+    let mut errors = Vec::new();
+
+    validate_lowered_program_shape(validation.program, &mut errors);
+    validate_lowered_program_references(
+        validation.program,
+        ProgramReferenceValidation {
+            component_id: validation.component_id,
+            config_schema: validation.config_schema,
+            slots: validation.slots,
+            validate_source_interpolations: validation.validate_source_interpolations,
+        },
+        &mut errors,
+    );
+    validate_lowered_program_mounts_into(
+        validation.program,
+        validation.mount_source_indices,
+        validation.config_schema,
+        validation.resources,
+        validation.slots,
+        validation.enabled_features,
+        &mut errors,
+    );
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn validate_lowered_program_mounts(
     program: &Program,
     mount_source_indices: &[usize],
@@ -190,10 +237,39 @@ pub(crate) fn validate_lowered_program_mounts(
     enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<(), Vec<ProgramLoweringError>> {
     let mut errors = Vec::new();
+    validate_lowered_program_mounts_into(
+        program,
+        mount_source_indices,
+        config_schema,
+        resources,
+        slots,
+        enabled_features,
+        &mut errors,
+    );
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn validate_lowered_program_mounts_into(
+    program: &Program,
+    mount_source_indices: &[usize],
+    config_schema: Option<&ConfigSchema>,
+    resources: &BTreeMap<ResourceName, ResourceDecl>,
+    slots: &BTreeMap<SlotName, SlotDecl>,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
     let mut seen_paths = BTreeSet::new();
 
     for (lowered_index, mount) in program.mounts().iter().enumerate() {
-        let authored_index = mount_source_indices[lowered_index];
+        let authored_index = mount_source_indices
+            .get(lowered_index)
+            .copied()
+            .unwrap_or(lowered_index);
         if let Some(message) =
             validate_lowered_mount(mount, config_schema, resources, slots, enabled_features)
         {
@@ -214,11 +290,623 @@ pub(crate) fn validate_lowered_program_mounts(
         }
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
+    if mount_source_indices.len() != program.mounts().len() {
+        errors.push(ProgramLoweringError {
+            site: ProgramLoweringSite::Program,
+            message: format!(
+                "lowered program has {} mount origin entries for {} mounts",
+                mount_source_indices.len(),
+                program.mounts().len()
+            ),
+        });
     }
+}
+
+fn validate_lowered_program_shape(program: &Program, errors: &mut Vec<ProgramLoweringError>) {
+    let Some(network) = program.network() else {
+        return;
+    };
+
+    let mut seen_names = BTreeSet::new();
+    for (index, endpoint) in network.endpoints.iter().enumerate() {
+        if endpoint.name.is_empty() {
+            errors.push(ProgramLoweringError {
+                site: ProgramLoweringSite::Endpoint(index),
+                message: "program endpoint names must not be empty".to_string(),
+            });
+        } else if !seen_names.insert(endpoint.name.as_str()) {
+            errors.push(ProgramLoweringError {
+                site: ProgramLoweringSite::Endpoint(index),
+                message: format!("duplicate endpoint name `{}`", endpoint.name),
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProgramReferenceValidation<'a> {
+    component_id: Option<ComponentId>,
+    config_schema: Option<&'a ConfigSchema>,
+    slots: &'a BTreeMap<SlotName, SlotDecl>,
+    validate_source_interpolations: bool,
+}
+
+fn validate_lowered_program_references(
+    program: &Program,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    match program {
+        Program::Image(program) => {
+            validate_program_string("program.image", &program.image, false, validation, errors);
+            validate_program_command(
+                "program.entrypoint",
+                &program.entrypoint,
+                validation,
+                errors,
+            );
+            validate_program_common("program", &program.common, validation, errors);
+        }
+        Program::Path(program) => {
+            validate_program_string("program.path", &program.path, false, validation, errors);
+            validate_program_command("program.args", &program.args, validation, errors);
+            validate_program_common("program", &program.common, validation, errors);
+        }
+        Program::Vm(program) => {
+            validate_program_string(
+                "program.vm.image",
+                &program.image,
+                false,
+                validation,
+                errors,
+            );
+            for (location, scalar) in [
+                ("program.vm.cpus", &program.cpus),
+                ("program.vm.memory_mib", &program.memory_mib),
+            ] {
+                if let VmScalarU32::Interpolated(raw) = scalar {
+                    validate_program_string(location, raw, false, validation, errors);
+                }
+            }
+            if let Some(raw) = program.cloud_init.user_data.as_deref() {
+                validate_program_string(
+                    "program.vm.cloud_init.user_data",
+                    raw,
+                    false,
+                    validation,
+                    errors,
+                );
+            }
+            if let Some(raw) = program.cloud_init.vendor_data.as_deref() {
+                validate_program_string(
+                    "program.vm.cloud_init.vendor_data",
+                    raw,
+                    false,
+                    validation,
+                    errors,
+                );
+            }
+            validate_program_mount_references(
+                "program.vm.mounts",
+                &program.mounts,
+                validation,
+                errors,
+            );
+        }
+        _ => push_program_error(
+            errors,
+            "program",
+            "unsupported scenario program variant".to_string(),
+        ),
+    }
+}
+
+fn validate_program_common(
+    location: &str,
+    common: &ProgramCommon,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    for (key, value) in &common.env {
+        validate_program_env_value(&format!("{location}.env.{key}"), value, validation, errors);
+    }
+    validate_program_mount_references(
+        &format!("{location}.mounts"),
+        &common.mounts,
+        validation,
+        errors,
+    );
+}
+
+fn validate_program_command(
+    location: &str,
+    command: &amber_manifest::ProgramEntrypoint,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    for (index, item) in command.0.iter().enumerate() {
+        let item_location = format!("{location}[{index}]");
+        validate_program_arg_item(&item_location, item, validation, errors);
+    }
+}
+
+fn validate_program_arg_item(
+    location: &str,
+    item: &amber_manifest::ProgramArgItem,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    if let Some(when) = item.when() {
+        validate_when_path(&format!("{location}.when"), when, validation, errors);
+    }
+    if let Some(each) = item.each() {
+        validate_each_path(&format!("{location}.each"), each, validation, errors);
+    }
+
+    match &item.value {
+        ProgramArgValue::Arg(arg) => validate_interpolated_string(
+            &format!("{location}.arg"),
+            arg,
+            item.is_repeated(),
+            validation,
+            errors,
+        ),
+        ProgramArgValue::Argv(argv) => {
+            for (arg_index, arg) in argv.0.iter().enumerate() {
+                validate_interpolated_string(
+                    &format!("{location}.argv[{arg_index}]"),
+                    arg,
+                    item.is_repeated(),
+                    validation,
+                    errors,
+                );
+            }
+        }
+    }
+}
+
+fn validate_program_env_value(
+    location: &str,
+    value: &amber_manifest::ProgramEnvValue,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    if let Some(when) = value.when() {
+        validate_when_path(&format!("{location}.when"), when, validation, errors);
+    }
+    if let Some(each) = value.each() {
+        validate_each_path(&format!("{location}.each"), each, validation, errors);
+    }
+
+    validate_interpolated_string(
+        &format!("{location}.value"),
+        value.value(),
+        value.is_repeated(),
+        validation,
+        errors,
+    );
+}
+
+fn validate_when_path(
+    location: &str,
+    when: &amber_manifest::WhenPath,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    match when.source() {
+        InterpolationSource::Config if validation.validate_source_interpolations => {
+            validate_config_ref(location, when.query(), validation.config_schema, errors)
+        }
+        InterpolationSource::Config => {}
+        InterpolationSource::Slots if validation.validate_source_interpolations => {
+            validate_slot_condition(location, when.query(), validation.slots, errors)
+        }
+        InterpolationSource::Slots => {}
+        InterpolationSource::Item if validation.validate_source_interpolations => {
+            push_program_error(
+                errors,
+                location,
+                "`item` interpolation is not valid in `when` conditions".to_string(),
+            )
+        }
+        InterpolationSource::Item => {}
+        other => push_program_error(
+            errors,
+            location,
+            format!("unsupported interpolation source `{other}` in `when` condition"),
+        ),
+    }
+}
+
+fn validate_each_path(
+    location: &str,
+    each: &amber_manifest::EachPath,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    match each.source() {
+        InterpolationSource::Config if validation.validate_source_interpolations => {
+            validate_config_ref(location, each.query(), validation.config_schema, errors)
+        }
+        InterpolationSource::Config => {}
+        InterpolationSource::Slots if validation.validate_source_interpolations => {
+            let Some(slot) = each.slot() else {
+                push_program_error(
+                    errors,
+                    location,
+                    "slot-based `each` must reference one slot".to_string(),
+                );
+                return;
+            };
+            validate_repeated_slot(location, slot, validation.slots, errors);
+        }
+        InterpolationSource::Slots => {}
+        InterpolationSource::Item if validation.validate_source_interpolations => {
+            push_program_error(
+                errors,
+                location,
+                "`item` interpolation is not valid in `each` selectors".to_string(),
+            )
+        }
+        InterpolationSource::Item => {}
+        other => push_program_error(
+            errors,
+            location,
+            format!("unsupported interpolation source `{other}` in `each` selector"),
+        ),
+    }
+}
+
+fn validate_program_string(
+    location: &str,
+    raw: &str,
+    item_allowed: bool,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    match raw.parse::<InterpolatedString>() {
+        Ok(value) => {
+            validate_interpolated_string(location, &value, item_allowed, validation, errors)
+        }
+        Err(err) if validation.validate_source_interpolations => {
+            push_program_error(errors, location, err.to_string())
+        }
+        Err(_) => {}
+    }
+}
+
+fn validate_interpolated_string(
+    location: &str,
+    value: &InterpolatedString,
+    item_allowed: bool,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    for part in &value.parts {
+        let InterpolatedPart::Interpolation { source, query } = part else {
+            continue;
+        };
+        match source {
+            InterpolationSource::Config if validation.validate_source_interpolations => {
+                validate_config_ref(location, query, validation.config_schema, errors)
+            }
+            InterpolationSource::Config => {}
+            InterpolationSource::Slots if validation.validate_source_interpolations => {
+                validate_slot_interpolation(location, query, validation.slots, errors)
+            }
+            InterpolationSource::Slots => {}
+            InterpolationSource::Item if validation.validate_source_interpolations => {
+                validate_item_ref(location, query, item_allowed, errors)
+            }
+            InterpolationSource::Item => {}
+            other => push_program_error(
+                errors,
+                location,
+                format!("unsupported interpolation source `{other}`"),
+            ),
+        }
+    }
+}
+
+fn validate_program_mount_references(
+    location: &str,
+    mounts: &[ProgramMount],
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    for (index, mount) in mounts.iter().enumerate() {
+        let location = format!("{location}[{index}]");
+        match mount {
+            ProgramMount::File(mount) => {
+                if let Some(when) = &mount.when {
+                    validate_program_condition(
+                        &format!("{location}.when"),
+                        when,
+                        validation,
+                        errors,
+                    );
+                }
+                if let Some(each) = &mount.each {
+                    validate_program_each(&format!("{location}.each"), each, validation, errors);
+                }
+                validate_template_string(
+                    &format!("{location}.path"),
+                    &mount.path,
+                    mount.each.is_some(),
+                    validation,
+                    errors,
+                );
+                match &mount.source {
+                    FileMountSource::Config { path } => validate_template_string(
+                        &format!("{location}.source"),
+                        path,
+                        mount.each.is_some(),
+                        validation,
+                        errors,
+                    ),
+                }
+            }
+            ProgramMount::Slot { .. }
+            | ProgramMount::Resource { .. }
+            | ProgramMount::Framework { .. } => {}
+        }
+    }
+}
+
+fn validate_program_condition(
+    location: &str,
+    condition: &ProgramCondition,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    match condition {
+        ProgramCondition::Config { path } => {
+            validate_config_ref(location, path, validation.config_schema, errors)
+        }
+        ProgramCondition::Slot { query } => {
+            validate_slot_condition(location, query, validation.slots, errors)
+        }
+    }
+}
+
+fn validate_program_each(
+    location: &str,
+    each: &ProgramEach,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    match each {
+        ProgramEach::Config { path } => {
+            validate_config_ref(location, path, validation.config_schema, errors)
+        }
+        ProgramEach::Slot { slot } => {
+            validate_repeated_slot(location, slot, validation.slots, errors)
+        }
+    }
+}
+
+fn validate_template_string(
+    location: &str,
+    value: &TemplateString,
+    item_allowed: bool,
+    validation: ProgramReferenceValidation<'_>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    for part in value {
+        match part {
+            TemplatePart::Lit { .. } => {}
+            TemplatePart::Config { config } => {
+                validate_config_ref(location, config, validation.config_schema, errors)
+            }
+            TemplatePart::Slot { slot, scope } => {
+                validate_template_scope(location, *scope, validation.component_id, errors);
+                validate_slot_interpolation(location, slot, validation.slots, errors);
+            }
+            TemplatePart::Item {
+                item, scope, slot, ..
+            } => {
+                validate_template_scope(location, *scope, validation.component_id, errors);
+                validate_repeated_slot(location, slot, validation.slots, errors);
+                validate_item_query(location, item, errors);
+            }
+            TemplatePart::CurrentItem { item } => {
+                validate_item_ref(location, item, item_allowed, errors);
+            }
+        }
+    }
+}
+
+fn validate_template_scope(
+    location: &str,
+    scope: u64,
+    component_id: Option<ComponentId>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    let Some(component_id) = component_id else {
+        return;
+    };
+    if scope != component_id.0 as u64 {
+        push_program_error(
+            errors,
+            location,
+            format!(
+                "template references slot scope {scope}, but this program belongs to component {}",
+                component_id.0
+            ),
+        );
+    }
+}
+
+fn validate_config_ref(
+    location: &str,
+    query: &str,
+    config_schema: Option<&ConfigSchema>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    let interp_suffix = if query.is_empty() {
+        "".to_string()
+    } else {
+        format!(".{query}")
+    };
+    let Some(schema) = config_schema else {
+        push_program_error(
+            errors,
+            location,
+            format!(
+                "references ${{config{interp_suffix}}}, but this component does not declare \
+                 `config_schema`"
+            ),
+        );
+        return;
+    };
+    if let Err(err) = rc::schema_lookup(&schema.0, query) {
+        push_program_error(
+            errors,
+            location,
+            format!("invalid ${{config{interp_suffix}}} reference: {err}"),
+        );
+    }
+}
+
+fn validate_slot_condition(
+    location: &str,
+    query: &str,
+    slots: &BTreeMap<SlotName, SlotDecl>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    match parse_slot_query(query) {
+        Ok(parsed) => match parsed.target {
+            SlotTarget::All => {}
+            SlotTarget::Slot(slot) => {
+                let Some(slot_decl) = slots.get(slot) else {
+                    push_program_error(errors, location, format!("unknown slot `{slot}`"));
+                    return;
+                };
+                if let Err(err) = validate_slot_query_for_slot(slot_decl, &parsed) {
+                    push_program_error(errors, location, err.to_string());
+                }
+            }
+        },
+        Err(err) => push_program_error(errors, location, err.to_string()),
+    }
+}
+
+fn validate_slot_interpolation(
+    location: &str,
+    query: &str,
+    slots: &BTreeMap<SlotName, SlotDecl>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    match parse_slot_query(query) {
+        Ok(parsed) => match parsed.target {
+            SlotTarget::All => {
+                if slots.values().any(|slot| slot.multiple) {
+                    push_program_error(
+                        errors,
+                        location,
+                        "`${slots}` cannot be used when the component declares repeated slots"
+                            .to_string(),
+                    );
+                } else if slots
+                    .values()
+                    .any(|slot_decl| slot_decl.decl.kind == CapabilityKind::Storage)
+                {
+                    push_program_error(
+                        errors,
+                        location,
+                        "storage slots are virtual storage objects and cannot be interpolated \
+                         through `${slots}`"
+                            .to_string(),
+                    );
+                }
+            }
+            SlotTarget::Slot(slot) => {
+                let Some(slot_decl) = slots.get(slot) else {
+                    push_program_error(errors, location, format!("unknown slot `{slot}`"));
+                    return;
+                };
+                if slot_decl.decl.kind == CapabilityKind::Storage {
+                    push_program_error(
+                        errors,
+                        location,
+                        format!(
+                            "storage slot `{slot}` is a virtual storage object, not a URL-shaped \
+                             slot"
+                        ),
+                    );
+                } else if slot_decl.multiple {
+                    push_program_error(
+                        errors,
+                        location,
+                        format!("slot `{slot}` is declared with `multiple: true`"),
+                    );
+                } else if let Err(err) = validate_slot_query_for_slot(slot_decl, &parsed) {
+                    push_program_error(errors, location, err.to_string());
+                }
+            }
+        },
+        Err(err) => push_program_error(errors, location, err.to_string()),
+    }
+}
+
+fn validate_repeated_slot(
+    location: &str,
+    slot: &str,
+    slots: &BTreeMap<SlotName, SlotDecl>,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    let Some(slot_decl) = slots.get(slot) else {
+        push_program_error(errors, location, format!("unknown slot `{slot}`"));
+        return;
+    };
+    if !slot_decl.multiple {
+        push_program_error(
+            errors,
+            location,
+            format!("slot `{slot}` is not declared with `multiple: true`"),
+        );
+    }
+}
+
+fn validate_item_ref(
+    location: &str,
+    query: &str,
+    item_allowed: bool,
+    errors: &mut Vec<ProgramLoweringError>,
+) {
+    if !item_allowed {
+        push_program_error(
+            errors,
+            location,
+            "`item` interpolation is only valid inside repeated `each` expansions".to_string(),
+        );
+        return;
+    }
+    validate_item_query(location, query, errors);
+}
+
+fn validate_item_query(location: &str, query: &str, errors: &mut Vec<ProgramLoweringError>) {
+    if query.is_empty() || query == "url" {
+        return;
+    }
+    if query.split('.').any(str::is_empty) {
+        push_program_error(
+            errors,
+            location,
+            format!("invalid item path {query:?}: empty segment"),
+        );
+    } else if query.contains('.') {
+        push_program_error(errors, location, format!("unknown item path {query:?}"));
+    } else {
+        push_program_error(errors, location, format!("unknown item field {query:?}"));
+    }
+}
+
+fn push_program_error(errors: &mut Vec<ProgramLoweringError>, location: &str, message: String) {
+    errors.push(ProgramLoweringError {
+        site: ProgramLoweringSite::Program,
+        message: format!("{location}: {message}"),
+    });
 }
 
 fn validate_lowered_mount(
@@ -1010,17 +1698,51 @@ fn push_template_literal(out: &mut TemplateString, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use amber_config::ConfigNode;
-    use amber_manifest::Manifest;
-    use amber_scenario::{FileMountSource, ProgramMount};
+    use amber_manifest::{
+        CapabilityDecl, CapabilityKind, ConfigSchema, ExperimentalFeature, InterpolatedString,
+        Manifest, ProgramEnvValue, ResourceDecl, ResourceName, SlotDecl, SlotName,
+    };
+    use amber_scenario::{
+        ComponentId, FileMount, FileMountSource, Program, ProgramCommon, ProgramMount, ProgramPath,
+    };
     use amber_template::TemplatePart;
+    use serde_json::json;
 
     use super::{
-        ProgramLoweringSite, lower_program, lower_program_with_origins,
-        lower_program_with_origins_and_root_schema, validate_lowered_program_mounts,
+        LoweredProgramValidation, ProgramLoweringSite, lower_program, lower_program_with_origins,
+        lower_program_with_origins_and_root_schema, validate_lowered_program,
+        validate_lowered_program_mounts,
     };
+
+    fn http_slot(multiple: bool) -> SlotDecl {
+        SlotDecl::builder()
+            .decl(CapabilityDecl::builder().kind(CapabilityKind::Http).build())
+            .multiple(multiple)
+            .build()
+    }
+
+    fn validate_test_program(
+        program: &Program,
+        component_id: ComponentId,
+        config_schema: Option<&ConfigSchema>,
+        resources: &BTreeMap<ResourceName, ResourceDecl>,
+        slots: &BTreeMap<SlotName, SlotDecl>,
+    ) -> Result<(), Vec<super::ProgramLoweringError>> {
+        let mount_source_indices = (0..program.mounts().len()).collect::<Vec<_>>();
+        validate_lowered_program(LoweredProgramValidation {
+            program,
+            mount_source_indices: &mount_source_indices,
+            component_id: Some(component_id),
+            config_schema,
+            resources,
+            slots,
+            enabled_features: &BTreeSet::<ExperimentalFeature>::new(),
+            validate_source_interpolations: true,
+        })
+    }
 
     #[test]
     fn lower_program_expands_static_config_endpoints() {
@@ -1643,5 +2365,109 @@ mod tests {
                 .message
                 .contains("requires `config_schema`, but the component does not declare one")
         );
+    }
+
+    #[test]
+    fn validate_lowered_program_rejects_missing_slot_use_in_env() {
+        let program = Program::Path(ProgramPath {
+            path: "./app".to_string(),
+            args: amber_manifest::ProgramEntrypoint::default(),
+            common: ProgramCommon {
+                env: BTreeMap::from([(
+                    "UPSTREAM_URL".to_string(),
+                    ProgramEnvValue::from(
+                        "${slots.missing.url}"
+                            .parse::<InterpolatedString>()
+                            .expect("valid interpolation"),
+                    ),
+                )]),
+                network: None,
+                mounts: Vec::new(),
+            },
+        });
+        let resources = BTreeMap::new();
+        let slots = BTreeMap::new();
+
+        let errors = validate_test_program(&program, ComponentId(12), None, &resources, &slots)
+            .expect_err("missing slot use must be rejected");
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].site, ProgramLoweringSite::Program);
+        assert!(errors[0].message.contains("unknown slot `missing`"));
+    }
+
+    #[test]
+    fn validate_lowered_program_rejects_config_ref_without_schema() {
+        let program = Program::Path(ProgramPath {
+            path: "./app".to_string(),
+            args: amber_manifest::ProgramEntrypoint::default(),
+            common: ProgramCommon {
+                env: BTreeMap::from([(
+                    "SECRET".to_string(),
+                    ProgramEnvValue::from(
+                        "${config.secret}"
+                            .parse::<InterpolatedString>()
+                            .expect("valid interpolation"),
+                    ),
+                )]),
+                network: None,
+                mounts: Vec::new(),
+            },
+        });
+        let resources = BTreeMap::new();
+        let slots = BTreeMap::new();
+
+        let errors = validate_test_program(&program, ComponentId(12), None, &resources, &slots)
+            .expect_err("config ref without schema must be rejected");
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].site, ProgramLoweringSite::Program);
+        assert!(
+            errors[0]
+                .message
+                .contains("does not declare `config_schema`")
+        );
+    }
+
+    #[test]
+    fn validate_lowered_program_rejects_template_slot_scope_mismatch() {
+        let config_schema = ConfigSchema::new(json!({
+            "type": "object",
+            "properties": {
+                "config_file": { "type": "string" },
+            },
+            "required": ["config_file"],
+        }))
+        .expect("valid config schema");
+        let program = Program::Path(ProgramPath {
+            path: "./app".to_string(),
+            args: amber_manifest::ProgramEntrypoint::default(),
+            common: ProgramCommon {
+                env: BTreeMap::new(),
+                network: None,
+                mounts: vec![ProgramMount::File(FileMount {
+                    when: None,
+                    each: None,
+                    path: vec![TemplatePart::slot(99, "api.url")],
+                    source: FileMountSource::Config {
+                        path: vec![TemplatePart::lit("config_file")],
+                    },
+                })],
+            },
+        });
+        let resources = BTreeMap::new();
+        let slots = BTreeMap::from([(SlotName::try_from("api").unwrap(), http_slot(false))]);
+
+        let errors = validate_test_program(
+            &program,
+            ComponentId(12),
+            Some(&config_schema),
+            &resources,
+            &slots,
+        )
+        .expect_err("template scope mismatch must be rejected");
+
+        assert_eq!(errors[0].site, ProgramLoweringSite::Program);
+        assert!(errors[0].message.contains("slot scope 99"));
     }
 }

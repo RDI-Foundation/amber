@@ -3,7 +3,7 @@ use amber_scenario::{ComponentId, Moniker};
 use url::Url;
 
 /// Per-compilation provenance captured alongside the Scenario graph.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Provenance {
     pub components: Vec<ComponentProvenance>,
 }
@@ -14,7 +14,7 @@ impl Provenance {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComponentProvenance {
     /// Stable component moniker as authored, before any optimization passes rewrite the tree.
     pub authored_moniker: Moniker,

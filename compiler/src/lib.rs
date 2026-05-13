@@ -19,6 +19,9 @@ mod linker;
 mod lint;
 pub mod mesh;
 mod mir;
+pub mod overlay;
+mod overlay_pass;
+mod overlays;
 pub mod run_plan;
 mod runtime_interface;
 mod slots;
@@ -27,8 +30,12 @@ mod targets;
 pub mod bundle;
 pub mod reporter;
 
+pub use amber_scenario_runner::{
+    RunningScenario, ScenarioRunOptions, ScenarioRunner, ScenarioRunnerError, ScenarioRunnerFuture,
+};
 pub use frontend::{DigestStore, ResolveOptions, ResolvedNode, ResolvedTree, ResolverRegistry};
 pub use linker::{ComponentProvenance, Provenance};
+pub use overlays::{OverlayExport, OverlayPlan, OverlayScopePlan};
 
 #[derive(Clone, Debug, Default)]
 pub struct CompileOptions {
@@ -57,6 +64,13 @@ impl Default for OptimizeOptions {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CheckOptions {
+    pub resolve: ResolveOptions,
+    pub optimize: OptimizeOptions,
+    pub apply_overlays: bool,
+}
+
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum Error {
@@ -71,6 +85,10 @@ pub enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Mir(#[from] mir::Error),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    OverlayPass(#[from] overlay_pass::Error),
 }
 
 #[derive(Clone)]
@@ -78,6 +96,7 @@ pub struct Compiler {
     resolver: Resolver,
     store: DigestStore,
     registry: ResolverRegistry,
+    scenario_runner: Option<Arc<dyn ScenarioRunner<reporter::CompiledScenario>>>,
 }
 
 impl Compiler {
@@ -86,6 +105,7 @@ impl Compiler {
             resolver,
             store,
             registry: ResolverRegistry::default(),
+            scenario_runner: None,
         }
     }
 
@@ -106,6 +126,14 @@ impl Compiler {
         self
     }
 
+    pub fn with_scenario_runner(
+        mut self,
+        scenario_runner: Arc<dyn ScenarioRunner<reporter::CompiledScenario>>,
+    ) -> Self {
+        self.scenario_runner = Some(scenario_runner);
+        self
+    }
+
     pub async fn resolve_tree(
         &self,
         root: ManifestRef,
@@ -122,31 +150,29 @@ impl Compiler {
     }
 
     #[allow(clippy::result_large_err)]
-    pub fn compile_from_tree(
+    pub async fn compile_from_tree(
         &self,
         tree: ResolvedTree,
         opts: OptimizeOptions,
     ) -> Result<CompileOutput, Error> {
         let mut diagnostics =
             slots::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
-        let (scenario, provenance) = linker::link(tree, &self.store)?;
+        let (scenario, overlays, provenance) = linker::link(tree, &self.store)?;
         diagnostics.extend(collect_manifest_diagnostics(
             &scenario,
             &provenance,
             &self.store,
         ));
 
-        let (scenario, provenance) = mir::optimize_linked_scenario(
-            scenario,
-            provenance,
-            &self.store,
-            mir::OptimizeOptions { dce: opts.dce },
-        )?;
+        let (scenario, overlays, provenance) = self
+            .finalize_linked_scenario(scenario, overlays, provenance, opts)
+            .await?;
         let config_analysis = config::analysis::ScenarioConfigAnalysis::from_scenario(&scenario)
             .expect("linked scenario should produce valid config analysis");
 
         Ok(CompileOutput {
             scenario,
+            overlays,
             store: self.store.clone(),
             provenance,
             diagnostics,
@@ -155,18 +181,42 @@ impl Compiler {
     }
 
     #[allow(clippy::result_large_err)]
-    pub fn check_from_tree(&self, tree: ResolvedTree) -> Result<CheckOutput, Error> {
+    pub async fn check_from_tree(&self, tree: ResolvedTree) -> Result<CheckOutput, Error> {
+        self.check_from_tree_with_options(tree, CheckFinalizeOptions::default())
+            .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn check_from_tree_with_options(
+        &self,
+        tree: ResolvedTree,
+        opts: CheckFinalizeOptions,
+    ) -> Result<CheckOutput, Error> {
         let mut diagnostics =
             slots::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
         let mut has_errors = false;
         let tree_for_manifest_lints = tree.clone();
 
         match linker::link(tree, &self.store) {
-            Ok((scenario, provenance)) => diagnostics.extend(collect_manifest_diagnostics(
-                &scenario,
-                &provenance,
-                &self.store,
-            )),
+            Ok((scenario, overlays, provenance)) => {
+                diagnostics.extend(collect_manifest_diagnostics(
+                    &scenario,
+                    &provenance,
+                    &self.store,
+                ));
+                let finalization = if opts.apply_overlays {
+                    self.finalize_linked_scenario(scenario, overlays, provenance, opts.optimize)
+                        .await
+                        .map(|_| ())
+                } else {
+                    self.optimize_linked_scenario(scenario, overlays, provenance, opts.optimize)
+                        .map(|_| ())
+                };
+                if let Err(err) = finalization {
+                    has_errors = true;
+                    diagnostics.push(Report::new(err));
+                }
+            }
             Err(err) => {
                 has_errors = true;
                 diagnostics.extend(collect_manifest_diagnostics_from_tree(
@@ -196,23 +246,101 @@ impl Compiler {
         opts: CompileOptions,
     ) -> Result<CompileOutput, Error> {
         let tree = self.resolve_tree(root, opts.resolve).await?;
-        self.compile_from_tree(tree, opts.optimize)
+        self.compile_from_tree(tree, opts.optimize).await
     }
 
-    /// Resolve and lint manifests, then attempt to link and report as many errors as possible.
+    /// Resolve manifests, run the compiler passes without emitting artifacts, and report
+    /// diagnostics.
     pub async fn check(
         &self,
         root: ManifestRef,
         opts: CompileOptions,
     ) -> Result<CheckOutput, Error> {
         let tree = self.resolve_tree(root, opts.resolve).await?;
-        self.check_from_tree(tree)
+        self.check_from_tree_with_options(
+            tree,
+            CheckFinalizeOptions {
+                optimize: opts.optimize,
+                apply_overlays: false,
+            },
+        )
+        .await
+    }
+
+    /// Resolve manifests, optionally apply scenario overlays, and report diagnostics without
+    /// emitting artifacts.
+    pub async fn check_with_options(
+        &self,
+        root: ManifestRef,
+        opts: CheckOptions,
+    ) -> Result<CheckOutput, Error> {
+        let tree = self.resolve_tree(root, opts.resolve).await?;
+        self.check_from_tree_with_options(
+            tree,
+            CheckFinalizeOptions {
+                optimize: opts.optimize,
+                apply_overlays: opts.apply_overlays,
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn optimize_linked_scenario(
+        &self,
+        scenario: Scenario,
+        overlays: Option<OverlayPlan>,
+        provenance: Provenance,
+        opts: OptimizeOptions,
+    ) -> Result<(Scenario, Option<OverlayPlan>, Provenance), Error> {
+        let (scenario, provenance) = mir::optimize_linked_scenario(
+            scenario,
+            provenance,
+            &self.store,
+            mir::OptimizeOptions { dce: opts.dce },
+        )?;
+        let overlays = overlays
+            .map(|overlays| -> Result<OverlayPlan, mir::Error> {
+                let (scenario, provenance) = mir::optimize_linked_scenario(
+                    overlays.scenario,
+                    overlays.provenance,
+                    &self.store,
+                    mir::OptimizeOptions { dce: opts.dce },
+                )?;
+                Ok(OverlayPlan {
+                    scenario,
+                    provenance,
+                    scopes: overlays.scopes,
+                })
+            })
+            .transpose()?;
+        Ok((scenario, overlays, provenance))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn finalize_linked_scenario(
+        &self,
+        scenario: Scenario,
+        overlays: Option<OverlayPlan>,
+        provenance: Provenance,
+        opts: OptimizeOptions,
+    ) -> Result<(Scenario, Option<OverlayPlan>, Provenance), Error> {
+        let (scenario, overlays, provenance) =
+            self.optimize_linked_scenario(scenario, overlays, provenance, opts)?;
+        let scenario = overlay_pass::apply_overlays(
+            scenario,
+            overlays.as_ref(),
+            self.scenario_runner.as_deref(),
+        )
+        .await?;
+        Ok((scenario, overlays, provenance))
     }
 }
 
 #[derive(Debug)]
 pub struct CompileOutput {
     pub scenario: Scenario,
+    pub overlays: Option<OverlayPlan>,
     pub store: DigestStore,
     pub provenance: Provenance,
     pub diagnostics: Vec<Report>,
@@ -243,6 +371,12 @@ impl CompileOutput {
 pub struct CheckOutput {
     pub diagnostics: Vec<Report>,
     pub has_errors: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CheckFinalizeOptions {
+    optimize: OptimizeOptions,
+    apply_overlays: bool,
 }
 
 fn collect_manifest_diagnostics(

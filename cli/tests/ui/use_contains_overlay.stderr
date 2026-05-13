@@ -1,0 +1,23 @@
+Error: compiler::use_contains_overlay
+
+  × check failed
+  ╰─▶ use `#wrapper` contains overlay declarations in its subtree: nested
+      `use` is not supported
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_contains_overlay.json5:4:14]
+ 3 │   use: {
+ 4 │     wrapper: "./use_contains_overlay_wrapper.json5",
+   ·              ───────────────────┬──────────────────
+   ·                                 ╰── use declared here
+ 5 │   },
+   ╰────
+  help: `use` components referenced by overlays must be self-contained.
+
+Advice: 
+  ☞ use `#wrapper` resolves to an overlay declaration here
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/use_contains_overlay_wrapper.json5:4:5]
+ 3 │   use: {
+ 4 │     nested: "./use_contains_overlay_nested.json5",
+   ·     ───┬──
+   ·        ╰── nested `use` declared here
+ 5 │   },
+   ╰────

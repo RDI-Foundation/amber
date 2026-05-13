@@ -20,7 +20,7 @@ Minimal leaf component exporting an HTTP API:
 
 ```json5
 {
-  manifest_version: "0.3.0",
+  manifest_version: "0.4.0",
   program: {
     image: "ghcr.io/acme/hello:v1",
     entrypoint: "--port 8080",
@@ -44,7 +44,8 @@ Minimal leaf component exporting an HTTP API:
 This crate **parses JSON5**, deserializes into Rust types, and validates:
 
 * `manifest_version` must be valid SemVer and **satisfy `>=0.1.0, <1.0.0`**.
-  New manifests should use `0.3.0`; older pre-1.0 manifests are still accepted.
+  New manifests should use `0.4.0`; older pre-1.0 manifests are still accepted when they do not
+  use syntax introduced by later manifest versions.
 * `experimental_features` entries must be known feature names.
 * No dots (`.`) in:
 
@@ -110,16 +111,18 @@ Top-level object:
 
 ```json5
 {
-  manifest_version: "0.3.0",   // required
+  manifest_version: "0.4.0",   // required
   experimental_features: ["docker"], // optional; default []
 
   program: { /* ... */ },      // optional
   components: { /* ... */ },   // optional; default {}
+  use: { /* ... */ },          // optional; default {}
   config_schema: { /* ... */ },// optional
   slots: { /* ... */ },        // optional; default {}
   resources: { /* ... */ },    // optional; default {}
   provides: { /* ... */ },      // optional; default {}
   bindings: [ /* ... */ ],      // optional; default []
+  overlays: [ /* ... */ ],      // optional; default []
   exports: { /* ... */ },       // optional; default {}
   metadata: { /* ... */ },      // optional
 }
@@ -133,6 +136,9 @@ Current values:
 
 * `"docker"`
 * `"kvm"`
+
+For scenario overlay request/response semantics and interposer behavior, see
+[`../OVERLAYS.md`](../OVERLAYS.md).
 
 Rules:
 
@@ -486,6 +492,29 @@ Notes:
 
 * `config` accepts any non-null JSON value; `null` is treated as omitted.
 * This crate does not validate `config` against `config_schema` (link-time concern).
+
+---
+
+## `use` (helper components)
+
+`use` is a map: **instance name → component declaration**.
+
+It uses the same declaration forms as [`components`](#components-child-components), but is only
+available in `manifest_version: "0.4.0"` or newer.
+
+`use` entries declare helper manifests that overlays may reference. They are kept out of the main
+compiled scenario.
+
+---
+
+## `overlays`
+
+`overlays` is an ordered list of overlay refs in `#use_name.export` form.
+
+`overlays` is available in `manifest_version: "0.4.0"` or newer.
+
+Each entry refers to an exported capability from the local `use` set. Link-time validation of
+those refs is handled by the compiler rather than this crate.
 
 ---
 

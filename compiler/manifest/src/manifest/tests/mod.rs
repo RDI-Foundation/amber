@@ -7,6 +7,7 @@ mod child_templates;
 mod components;
 mod exports;
 mod mounts;
+mod overlays;
 
 fn parse_raw(input: &str) -> RawManifest {
     amber_json5::parse(input).unwrap()

@@ -258,6 +258,13 @@ fn prune_config_node(
                     allowed_leaf_paths,
                 )?));
             }
+            rc::ConfigNode::SymbolicConfigRef(root_path) => {
+                return Ok(Some(project_symbolic_config_ref(
+                    root_path,
+                    path,
+                    allowed_leaf_paths,
+                )?));
+            }
             rc::ConfigNode::Object(_) => {}
             _ => return Ok(Some(node.clone())),
         }
@@ -292,6 +299,11 @@ fn prune_config_node(
             }
         }
         rc::ConfigNode::ConfigRef(root_path) => Ok(Some(project_config_ref(
+            root_path,
+            path,
+            allowed_leaf_paths,
+        )?)),
+        rc::ConfigNode::SymbolicConfigRef(root_path) => Ok(Some(project_symbolic_config_ref(
             root_path,
             path,
             allowed_leaf_paths,
@@ -337,6 +349,29 @@ fn project_config_ref(
     }
 
     Ok(rc::ConfigNode::Object(out))
+}
+
+fn project_symbolic_config_ref(
+    root_path: &str,
+    prefix: &str,
+    allowed_leaf_paths: &BTreeSet<String>,
+) -> Result<rc::ConfigNode, String> {
+    let projected = project_config_ref(root_path, prefix, allowed_leaf_paths)?;
+    symbolic_projected_node(projected)
+}
+
+fn symbolic_projected_node(node: rc::ConfigNode) -> Result<rc::ConfigNode, String> {
+    match node {
+        rc::ConfigNode::ConfigRef(path) => Ok(rc::ConfigNode::SymbolicConfigRef(path)),
+        rc::ConfigNode::Object(map) => Ok(rc::ConfigNode::Object(
+            map.into_iter()
+                .map(|(key, value)| symbolic_projected_node(value).map(|value| (key, value)))
+                .collect::<Result<_, _>>()?,
+        )),
+        other => Err(format!(
+            "cannot project symbolic config ref through non-config node {other:?}"
+        )),
+    }
 }
 
 fn insert_config_node(
@@ -662,5 +697,55 @@ mod tests {
         assert!(template_json.contains("repo"));
         assert!(template_json.contains("tag"));
         assert!(!template_json.contains("token"));
+    }
+
+    #[test]
+    fn build_runtime_config_view_ignores_symbolic_refs_for_runtime_inputs() {
+        let root_schema = json!({
+            "type": "object",
+            "properties": {
+                "launch_code": { "type": "string" },
+                "api_key": { "type": "string", "secret": true }
+            }
+        });
+        let root_leaves = rc::collect_leaf_paths(&root_schema).expect("collect root leaves");
+
+        let component_schema = json!({
+            "type": "object",
+            "properties": {
+                "redaction_terms": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
+            }
+        });
+        let component_template =
+            rc::RootConfigTemplate::Node(rc::ConfigNode::Object(BTreeMap::from([(
+                "redaction_terms".to_string(),
+                rc::ConfigNode::Array(vec![
+                    rc::ConfigNode::SymbolicConfigRef("launch_code".to_string()),
+                    rc::ConfigNode::SymbolicConfigRef("api_key".to_string()),
+                ]),
+            )])));
+        let used_component_paths = BTreeSet::from(["redaction_terms".to_string()]);
+
+        let view = build_runtime_config_view(
+            "/overlay",
+            &root_schema,
+            &root_leaves,
+            &component_template,
+            &component_schema,
+            &used_component_paths,
+        )
+        .expect("build view");
+
+        assert!(
+            view.allowed_root_leaf_paths.is_empty(),
+            "symbolic refs should not require runtime root inputs"
+        );
+        assert_eq!(
+            view.pruned_root_schema,
+            serde_json::json!({ "type": "object" })
+        );
     }
 }

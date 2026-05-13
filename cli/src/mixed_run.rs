@@ -1611,6 +1611,36 @@ pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) 
         .map_err(|err| miette::miette!("invalid {} {}: {err}", label, path.display()))
 }
 
+pub(crate) fn startup_failure_for_run(run_root: &Path) -> Result<Option<String>> {
+    let state_root = run_root.join("state");
+    let Ok(entries) = fs::read_dir(&state_root) else {
+        return Ok(None);
+    };
+    for entry in entries {
+        let entry = entry.into_diagnostic().wrap_err_with(|| {
+            format!(
+                "failed to read run state entry under {}",
+                state_root.display()
+            )
+        })?;
+        let state_path = entry.path().join("manager-state.json");
+        if !state_path.is_file() {
+            continue;
+        }
+        let state: SiteManagerState = read_json(&state_path, "site manager state")?;
+        if matches!(state.status, SiteLifecycleStatus::Failed) {
+            return Ok(Some(format!(
+                "site `{}` failed during startup: {}",
+                state.site_id,
+                state
+                    .last_error
+                    .unwrap_or_else(|| "unknown failure".to_string())
+            )));
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn parse_control_endpoint(raw: &str) -> Result<ControlEndpoint> {
     if let Some(path) = raw.strip_prefix("unix://") {
         return Ok(ControlEndpoint::Unix(PathBuf::from(path)));
