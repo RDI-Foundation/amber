@@ -825,8 +825,18 @@ pub struct ConfigSchema(pub Value);
 
 impl ConfigSchema {
     pub(crate) fn validate_value(value: &Value) -> Result<(), Error> {
-        jsonschema::validator_for(value).map_err(|e| Error::InvalidConfigSchema(e.to_string()))?;
-        config_schema_profile::validate(value).map_err(Error::InvalidConfigSchema)?;
+        jsonschema::validator_for(value).map_err(|e| Error::InvalidConfigSchema {
+            path: "<root>".to_string(),
+            message: e.to_string(),
+            pointer: Some(String::new()),
+            key: None,
+        })?;
+        config_schema_profile::validate(value).map_err(|e| Error::InvalidConfigSchema {
+            path: e.path,
+            message: e.message,
+            pointer: e.pointer,
+            key: e.key,
+        })?;
         Ok(())
     }
 
@@ -850,7 +860,9 @@ impl<'de> Deserialize<'de> for ConfigSchema {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        ConfigSchema::new(value).map_err(serde::de::Error::custom)
+        // Raw manifests validate config_schema after deserialization so diagnostics can use
+        // manifest-level source spans instead of pointing at the whole field.
+        Ok(ConfigSchema(value))
     }
 }
 

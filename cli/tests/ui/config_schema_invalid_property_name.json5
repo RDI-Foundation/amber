@@ -1,0 +1,9 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      agent_HF_TOKEN: { type: "string", secret: true },
+    },
+  },
+}

@@ -266,9 +266,14 @@ pub enum Error {
     #[diagnostic(code(manifest::unsupported_mount_source))]
     UnsupportedMountSource { mount: String },
 
-    #[error("invalid config definition: {0}")]
+    #[error("invalid config definition at {path}: {message}")]
     #[diagnostic(code(manifest::invalid_config_schema))]
-    InvalidConfigSchema(String),
+    InvalidConfigSchema {
+        path: String,
+        message: String,
+        pointer: Option<String>,
+        key: Option<String>,
+    },
 
     #[error("unsupported manifest version `{version}` (supported: {supported_req})")]
     #[diagnostic(code(manifest::unsupported_version))]

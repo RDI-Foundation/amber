@@ -1,0 +1,15 @@
+Error: manifest::invalid_config_schema
+
+  × check failed
+  ╰─▶ invalid config definition at properties.agent_HF_TOKEN: config property
+      name `agent_HF_TOKEN` is invalid; config property names must start with
+      a lowercase ASCII letter and contain only lowercase ASCII letters,
+      digits, and underscores; double underscores are not allowed. Uppercase
+      letters are not allowed; use `agent_hf_token` instead
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/config_schema_invalid_property_name.json5:6:7]
+ 5 │     properties: {
+ 6 │       agent_HF_TOKEN: { type: "string", secret: true },
+   ·       ───────┬──────
+   ·              ╰── invalid config definition here
+ 7 │     },
+   ╰────
