@@ -18,7 +18,6 @@ use serde_with::{
 };
 
 use crate::{
-    config_schema_profile,
     error::Error,
     interpolation::{
         InlineStringSpec, InterpolatedString, InterpolationSource, ProgramEntrypoint,
@@ -825,17 +824,22 @@ pub struct ConfigSchema(pub Value);
 
 impl ConfigSchema {
     pub(crate) fn validate_value(value: &Value) -> Result<(), Error> {
-        jsonschema::validator_for(value).map_err(|e| Error::InvalidConfigSchema {
-            path: "<root>".to_string(),
-            message: e.to_string(),
-            pointer: Some(String::new()),
-            key: None,
+        amber_config::validate_config_schema_profile(value).map_err(|e| {
+            Error::InvalidConfigSchema {
+                path: e.path,
+                message: e.message,
+                pointer: e.pointer,
+                key: e.key,
+            }
         })?;
-        config_schema_profile::validate(value).map_err(|e| Error::InvalidConfigSchema {
-            path: e.path,
-            message: e.message,
-            pointer: e.pointer,
-            key: e.key,
+        jsonschema::validator_for(value).map_err(|e| {
+            let e = amber_config::ConfigSchemaProfileError::from_json_schema_validation(&e);
+            Error::InvalidConfigSchema {
+                path: e.path,
+                message: e.message,
+                pointer: e.pointer,
+                key: e.key,
+            }
         })?;
         Ok(())
     }

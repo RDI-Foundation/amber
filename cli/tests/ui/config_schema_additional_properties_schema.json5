@@ -1,0 +1,10 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      token: { type: "string" },
+    },
+    additionalProperties: { type: "string" },
+  },
+}
