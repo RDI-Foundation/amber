@@ -636,7 +636,7 @@ impl NormalizedTraceInteraction {
             parse_story_actors(story).or_else(|| parse_story_receivers(story))?;
         Some(Self {
             severity: severity
-                .filter(|severity| !severity.eq_ignore_ascii_case("info"))
+                .filter(|severity: &&str| !severity.eq_ignore_ascii_case("info"))
                 .map(ToString::to_string),
             actor,
             recipient,
@@ -996,7 +996,7 @@ fn event_attr_str<'a>(event: &'a PersistedTraceEvent, key: &str) -> Option<&'a s
 
 fn event_attr_bool(event: &PersistedTraceEvent, key: &str) -> Option<bool> {
     match event.attributes.get(key)? {
-        JsonValue::Bool(value) => Some(*value),
+        JsonValue::Bool(value) => Some(value.to_owned()),
         _ => None,
     }
 }

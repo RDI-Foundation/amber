@@ -1,6 +1,28 @@
 use super::*;
 
-const FRAMEWORK_MUTATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const FRAMEWORK_CONTROL_RESPONSE_GRACE: Duration = Duration::from_secs(30);
+
+fn framework_control_timeout_for_vm_ready_timeout(vm_ready_timeout: Duration) -> Duration {
+    vm_ready_timeout.max(Duration::from_secs(300))
+}
+
+fn framework_control_timeout() -> Duration {
+    framework_control_timeout_for_vm_ready_timeout(
+        amber_site_controller::vm_endpoint_forward_ready_timeout(),
+    )
+}
+
+fn framework_mutation_request_timeout_for_control_timeout(control_timeout: Duration) -> Duration {
+    control_timeout + FRAMEWORK_CONTROL_RESPONSE_GRACE
+}
+
+fn framework_mutation_request_timeout() -> Duration {
+    framework_mutation_request_timeout_for_control_timeout(framework_control_timeout())
+}
+
+fn framework_control_timeout_env_value() -> String {
+    format!("{:.3}", framework_control_timeout().as_secs_f64())
+}
 
 const FRAMEWORK_ADMIN_APP: &str = r#"import json
 import os
@@ -11,7 +33,7 @@ from urllib.request import Request, urlopen
 NAME = os.environ["NAME"]
 PORT = int(os.environ["PORT"])
 CTL_URL = os.environ["CTL_URL"].rstrip("/")
-CONTROL_TIMEOUT = 300.0
+CONTROL_TIMEOUT = float(os.environ.get("CONTROL_TIMEOUT", "300.0"))
 
 def send(handler, status, body, content_type="text/plain; charset=utf-8"):
     payload = body.encode("utf-8")
@@ -567,12 +589,13 @@ ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 fn write_framework_admin_component(root: &Path, file_name: &str, image: bool, port: u16) {
     let program = if image {
         json!({
-            "image": TEST_APP_IMAGE,
+            "image": test_app_image(),
             "entrypoint": ["python3", "-u", "-c", { "file": "./admin.py" }],
             "env": {
                 "NAME": "admin",
                 "PORT": port.to_string(),
-                "CTL_URL": "${slots.ctl.url}"
+                "CTL_URL": "${slots.ctl.url}",
+                "CONTROL_TIMEOUT": framework_control_timeout_env_value()
             },
             "network": {
                 "endpoints": [
@@ -587,7 +610,8 @@ fn write_framework_admin_component(root: &Path, file_name: &str, image: bool, po
             "env": {
                 "NAME": "admin",
                 "PORT": port.to_string(),
-                "CTL_URL": "${slots.ctl.url}"
+                "CTL_URL": "${slots.ctl.url}",
+                "CONTROL_TIMEOUT": framework_control_timeout_env_value()
             },
             "network": {
                 "endpoints": [
@@ -623,7 +647,7 @@ fn write_framework_worker_component(
 ) {
     let program = if image {
         json!({
-            "image": TEST_APP_IMAGE,
+            "image": test_app_image(),
             "entrypoint": ["python3", "-u", "-c", { "file": "./worker.py" }],
             "env": {
                 "NAME": name,
@@ -701,7 +725,7 @@ fn write_dynamic_caps_component(
         .collect::<serde_json::Map<_, _>>();
     let program = if image {
         json!({
-            "image": TEST_APP_IMAGE,
+            "image": test_app_image(),
             "entrypoint": ["python3", "-u", "-c", { "file": "./dynamic_caps_app.py" }],
             "env": env,
             "network": {
@@ -739,47 +763,117 @@ fn write_dynamic_caps_component(
 }
 
 fn framework_control_state_path(run: &RunHandle) -> PathBuf {
-    run.run_root
-        .join("state")
-        .join("framework-component")
-        .join("control-state.json")
+    run.run_root.join("state")
 }
 
-fn framework_control_state_plan_path(run: &RunHandle) -> PathBuf {
-    run.run_root
-        .join("state")
-        .join("framework-component")
-        .join("control-state-plan.json")
+fn read_framework_control_state(control_state_root: &Path) -> Value {
+    framework_control_state_snapshot(control_state_root)
 }
 
-fn framework_control_state_post(run: &RunHandle, path: &str, payload: &Value) -> (u16, String) {
-    let plan = read_json(&framework_control_state_plan_path(run));
-    let listen_addr = plan["listen_addr"]
+fn framework_site_controller_plan_path(run: &RunHandle) -> PathBuf {
+    let state_root = run.run_root.join("state");
+    let entries = fs::read_dir(&state_root).expect("run state directory should be readable");
+    let mut site_ids = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| entry.file_name().to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>();
+    site_ids.sort();
+    site_ids
+        .into_iter()
+        .map(|site_id| state_root.join(site_id).join("site-controller-plan.json"))
+        .find(|path| path.is_file())
+        .expect("run should materialize at least one site controller plan")
+}
+
+fn framework_site_controller_state_path(run: &RunHandle) -> PathBuf {
+    let state_root = run.run_root.join("state");
+    let entries = fs::read_dir(&state_root).expect("run state directory should be readable");
+    let mut site_ids = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| entry.file_name().to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>();
+    site_ids.sort();
+    site_ids
+        .into_iter()
+        .map(|site_id| state_root.join(site_id).join("site-controller-state.json"))
+        .find(|path| path.is_file())
+        .expect("run should materialize at least one site controller state file")
+}
+
+fn framework_controller_internal_route_id(run: &RunHandle, site_id: &str) -> String {
+    let state = read_json(&framework_site_controller_state_path(run));
+    let controller_moniker = state["base_scenario"]["components"]
+        .as_array()
+        .expect("site controller state should include base scenario components")
+        .iter()
+        .find(|component| {
+            component["metadata"]["kind"]
+                == amber_compiler::run_plan::FRAMEWORK_COMPONENT_CONTROLLER_METADATA_KIND
+                && component["metadata"]["execution_site"] == site_id
+        })
+        .and_then(|component| component["moniker"].as_str())
+        .expect("base scenario should include the local synthetic site controller component");
+    amber_mesh::component_route_id(
+        controller_moniker,
+        amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME,
+        amber_mesh::MeshProtocol::Http,
+    )
+}
+
+fn framework_controller_post(run: &RunHandle, path: &str, payload: &Value) -> (u16, String) {
+    let plan = read_json(&framework_site_controller_plan_path(run));
+    let authority_url = plan["authority_url"]
         .as_str()
-        .expect("framework control-state plan should publish listen_addr");
-    let auth_token = plan["auth_token"]
+        .expect("site controller plan should publish authority_url");
+    let site_id = plan["site_id"]
         .as_str()
-        .expect("framework control-state plan should publish auth token");
+        .expect("site controller plan should publish site_id");
+    let route_id = framework_controller_internal_route_id(run, site_id);
+    let logical_component_id = payload["holder_component_id"]
+        .as_str()
+        .or_else(|| payload["caller_component_id"].as_str())
+        .expect("dynamic capability controller request should identify the calling component");
+    let peer_id = logical_component_id
+        .strip_prefix("components.")
+        .filter(|moniker| moniker.starts_with('/'))
+        .expect("dynamic capability logical component id should be a component moniker");
     let body = serde_json::to_string(payload).expect("request body should serialize");
-    let output = std::process::Command::new("curl")
-        .arg("-sS")
-        .arg("--max-time")
-        .arg("30.000")
-        .arg("-X")
-        .arg("POST")
-        .arg("-H")
-        .arg("content-type: application/json")
-        .arg("-H")
-        .arg(format!("x-amber-framework-auth: {auth_token}"))
-        .arg("--data")
-        .arg(body)
-        .arg("-o")
-        .arg("-")
-        .arg("-w")
-        .arg("\n%{http_code}")
-        .arg(format!("http://{listen_addr}{path}"))
-        .output()
-        .expect("framework control-state request should complete");
+    let output = command_output_via_tempfiles(
+        std::process::Command::new("curl")
+            .arg("-sS")
+            .arg("--max-time")
+            .arg("30.000")
+            .arg("-X")
+            .arg("POST")
+            .arg("-H")
+            .arg("content-type: application/json")
+            .arg("-H")
+            .arg("x-amber-site-controller-local-only: 1")
+            .arg("-H")
+            .arg(format!("x-amber-route-id: {route_id}"))
+            .arg("-H")
+            .arg(format!("x-amber-peer-id: {peer_id}"))
+            .arg("--data")
+            .arg(body)
+            .arg("-o")
+            .arg("-")
+            .arg("-w")
+            .arg("\n%{http_code}")
+            .arg(format!("{}{path}", authority_url.trim_end_matches('/'))),
+        "framework controller request",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let (body, status) = stdout
         .rsplit_once('\n')
@@ -797,7 +891,7 @@ fn wait_for_live_child(control_state_path: &Path, name: &str) -> u64 {
     wait_for_condition(
         Duration::from_secs(60),
         || {
-            read_json(control_state_path)["live_children"]
+            read_framework_control_state(control_state_path)["live_children"]
                 .as_array()
                 .is_some_and(|children| {
                     children
@@ -807,7 +901,7 @@ fn wait_for_live_child(control_state_path: &Path, name: &str) -> u64 {
         },
         &format!("dynamic child `{name}` live in control state"),
     );
-    let control_state = read_json(control_state_path);
+    let control_state = read_framework_control_state(control_state_path);
     control_state["live_children"]
         .as_array()
         .expect("live children should be an array")
@@ -817,14 +911,97 @@ fn wait_for_live_child(control_state_path: &Path, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("dynamic child `{name}` should have an id"))
 }
 
+fn rule_contains(rule: &Value, key: &str, expected: &str) -> bool {
+    rule.get(key)
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(expected)))
+}
+
+fn kubernetes_role(kind_state: &Value, name: &str) -> Value {
+    let namespace = kind_state["kubernetes_namespace"]
+        .as_str()
+        .expect("kubernetes site should publish namespace");
+    let output = kubectl_for_manager_state(kind_state)
+        .arg("-n")
+        .arg(namespace)
+        .arg("get")
+        .arg("role")
+        .arg(name)
+        .arg("-o")
+        .arg("json")
+        .output()
+        .unwrap_or_else(|err| panic!("failed to query Kubernetes Role {name}: {err}"));
+    assert!(
+        output.status.success(),
+        "failed to query Kubernetes Role {name}:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("Kubernetes Role {name} should parse: {err}"))
+}
+
+fn assert_kubernetes_site_controller_role_cannot_write_rbac(kind_state: &Value) {
+    let role = kubernetes_role(kind_state, "amber-site-controller");
+    let rules = role["rules"]
+        .as_array()
+        .expect("site-controller Role should include rules");
+    assert!(
+        rules.iter().all(|rule| {
+            !rule_contains(rule, "apiGroups", "rbac.authorization.k8s.io")
+                && !rule_contains(rule, "resources", "serviceaccounts")
+                && !rule_contains(rule, "resources", "roles")
+                && !rule_contains(rule, "resources", "rolebindings")
+        }),
+        "site-controller Role should not be able to create or update Kubernetes RBAC objects"
+    );
+}
+
+fn assert_kubernetes_dynamic_provisioner_role_is_secret_only(kind_state: &Value) {
+    let role = kubernetes_role(kind_state, "amber-provisioner-dynamic");
+    let rules = role["rules"]
+        .as_array()
+        .expect("dynamic provisioner Role should include rules");
+    assert_eq!(
+        rules.len(),
+        1,
+        "dynamic provisioner Role should contain only the mesh-secret write rule"
+    );
+    let rule = &rules[0];
+    assert_string_array_members(
+        &rule["resources"],
+        &["secrets"],
+        "dynamic provisioner Role should be limited to Kubernetes Secrets",
+    );
+    assert_string_array_members(
+        &rule["verbs"],
+        &["create", "get", "update"],
+        "dynamic provisioner Role should only cover the verbs required for generated secrets",
+    );
+}
+
+fn assert_kubernetes_dynamic_child_artifact_omits_provisioner_rbac(artifact: &Path) {
+    let kustomization = fs::read_to_string(artifact.join("kustomization.yaml"))
+        .expect("kubernetes dynamic child kustomization should read");
+    assert!(kustomization.contains("01-configmaps/amber-mesh-provision.yaml"));
+    assert!(kustomization.contains("02-rbac/amber-provisioner-job.yaml"));
+    assert!(!kustomization.contains("02-rbac/amber-provisioner-sa.yaml"));
+    assert!(!kustomization.contains("02-rbac/amber-provisioner-role.yaml"));
+    assert!(!kustomization.contains("02-rbac/amber-provisioner-rolebinding.yaml"));
+    assert!(!artifact.join("02-rbac/amber-provisioner-sa.yaml").exists());
+    assert!(
+        !artifact
+            .join("02-rbac/amber-provisioner-role.yaml")
+            .exists()
+    );
+    assert!(
+        !artifact
+            .join("02-rbac/amber-provisioner-rolebinding.yaml")
+            .exists()
+    );
+}
+
 fn framework_child_artifact(run: &RunHandle, site_id: &str, child_id: u64) -> PathBuf {
-    run.run_root
-        .join("state")
-        .join(site_id)
-        .join("framework-component")
-        .join("children")
-        .join(child_id.to_string())
-        .join("artifact")
+    framework_child_artifact_dir(&run.run_root, site_id, child_id)
 }
 
 fn framework_manifest_url(path: &Path) -> String {
@@ -868,18 +1045,23 @@ fn spawn_framework_proxy_for_site(
 }
 
 fn wait_for_framework_child_absent(
+    run: &RunHandle,
     control_state_path: &Path,
     child_name: &str,
-    child_roots: &[PathBuf],
+    child_sites: &[&str],
+    child_id: u64,
     timeout: Duration,
 ) {
     wait_for_condition(
         timeout,
         || {
-            let no_live_child = read_json(control_state_path)["live_children"]
+            let no_live_child = read_framework_control_state(control_state_path)["live_children"]
                 .as_array()
                 .is_some_and(|children| children.iter().all(|child| child["name"] != child_name));
-            no_live_child && child_roots.iter().all(|root| !root.exists())
+            no_live_child
+                && child_sites
+                    .iter()
+                    .all(|site_id| framework_child_is_absent(&run.run_root, site_id, child_id))
         },
         &format!("dynamic child `{child_name}` removed from control state and site artifacts"),
     );
@@ -911,6 +1093,7 @@ write_files:
       Environment=NAME=admin
       Environment=PORT={port}
       Environment=CTL_URL=${{slots.ctl.url}}
+      Environment=CONTROL_TIMEOUT={control_timeout}
       ExecStart=/usr/bin/python3 /usr/local/bin/framework-admin.py
       Restart=always
 
@@ -921,6 +1104,7 @@ runcmd:
   - [systemctl, enable, --now, framework-admin.service]
 "#,
         script = indent_block(FRAMEWORK_ADMIN_APP, 6),
+        control_timeout = framework_control_timeout_env_value(),
     )
 }
 
@@ -1011,6 +1195,67 @@ fn write_framework_dynamic_child_manifest(
             "exports": exports
         }),
     );
+}
+
+fn write_framework_kubernetes_dynamic_child_fixture(
+    root: &Path,
+    kind_cluster: &KindCluster,
+) -> ScenarioFixture {
+    fs::write(root.join("admin.py"), FRAMEWORK_ADMIN_APP).expect("failed to write admin.py");
+    fs::write(root.join("worker.py"), FRAMEWORK_WORKER_APP).expect("failed to write worker.py");
+    write_framework_admin_component(root, "admin.json5", true, 8080);
+    write_framework_worker_component(root, "child-kind-root.json5", true, "child-kind-root", 8080);
+    write_framework_dynamic_child_manifest(root, "child-kind.json5", "child-kind-root.json5", &[]);
+
+    let manifest = root.join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true }
+            },
+            "components": {
+                "admin": "./admin.json5"
+            },
+            "child_templates": {
+                "child_kind": { "manifest": "./child-kind.json5" }
+            },
+            "bindings": [
+                { "to": "#admin.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "admin_http": "#admin.http"
+            }
+        }),
+    );
+
+    let placement = root.join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "kind_local": {
+                    "kind": "kubernetes",
+                    "context": kind_cluster.context_name()
+                }
+            },
+            "defaults": {
+                "image": "kind_local"
+            },
+            "components": {
+                "/admin": "kind_local",
+                "/job-kind/root": "kind_local"
+            }
+        }),
+    );
+
+    ScenarioFixture {
+        manifest,
+        placement,
+    }
 }
 
 fn write_framework_matrix_fixture(root: &Path, kind_cluster: &KindCluster) -> ScenarioFixture {
@@ -1381,40 +1626,76 @@ fn assert_string_array_members(value: &Value, expected: &[&str], message: &str) 
     assert_eq!(actual, expected, "{message}");
 }
 
+fn framework_admin_request(
+    method: &str,
+    port: u16,
+    path: &str,
+    body: Option<&str>,
+    purpose: &str,
+) -> (u16, String) {
+    let timeout = framework_mutation_request_timeout();
+    http_request_with_timeout_result(method, port, path, body, timeout).unwrap_or_else(|err| {
+        panic!("{purpose} via framework admin {method} http://127.0.0.1:{port}{path} failed: {err}")
+    })
+}
+
+fn framework_admin_get(port: u16, path: &str, purpose: &str) -> (u16, String) {
+    let timeout = framework_mutation_request_timeout();
+    http_get_with_timeout_result(port, path, timeout).unwrap_or_else(|err| {
+        panic!("{purpose} via framework admin GET http://127.0.0.1:{port}{path} failed: {err}")
+    })
+}
+
 fn framework_create_child_with_request(port: u16, request: &Value) -> (u16, String) {
     let body = serde_json::to_string(request).expect("create request should serialize");
-    http_request_with_timeout(
-        "POST",
-        port,
-        "/create",
-        Some(&body),
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("create request should return an HTTP response")
+    framework_admin_request("POST", port, "/create", Some(&body), "create request")
 }
 
 fn framework_destroy_child_via_admin(port: u16, name: &str) -> (u16, String) {
-    http_request_with_timeout(
+    framework_admin_request(
         "DELETE",
         port,
         &format!("/destroy/{name}"),
         None,
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
+        "destroy request",
     )
-    .expect("destroy request should return an HTTP response")
 }
 
 fn framework_snapshot_via_admin(port: u16) -> Value {
-    let (status, body) = http_request_with_timeout(
-        "POST",
-        port,
-        "/snapshot",
-        Some("{}"),
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("snapshot request should return an HTTP response");
+    let (status, body) =
+        framework_admin_request("POST", port, "/snapshot", Some("{}"), "snapshot request");
     assert_eq!(status, 200, "snapshot request should succeed: {body}");
     serde_json::from_str(&body).expect("snapshot response should be valid json")
+}
+
+#[test]
+fn framework_control_timeout_tracks_vm_ready_budget() {
+    assert_eq!(
+        framework_control_timeout_for_vm_ready_timeout(Duration::from_secs(120)),
+        Duration::from_secs(300),
+        "fast VM environments should keep the existing 300s framework control budget",
+    );
+    assert_eq!(
+        framework_control_timeout_for_vm_ready_timeout(Duration::from_secs(720)),
+        Duration::from_secs(720),
+        "slow TCG VM environments should inherit the full VM-ready budget",
+    );
+}
+
+#[test]
+fn framework_mutation_request_timeout_keeps_response_grace_after_control_budget() {
+    assert_eq!(
+        framework_mutation_request_timeout_for_control_timeout(Duration::from_secs(300)),
+        Duration::from_secs(330),
+        "framework admin curl requests should outlive the inner control timeout long enough to \
+         receive the terminal response",
+    );
+    assert_eq!(
+        framework_mutation_request_timeout_for_control_timeout(Duration::from_secs(720)),
+        Duration::from_secs(750),
+        "slow TCG control paths should keep the same response grace instead of truncating the \
+         request at 300s",
+    );
 }
 
 fn write_snapshot_run_inputs(root: &Path, snapshot: &Value) -> (PathBuf, PathBuf) {
@@ -1654,7 +1935,10 @@ fn framework_component_direct_create_destroy_live() {
             }
         }),
     );
-    assert_eq!(create_status, 200, "create request should succeed");
+    assert_eq!(
+        create_status, 200,
+        "create request should succeed: {create_response}"
+    );
     let create_json: Value =
         serde_json::from_str(&create_response).expect("create response should be valid json");
     assert_eq!(create_json["child"]["name"], "job-1");
@@ -1701,7 +1985,7 @@ fn framework_component_direct_create_destroy_live() {
         Duration::from_secs(60),
         || {
             !child_root.exists()
-                && read_json(&control_state_path)["live_children"]
+                && read_framework_control_state(&control_state_path)["live_children"]
                     .as_array()
                     .is_some_and(|children| children.iter().all(|child| child["name"] != "job-1"))
         },
@@ -1984,7 +2268,7 @@ fn framework_component_concurrent_create_serialization_live() {
                 "required": ["name"]
             },
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["python3", "-u", "-c", { "file": "./worker.py" }],
                 "env": {
                     "NAME": "${config.name}",
@@ -2278,15 +2562,16 @@ fn framework_component_create_to_unoffered_site_fails_deterministically_live() {
     );
 
     let storage_root = temp.path().join("state");
-    let output = amber_command()
-        .arg("run")
-        .arg(&manifest)
-        .arg("--placement")
-        .arg(&placement)
-        .arg("--storage-root")
-        .arg(&storage_root)
-        .output()
-        .expect("failed to run amber");
+    let output = command_output_via_tempfiles(
+        amber_command()
+            .arg("run")
+            .arg(&manifest)
+            .arg("--placement")
+            .arg(&placement)
+            .arg("--storage-root")
+            .arg(&storage_root),
+        "amber run",
+    );
     assert!(
         !output.status.success(),
         "run should fail deterministically when a bounded template allows a manifest that \
@@ -2343,7 +2628,7 @@ fn framework_component_root_external_binding_live() {
                 "catalog_api": { "kind": "http" }
             },
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["python3", "-u", "-c", { "file": "./external_bind.py" }],
                 "env": {
                     "NAME": "external-worker",
@@ -2398,7 +2683,7 @@ fn framework_component_root_external_binding_live() {
                 "catalog_api": { "kind": "http" }
             },
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["sleep", "3600"]
             },
             "components": {
@@ -2599,7 +2884,7 @@ fn framework_component_nonweak_publication_barrier_live() {
                 "weak_api": { "kind": "http" }
             },
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["python3", "-u", "-c", { "file": "./barrier_probe.py" }],
                 "env": {
                     "NAME": "consumer",
@@ -2631,7 +2916,7 @@ fn framework_component_nonweak_publication_barrier_live() {
                 "delayed_api": { "kind": "http" }
             },
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["sleep", "3600"]
             },
             "components": {
@@ -3004,12 +3289,11 @@ fn framework_component_delegated_realm_cross_site_live() {
         "delegated destroy should succeed; response: {destroy_response}"
     );
     wait_for_framework_child_absent(
+        &run,
         &control_state_path,
         "sibling",
-        &[sibling_artifact
-            .parent()
-            .expect("sibling artifact should have a parent")
-            .to_path_buf()],
+        &["compose_local"],
+        sibling_id,
         Duration::from_secs(60),
     );
 
@@ -3120,13 +3404,15 @@ fn framework_component_compose_parent_standby_direct_live() {
         "admin"
     );
 
-    let (create_status, create_response) = http_get_with_timeout(
+    let (create_status, create_response) = framework_admin_get(
         proxy_port,
         "/create/worker/job-1",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("create request should return an HTTP response");
-    assert_eq!(create_status, 200, "create request should succeed");
+        "create request should return an HTTP response",
+    );
+    assert_eq!(
+        create_status, 200,
+        "create request should succeed: {create_response}"
+    );
     let create_json: Value =
         serde_json::from_str(&create_response).expect("create response should be valid json");
     assert_eq!(create_json["child"]["name"], "job-1");
@@ -3259,13 +3545,15 @@ fn framework_component_direct_parent_compose_child_live() {
         "admin"
     );
 
-    let (create_status, create_response) = http_get_with_timeout(
+    let (create_status, create_response) = framework_admin_get(
         proxy_port,
         "/create/job-1",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("create request should return an HTTP response");
-    assert_eq!(create_status, 200, "create request should succeed");
+        "create request should return an HTTP response",
+    );
+    assert_eq!(
+        create_status, 200,
+        "create request should succeed: {create_response}"
+    );
     let create_json: Value =
         serde_json::from_str(&create_response).expect("create response should be valid json");
     assert_eq!(create_json["child"]["name"], "job-1");
@@ -3393,12 +3681,11 @@ fn framework_component_dynamic_children_teardown_with_run_live() {
     );
     wait_for_path(&mut admin_proxy, proxy_port, "/id", Duration::from_secs(60));
 
-    let (create_direct_status, create_direct_response) = http_get_with_timeout(
+    let (create_direct_status, create_direct_response) = framework_admin_get(
         proxy_port,
         "/create/worker_direct/job-direct",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("direct create request should return an HTTP response");
+        "direct create request should return an HTTP response",
+    );
     assert_eq!(
         create_direct_status, 200,
         "direct child create request should succeed"
@@ -3407,12 +3694,11 @@ fn framework_component_dynamic_children_teardown_with_run_live() {
         .expect("direct child create response should be valid json");
     assert_eq!(create_direct_json["child"]["name"], "job-direct");
 
-    let (create_compose_status, create_compose_response) = http_get_with_timeout(
+    let (create_compose_status, create_compose_response) = framework_admin_get(
         proxy_port,
         "/create/worker_compose/job-compose",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("compose create request should return an HTTP response");
+        "compose create request should return an HTTP response",
+    );
     assert_eq!(
         create_compose_status, 200,
         "compose child create request should succeed"
@@ -3596,12 +3882,11 @@ fn framework_component_destroy_of_provider_keeps_consumer_live() {
     );
     wait_for_path(&mut admin_proxy, proxy_port, "/id", Duration::from_secs(60));
 
-    let (create_provider_status, create_provider_response) = http_get_with_timeout(
+    let (create_provider_status, create_provider_response) = framework_admin_get(
         proxy_port,
         "/create/producer/source",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("producer create request should return an HTTP response");
+        "producer create request should return an HTTP response",
+    );
     assert_eq!(
         create_provider_status, 200,
         "producer create request should succeed"
@@ -3679,7 +3964,7 @@ fn framework_component_destroy_of_provider_keeps_consumer_live() {
         Duration::from_secs(60),
         || {
             !source_root.exists()
-                && read_json(&control_state_path)["live_children"]
+                && read_framework_control_state(&control_state_path)["live_children"]
                     .as_array()
                     .is_some_and(|children| children.iter().all(|child| child["name"] != "source"))
         },
@@ -3707,6 +3992,91 @@ fn framework_component_destroy_of_provider_keeps_consumer_live() {
 
     stop_proxy(&mut sink_proxy);
     stop_proxy(&mut admin_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires docker + kind + kubectl + qemu + an Ubuntu 24.04 cloud image matching the \
+            host architecture; run manually or in CI"]
+fn framework_component_kubernetes_dynamic_child_rbac_live() {
+    ensure_internal_images();
+    let temp = temp_output_dir("framework-component-kubernetes-rbac-");
+    let kubeconfig = temp.path().join("kubeconfig");
+    let kind_cluster = KindCluster::from_env_or_create(&kubeconfig);
+    ensure_kind_internal_images(&kind_cluster);
+    let kubeconfig_env = kind_cluster.kubeconfig.display().to_string();
+
+    let fixture = write_framework_kubernetes_dynamic_child_fixture(temp.path(), &kind_cluster);
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest_with_env(
+        &fixture.manifest,
+        &fixture.placement,
+        &storage_root,
+        &[("KUBECONFIG", &kubeconfig_env)],
+    );
+
+    let kind_state = wait_for_state_status(
+        &run.run_root,
+        "kind_local",
+        "running",
+        Duration::from_secs(120),
+    );
+    assert_kubernetes_site_controller_role_cannot_write_rbac(&kind_state);
+    assert_kubernetes_dynamic_provisioner_role_is_secret_only(&kind_state);
+
+    let control_state_path = framework_control_state_path(&run);
+    let creator_port = pick_free_port();
+    let mut creator_proxy = spawn_framework_proxy_for_site(
+        &run.site_artifact_dir("kind_local"),
+        "admin_http",
+        creator_port,
+        &kind_state,
+    );
+    wait_for_path(
+        &mut creator_proxy,
+        creator_port,
+        "/id",
+        framework_mutation_request_timeout(),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut creator_proxy,
+            creator_port,
+            "/id",
+            Duration::from_secs(30),
+        ),
+        "admin"
+    );
+
+    let (create_status, create_response) = framework_admin_get(
+        creator_port,
+        "/create/child_kind/job-kind",
+        "create request should return an HTTP response",
+    );
+    assert_eq!(
+        create_status, 200,
+        "create request should succeed; response: {create_response}"
+    );
+    let child_id = wait_for_live_child(&control_state_path, "job-kind");
+
+    let root_artifact = framework_child_artifact(&run, "kind_local", child_id);
+    assert_kubernetes_dynamic_child_artifact_omits_provisioner_rbac(&root_artifact);
+    let root_port = pick_free_port();
+    let mut root_proxy =
+        spawn_framework_proxy_for_site(&root_artifact, "http", root_port, &kind_state);
+    wait_for_path(
+        &mut root_proxy,
+        root_port,
+        "/id",
+        framework_mutation_request_timeout(),
+    );
+    assert_eq!(
+        wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
+        "child-kind-root"
+    );
+
+    stop_proxy(&mut root_proxy);
+    stop_proxy(&mut creator_proxy);
     run.stop();
 }
 
@@ -3752,7 +4122,7 @@ fn framework_component_kind_root_export_live() {
         &run.run_root,
         "vm_local",
         "running",
-        Duration::from_secs(240),
+        framework_control_timeout(),
     );
     let site_state = |site_id: &str| match site_id {
         "compose_local" => &compose_state,
@@ -3774,7 +4144,7 @@ fn framework_component_kind_root_export_live() {
         &mut creator_proxy,
         creator_port,
         "/id",
-        Duration::from_secs(240),
+        framework_mutation_request_timeout(),
     );
     assert_eq!(
         wait_for_body(
@@ -3786,12 +4156,11 @@ fn framework_component_kind_root_export_live() {
         "admin",
     );
 
-    let (create_status, create_response) = http_get_with_timeout(
+    let (create_status, create_response) = framework_admin_get(
         creator_port,
         "/create/child_kind/job-kind",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("create request should return an HTTP response");
+        "create request should return an HTTP response",
+    );
     assert_eq!(
         create_status, 200,
         "create request should succeed; response: {create_response}"
@@ -3802,7 +4171,12 @@ fn framework_component_kind_root_export_live() {
     let root_port = pick_free_port();
     let mut root_proxy =
         spawn_framework_proxy_for_site(&root_artifact, "http", root_port, site_state("kind_local"));
-    wait_for_path(&mut root_proxy, root_port, "/id", Duration::from_secs(300));
+    wait_for_path(
+        &mut root_proxy,
+        root_port,
+        "/id",
+        framework_mutation_request_timeout(),
+    );
     assert_eq!(
         wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
         "child-kind-root"
@@ -3855,7 +4229,7 @@ fn framework_component_kind_creator_compose_child_live() {
         &run.run_root,
         "vm_local",
         "running",
-        Duration::from_secs(240),
+        framework_control_timeout(),
     );
     let site_state = |site_id: &str| match site_id {
         "compose_local" => &compose_state,
@@ -3877,7 +4251,7 @@ fn framework_component_kind_creator_compose_child_live() {
         &mut creator_proxy,
         creator_port,
         "/id",
-        Duration::from_secs(240),
+        framework_mutation_request_timeout(),
     );
     assert_eq!(
         wait_for_body(
@@ -3890,12 +4264,11 @@ fn framework_component_kind_creator_compose_child_live() {
         "kind creator should expose the framework admin app"
     );
 
-    let (create_status, create_response) = http_get_with_timeout(
+    let (create_status, create_response) = framework_admin_get(
         creator_port,
         "/create/child_compose/job-compose",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("create request should return an HTTP response");
+        "create request should return an HTTP response",
+    );
     assert_eq!(
         create_status, 200,
         "create request should succeed; response: {create_response}"
@@ -3910,7 +4283,12 @@ fn framework_component_kind_creator_compose_child_live() {
         root_port,
         site_state("compose_local"),
     );
-    wait_for_path(&mut root_proxy, root_port, "/id", Duration::from_secs(300));
+    wait_for_path(
+        &mut root_proxy,
+        root_port,
+        "/id",
+        framework_mutation_request_timeout(),
+    );
     assert_eq!(
         wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
         "child-compose-root"
@@ -3963,7 +4341,7 @@ fn framework_component_kind_creator_after_compose_churn_live() {
         &run.run_root,
         "vm_local",
         "running",
-        Duration::from_secs(240),
+        framework_control_timeout(),
     );
     let site_state = |site_id: &str| match site_id {
         "compose_local" => &compose_state,
@@ -3986,7 +4364,7 @@ fn framework_component_kind_creator_after_compose_churn_live() {
         &mut compose_creator_proxy,
         compose_creator_port,
         "/id",
-        Duration::from_secs(240),
+        framework_mutation_request_timeout(),
     );
     assert_eq!(
         wait_for_body(
@@ -4004,27 +4382,21 @@ fn framework_component_kind_creator_after_compose_churn_live() {
             "/create/{}/{}",
             template_case.template, template_case.child_name
         );
-        let (create_status, create_response) = http_get_with_timeout(
+        let (create_status, create_response) = framework_admin_get(
             compose_creator_port,
             &create_path,
-            FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-        )
-        .expect("compose churn create request should return an HTTP response");
+            "compose churn create request should return an HTTP response",
+        );
         assert_eq!(
             create_status, 200,
             "compose churn create request {create_path} should succeed; response: \
              {create_response}"
         );
         let child_id = wait_for_live_child(&control_state_path, template_case.child_name);
-        let child_roots = template_case
+        let child_sites = template_case
             .exports
             .iter()
-            .map(|(site_id, _, _)| {
-                framework_child_artifact(&run, site_id, child_id)
-                    .parent()
-                    .expect("dynamic child artifact should have a parent")
-                    .to_path_buf()
-            })
+            .map(|(site_id, _, _)| *site_id)
             .collect::<Vec<_>>();
         let (destroy_status, destroy_response) =
             framework_destroy_child_via_admin(compose_creator_port, template_case.child_name);
@@ -4034,10 +4406,12 @@ fn framework_component_kind_creator_after_compose_churn_live() {
             template_case.child_name,
         );
         wait_for_framework_child_absent(
+            &run,
             &control_state_path,
             template_case.child_name,
-            &child_roots,
-            Duration::from_secs(300),
+            &child_sites,
+            child_id,
+            framework_mutation_request_timeout(),
         );
     }
     stop_proxy(&mut compose_creator_proxy);
@@ -4053,7 +4427,7 @@ fn framework_component_kind_creator_after_compose_churn_live() {
         &mut kind_creator_proxy,
         kind_creator_port,
         "/id",
-        Duration::from_secs(240),
+        framework_mutation_request_timeout(),
     );
     assert_eq!(
         wait_for_body(
@@ -4079,16 +4453,37 @@ fn framework_component_kind_creator_after_compose_churn_live() {
         "kind creator control path should be healthy after compose churn"
     );
 
-    let (create_status, create_response) = http_get_with_timeout(
+    let (create_status, create_response) = framework_admin_get(
         kind_creator_port,
         "/create/child_compose/job-compose",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("kind create request should return an HTTP response");
+        "kind create request should return an HTTP response",
+    );
     assert_eq!(
         create_status, 200,
         "kind creator create after compose churn should succeed; response: {create_response}"
     );
+    let child_id = wait_for_live_child(&control_state_path, "job-compose");
+
+    let root_artifact = framework_child_artifact(&run, "compose_local", child_id);
+    let root_port = pick_free_port();
+    let mut root_proxy = spawn_framework_proxy_for_site(
+        &root_artifact,
+        "http",
+        root_port,
+        site_state("compose_local"),
+    );
+    wait_for_path(
+        &mut root_proxy,
+        root_port,
+        "/id",
+        framework_mutation_request_timeout(),
+    );
+    assert_eq!(
+        wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
+        "child-compose-root",
+        "kind creator should expose the recreated compose child after compose churn"
+    );
+    stop_proxy(&mut root_proxy);
 
     stop_proxy(&mut kind_creator_proxy);
     run.stop();
@@ -4136,7 +4531,7 @@ fn framework_component_cross_backend_matrix_live() {
         &run.run_root,
         "vm_local",
         "running",
-        Duration::from_secs(240),
+        framework_control_timeout(),
     );
     let site_state = |site_id: &str| match site_id {
         "compose_local" => &compose_state,
@@ -4160,7 +4555,7 @@ fn framework_component_cross_backend_matrix_live() {
             &mut creator_proxy,
             creator_port,
             "/id",
-            Duration::from_secs(240),
+            framework_mutation_request_timeout(),
         );
         assert_eq!(
             wait_for_body(
@@ -4178,12 +4573,11 @@ fn framework_component_cross_backend_matrix_live() {
                 "/create/{}/{}",
                 template_case.template, template_case.child_name
             );
-            let (create_status, create_response) = http_get_with_timeout(
+            let (create_status, create_response) = framework_admin_get(
                 creator_port,
                 &create_path,
-                FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-            )
-            .expect("create request should return an HTTP response");
+                "create request should return an HTTP response",
+            );
             assert_eq!(
                 create_status, 200,
                 "create request {create_path} from {creator_site} should succeed; response: \
@@ -4194,15 +4588,10 @@ fn framework_component_cross_backend_matrix_live() {
             assert_eq!(create_json["child"]["name"], template_case.child_name);
 
             let child_id = wait_for_live_child(&control_state_path, template_case.child_name);
-            let child_roots = template_case
+            let child_sites = template_case
                 .exports
                 .iter()
-                .map(|(site_id, _, _)| {
-                    framework_child_artifact(&run, site_id, child_id)
-                        .parent()
-                        .expect("dynamic child artifact should have a parent")
-                        .to_path_buf()
-                })
+                .map(|(site_id, _, _)| *site_id)
                 .collect::<Vec<_>>();
 
             let root_site_id = template_case.exports[0].0;
@@ -4214,7 +4603,12 @@ fn framework_component_cross_backend_matrix_live() {
                 root_port,
                 site_state(root_site_id),
             );
-            wait_for_path(&mut root_proxy, root_port, "/id", Duration::from_secs(300));
+            wait_for_path(
+                &mut root_proxy,
+                root_port,
+                "/id",
+                framework_mutation_request_timeout(),
+            );
             assert_eq!(
                 wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
                 template_case.exports[0].2
@@ -4229,7 +4623,12 @@ fn framework_component_cross_backend_matrix_live() {
                     port,
                     site_state(site_id),
                 );
-                wait_for_path(&mut proxy, port, "/id", Duration::from_secs(300));
+                wait_for_path(
+                    &mut proxy,
+                    port,
+                    "/id",
+                    framework_mutation_request_timeout(),
+                );
                 assert_eq!(
                     wait_for_body(&mut proxy, port, "/id", Duration::from_secs(30)),
                     *expected_id,
@@ -4257,10 +4656,12 @@ fn framework_component_cross_backend_matrix_live() {
                 template_case.child_name,
             );
             wait_for_framework_child_absent(
+                &run,
                 &control_state_path,
                 template_case.child_name,
-                &child_roots,
-                Duration::from_secs(300),
+                &child_sites,
+                child_id,
+                framework_mutation_request_timeout(),
             );
         }
 
@@ -5873,7 +6274,8 @@ fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
     wait_for_condition(
         Duration::from_secs(60),
         || {
-            read_json(&replay_control_state)["base_scenario"]["components"]
+            read_json(&framework_site_controller_state_path(&replay_run))["base_scenario"]
+                ["components"]
                 .as_array()
                 .is_some_and(|components| {
                     components
@@ -5885,9 +6287,9 @@ fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
     );
     wait_for_live_child(&replay_control_state, "job-replay");
     let replay_held = response_json_from(
-        framework_control_state_post(
+        framework_controller_post(
             &replay_run,
-            "/v1/control-state/dynamic-caps/held",
+            "/v1/controller/dynamic-caps/held",
             &json!({
                 "holder_component_id": "components./job-replay"
             }),
@@ -5927,9 +6329,9 @@ fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
         .expect("replay share should return a grant id");
 
     let replay_ref_detail = response_json_from(
-        framework_control_state_post(
+        framework_controller_post(
             &replay_run,
-            "/v1/control-state/dynamic-caps/inspect-ref",
+            "/v1/controller/dynamic-caps/inspect-ref",
             &json!({
                 "holder_component_id": "components./job-replay",
                 "ref": replay_ref
@@ -5949,9 +6351,9 @@ fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
         .to_string();
 
     let replay_held_detail = response_json_from(
-        framework_control_state_post(
+        framework_controller_post(
             &replay_run,
-            "/v1/control-state/dynamic-caps/held/detail",
+            "/v1/controller/dynamic-caps/held/detail",
             &json!({
                 "holder_component_id": "components./job-replay",
                 "held_id": replay_shared_held_id
@@ -5974,9 +6376,9 @@ fn dynamic_capabilities_snapshot_replay_dynamic_child_live() {
         "replay should either reuse the restored grant or create a new live one"
     );
 
-    let (old_ref_status, old_ref_body) = framework_control_state_post(
+    let (old_ref_status, old_ref_body) = framework_controller_post(
         &replay_run,
-        "/v1/control-state/dynamic-caps/inspect-ref",
+        "/v1/controller/dynamic-caps/inspect-ref",
         &json!({
             "holder_component_id": "components./job-replay",
             "ref": old_ref

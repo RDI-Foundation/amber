@@ -16,9 +16,7 @@ use serde::{Deserialize, Serialize};
 
 mod framework_docker_injection;
 
-use framework_docker_injection::{
-    FRAMEWORK_DOCKER_GATEWAY_PORT, rewrite_framework_docker_as_injected_component,
-};
+use framework_docker_injection::rewrite_framework_docker_as_injected_component;
 
 use crate::{
     config::analysis::ScenarioConfigAnalysis,
@@ -29,6 +27,10 @@ use crate::{
             build_execution_guide,
         },
     },
+    run_plan::{
+        SiteDefinition, SiteKind, framework_component_controller_metadata,
+        lower_framework_component_bindings_for_single_site,
+    },
     runtime_interface::{RootInputDescriptor, collect_root_inputs},
     targets::{
         mesh::{
@@ -38,8 +40,9 @@ use crate::{
             },
             internal_images::resolve_internal_images,
             mesh_config::{
-                MeshConfigBuildInput, MeshConfigBuildOptions, MeshServiceName, RouterPorts,
-                ServiceMeshAddressing, build_mesh_config_plan, default_mesh_config_build_options,
+                DockerGatewayMeshConfig, MeshConfigBuildInput, MeshConfigBuildOptions,
+                MeshServiceName, RouterPorts, ServiceMeshAddressing, build_mesh_config_plan,
+                default_mesh_config_build_options,
             },
             plan::{MeshOptions, component_label, map_program_components},
             ports::{LocalRoutePorts, allocate_local_route_ports, allocate_mesh_ports},
@@ -59,13 +62,13 @@ const BOUNDARY_NETWORK_NAME: &str = "amber_boundary";
 
 const ROUTER_SERVICE_NAME: &str = "amber-router";
 const ROUTER_CONTROL_INIT_SERVICE_NAME: &str = "amber-router-control-init";
+const SITE_CONTROLLER_SERVICE_NAME: &str = "amber-site-controller";
 const PROVISIONER_SERVICE_NAME: &str = "amber-provisioner";
 const HELPER_VOLUME_NAME: &str = "amber-helper-bin";
 const HELPER_INIT_SERVICE: &str = "amber-init";
 const HELPER_BIN_DIR: &str = "/amber/bin";
 const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
 const DOCKER_MOUNT_PROXY_SPEC_ENV: &str = "AMBER_DOCKER_MOUNT_PROXY_SPEC_B64";
-const DOCKER_GATEWAY_CONFIG_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_JSON";
 const DOCKER_GATEWAY_HOST_SOCK_ENV: &str = "AMBER_DOCKER_SOCK";
 const DOCKER_GATEWAY_CONTAINER_SOCK: &str = "/var/run/docker.sock";
 const MESH_CONFIG_DIR: &str = "/amber/mesh";
@@ -99,12 +102,42 @@ const LOG_LABEL_SERVICE_NAME: &str = "amber_service_name";
 const LOG_LABEL_LIST: &str = "amber_component_moniker,amber_service_name";
 pub const COMPOSE_FILENAME: &str = GENERATED_COMPOSE_FILENAME;
 
+fn build_control_socket_init_service(volume_name: &str) -> Service {
+    let mut service = Service::new("busybox:1.36.1".to_string());
+    service.user = Some("0:0".to_string());
+    service.command = Some(vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        format!(
+            "mkdir -p {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} && chown \
+             {ROUTER_RUNTIME_UID}:{ROUTER_RUNTIME_GID} {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} \
+             && chmod 0770 {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
+        ),
+    ]);
+    service.volumes.push(format!(
+        "{volume_name}:{ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
+    ));
+    service.restart = Some("no".to_string());
+    service
+}
+
+fn component_control_init_service_name(service_name: &str) -> String {
+    format!("{service_name}-control-init")
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DockerComposeReporter;
 
 #[derive(Clone, Debug)]
 pub struct DockerComposeArtifact {
     pub files: BTreeMap<PathBuf, String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DockerComposeArtifactBuildOptions<'a> {
+    pub(crate) force_router: bool,
+    pub(crate) router_identity_id: &'a str,
+    pub(crate) mesh_scope: Option<&'a str>,
 }
 
 impl DockerComposeArtifact {
@@ -285,23 +318,6 @@ impl MeshServiceName for ServiceNames {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct DockerGatewayCallerConfig {
-    host: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    port: Option<u16>,
-    component: String,
-    compose_service: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct DockerGatewayConfig {
-    listen: String,
-    docker_sock: String,
-    compose_project: String,
-    callers: Vec<DockerGatewayCallerConfig>,
-}
-
-#[derive(Clone, Debug, Serialize)]
 struct DockerMountProxySpec {
     path: String,
     tcp_host: String,
@@ -349,13 +365,44 @@ pub(crate) fn emit_docker_compose_artifact(
     compiled: &CompiledScenario,
     force_router: bool,
 ) -> Result<DockerComposeArtifact, ReporterError> {
-    render_docker_compose_inner(compiled.scenario(), force_router)
-        .map_err(DockerComposeError::into_reporter_error)
+    emit_docker_compose_artifact_with_options(
+        compiled,
+        DockerComposeArtifactBuildOptions {
+            force_router,
+            router_identity_id: crate::targets::mesh::mesh_config::DEFAULT_ROUTER_ID,
+            mesh_scope: None,
+        },
+    )
+}
+
+pub(crate) fn emit_docker_compose_artifact_with_options(
+    compiled: &CompiledScenario,
+    options: DockerComposeArtifactBuildOptions<'_>,
+) -> Result<DockerComposeArtifact, ReporterError> {
+    let lowered = lower_framework_component_bindings_for_single_site(
+        compiled,
+        "compose_local",
+        SiteDefinition {
+            kind: SiteKind::Compose,
+            context: None,
+            controller_site: None,
+        },
+    )
+    .map_err(|err| ReporterError::new(err.to_string()))?;
+    render_docker_compose_inner(
+        lowered.scenario(),
+        options.force_router,
+        options.router_identity_id,
+        options.mesh_scope,
+    )
+    .map_err(DockerComposeError::into_reporter_error)
 }
 
 fn render_docker_compose_inner(
     scenario: &Scenario,
     force_router: bool,
+    router_identity_id: &str,
+    mesh_scope: Option<&str>,
 ) -> DcResult<DockerComposeArtifact> {
     let transformed = rewrite_framework_docker_as_injected_component(scenario).map_err(dc_other)?;
     let s = &transformed.scenario;
@@ -377,7 +424,13 @@ fn render_docker_compose_inner(
     // Precompute service names (injective & stable).
     let names: HashMap<ComponentId, ServiceNames> =
         map_program_components(s, program_components, |id, local_name| {
-            let base = service_base_name(id, local_name);
+            let base = if framework_component_controller_metadata(s.component(id).metadata.as_ref())
+                .is_some()
+            {
+                SITE_CONTROLLER_SERVICE_NAME.to_string()
+            } else {
+                service_base_name(id, local_name)
+            };
             let sidecar = format!("{base}-net");
             ServiceNames {
                 program: base.clone(),
@@ -435,7 +488,13 @@ fn render_docker_compose_inner(
         router_ports,
         addressing: &mesh_addressing,
         options: MeshConfigBuildOptions {
+            router_identity_id,
+            mesh_scope,
             force_router,
+            docker_gateway: docker_gateway_component.map(|_| DockerGatewayMeshConfig {
+                docker_sock: DOCKER_GATEWAY_CONTAINER_SOCK,
+                compose_project_env: COMPOSE_PROJECT_NAME_ENV,
+            }),
             ..default_mesh_config_build_options()
         },
     })
@@ -629,22 +688,8 @@ fn render_docker_compose_inner(
             .entry(ROUTER_CONTROL_SOCKET_VOLUME_NAME.to_string())
             .or_insert_with(EmptyMap::default);
 
-        let mut control_init_service = Service::new("busybox:1.36.1".to_string());
-        control_init_service.user = Some("0:0".to_string());
-        control_init_service.command = Some(vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            format!(
-                "mkdir -p {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} && chown \
-                 {ROUTER_RUNTIME_UID}:{ROUTER_RUNTIME_GID} \
-                 {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} && chmod 0700 \
-                 {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
-            ),
-        ]);
-        control_init_service.volumes.push(format!(
-            "{ROUTER_CONTROL_SOCKET_VOLUME_NAME}:{ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
-        ));
-        control_init_service.restart = Some("no".to_string());
+        let control_init_service =
+            build_control_socket_init_service(ROUTER_CONTROL_SOCKET_VOLUME_NAME);
         compose.services.insert(
             ROUTER_CONTROL_INIT_SERVICE_NAME.to_string(),
             control_init_service,
@@ -742,6 +787,8 @@ fn render_docker_compose_inner(
         let mut sidecar_env_entries = vec![
             format!("AMBER_ROUTER_CONFIG_PATH={}", mesh_config_path()),
             format!("AMBER_ROUTER_IDENTITY_PATH={}", mesh_identity_path()),
+            format!("AMBER_ROUTER_CONTROL_SOCKET_PATH={ROUTER_CONTROL_SOCKET_PATH_IN_CONTAINER}"),
+            format!("{COMPOSE_PROJECT_NAME_ENV}=${{{COMPOSE_PROJECT_NAME_ENV}:-default}}"),
         ];
         sidecar_env_entries.extend(
             mesh_config_plan
@@ -751,6 +798,9 @@ fn render_docker_compose_inner(
         );
         push_router_observability_env(&mut sidecar_env_entries);
         sidecar_service.environment = Some(Environment::List(sidecar_env_entries));
+        sidecar_service
+            .extra_hosts
+            .push(HOST_GATEWAY_ENTRY.to_string());
         sidecar_service
             .networks
             .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
@@ -765,22 +815,54 @@ fn render_docker_compose_inner(
         sidecar_service
             .volumes
             .push(format!("{sidecar_volume}:{MESH_CONFIG_DIR}:ro"));
+        let sidecar_control_volume = component_control_socket_volume_expr(&svc.sidecar);
+        compose
+            .volumes
+            .entry(sidecar_control_volume.clone())
+            .or_insert_with(EmptyMap::default);
+        sidecar_service.volumes.push(format!(
+            "{sidecar_control_volume}:{ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
+        ));
+        if Some(*id) == docker_gateway_component {
+            sidecar_service.user = Some("0:0".to_string());
+            sidecar_service.volumes.push(format!(
+                "${{{DOCKER_GATEWAY_HOST_SOCK_ENV}:-{}}}:{DOCKER_GATEWAY_CONTAINER_SOCK}",
+                detect_default_host_docker_sock().display()
+            ));
+        }
+        let sidecar_control_init_service_name = component_control_init_service_name(&svc.sidecar);
         sidecar_service.depends_on = build_depends_on(
             false,
-            vec![(
-                PROVISIONER_SERVICE_NAME.to_string(),
-                "service_completed_successfully",
-            )],
+            vec![
+                (
+                    PROVISIONER_SERVICE_NAME.to_string(),
+                    "service_completed_successfully",
+                ),
+                (
+                    sidecar_control_init_service_name.clone(),
+                    "service_completed_successfully",
+                ),
+            ],
         );
         apply_default_service_hardening(&mut sidecar_service);
         apply_internal_service_rootfs_hardening(&mut sidecar_service);
+        compose.services.insert(
+            sidecar_control_init_service_name,
+            build_control_socket_init_service(&sidecar_control_volume),
+        );
         compose
             .services
             .insert(svc.sidecar.clone(), sidecar_service);
 
         let mut egress_init_service = Service::new(images.helper.clone());
         egress_init_service.user = Some("0:0".to_string());
-        egress_init_service.command = Some(vec!["install-default-egress-guard".to_string()]);
+        let mesh_port = *mesh_ports_by_component
+            .get(id)
+            .expect("mesh port should be allocated before rendering services");
+        egress_init_service.command = Some(vec![
+            "install-network-guard".to_string(),
+            mesh_port.to_string(),
+        ]);
         egress_init_service.network_mode = Some(format!("service:{}", svc.sidecar));
         egress_init_service.cap_add.push("NET_ADMIN".to_string());
         egress_init_service.depends_on =
@@ -791,10 +873,16 @@ fn render_docker_compose_inner(
             .services
             .insert(svc.egress_init.clone(), egress_init_service);
 
+        if Some(*id) == docker_gateway_component {
+            continue;
+        }
+
         // depends_on: own sidecar + strong deps provider programs (+ amber-init for helper-backed services)
         let program_plan = program_plans.get(id).expect("program plan computed");
-        let image = if Some(*id) == docker_gateway_component {
-            images.docker_gateway.clone()
+        let is_site_controller =
+            framework_component_controller_metadata(s.component(*id).metadata.as_ref()).is_some();
+        let image = if is_site_controller {
+            images.site_controller.clone()
         } else {
             let image_plan = program_plan.image().ok_or_else(|| {
                 DockerComposeError::Other(format!(
@@ -846,7 +934,12 @@ fn render_docker_compose_inner(
         if let Some(ds) = mesh_plan.strong_deps().get(id) {
             for dep in ds {
                 if let Some(dep_names) = names.get(dep) {
-                    deps.push((dep_names.program.clone(), "service_started"));
+                    let service = if Some(*dep) == docker_gateway_component {
+                        dep_names.sidecar.clone()
+                    } else {
+                        dep_names.program.clone()
+                    };
+                    deps.push((service, "service_started"));
                 } else {
                     return Err(format!(
                         "internal error: missing service name for dependency {}",
@@ -940,16 +1033,17 @@ fn render_docker_compose_inner(
                 program_service.environment = Some(Environment::List(env_entries));
             }
         }
-        if Some(*id) == docker_gateway_component {
-            configure_injected_docker_gateway_service(&mut program_service, s, *id, svc)?;
-            apply_internal_service_rootfs_hardening(&mut program_service);
-        }
         for storage_mount in storage_mounts {
             program_service.volumes.push(format!(
                 "{}:{}",
                 compose_storage_volume_name(&storage_mount.identity),
                 storage_mount.mount_path
             ));
+        }
+        if is_site_controller {
+            program_service
+                .volumes
+                .push(format!("{sidecar_volume}:{MESH_CONFIG_DIR}:ro"));
         }
         configure_program_log_shipping(
             &mut program_service,
@@ -1294,39 +1388,6 @@ fn collect_framework_docker_mount_paths(
     out
 }
 
-fn configure_injected_docker_gateway_service(
-    service: &mut Service,
-    scenario: &Scenario,
-    id: ComponentId,
-    names: &ServiceNames,
-) -> DcResult<()> {
-    let config_json =
-        build_docker_gateway_config_json(scenario.component(id).moniker.as_str(), &names.program)?;
-    match service.environment.take() {
-        Some(Environment::Map(mut env)) => {
-            env.insert(DOCKER_GATEWAY_CONFIG_ENV.to_string(), config_json);
-            service.environment = Some(Environment::Map(env));
-        }
-        Some(Environment::List(_)) => {
-            return Err(DockerComposeError::Other(
-                "internal error: injected docker gateway should not use list-style environment"
-                    .to_string(),
-            ));
-        }
-        None => {
-            service.environment = Some(Environment::Map(BTreeMap::from([(
-                DOCKER_GATEWAY_CONFIG_ENV.to_string(),
-                config_json,
-            )])));
-        }
-    }
-    service.volumes.push(format!(
-        "${{{DOCKER_GATEWAY_HOST_SOCK_ENV}:-{}}}:{DOCKER_GATEWAY_CONTAINER_SOCK}",
-        detect_default_host_docker_sock().display()
-    ));
-    Ok(())
-}
-
 fn docker_proxy_ports_by_component(
     scenario: &Scenario,
     route_ports: &LocalRoutePorts,
@@ -1367,29 +1428,6 @@ fn encode_docker_mount_proxy_spec_b64(
         ))
     })?;
     Ok(base64::engine::general_purpose::STANDARD.encode(payload))
-}
-
-fn build_docker_gateway_config_json(
-    caller_component: &str,
-    caller_compose_service: &str,
-) -> DcResult<String> {
-    let callers = vec![DockerGatewayCallerConfig {
-        host: "127.0.0.1".to_string(),
-        port: None,
-        component: caller_component.to_string(),
-        compose_service: caller_compose_service.to_string(),
-    }];
-
-    let config = DockerGatewayConfig {
-        listen: format!("0.0.0.0:{FRAMEWORK_DOCKER_GATEWAY_PORT}"),
-        docker_sock: DOCKER_GATEWAY_CONTAINER_SOCK.to_string(),
-        compose_project: "${COMPOSE_PROJECT_NAME}".to_string(),
-        callers,
-    };
-
-    serde_json::to_string(&config).map_err(|err| {
-        DockerComposeError::Other(format!("failed to serialize docker gateway config: {err}"))
-    })
 }
 
 fn detect_default_host_docker_sock() -> PathBuf {
@@ -1538,6 +1576,10 @@ fn compose_control_socket_volume_expr() -> String {
         "${{{}:-default}}_{}",
         COMPOSE_PROJECT_NAME_ENV, ROUTER_CONTROL_SOCKET_VOLUME_NAME
     )
+}
+
+fn component_control_socket_volume_expr(service_name: &str) -> String {
+    format!("{service_name}-control")
 }
 
 fn sanitize_service_suffix(s: &str) -> String {

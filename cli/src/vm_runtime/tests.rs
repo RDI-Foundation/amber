@@ -1,5 +1,11 @@
-use amber_compiler::reporter::vm::{MESH_PROVISION_PLAN_FILENAME, VmStorageMount};
-use amber_mesh::{MeshProtocol, OutboundRoute, TransportConfig};
+use amber_compiler::reporter::vm::{
+    MESH_PROVISION_PLAN_FILENAME, VM_PLAN_FILENAME, VmStorageMount,
+};
+use amber_mesh::{
+    MESH_PROVISION_PLAN_VERSION, MeshConfigTemplate, MeshIdentityTemplate, MeshPeerTemplate,
+    MeshProtocol, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget,
+    MeshProvisionTargetKind, OutboundRoute, TransportConfig,
+};
 
 use super::*;
 
@@ -447,6 +453,104 @@ fn build_vm_launch_preview_keeps_command_when_base_image_is_unresolved() {
                 .detail
                 .contains("\"base_image\" is a required property")
     }));
+}
+
+#[test]
+fn build_vm_site_launch_preview_tolerates_missing_peer_router_identity() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let plan_root = temp.path().join("artifact");
+    let runtime_root = temp.path().join("runtime");
+    let storage_root = temp.path().join("storage");
+    fs::create_dir_all(&plan_root).expect("plan root");
+    fs::create_dir_all(&runtime_root).expect("runtime root");
+    fs::create_dir_all(&storage_root).expect("storage root");
+    let base_image = temp.path().join("base.img");
+    fs::write(&base_image, []).expect("base image");
+
+    let vm_plan = VmPlan {
+        version: VM_PLAN_VERSION.to_string(),
+        mesh_provision_plan: MESH_PROVISION_PLAN_FILENAME.to_string(),
+        startup_order: vec![7],
+        runtime_addresses: DirectRuntimeAddressPlan::default(),
+        components: vec![VmComponentPlan {
+            id: 7,
+            moniker: "/app".to_string(),
+            log_name: "app".to_string(),
+            depends_on: Vec::new(),
+            mesh_config_path: "mesh/components/app/mesh-config.json".to_string(),
+            mesh_identity_path: "mesh/components/app/mesh-identity.json".to_string(),
+            cpus: VmScalarPlanU32::Literal { value: 1 },
+            memory_mib: VmScalarPlanU32::Literal { value: 512 },
+            base_image: VmHostPathPlan::Static {
+                path: base_image.display().to_string(),
+            },
+            cloud_init_user_data: None,
+            cloud_init_vendor_data: None,
+            egress: VmEgressPlan::None,
+            storage_mounts: Vec::new(),
+            runtime_config: None,
+            mount_spec_b64: None,
+        }],
+        router: None,
+    };
+    let mesh_plan = MeshProvisionPlan {
+        version: MESH_PROVISION_PLAN_VERSION.to_string(),
+        identity_seed: None,
+        existing_peer_identities: Vec::new(),
+        targets: vec![MeshProvisionTarget {
+            kind: MeshProvisionTargetKind::Component,
+            config: MeshConfigTemplate {
+                identity: MeshIdentityTemplate {
+                    id: "/app".to_string(),
+                    mesh_scope: None,
+                },
+                mesh_listen: "127.0.0.1:19000".parse().expect("mesh listen"),
+                control_listen: None,
+                dynamic_caps_listen: None,
+                control_allow: None,
+                peers: vec![MeshPeerTemplate {
+                    id: "/site/direct_local/router".to_string(),
+                }],
+                inbound: Vec::new(),
+                outbound: Vec::new(),
+                transport: TransportConfig::NoiseIk {},
+            },
+            output: MeshProvisionOutput::Filesystem {
+                dir: "mesh/components/app".to_string(),
+            },
+        }],
+    };
+
+    fs::write(
+        plan_root.join(VM_PLAN_FILENAME),
+        serde_json::to_string_pretty(&vm_plan).expect("serialize vm plan"),
+    )
+    .expect("write vm plan");
+    fs::write(
+        plan_root.join(MESH_PROVISION_PLAN_FILENAME),
+        serde_json::to_string_pretty(&mesh_plan).expect("serialize mesh provision plan"),
+    )
+    .expect("write mesh provision plan");
+
+    let preview = build_vm_site_launch_preview(
+        &plan_root.join(VM_PLAN_FILENAME),
+        &storage_root,
+        &runtime_root,
+        None,
+    )
+    .expect("vm preview");
+
+    assert_eq!(preview.virtual_machines.len(), 1);
+    assert!(
+        !preview.virtual_machines[0].command.is_empty(),
+        "preview should still emit a local QEMU command when peer routers are unresolved"
+    );
+    assert!(
+        preview
+            .inspectability_warnings
+            .iter()
+            .any(|warning| warning.contains("missing one or more peer-site router identities"))
+    );
 }
 
 #[test]

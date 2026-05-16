@@ -36,25 +36,12 @@ async fn docker_daemon_e2e_enforces_scoping_and_policy() {
     let owned_volume = format!("amber-gw-owned-vol-{suffix}");
     let foreign_volume = format!("amber-gw-foreign-vol-{suffix}");
 
-    let listen = reserve_loopback_socket_addr();
-    let config = DockerGatewayConfig {
-        listen,
-        docker_sock: docker_sock.clone(),
-        compose_project: compose_project.clone(),
-        callers: vec![CallerConfig {
-            host: "127.0.0.1".to_string(),
-            port: None,
-            component: component.clone(),
-            compose_service: component.clone(),
-        }],
-    };
-
-    let gateway_task = tokio::spawn(async move {
-        if let Err(err) = run(config).await {
-            panic!("gateway run failed in e2e test: {err}");
-        }
-    });
-    wait_until_gateway_listens(listen, &gateway_task).await;
+    let (listen, gateway_task) = start_gateway_listener(
+        docker_sock.clone(),
+        compose_project.clone(),
+        component.clone(),
+    )
+    .await;
 
     send_docker_request(
         &docker_sock,
@@ -358,39 +345,21 @@ async fn docker_daemon_e2e_enforces_multicaller_container_exec_and_upgrade() {
     let owned_network_b = format!("amber-gw-owned-net-b-{suffix}");
     let owned_container_a = format!("amber-gw-owned-container-a-{suffix}");
 
-    let (caller_a_socket, caller_a_port) = reserve_bound_loopback_socket();
-    let (caller_b_socket, caller_b_port) = reserve_bound_loopback_socket();
+    let (listen_a, gateway_task_a) = start_gateway_listener(
+        docker_sock.clone(),
+        compose_project.clone(),
+        component_a.clone(),
+    )
+    .await;
+    let (listen_b, gateway_task_b) = start_gateway_listener(
+        docker_sock.clone(),
+        compose_project.clone(),
+        component_b.clone(),
+    )
+    .await;
 
-    let listen = reserve_loopback_socket_addr();
-    let config = DockerGatewayConfig {
-        listen,
-        docker_sock: docker_sock.clone(),
-        compose_project: compose_project.clone(),
-        callers: vec![
-            CallerConfig {
-                host: "127.0.0.1".to_string(),
-                port: Some(caller_a_port),
-                component: component_a.clone(),
-                compose_service: component_a.clone(),
-            },
-            CallerConfig {
-                host: "127.0.0.1".to_string(),
-                port: Some(caller_b_port),
-                component: component_b.clone(),
-                compose_service: component_b.clone(),
-            },
-        ],
-    };
-
-    let gateway_task = tokio::spawn(async move {
-        if let Err(err) = run(config).await {
-            panic!("gateway run failed in multicaller e2e test: {err}");
-        }
-    });
-    wait_until_gateway_listens(listen, &gateway_task).await;
-
-    let mut caller_a = GatewayClient::connect_from_socket(caller_a_socket, listen).await;
-    let mut caller_b = GatewayClient::connect_from_socket(caller_b_socket, listen).await;
+    let mut caller_a = GatewayClient::connect(listen_a).await;
+    let mut caller_b = GatewayClient::connect(listen_b).await;
 
     let create_network_a = caller_a
         .request(
@@ -584,7 +553,8 @@ async fn docker_daemon_e2e_enforces_multicaller_container_exec_and_upgrade() {
         String::from_utf8_lossy(&allowed_exec_start.body)
     );
 
-    gateway_task.abort();
+    gateway_task_a.abort();
+    gateway_task_b.abort();
     docker_delete_container_best_effort(&docker_sock, &owned_container_a).await;
     docker_delete_network_best_effort(&docker_sock, &owned_network_a).await;
     docker_delete_network_best_effort(&docker_sock, &owned_network_b).await;
@@ -626,25 +596,12 @@ async fn docker_daemon_e2e_container_create_without_network_mode() {
     let component = format!("amber-gw-e2e-netmode-comp-{suffix}");
     let container_name = format!("amber-gw-e2e-netmode-ctr-{suffix}");
 
-    let listen = reserve_loopback_socket_addr();
-    let config = DockerGatewayConfig {
-        listen,
-        docker_sock: docker_sock.clone(),
-        compose_project: compose_project.clone(),
-        callers: vec![CallerConfig {
-            host: "127.0.0.1".to_string(),
-            port: None,
-            component: component.clone(),
-            compose_service: component.clone(),
-        }],
-    };
-
-    let gateway_task = tokio::spawn(async move {
-        if let Err(err) = run(config).await {
-            panic!("gateway run failed in network-mode e2e test: {err}");
-        }
-    });
-    wait_until_gateway_listens(listen, &gateway_task).await;
+    let (listen, gateway_task) = start_gateway_listener(
+        docker_sock.clone(),
+        compose_project.clone(),
+        component.clone(),
+    )
+    .await;
 
     // Docker CLI v27+ sends EndpointsConfig:{"default":{}} when no
     // --network flag is given. The gateway should skip builtin names.

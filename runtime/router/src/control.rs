@@ -1,3 +1,5 @@
+use std::env;
+
 use super::*;
 
 #[derive(Clone)]
@@ -22,6 +24,7 @@ pub(super) struct InboundRuntime {
     client: Arc<HttpClient>,
     a2a_url_rewrite_table: Arc<a2a::UrlRewriteTable>,
     dynamic_caps: Option<Arc<DynamicCapsRuntime>>,
+    docker_gateways: DockerGatewayRuntimes,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +159,7 @@ pub async fn run_with_listeners(
     let trust = Arc::new(TrustBundle::new(&config)?);
     let inbound_routes = Arc::new(build_inbound_routes(&config)?);
     validate_outbound_routes(&config)?;
+    let docker_gateways = Arc::new(build_docker_gateway_runtimes(&config)?);
     let a2a_url_rewrite_table = Arc::new(a2a::UrlRewriteTable::from_routes(
         &config.inbound,
         &config.outbound,
@@ -191,6 +195,7 @@ pub async fn run_with_listeners(
                 client: client.clone(),
                 a2a_url_rewrite_table: a2a_url_rewrite_table.clone(),
                 dynamic_caps: dynamic_caps.clone(),
+                docker_gateways: docker_gateways.clone(),
             },
             listeners_by_route.mesh.take(),
         ));
@@ -377,6 +382,7 @@ pub(super) async fn handle_inbound(
         client,
         a2a_url_rewrite_table,
         dynamic_caps,
+        docker_gateways,
     } = state;
     let noise_keys = noise_keys_for_identity(&config.identity)?;
     let mut session = accept_noise(stream, &noise_keys, &trust).await?;
@@ -423,20 +429,34 @@ pub(super) async fn handle_inbound(
                 proxy_noise_to_plain(&mut session, target).await?;
             }
         }
+        InboundTarget::DockerGateway { .. } => {
+            if route.protocol != MeshProtocol::Tcp {
+                return Err(RouterError::InvalidConfig(format!(
+                    "docker gateway route {} must use tcp protocol",
+                    route.route_id
+                )));
+            }
+            let gateway = docker_gateways
+                .get(&route.route_id)
+                .cloned()
+                .ok_or_else(|| {
+                    RouterError::InvalidConfig(format!(
+                        "missing docker gateway runtime for route {}",
+                        route.route_id
+                    ))
+                })?;
+            proxy_noise_to_docker_gateway(&mut session, remote_id, gateway).await?;
+        }
         InboundTarget::External {
             ref url_env,
             optional,
         } => match route.protocol {
             MeshProtocol::Http => {
-                let framework_route_id = (url_env == amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV)
-                    .then(|| Arc::<str>::from(route.route_id.as_str()));
-                let framework_peer_id = (url_env == amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV)
-                    .then(|| Arc::<str>::from(remote_id.as_str()));
                 proxy_noise_to_external(
                     &mut session,
                     ExternalProxyRequest {
-                        route_id: framework_route_id,
-                        peer_id: framework_peer_id,
+                        route_id: None,
+                        peer_id: None,
                         labels: HttpExchangeLabels::inbound_from_route(
                             config.identity.id.clone().into(),
                             remote_id.clone().into(),
@@ -556,6 +576,7 @@ pub(super) async fn handle_inbound(
                     &mut session,
                     outbound,
                     route.route_id.clone().into(),
+                    remote_id.clone().into(),
                     plugins,
                     labels,
                 )
@@ -675,6 +696,7 @@ pub(super) async fn handle_outbound(
         proxy_local_http_to_noise(
             &mut outbound,
             route.route_id.clone().into(),
+            config.identity.id.clone().into(),
             stream,
             plugins,
             HttpExchangeLabels::outbound_from_route(config.identity.id.clone().into(), &route),
@@ -758,7 +780,7 @@ pub(super) fn bind_unix_listener(path: &str) -> Result<UnixListener, RouterError
             path: path.clone(),
             source,
         })?;
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660)).map_err(
         |source| RouterError::BindUnixFailed {
             path: path.clone(),
             source,
@@ -1320,10 +1342,18 @@ pub(super) async fn apply_route_overlay(
         let mut issuers = dynamic_issuers.write().await;
         remove_dynamic_issuer_grants(&mut issuers, &existing_overlay.static_issuer_grants);
         for peer in &existing_overlay.peers {
-            trust
-                .remove_peer(peer)
-                .await
-                .map_err(|err| format!("failed to replace overlay peer {}: {err}", peer.id))?;
+            if let Err(remove_err) = trust.remove_peer(peer).await {
+                trust
+                    .remove_dynamic_peer_by_id(&peer.id)
+                    .await
+                    .map_err(|cleanup_err| {
+                        format!(
+                            "failed to replace overlay peer {}: {remove_err}; fallback cleanup \
+                             failed: {cleanup_err}",
+                            peer.id
+                        )
+                    })?;
+            }
         }
     }
 
@@ -1373,7 +1403,9 @@ pub(super) async fn revoke_route_overlay(
     let removed = dynamic_route_overlays.write().await.remove(overlay_id);
     if let Some(overlay) = removed {
         for peer in &overlay.peers {
-            let _ = trust.remove_peer(peer).await;
+            if trust.remove_peer(peer).await.is_err() {
+                let _ = trust.remove_dynamic_peer_by_id(&peer.id).await;
+            }
         }
         let mut issuers = dynamic_issuers.write().await;
         for route_id in overlay.routes.keys() {
@@ -1467,6 +1499,15 @@ pub(super) fn control_protocol(value: &str) -> Result<MeshProtocol, String> {
 pub(super) fn build_inbound_routes(config: &MeshConfig) -> Result<InboundRoutes, RouterError> {
     let mut map = HashMap::new();
     for route in &config.inbound {
+        if matches!(route.target, InboundTarget::DockerGateway { .. })
+            && route.protocol != MeshProtocol::Tcp
+        {
+            return Err(RouterError::InvalidConfig(format!(
+                "inbound route {} targets the docker gateway but uses {} protocol",
+                route.route_id,
+                protocol_string(route.protocol)
+            )));
+        }
         if route.protocol != MeshProtocol::Http && !route.http_plugins.is_empty() {
             return Err(RouterError::InvalidConfig(format!(
                 "inbound route {} has http plugins but uses {} protocol",
@@ -1488,6 +1529,38 @@ pub(super) fn build_inbound_routes(config: &MeshConfig) -> Result<InboundRoutes,
         }
     }
     Ok(map)
+}
+
+pub(super) fn build_docker_gateway_runtimes(
+    config: &MeshConfig,
+) -> Result<HashMap<String, Arc<DockerGatewayRuntime>>, RouterError> {
+    let mut runtimes = HashMap::new();
+    for route in &config.inbound {
+        let InboundTarget::DockerGateway {
+            docker_sock,
+            compose_project_env,
+        } = &route.target
+        else {
+            continue;
+        };
+        let compose_project = env::var(compose_project_env)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                RouterError::InvalidConfig(format!(
+                    "docker gateway route {} requires non-empty {compose_project_env}",
+                    route.route_id
+                ))
+            })?;
+        let runtime = DockerGatewayRuntime::new(DockerGatewayConfig {
+            docker_sock: docker_sock.clone(),
+            compose_project,
+        })
+        .map_err(|err| RouterError::InvalidConfig(err.to_string()))?;
+        runtimes.insert(route.route_id.clone(), Arc::new(runtime));
+    }
+    Ok(runtimes)
 }
 
 pub(super) fn validate_outbound_routes(config: &MeshConfig) -> Result<(), RouterError> {

@@ -367,6 +367,24 @@ pub(super) async fn proxy_noise_to_external_tcp(
     proxy_noise_to_plain(session, upstream).await
 }
 
+pub(super) async fn proxy_noise_to_docker_gateway(
+    session: &mut NoiseSession,
+    peer_id: String,
+    gateway: Arc<DockerGatewayRuntime>,
+) -> Result<(), RouterError> {
+    let (local, remote) = duplex(64 * 1024);
+    let mut noise_session = session.clone();
+    let bridge = tokio::spawn(async move { proxy_noise_to_plain(&mut noise_session, local).await });
+
+    gateway
+        .serve_connection(remote, peer_id)
+        .await
+        .map_err(|err| RouterError::Transport(err.to_string()))?;
+
+    let _ = bridge.await;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn proxy_noise_to_local_http(
     session: &mut NoiseSession,
@@ -421,6 +439,7 @@ pub(super) async fn proxy_noise_to_noise_http(
     session: &mut NoiseSession,
     outbound: NoiseSession,
     route_id: Arc<str>,
+    peer_id: Arc<str>,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     labels: HttpExchangeLabels,
 ) -> Result<(), RouterError> {
@@ -453,6 +472,7 @@ pub(super) async fn proxy_noise_to_noise_http(
         upstream: Arc::new(Mutex::new(sender)),
         plugins,
         route_id,
+        peer_id,
         labels,
         dynamic_caps: None,
     };
@@ -607,6 +627,21 @@ impl TrustBundle {
             inner.noise_by_id.remove(&peer.id);
             inner.id_by_noise.remove(&noise);
         }
+        Ok(())
+    }
+
+    pub(super) async fn remove_dynamic_peer_by_id(&self, peer_id: &str) -> Result<(), RouterError> {
+        let mut inner = self.inner.write().await;
+        let Some(existing) = inner.noise_by_id.remove(peer_id) else {
+            return Ok(());
+        };
+        if existing.static_peer {
+            inner.noise_by_id.insert(peer_id.to_string(), existing);
+            return Err(RouterError::Auth(format!(
+                "peer {peer_id} is statically registered"
+            )));
+        }
+        inner.id_by_noise.remove(&existing.noise);
         Ok(())
     }
 }

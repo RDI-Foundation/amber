@@ -1,13 +1,13 @@
 mod command_support;
 mod direct_runtime;
 mod docs;
-mod framework_component;
 mod mixed_run;
 mod run_inputs;
 mod run_logs;
 mod scenario_runner;
 mod site_proxy_metadata;
 mod tcp_readiness;
+mod unix_process;
 mod vm_runtime;
 
 #[cfg(target_os = "linux")]
@@ -22,7 +22,7 @@ use std::{
     future::Future,
     io,
     io::{IsTerminal as _, Write as _},
-    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Stdio},
     sync::Arc,
@@ -41,7 +41,7 @@ use amber_compiler::{
         dot::DotReporter,
         metadata::MetadataReporter,
         scenario_ir::ScenarioIrReporter,
-        vm::VM_PLAN_FILENAME,
+        vm::{VM_PLAN_FILENAME, VM_RUN_SCRIPT_FILENAME, VmReporter},
     },
     run_plan::{
         PlacementFile, RUN_PLAN_SCHEMA, RunPlan, SiteKind, build_homogeneous_export_run_plan,
@@ -429,12 +429,8 @@ enum Command {
     RunVmInit(RunVmInitArgs),
     #[command(hide = true, name = "run-site-supervisor")]
     RunSiteSupervisor(RunSiteSupervisorArgs),
-    #[command(hide = true, name = "run-site-actuator")]
-    RunSiteActuator(RunSiteActuatorArgs),
-    #[command(hide = true, name = "run-framework-control-state")]
-    RunFrameworkControlState(RunFrameworkControlStateArgs),
-    #[command(hide = true, name = "run-framework-ccs")]
-    RunFrameworkCcs(RunFrameworkCcsArgs),
+    #[command(hide = true, name = "run-site-controller")]
+    RunSiteController(RunSiteControllerArgs),
     #[command(hide = true, name = "run-detached-coordinator")]
     RunDetachedCoordinator(RunDetachedCoordinatorArgs),
     #[command(hide = true, name = "run-observability-sink")]
@@ -711,22 +707,8 @@ struct RunSiteSupervisorArgs {
 }
 
 #[derive(Args)]
-struct RunSiteActuatorArgs {
-    /// Path to a mixed-site site-actuator plan JSON file.
-    #[arg(long = "plan", value_name = "FILE")]
-    plan: PathBuf,
-}
-
-#[derive(Args)]
-struct RunFrameworkControlStateArgs {
-    /// Path to a framework control-state service plan JSON file.
-    #[arg(long = "plan", value_name = "FILE")]
-    plan: PathBuf,
-}
-
-#[derive(Args)]
-struct RunFrameworkCcsArgs {
-    /// Path to a framework CCS plan JSON file.
+struct RunSiteControllerArgs {
+    /// Path to a mixed-site site-controller plan JSON file.
     #[arg(long = "plan", value_name = "FILE")]
     plan: PathBuf,
 }
@@ -905,12 +887,8 @@ async fn main() -> Result<()> {
                     .await
                 }
                 Command::RunSiteSupervisor(args) => mixed_run::run_site_supervisor(args.plan).await,
-                Command::RunSiteActuator(args) => mixed_run::run_site_actuator(args.plan).await,
-                Command::RunFrameworkControlState(args) => {
-                    framework_component::run_framework_control_state(args.plan).await
-                }
-                Command::RunFrameworkCcs(args) => {
-                    framework_component::run_framework_ccs(args.plan).await
+                Command::RunSiteController(args) => {
+                    amber_site_controller::run_site_controller_default(args.plan).await
                 }
                 Command::RunDetachedCoordinator(args) => run_detached_coordinator(args).await,
                 Command::RunObservabilitySink(args) => {
@@ -1188,10 +1166,16 @@ async fn compile(args: CompileArgs) -> Result<()> {
     }
 
     if let Some(vm_dest) = outputs.vm {
-        let run_plan = build_homogeneous_export_run_plan(&compiled, SiteKind::Vm)
-            .into_diagnostic()
-            .wrap_err("failed to build homogeneous vm export plan")?;
-        write_unmanaged_export_output(&vm_dest, &run_plan, SiteKind::Vm)?;
+        let artifact = VmReporter
+            .emit(&compiled)
+            .map_err(miette::Report::new)
+            .wrap_err("failed to build vm artifact")?;
+        write_directory_output(
+            &vm_dest,
+            "vm output directory",
+            &artifact.files,
+            Some(Path::new(VM_RUN_SCRIPT_FILENAME)),
+        )?;
     }
 
     if let Some(metadata_dest) = outputs.metadata {

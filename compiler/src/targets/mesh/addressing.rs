@@ -184,10 +184,11 @@ impl Addressing for LocalAddressing<'_> {
         binding: &ResolvedFrameworkBinding,
     ) -> Result<String, Self::Error> {
         match binding.capability.as_str() {
-            "component" => {
-                let local_port = self.local_framework_binding_port(binding)?;
-                Ok(format!("http://127.0.0.1:{local_port}"))
-            }
+            "component" => Err(MeshError::new(format!(
+                "framework.component binding {}.{} must be lowered before mesh address planning",
+                component_label(self.scenario, binding.consumer),
+                binding.slot,
+            ))),
             "docker" => match self.options.docker_binding {
                 DockerFrameworkBindingPolicy::LoopbackTcp => {
                     let local_port = self.local_framework_binding_port(binding)?;
@@ -592,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn build_address_plan_maps_framework_component_to_loopback_http() {
+    fn build_address_plan_rejects_unlowered_framework_component() {
         let mut consumer = component(0, "/consumer", "consumer");
         consumer.slots.insert(
             "realm".to_string(),
@@ -634,16 +635,12 @@ mod tests {
                 docker_binding: DockerFrameworkBindingPolicy::LoopbackTcp,
             },
         );
-        let plan = build_address_plan(&mesh_plan, addressing).expect("address plan");
-
-        let slot_value = plan
-            .slot_values_by_component
-            .get(&ComponentId(0))
-            .and_then(|slots| slots.get("realm"))
-            .expect("slot value");
-        let SlotValue::One(value) = slot_value else {
-            panic!("expected singular slot value, got {slot_value:?}");
-        };
-        assert_eq!(value.url, "http://127.0.0.1:20000");
+        let err = build_address_plan(&mesh_plan, addressing)
+            .expect_err("framework.component should be lowered before address planning");
+        assert!(
+            err.to_string()
+                .contains("must be lowered before mesh address planning"),
+            "unexpected address-plan error: {err}",
+        );
     }
 }

@@ -201,7 +201,12 @@ jobs:
   kvm-smoke-tests:
     name: KVM Smoke Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    needs: docker-build
+    if: ${{ always() && (github.event_name != 'pull_request' || needs.docker-build.result == 'success') }}
+    permissions:
+      contents: read
+      packages: read
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
@@ -209,8 +214,43 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Compute image registries
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner_lc="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          ci_registry="ghcr.io/${owner_lc}"
+          code_registry="$(jq -r '.registry' docker/images.json)"
+          if [ -z "$code_registry" ] || [ "$code_registry" = "null" ]; then
+            echo "docker/images.json registry is missing" >&2
+            exit 1
+          fi
+          code_registry="${code_registry%/}"
+          echo "CI_IMAGE_REGISTRY=${ci_registry}" >> "$GITHUB_ENV"
+          echo "CODE_IMAGE_REGISTRY=${code_registry}" >> "$GITHUB_ENV"
+      - uses: docker/login-action@v3
+        if: github.event_name == 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and retag images for KVM smoke test
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          SOURCE_IMAGE_REGISTRY="$CI_IMAGE_REGISTRY" \
+          TARGET_IMAGE_REGISTRY="$CODE_IMAGE_REGISTRY" \
+          SOURCE_IMAGE_TAG="$GITHUB_SHA" \
+          ./.github/scripts/prepare_prebuilt_images.sh
       - name: Run KVM smoke test
-        run: cargo test -p amber-cli --test kvm_smoke -- --ignored --nocapture --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            export AMBER_TEST_USE_PREBUILT_IMAGES=1
+          fi
+          cargo test -p amber-cli --test kvm_smoke -- --ignored --nocapture --test-threads=1
 
   kubernetes-tests:
     name: Kubernetes Reporter Tests

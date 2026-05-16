@@ -19,6 +19,7 @@ pub(crate) struct LocalRoutePorts {
     slot_ports_by_component: HashMap<ComponentId, BTreeMap<String, u16>>,
     reserved_ports_by_component: HashMap<ComponentId, Vec<u16>>,
     dynamic_caps_ports_by_component: HashMap<ComponentId, u16>,
+    controller_internal_ports_by_component: HashMap<ComponentId, u16>,
     component_binding_ports: HashMap<BindingIdentity<ResolvedComponentBinding>, u16>,
     external_binding_ports: HashMap<BindingIdentity<ResolvedExternalBinding>, u16>,
     framework_binding_ports: HashMap<BindingIdentity<ResolvedFrameworkBinding>, u16>,
@@ -41,6 +42,12 @@ impl LocalRoutePorts {
 
     pub(crate) fn dynamic_caps_port(&self, component: ComponentId) -> Option<u16> {
         self.dynamic_caps_ports_by_component
+            .get(&component)
+            .copied()
+    }
+
+    pub(crate) fn controller_internal_port(&self, component: ComponentId) -> Option<u16> {
+        self.controller_internal_ports_by_component
             .get(&component)
             .copied()
     }
@@ -198,6 +205,8 @@ pub(crate) fn allocate_local_route_ports(
     for id in mesh_plan.program_components() {
         let mut allocator = ComponentRoutePortAllocator::new(endpoint_plan, *id);
         let dynamic_caps_port = allocator.allocate_reserved(scenario, *id, "dynamic caps api")?;
+        let controller_internal_port =
+            allocator.allocate_reserved(scenario, *id, "site controller control route")?;
 
         for binding in mesh_plan.bindings_for_consumer(*id) {
             let port = allocator.allocate(scenario, *id, binding.slot())?;
@@ -220,6 +229,8 @@ pub(crate) fn allocate_local_route_ports(
         let (reserved_ports, slot_ports) = allocator.finish();
         out.dynamic_caps_ports_by_component
             .insert(*id, dynamic_caps_port);
+        out.controller_internal_ports_by_component
+            .insert(*id, controller_internal_port);
         out.reserved_ports_by_component.insert(*id, reserved_ports);
         out.slot_ports_by_component.insert(*id, slot_ports);
     }
@@ -239,6 +250,9 @@ pub(crate) fn placeholder_local_route_ports(
         let dynamic_caps_port = allocator
             .allocate_reserved(scenario, *id, "dynamic caps api")
             .expect("dynamic caps api port allocation should not overflow");
+        let controller_internal_port = allocator
+            .allocate_reserved(scenario, *id, "site controller control route")
+            .expect("site controller control route port allocation should not overflow");
 
         for binding in mesh_plan.bindings_for_consumer(*id) {
             let port = allocator
@@ -263,6 +277,8 @@ pub(crate) fn placeholder_local_route_ports(
         let (reserved, slot_ports) = allocator.finish();
         out.dynamic_caps_ports_by_component
             .insert(*id, dynamic_caps_port);
+        out.controller_internal_ports_by_component
+            .insert(*id, controller_internal_port);
         out.reserved_ports_by_component.insert(*id, reserved);
         out.slot_ports_by_component.insert(*id, slot_ports);
     }

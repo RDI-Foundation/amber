@@ -163,6 +163,16 @@ fn kubernetes_emits_router_for_external_slots() {
         .get(&PathBuf::from("04-services/amber-router.yaml"))
         .expect("router service");
     assert!(router_service.contains("port: 24000"), "{router_service}");
+    assert!(router_service.contains("port: 24100"), "{router_service}");
+    assert!(router_service.contains("name: control"), "{router_service}");
+    let mesh_provision = artifact
+        .files
+        .get(&PathBuf::from("01-configmaps/amber-mesh-provision.yaml"))
+        .expect("mesh provision configmap");
+    assert!(
+        mesh_provision.contains("\"control_listen\": \"0.0.0.0:24100\""),
+        "{mesh_provision}"
+    );
 
     let router_env = artifact
         .files
@@ -267,6 +277,114 @@ fn kubernetes_emits_router_for_external_slots() {
     assert_eq!(
         scenario_json["external_slots"]["api"]["kind"],
         serde_json::Value::String("http".to_string())
+    );
+}
+
+#[test]
+fn kubernetes_network_policy_only_exposes_component_mesh_port() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let server_path = dir.path().join("server.json5");
+    let client_path = dir.path().join("client.json5");
+
+    fs::write(
+        &root_path,
+        format!(
+            r##"
+        {{
+          manifest_version: "0.1.0",
+          components: {{
+            server: "{}",
+            client: "{}"
+          }},
+          bindings: [
+            {{ to: "#client.api", from: "#server.api" }}
+          ]
+        }}
+        "##,
+            file_url(&server_path),
+            file_url(&client_path),
+        ),
+    )
+    .expect("write root manifest");
+
+    fs::write(
+        &server_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "server",
+            entrypoint: ["server"],
+            network: {
+              endpoints: [{ name: "api", port: 8080, protocol: "http" }]
+            }
+          },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" }
+        }
+        "#,
+    )
+    .expect("write server manifest");
+    fs::write(
+        &client_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "client",
+            entrypoint: ["client"],
+            env: { API_URL: "${slots.api.url}" }
+          },
+          slots: { api: { kind: "http" } }
+        }
+        "#,
+    )
+    .expect("write client manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+        .expect("compile scenario");
+    let artifact = render_artifact(&output);
+
+    let service_yaml = artifact
+        .files
+        .get(&PathBuf::from("04-services/c2-server.yaml"))
+        .expect("server service");
+    let service_doc: serde_yaml::Value =
+        serde_yaml::from_str(service_yaml).expect("parse server service");
+    let service_ports = service_doc["spec"]["ports"]
+        .as_sequence()
+        .expect("service ports")
+        .iter()
+        .map(|port| port["port"].as_u64().expect("service port"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(service_ports, BTreeSet::from([23000]));
+
+    let netpol_yaml = artifact
+        .files
+        .get(&PathBuf::from("05-networkpolicies/c2-server-netpol.yaml"))
+        .expect("server network policy");
+    let netpol_doc: serde_yaml::Value =
+        serde_yaml::from_str(netpol_yaml).expect("parse server network policy");
+    let ingress_ports = netpol_doc["spec"]["ingress"]
+        .as_sequence()
+        .expect("ingress rules")
+        .iter()
+        .flat_map(|rule| rule["ports"].as_sequence().into_iter().flatten())
+        .map(|port| port["port"].as_u64().expect("network policy port"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(ingress_ports, BTreeSet::from([23000]));
+    assert!(
+        !netpol_yaml.contains("8080"),
+        "program endpoint port must not be directly reachable through \
+         NetworkPolicy:\n{netpol_yaml}"
     );
 }
 
@@ -702,7 +820,7 @@ fn kubernetes_emits_otelcol_and_wires_otel_env() {
 }
 
 #[test]
-fn kubernetes_templates_dynamic_caps_sidecar_control_env() {
+fn kubernetes_templates_omit_dynamic_caps_sidecar_control_env_without_local_controller() {
     let dir = tempdir().expect("temp dir");
     let root_path = dir.path().join("root.json5");
     let worker_path = dir.path().join("worker.json5");
@@ -753,57 +871,38 @@ fn kubernetes_templates_dynamic_caps_sidecar_control_env() {
         })
         .expect("worker deployment");
     assert!(
-        component_deploy.contains("AMBER_DYNAMIC_CAPS_API_URL"),
+        !component_deploy.contains("AMBER_DYNAMIC_CAPS_API_URL"),
         "{component_deploy}"
     );
     assert!(
-        component_deploy.contains("http://127.0.0.1:19000"),
+        !component_deploy.contains("http://127.0.0.1:19000"),
         "{component_deploy}"
     );
     assert!(
-        component_deploy.contains("amber-component-sidecar-env"),
+        !component_deploy.contains("amber-component-sidecar-env"),
         "{component_deploy}"
     );
 
-    let sidecar_env = artifact
+    if let Some(sidecar_env) = artifact
         .files
         .get(&PathBuf::from(super::COMPONENT_SIDECAR_ENV_FILE))
-        .expect("component sidecar env template");
-    assert!(
-        sidecar_env.contains("AMBER_DYNAMIC_CAPS_CONTROL_URL="),
-        "{sidecar_env}"
-    );
-    assert!(
-        sidecar_env.contains("AMBER_DYNAMIC_CAPS_CONTROL_AUTH_TOKEN="),
-        "{sidecar_env}"
-    );
-    assert!(
-        sidecar_env.contains("AMBER_DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64="),
-        "{sidecar_env}"
-    );
+    {
+        assert!(
+            !sidecar_env.contains("AMBER_FRAMEWORK_COMPONENT_CONTROLLER_URL="),
+            "controller URLs must not be injected as ambient sidecar env: {sidecar_env}"
+        );
+        assert!(
+            !sidecar_env.contains("AMBER_FRAMEWORK_COMPONENT_CONTROLLER_AUTH_TOKEN="),
+            "controller auth must not be injected as ambient sidecar env: {sidecar_env}"
+        );
+    }
 
     let kustomization = artifact
         .files
         .get(&PathBuf::from("kustomization.yaml"))
         .expect("kustomization");
     assert!(
-        kustomization.contains("name: amber-component-sidecar-env"),
+        !kustomization.contains("amber-component-sidecar-env"),
         "{kustomization}"
-    );
-    assert!(
-        kustomization.contains(super::COMPONENT_SIDECAR_ENV_FILE),
-        "{kustomization}"
-    );
-    assert!(
-        !kustomization.contains(&format!(
-            "resources:\n- {}",
-            super::COMPONENT_SIDECAR_ENV_FILE
-        )),
-        "{kustomization}"
-    );
-    assert!(
-        !kustomization.contains(&format!("\n- {}\n", super::COMPONENT_SIDECAR_ENV_FILE)),
-        "kustomization resources must not treat the sidecar env template as a manifest: \
-         {kustomization}"
     );
 }

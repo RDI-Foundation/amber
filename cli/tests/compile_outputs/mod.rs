@@ -4,10 +4,7 @@ use std::{
     process::Command,
 };
 
-use amber_compiler::reporter::{
-    direct::{DIRECT_CONTROL_SOCKET_RELATIVE_PATH, DIRECT_PLAN_VERSION},
-    vm::{VM_PLAN_FILENAME, VM_PLAN_VERSION},
-};
+use amber_compiler::reporter::direct::{DIRECT_CONTROL_SOCKET_RELATIVE_PATH, DIRECT_PLAN_VERSION};
 use amber_images::AMBER_ROUTER;
 use amber_manifest::ManifestDigest;
 use amber_template::{

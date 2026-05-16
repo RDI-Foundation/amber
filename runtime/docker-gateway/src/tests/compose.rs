@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn compose_in_compose_setup_injects_scoped_labels() {
-    let gateway = GatewayHarness::start(vec![default_caller()]).await;
+    let gateway = GatewayHarness::start(TEST_COMPONENT).await;
     gateway.enqueue_json(
         Method::POST,
         "/networks/create",
@@ -167,7 +167,7 @@ async fn compose_in_compose_setup_injects_scoped_labels() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn compose_in_compose_teardown_allows_owned_resource_removal() {
-    let gateway = GatewayHarness::start(vec![default_caller()]).await;
+    let gateway = GatewayHarness::start(TEST_COMPONENT).await;
     gateway.enqueue_json(
         Method::GET,
         "/containers/inner-workload/json",
@@ -289,7 +289,7 @@ async fn compose_in_compose_teardown_allows_owned_resource_removal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn compose_in_compose_remove_orphans_rewrites_project_filters() {
-    let gateway = GatewayHarness::start(vec![default_caller()]).await;
+    let gateway = GatewayHarness::start(TEST_COMPONENT).await;
     gateway.enqueue_json(
         Method::GET,
         "/containers/json",
@@ -396,10 +396,8 @@ async fn compose_in_compose_remove_orphans_rewrites_project_filters() {
 async fn shutdown_cleanup_removes_owned_resources() {
     let docker = MockDocker::start().await;
     let state = State::new(DockerGatewayConfig {
-        listen: "127.0.0.1:23750".parse().expect("valid listen addr"),
         docker_sock: docker.socket_path.clone(),
         compose_project: TEST_PROJECT.to_string(),
-        callers: vec![default_caller()],
     });
 
     docker.enqueue_json(
@@ -503,7 +501,7 @@ async fn shutdown_cleanup_removes_owned_resources() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn versioned_paths_preserve_version_for_authorization_and_forwarding() {
-    let gateway = GatewayHarness::start(vec![default_caller()]).await;
+    let gateway = GatewayHarness::start(TEST_COMPONENT).await;
     gateway.enqueue_json(
         Method::GET,
         "/v1.41/containers/workload/json",
@@ -534,7 +532,7 @@ async fn versioned_paths_preserve_version_for_authorization_and_forwarding() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn exec_start_uses_cached_exec_to_container_mapping() {
-    let gateway = GatewayHarness::start(vec![default_caller()]).await;
+    let gateway = GatewayHarness::start(TEST_COMPONENT).await;
     gateway.enqueue_json(
         Method::GET,
         "/containers/workload/json",
@@ -590,7 +588,7 @@ async fn exec_start_uses_cached_exec_to_container_mapping() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn exec_start_falls_back_to_exec_inspect_when_cache_is_missing() {
-    let gateway = GatewayHarness::start(vec![default_caller()]).await;
+    let gateway = GatewayHarness::start(TEST_COMPONENT).await;
     gateway.enqueue_json(
         Method::GET,
         "/exec/exec-2/json",
@@ -629,7 +627,7 @@ async fn exec_start_falls_back_to_exec_inspect_when_cache_is_missing() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn exec_start_denies_access_when_exec_belongs_to_foreign_container() {
-    let gateway = GatewayHarness::start(vec![default_caller()]).await;
+    let gateway = GatewayHarness::start(TEST_COMPONENT).await;
     gateway.enqueue_json(
         Method::GET,
         "/exec/exec-9/json",

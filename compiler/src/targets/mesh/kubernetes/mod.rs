@@ -26,6 +26,10 @@ use crate::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{GENERATED_README_FILENAME, build_execution_guide},
     },
+    run_plan::{
+        SiteDefinition, SiteKind, framework_component_controller_metadata,
+        lower_framework_component_bindings_for_single_site,
+    },
     runtime_interface::{RootInputDescriptor, build_runtime_interface},
     targets::{
         mesh::{
@@ -66,6 +70,7 @@ const MESH_CONFIG_DIR: &str = "/amber/mesh";
 const MESH_SECRET_VOLUME_NAME: &str = "amber-mesh";
 const ROUTER_NAME: &str = "amber-router";
 const PROVISIONER_NAME: &str = "amber-provisioner";
+const SITE_CONTROLLER_SERVICE_NAME: &str = "amber-site-controller";
 const PROVISIONER_CONFIGMAP_NAME: &str = "amber-mesh-provision";
 const PROVISIONER_SERVICE_ACCOUNT: &str = "amber-provisioner";
 const PROVISIONER_ROLE_NAME: &str = "amber-provisioner";
@@ -109,6 +114,13 @@ pub struct KubernetesReporter;
 pub struct KubernetesArtifact {
     /// Map of relative path -> YAML content.
     pub files: BTreeMap<PathBuf, String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KubernetesArtifactBuildOptions<'a> {
+    pub(crate) force_router: bool,
+    pub(crate) router_identity_id: &'a str,
+    pub(crate) mesh_scope: Option<&'a str>,
 }
 
 impl Reporter for KubernetesReporter {
@@ -172,6 +184,31 @@ pub(crate) fn emit_kubernetes_artifact(
     compiled: &CompiledScenario,
     force_router: bool,
 ) -> KubernetesResult<KubernetesArtifact> {
+    emit_kubernetes_artifact_with_options(
+        compiled,
+        KubernetesArtifactBuildOptions {
+            force_router,
+            router_identity_id: crate::targets::mesh::mesh_config::DEFAULT_ROUTER_ID,
+            mesh_scope: None,
+        },
+    )
+}
+
+pub(crate) fn emit_kubernetes_artifact_with_options(
+    compiled: &CompiledScenario,
+    options: KubernetesArtifactBuildOptions<'_>,
+) -> KubernetesResult<KubernetesArtifact> {
+    let lowered = lower_framework_component_bindings_for_single_site(
+        compiled,
+        "kubernetes_local",
+        SiteDefinition {
+            kind: SiteKind::Kubernetes,
+            context: None,
+            controller_site: None,
+        },
+    )
+    .map_err(|err| ReporterError::new(err.to_string()))?;
+    let compiled = &lowered;
     let s = compiled.scenario();
     let scenario_digest =
         scenario_ir_digest(s).map_err(|err| ReporterError::new(err.to_string()))?;
@@ -216,14 +253,20 @@ pub(crate) fn emit_kubernetes_artifact(
 
     let names: HashMap<ComponentId, ComponentNames> =
         map_program_components(s, program_components, |id, local_name| {
-            let base = service_name(id, local_name);
+            let base = if framework_component_controller_metadata(s.component(id).metadata.as_ref())
+                .is_some()
+            {
+                SITE_CONTROLLER_SERVICE_NAME.to_string()
+            } else {
+                service_name(id, local_name)
+            };
             ComponentNames {
                 service: base.clone(),
                 netpol: format!("{base}-netpol"),
             }
         });
     let provisioner_job_name = provisioner_job_name(&scenario_digest);
-    let needs_router = mesh_plan.needs_router() || force_router;
+    let needs_router = mesh_plan.needs_router() || options.force_router;
 
     let route_ports = allocate_local_route_ports(s, &endpoint_plan, &mesh_plan)
         .map_err(|e| ReporterError::new(e.to_string()))?;
@@ -274,7 +317,9 @@ pub(crate) fn emit_kubernetes_artifact(
         router_ports,
         addressing: &mesh_addressing,
         options: MeshConfigBuildOptions {
-            force_router,
+            router_identity_id: options.router_identity_id,
+            mesh_scope: options.mesh_scope,
+            force_router: options.force_router,
             ..default_mesh_config_build_options()
         },
     })
@@ -291,16 +336,7 @@ pub(crate) fn emit_kubernetes_artifact(
             name: mesh_secret_name(ROUTER_NAME),
             namespace: None,
         },
-        |router_config| {
-            if let Some(control_listen) = router_config.control_listen {
-                router_config.control_listen = Some(
-                    format!("127.0.0.1:{}", control_listen.port())
-                        .parse()
-                        .expect("control listen"),
-                );
-            }
-            router_config.control_allow = Some(vec!["127.0.0.1".to_string(), "::1".to_string()]);
-        },
+        |_| {},
     )
     .map_err(|err| ReporterError::new(err.to_string()))?;
 
@@ -717,6 +753,8 @@ pub(crate) fn emit_kubernetes_artifact(
         let mesh_port = *mesh_ports_by_component.get(id).expect("mesh port missing");
         let label = component_label(s, *id);
         let pod_annotations = component_pod_annotations(&label);
+        let is_site_controller =
+            framework_component_controller_metadata(s.component(*id).metadata.as_ref()).is_some();
         let image_origin = program_plan.image_origin().ok_or_else(|| {
             ReporterError::new(format!(
                 "internal error: {} is missing a container image origin",
@@ -729,14 +767,18 @@ pub(crate) fn emit_kubernetes_artifact(
                 component_label(s, *id)
             ))
         })?;
-        let image_source = program_image_source(compiled, s, *id, image_origin);
-        let (program_image, image_source_env_var) = render_kubernetes_image(
-            image_plan,
-            &root_leaf_by_path,
-            &cnames.service,
-            &label,
-            image_source.as_ref(),
-        )?;
+        let (program_image, image_source_env_var) = if is_site_controller {
+            (images.site_controller.clone(), None)
+        } else {
+            let image_source = program_image_source(compiled, s, *id, image_origin);
+            render_kubernetes_image(
+                image_plan,
+                &root_leaf_by_path,
+                &cnames.service,
+                &label,
+                image_source.as_ref(),
+            )?
+        };
         let mount_specs = config_plan.mount_specs.get(id).map(Vec::as_slice);
         let runtime_plan = build_component_runtime_plan(
             &label,
@@ -871,6 +913,13 @@ pub(crate) fn emit_kubernetes_artifact(
             MESH_SECRET_VOLUME_NAME.to_string(),
             mesh_secret,
         ));
+        if is_site_controller {
+            container.volume_mounts.push(VolumeMount {
+                name: MESH_SECRET_VOLUME_NAME.to_string(),
+                mount_path: MESH_CONFIG_DIR.to_string(),
+                read_only: Some(true),
+            });
+        }
 
         let mut sidecar_env = vec![
             EnvVar::literal(
@@ -1132,6 +1181,12 @@ pub(crate) fn emit_kubernetes_artifact(
         );
 
         if !router_service_ports.is_empty() {
+            router_service_ports.push(ServicePort {
+                name: "control".to_string(),
+                port: ROUTER_CONTROL_PORT_BASE,
+                target_port: ROUTER_CONTROL_PORT_BASE,
+                protocol: "TCP",
+            });
             let service = Service::new(
                 ROUTER_NAME,
                 &namespace,
@@ -1233,8 +1288,13 @@ pub(crate) fn emit_kubernetes_artifact(
         }
 
         let egress_from_consumers = egress_allow.get(id);
-        let egress_to_router = egress_router_allow.get(id);
-        if egress_from_consumers.is_some() || egress_to_router.is_some() {
+        let mut egress_to_router = egress_router_allow.get(id).cloned().unwrap_or_default();
+        if framework_component_controller_metadata(s.component(*id).metadata.as_ref()).is_some()
+            && needs_router
+        {
+            egress_to_router.insert(ROUTER_CONTROL_PORT_BASE);
+        }
+        if egress_from_consumers.is_some() || !egress_to_router.is_empty() {
             netpol.add_egress_rule(NetworkPolicyEgressRule {
                 to: vec![NetworkPolicyPeer {
                     pod_selector: None,
@@ -1296,7 +1356,7 @@ pub(crate) fn emit_kubernetes_artifact(
                 }
             }
 
-            if let Some(ports) = egress_to_router {
+            if !egress_to_router.is_empty() {
                 netpol.add_egress_rule(NetworkPolicyEgressRule {
                     to: vec![NetworkPolicyPeer {
                         pod_selector: Some(LabelSelector {
@@ -1305,7 +1365,7 @@ pub(crate) fn emit_kubernetes_artifact(
                         namespace_selector: None,
                         ip_block: None,
                     }],
-                    ports: ports
+                    ports: egress_to_router
                         .iter()
                         .map(|port| NetworkPolicyPort {
                             protocol: "TCP",

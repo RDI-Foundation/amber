@@ -158,12 +158,10 @@ impl MeshPlan {
     }
 
     pub(crate) fn needs_router(&self) -> bool {
-        self.bindings.iter().any(|binding| {
-            binding.as_external().is_some()
-                || binding
-                    .as_framework()
-                    .is_some_and(|binding| binding.capability.as_str() == "component")
-        }) || !self.exports.is_empty()
+        self.bindings
+            .iter()
+            .any(|binding| binding.as_external().is_some())
+            || !self.exports.is_empty()
     }
 
     pub(crate) fn exports(&self) -> &[ResolvedExport] {

@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    env,
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
@@ -10,6 +9,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use amber_docker_gateway::{DockerGatewayConfig, DockerGatewayRuntime};
 use amber_mesh::{
     HttpRoutePlugin, InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity,
     MeshIdentityPublic, MeshIdentitySecret, MeshPeer, MeshProtocol, OutboundRoute,
@@ -209,6 +209,29 @@ impl HttpExchangeLabels {
                     )
                 }
             }
+            InboundTarget::DockerGateway { .. } => {
+                if router_forwarded_export {
+                    (
+                        HttpEdgeKind::Export,
+                        false,
+                        None,
+                        source_from_open
+                            .clone()
+                            .unwrap_or_else(|| capability.clone()),
+                        Some(local_id.clone()),
+                        capability.clone(),
+                    )
+                } else {
+                    (
+                        HttpEdgeKind::Binding,
+                        true,
+                        Some(remote_id.clone()),
+                        source_from_open.unwrap_or_else(|| capability.clone()),
+                        Some(local_id.clone()),
+                        capability.clone(),
+                    )
+                }
+            }
             InboundTarget::External { .. } => (
                 HttpEdgeKind::ExternalSlot,
                 true,
@@ -304,26 +327,18 @@ struct LocalHttpProxyState {
 
 const AMBER_ROUTE_ID_HEADER: &str = "x-amber-route-id";
 const AMBER_PEER_ID_HEADER: &str = "x-amber-peer-id";
-const AMBER_FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
-
-fn framework_component_auth_header_value() -> Option<HeaderValue> {
-    env::var(amber_mesh::FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .and_then(|value| HeaderValue::from_str(&value).ok())
-}
-
 #[derive(Clone)]
 struct OutboundHttpProxyState {
     upstream: Arc<Mutex<client_http1::SendRequest<BoxBody>>>,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     route_id: Arc<str>,
+    peer_id: Arc<str>,
     labels: HttpExchangeLabels,
     dynamic_caps: Option<Arc<DynamicCapsRuntime>>,
 }
 
 type HttpClient = Client<HttpsConnector<HttpConnector<ExternalHttpResolver>>, BoxBody>;
+type DockerGatewayRuntimes = Arc<HashMap<String, Arc<DockerGatewayRuntime>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BodyMode {
@@ -1009,12 +1024,6 @@ async fn proxy_local_http_request(
             HeaderValue::from_str(state.peer_id.as_ref())
                 .expect("peer id header value should be valid"),
         );
-        if let Some(auth_token) = framework_component_auth_header_value() {
-            request_parts.headers.insert(
-                header::HeaderName::from_static(AMBER_FRAMEWORK_AUTH_HEADER),
-                auth_token,
-            );
-        }
         if emit_telemetry {
             inject_trace_context(&span, &mut request_parts.headers);
         }
@@ -1233,6 +1242,7 @@ async fn proxy_local_http_request(
 async fn proxy_local_http_to_noise(
     session: &mut NoiseSession,
     route_id: Arc<str>,
+    peer_id: Arc<str>,
     stream: tokio::net::TcpStream,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     labels: HttpExchangeLabels,
@@ -1259,6 +1269,7 @@ async fn proxy_local_http_to_noise(
         upstream: Arc::new(Mutex::new(sender)),
         plugins,
         route_id,
+        peer_id,
         labels,
         dynamic_caps,
     };
@@ -1470,6 +1481,16 @@ async fn proxy_http_request_to_noise(
         }
         let host_header = outgoing_host_header(&request_parts.uri, &request_parts.headers);
         sanitize_request_headers(&mut request_parts.headers, host_header.as_str());
+        request_parts.headers.insert(
+            header::HeaderName::from_static(AMBER_ROUTE_ID_HEADER),
+            HeaderValue::from_str(state.route_id.as_ref())
+                .expect("route id header value should be valid"),
+        );
+        request_parts.headers.insert(
+            header::HeaderName::from_static(AMBER_PEER_ID_HEADER),
+            HeaderValue::from_str(state.peer_id.as_ref())
+                .expect("peer id header value should be valid"),
+        );
         inject_trace_context(&span, &mut request_parts.headers);
         let upstream_uri = request_parts.uri.to_string();
 
@@ -1726,24 +1747,28 @@ async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Re
         };
 
         sanitize_request_headers(&mut parts.0.headers, &host_header);
-        if let Some(route_id) = state.route_id.as_ref() {
+        if let Some(route_id) = state.route_id.as_ref()
+            && !parts
+                .0
+                .headers
+                .contains_key(header::HeaderName::from_static(AMBER_ROUTE_ID_HEADER))
+        {
             parts.0.headers.insert(
                 header::HeaderName::from_static(AMBER_ROUTE_ID_HEADER),
                 HeaderValue::from_str(route_id.as_ref())
                     .expect("route id header value should be valid"),
             );
         }
-        if let Some(peer_id) = state.peer_id.as_ref() {
+        if let Some(peer_id) = state.peer_id.as_ref()
+            && !parts
+                .0
+                .headers
+                .contains_key(header::HeaderName::from_static(AMBER_PEER_ID_HEADER))
+        {
             parts.0.headers.insert(
                 header::HeaderName::from_static(AMBER_PEER_ID_HEADER),
                 HeaderValue::from_str(peer_id.as_ref())
                     .expect("peer id header value should be valid"),
-            );
-        }
-        if let Some(auth_token) = framework_component_auth_header_value() {
-            parts.0.headers.insert(
-                header::HeaderName::from_static(AMBER_FRAMEWORK_AUTH_HEADER),
-                auth_token,
             );
         }
         inject_trace_context(&span, &mut parts.0.headers);

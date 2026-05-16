@@ -35,6 +35,7 @@ const IP_BIN: &str = "/usr/sbin/ip";
 const IPTABLES_BIN: &str = "/usr/sbin/iptables";
 const IP6TABLES_BIN: &str = "/usr/sbin/ip6tables";
 const DEFAULT_EGRESS_CHAIN: &str = "AMBER_EGRESS";
+const DEFAULT_INGRESS_CHAIN: &str = "AMBER_INGRESS";
 const HOST_GATEWAY_NAME: &str = "host.docker.internal";
 const BLOCKED_IPV4_CIDRS: &[&str] = &[
     "10.0.0.0/8",
@@ -96,10 +97,21 @@ pub enum HelperError {
 
 pub type Result<T> = std::result::Result<T, HelperError>;
 
+pub fn install_default_network_guard(allowed_ingress_tcp_ports: &[u16]) -> Result<()> {
+    install_default_ingress_guard(allowed_ingress_tcp_ports)?;
+    install_default_egress_guard()
+}
+
 pub fn install_default_egress_guard() -> Result<()> {
     let host_gateway_ips = resolve_host_gateway_ips();
     install_egress_guard_family(IPTABLES_BIN, "-4", BLOCKED_IPV4_CIDRS, &host_gateway_ips)?;
     install_egress_guard_family(IP6TABLES_BIN, "-6", BLOCKED_IPV6_CIDRS, &host_gateway_ips)?;
+    Ok(())
+}
+
+fn install_default_ingress_guard(allowed_tcp_ports: &[u16]) -> Result<()> {
+    install_ingress_guard_family(IPTABLES_BIN, allowed_tcp_ports)?;
+    install_ingress_guard_family(IP6TABLES_BIN, allowed_tcp_ports)?;
     Ok(())
 }
 
@@ -218,6 +230,71 @@ fn install_egress_guard_family(
             ],
         )?;
     }
+    Ok(())
+}
+
+fn install_ingress_guard_family(iptables_bin: &str, allowed_tcp_ports: &[u16]) -> Result<()> {
+    run_command_allow_failure(
+        iptables_bin,
+        ["-w", "-D", "INPUT", "-j", DEFAULT_INGRESS_CHAIN],
+    )?;
+    run_command_allow_failure(iptables_bin, ["-w", "-F", DEFAULT_INGRESS_CHAIN])?;
+    run_command_allow_failure(iptables_bin, ["-w", "-X", DEFAULT_INGRESS_CHAIN])?;
+
+    run_command(iptables_bin, ["-w", "-N", DEFAULT_INGRESS_CHAIN])?;
+    run_command(
+        iptables_bin,
+        ["-w", "-A", "INPUT", "-j", DEFAULT_INGRESS_CHAIN],
+    )?;
+    run_command(
+        iptables_bin,
+        [
+            "-w",
+            "-A",
+            DEFAULT_INGRESS_CHAIN,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "RETURN",
+        ],
+    )?;
+    run_command(
+        iptables_bin,
+        [
+            "-w",
+            "-A",
+            DEFAULT_INGRESS_CHAIN,
+            "-i",
+            "lo",
+            "-j",
+            "RETURN",
+        ],
+    )?;
+
+    for port in allowed_tcp_ports {
+        let port = port.to_string();
+        run_command(
+            iptables_bin,
+            [
+                "-w",
+                "-A",
+                DEFAULT_INGRESS_CHAIN,
+                "-p",
+                "tcp",
+                "--dport",
+                port.as_str(),
+                "-j",
+                "RETURN",
+            ],
+        )?;
+    }
+
+    run_command(
+        iptables_bin,
+        ["-w", "-A", DEFAULT_INGRESS_CHAIN, "-j", "REJECT"],
+    )?;
     Ok(())
 }
 

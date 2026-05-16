@@ -1,5 +1,164 @@
 use super::*;
 
+pub(super) fn site_controller_image_reference_from_overrides(
+    overrides: &BTreeMap<String, String>,
+) -> String {
+    overrides
+        .get("site_controller")
+        .map(|tag| amber_images::override_reference(&amber_images::AMBER_SITE_CONTROLLER, tag))
+        .unwrap_or_else(|| amber_images::AMBER_SITE_CONTROLLER.reference.to_string())
+}
+
+pub(crate) fn site_controller_image_reference() -> Result<String> {
+    let overrides =
+        amber_images::parse_dev_image_tag_overrides(amber_images::INTERNAL_IMAGE_OVERRIDE_KEYS)
+            .map_err(|err| miette::miette!(err))?;
+    Ok(site_controller_image_reference_from_overrides(&overrides))
+}
+
+pub(crate) fn site_controller_local_router_control(kind: SiteKind, artifact_dir: &Path) -> String {
+    match kind {
+        SiteKind::Direct => format!(
+            "unix://{}",
+            direct_current_control_socket_path(artifact_dir).display()
+        ),
+        SiteKind::Vm => format!(
+            "unix://{}",
+            vm_current_control_socket_path(artifact_dir).display()
+        ),
+        SiteKind::Compose => "unix:///amber/control/router-control.sock".to_string(),
+        SiteKind::Kubernetes => "amber-router:24100".to_string(),
+    }
+}
+
+pub(crate) fn site_controller_component_port(site_plan: &RunSitePlan) -> Result<Option<u16>> {
+    let scenario =
+        amber_scenario::Scenario::try_from(site_plan.scenario_ir.clone()).map_err(|err| {
+            miette::miette!(
+                "failed to parse site scenario for router `{}`: {err}",
+                site_plan.router_identity_id
+            )
+        })?;
+    let mut controller_ports = Vec::new();
+    for (_, component) in scenario.components_iter() {
+        if amber_compiler::run_plan::framework_component_controller_metadata(
+            component.metadata.as_ref(),
+        )
+        .is_none()
+        {
+            continue;
+        }
+        let port = component
+            .program
+            .as_ref()
+            .and_then(|program| program.network())
+            .and_then(|network| network.endpoints.first())
+            .map(|endpoint| endpoint.port)
+            .ok_or_else(|| {
+                miette::miette!(
+                    "synthetic framework.component controller `{}` on site `{}` is missing its \
+                     endpoint",
+                    component.moniker,
+                    site_plan.router_identity_id
+                )
+            })?;
+        controller_ports.push((component.moniker.clone(), port));
+    }
+    match controller_ports.as_slice() {
+        [] => Ok(None),
+        [(_, port)] => Ok(Some(*port)),
+        _ => Err(miette::miette!(
+            "site `{}` has multiple synthetic framework.component controllers: {}",
+            site_plan.router_identity_id,
+            controller_ports
+                .iter()
+                .map(|(moniker, _)| moniker.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+pub(crate) fn site_controller_identity_path(
+    kind: SiteKind,
+    artifact_dir: &Path,
+    runtime_root: Option<&str>,
+) -> Result<Option<String>> {
+    match kind {
+        SiteKind::Compose | SiteKind::Kubernetes => Ok(Some(
+            amber_site_controller::SITE_CONTROLLER_MESH_IDENTITY_PATH.to_string(),
+        )),
+        SiteKind::Direct => {
+            let Some(runtime_root) = runtime_root else {
+                return Ok(None);
+            };
+            let direct_plan_path =
+                artifact_dir.join(amber_compiler::reporter::direct::DIRECT_PLAN_FILENAME);
+            let direct_plan: amber_compiler::reporter::direct::DirectPlan =
+                read_json(&direct_plan_path, "direct plan")?;
+            let controller = direct_plan
+                .components
+                .iter()
+                .find(|component| {
+                    matches!(
+                        component.program.execution,
+                        amber_compiler::reporter::direct::DirectProgramExecutionPlan::InternalSiteController
+                    )
+                })
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "direct site controller plan is missing its internal site controller \
+                         component"
+                    )
+                })?;
+            Ok(Some(
+                Path::new(runtime_root)
+                    .join(&controller.sidecar.mesh_identity_path)
+                    .display()
+                    .to_string(),
+            ))
+        }
+        SiteKind::Vm => Ok(None),
+    }
+}
+
+pub(crate) fn prepare_site_state_root(site_state_root: &Path, kind: SiteKind) -> Result<()> {
+    fs::create_dir_all(site_state_root)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create site state directory {}",
+                site_state_root.display()
+            )
+        })?;
+
+    #[cfg(unix)]
+    if kind == SiteKind::Compose {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut permissions = fs::metadata(site_state_root)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to read permissions for site state directory {}",
+                    site_state_root.display()
+                )
+            })?
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(site_state_root, permissions)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to restrict compose site state directory {}",
+                    site_state_root.display()
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn dry_run_run_plan(
     source_plan_path: Option<&Path>,
     run_plan: &RunPlan,
@@ -52,9 +211,7 @@ pub(super) fn materialize_launch_bundle(
 
     let run_plan_path = run_plan_path(bundle_root);
     write_json(&run_plan_path, run_plan)?;
-
-    let framework_control_state =
-        materialize_framework_control_state(run_plan, &state_root, run_id)?;
+    let site_controller_image = site_controller_image_reference()?;
 
     let observability =
         materialize_observability(bundle_root, run_id, &run_plan.mesh_scope, observability)?;
@@ -63,49 +220,38 @@ pub(super) fn materialize_launch_bundle(
         .map(|materialized| materialized.receipt.endpoint.as_str());
 
     let mut sites = BTreeMap::new();
-    for (site_id, site_plan) in &run_plan.sites {
+    for (site_index, (site_id, site_plan)) in run_plan.sites.iter().enumerate() {
         let artifact_dir = materialize_site_artifacts(&sites_root, site_id, site_plan)?;
+        amber_site_controller::set_site_artifact_mesh_identity_seed(&artifact_dir, run_id)?;
         let site_state_root = state_root.join(site_id);
-        let mut framework_env = BTreeMap::new();
-        let framework_ccs_plan_path = if let Some(control_state) = framework_control_state.as_ref()
-        {
-            let port = reserve_loopback_port()?;
-            let listen_addr =
-                crate::framework_component::ccs_listen_addr_for_site(site_plan.site.kind, port);
-            framework_env.insert(
-                amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV.to_string(),
-                crate::framework_component::ccs_url_for_site(site_plan.site.kind, port),
-            );
-            framework_env.insert(
-                amber_mesh::FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV.to_string(),
-                control_state.router_auth_token.clone(),
-            );
-            framework_env.insert(
-                amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV.to_string(),
-                control_state.receipt.url.clone(),
-            );
-            framework_env.insert(
-                amber_mesh::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV.to_string(),
-                control_state.control_state_auth_token.clone(),
-            );
-            framework_env.insert(
-                amber_mesh::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV.to_string(),
-                control_state.dynamic_caps_token_verify_key_b64.clone(),
-            );
-            let plan_path = site_state_root.join("framework-ccs-plan.json");
-            crate::framework_component::write_framework_ccs_plan(
-                &plan_path,
-                site_id,
-                &site_state_root,
+        prepare_site_state_root(&site_state_root, site_plan.site.kind)?;
+        let controller = site_controller_component_port(site_plan)?.map(|controller_port| {
+            let listen_addr = match site_plan.site.kind {
+                SiteKind::Direct | SiteKind::Vm => {
+                    host_service_bind_addr_for_consumer(site_plan.site.kind, controller_port)
+                }
+                SiteKind::Compose | SiteKind::Kubernetes => {
+                    SocketAddr::from(([0, 0, 0, 0], controller_port))
+                }
+            };
+            let url = match site_plan.site.kind {
+                SiteKind::Direct | SiteKind::Vm => {
+                    amber_site_controller::authority_url_for_listen_addr(listen_addr)
+                }
+                SiteKind::Compose | SiteKind::Kubernetes => format!(
+                    "http://{}:{}",
+                    amber_site_controller::SITE_CONTROLLER_SERVICE_NAME,
+                    controller_port
+                ),
+            };
+            MaterializedSiteController {
+                state_path: site_state_root.join("site-controller-state.json"),
+                plan_path: site_controller_plan_path(&site_state_root),
                 listen_addr,
-                control_state.receipt.url.as_str(),
-                &control_state.router_auth_token,
-                &control_state.control_state_auth_token,
-            )?;
-            Some(plan_path)
-        } else {
-            None
-        };
+                url,
+            }
+        });
+        let framework_env = BTreeMap::new();
         patch_site_artifacts(
             &artifact_dir,
             run_id,
@@ -114,16 +260,6 @@ pub(super) fn materialize_launch_bundle(
             &merge_env_maps(runtime_env, &framework_env),
             observability_endpoint,
         )?;
-        let site_actuator_plan_path = if framework_control_state.is_some()
-            && run_plan
-                .dynamic_enabled_sites
-                .iter()
-                .any(|active| active == site_id)
-        {
-            Some(site_actuator_plan_path(&site_state_root))
-        } else {
-            None
-        };
         let launch_env = launch_env(
             run_id,
             &run_plan.mesh_scope,
@@ -142,41 +278,30 @@ pub(super) fn materialize_launch_bundle(
                 artifact_dir: &artifact_dir,
                 site_state_root: &site_state_root,
                 observability_endpoint,
-                framework_ccs_plan_path: framework_ccs_plan_path.as_deref(),
-                site_actuator_plan_path: site_actuator_plan_path.as_deref(),
+                site_controller_url: controller
+                    .as_ref()
+                    .map(|controller| controller.url.as_str()),
             },
             launch_env.clone(),
         )?;
-        if let Some(site_actuator_plan_path) = site_actuator_plan_path.as_ref() {
-            write_site_actuator_plan(
-                site_actuator_plan_path,
-                &SiteActuatorPlan {
-                    schema: SITE_ACTUATOR_PLAN_SCHEMA.to_string(),
-                    version: SITE_ACTUATOR_PLAN_VERSION,
-                    run_id: run_id.to_string(),
-                    mesh_scope: run_plan.mesh_scope.clone(),
-                    run_root: bundle_root.display().to_string(),
-                    site_id: site_id.clone(),
-                    kind: site_plan.site.kind,
-                    router_identity_id: site_plan.router_identity_id.clone(),
-                    artifact_dir: artifact_dir.display().to_string(),
-                    site_state_root: site_state_root.display().to_string(),
-                    listen_addr: SocketAddr::from(([127, 0, 0, 1], reserve_loopback_port()?)),
-                    storage_root: base_supervisor_plan.storage_root.clone(),
-                    runtime_root: base_supervisor_plan.runtime_root.clone(),
-                    router_mesh_port: base_supervisor_plan.router_mesh_port,
-                    compose_project: base_supervisor_plan.compose_project.clone(),
-                    kubernetes_namespace: base_supervisor_plan.kubernetes_namespace.clone(),
-                    context: base_supervisor_plan.context.clone(),
-                    observability_endpoint: base_supervisor_plan.observability_endpoint.clone(),
-                    launch_env: launch_env.clone(),
-                },
+        if site_plan.site.kind == SiteKind::Compose
+            && let Some(router_mesh_port) = base_supervisor_plan.router_mesh_port
+        {
+            amber_site_controller::set_compose_router_published_mesh_port(
+                &artifact_dir,
+                router_mesh_port,
             )?;
         }
-        write_json(
-            &site_supervisor_plan_path(&site_state_root),
-            &base_supervisor_plan,
-        )?;
+        if let Some(controller) = &controller {
+            let controller_state = amber_site_controller::build_site_controller_state(
+                run_id,
+                run_plan,
+                site_id,
+                site_index,
+                run_plan.sites.len(),
+            )?;
+            amber_site_controller::write_control_state(&controller.state_path, &controller_state)?;
+        }
         write_json(
             &desired_links_path(&site_state_root),
             &DesiredLinkState {
@@ -194,9 +319,177 @@ pub(super) fn materialize_launch_bundle(
                 site_plan: site_plan.clone(),
                 artifact_dir,
                 site_state_root,
+                controller,
                 base_supervisor_plan,
             },
         );
+    }
+
+    let planned_router_mesh_addrs = sites
+        .iter()
+        .map(|(site_id, site)| {
+            Ok((
+                site_id.clone(),
+                planned_router_mesh_addr(&site.base_supervisor_plan)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let controller_sites = sites
+        .iter()
+        .filter(|(_, site)| site.controller.is_some())
+        .map(|(site_id, site)| {
+            (
+                site_id.clone(),
+                site.site_plan.router_identity_id.clone(),
+                site.site_plan.site.kind,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (site_id, site) in &mut sites {
+        if let Some(controller) = &site.controller {
+            let allowed_issuers = controller_sites
+                .iter()
+                .filter(|(peer_site_id, _, _)| peer_site_id != site_id)
+                .map(|(_, router_identity_id, _)| router_identity_id.clone())
+                .collect::<Vec<_>>();
+            let route_listen_addr =
+                site_controller_route_listen_addr(site.site_plan.site.kind).to_string();
+            let mut peer_site_router_urls = BTreeMap::new();
+            let mut peer_router_identities = BTreeMap::new();
+            let mut peer_router_mesh_addrs = BTreeMap::new();
+            let mut controller_routes = Vec::new();
+            for (peer_site_id, peer_router_identity_id, peer_site_kind) in &controller_sites {
+                if peer_site_id == site_id {
+                    continue;
+                }
+                let route_port = reserve_loopback_port()?;
+                peer_site_router_urls.insert(
+                    peer_site_id.clone(),
+                    amber_site_controller::site_controller_peer_router_url(
+                        site.site_plan.site.kind,
+                        route_port,
+                    ),
+                );
+                peer_router_identities.insert(
+                    peer_site_id.clone(),
+                    planned_router_identity(run_id, &run_plan.mesh_scope, peer_router_identity_id),
+                );
+                let peer_router_mesh_addr = planned_router_mesh_addrs
+                    .get(peer_site_id)
+                    .expect("planned router mesh addr should exist for every site");
+                peer_router_mesh_addrs.insert(peer_site_id.clone(), peer_router_mesh_addr.clone());
+                let peer_addr = amber_site_controller::router_mesh_addr_for_consumer(
+                    *peer_site_kind,
+                    site.site_plan.site.kind,
+                    peer_router_mesh_addr,
+                )?;
+                controller_routes.push(amber_site_controller::SiteControllerPeerRouterRoute {
+                    site_id: peer_site_id.clone(),
+                    peer_router: planned_router_identity(
+                        run_id,
+                        &run_plan.mesh_scope,
+                        peer_router_identity_id,
+                    ),
+                    peer_addr,
+                    listen_addr: route_listen_addr.clone(),
+                    listen_port: route_port,
+                });
+            }
+
+            write_json(
+                &site_existing_peer_ports_path(&site.site_state_root),
+                &peer_router_ports_by_identity(&peer_router_identities, &peer_router_mesh_addrs)?,
+            )?;
+            write_json(
+                &site_existing_peer_identities_path(&site.site_state_root),
+                &peer_router_identities_by_id(&peer_router_identities),
+            )?;
+
+            amber_site_controller::inject_site_controller_peer_router_routes(
+                &site.artifact_dir,
+                site_id,
+                &allowed_issuers,
+                &controller_routes,
+            )?;
+            let local_router_control =
+                site_controller_local_router_control(site.site_plan.site.kind, &site.artifact_dir);
+            let published_router_mesh_addr =
+                planned_router_mesh_addrs.get(site_id).map(String::as_str);
+            let compose_consumer_router_mesh_addr = published_router_mesh_addr
+                .map(|addr| {
+                    amber_site_controller::router_mesh_addr_for_consumer(
+                        site.site_plan.site.kind,
+                        SiteKind::Compose,
+                        addr,
+                    )
+                })
+                .transpose()?;
+            let kubernetes_consumer_router_mesh_addr = published_router_mesh_addr
+                .map(|addr| {
+                    amber_site_controller::router_mesh_addr_for_consumer(
+                        site.site_plan.site.kind,
+                        SiteKind::Kubernetes,
+                        addr,
+                    )
+                })
+                .transpose()?;
+
+            amber_site_controller::write_site_controller_plan(
+                &controller.plan_path,
+                run_id,
+                &run_plan.mesh_scope,
+                site_id,
+                site.site_plan.site.kind,
+                controller.listen_addr,
+                &controller.url,
+                &site.site_plan.router_identity_id,
+                &peer_site_router_urls,
+                &peer_router_identities,
+                &peer_router_mesh_addrs,
+                Some(local_router_control.as_str()),
+                published_router_mesh_addr,
+                compose_consumer_router_mesh_addr.as_deref(),
+                kubernetes_consumer_router_mesh_addr.as_deref(),
+                &controller.state_path,
+                bundle_root,
+                &state_root,
+                &site.site_state_root,
+                &site.artifact_dir,
+                site_controller_identity_path(
+                    site.site_plan.site.kind,
+                    &site.artifact_dir,
+                    site.base_supervisor_plan.runtime_root.as_deref(),
+                )?
+                .as_deref(),
+                site.base_supervisor_plan.storage_root.as_deref(),
+                site.base_supervisor_plan.runtime_root.as_deref(),
+                site.base_supervisor_plan.router_mesh_port,
+                site.base_supervisor_plan.compose_project.as_deref(),
+                site.base_supervisor_plan.kubernetes_namespace.as_deref(),
+                site.base_supervisor_plan.context.as_deref(),
+                site.base_supervisor_plan.observability_endpoint.as_deref(),
+                &site.base_supervisor_plan.launch_env,
+            )?;
+            match site.site_plan.site.kind {
+                SiteKind::Compose => amber_site_controller::inject_compose_site_controller(
+                    &site.artifact_dir,
+                    &read_json(&controller.plan_path, "site controller plan")?,
+                    &controller.plan_path,
+                    site_controller_image.as_str(),
+                )?,
+                SiteKind::Kubernetes => amber_site_controller::inject_kubernetes_site_controller(
+                    &site.artifact_dir,
+                    &read_json(&controller.plan_path, "site controller plan")?,
+                    site_controller_image.as_str(),
+                )?,
+                SiteKind::Direct | SiteKind::Vm => {}
+            }
+        }
+        write_json(
+            &site_supervisor_plan_path(&site.site_state_root),
+            &site.base_supervisor_plan,
+        )?;
     }
 
     let manifest = build_launch_bundle_manifest(
@@ -212,60 +505,78 @@ pub(super) fn materialize_launch_bundle(
 
     Ok(MaterializedLaunchBundle {
         run_plan_path,
-        framework_control_state,
         observability,
         sites,
     })
 }
 
-fn materialize_framework_control_state(
-    run_plan: &RunPlan,
-    state_root: &Path,
-    run_id: &str,
-) -> Result<Option<MaterializedFrameworkControlState>> {
-    let control_state = crate::framework_component::build_control_state(run_id, run_plan)?;
-    let root = state_root.join("framework-component");
-    let state_path = root.join("control-state.json");
-    crate::framework_component::write_control_state(&state_path, &control_state)?;
-    let router_auth_token =
-        crate::framework_component::generate_framework_auth_token(&run_plan.mesh_scope, "router");
-    let control_state_auth_token = crate::framework_component::generate_framework_auth_token(
-        &run_plan.mesh_scope,
-        "control-state",
-    );
+fn planned_router_mesh_addr(plan: &SiteSupervisorPlan) -> Result<String> {
+    match plan.kind {
+        SiteKind::Direct | SiteKind::Vm | SiteKind::Compose => plan
+            .router_mesh_port
+            .map(|port| format!("127.0.0.1:{port}"))
+            .ok_or_else(|| {
+                miette::miette!("site `{}` is missing its router mesh port", plan.site_id)
+            }),
+        SiteKind::Kubernetes => plan
+            .port_forward_mesh_port
+            .map(|port| format!("127.0.0.1:{port}"))
+            .ok_or_else(|| {
+                miette::miette!(
+                    "site `{}` is missing its kubernetes router mesh forward port",
+                    plan.site_id
+                )
+            }),
+    }
+}
 
-    let listen_addr = SocketAddr::from(([127, 0, 0, 1], reserve_loopback_port()?));
-    let plan_path = root.join("control-state-plan.json");
-    crate::framework_component::write_control_state_service_plan(
-        &plan_path,
-        listen_addr,
-        &state_path,
-        state_root.parent().unwrap_or(state_root),
-        state_root,
-        &run_plan.mesh_scope,
-        &control_state_auth_token,
-    )?;
-    let dynamic_caps_token_verify_key_b64 = amber_mesh::dynamic_caps::verify_key_b64(
-        &amber_mesh::dynamic_caps::signing_key_from_seed_b64(
-            &control_state.dynamic_capability_signing_seed_b64,
-        )
-        .map_err(|err| {
-            miette::miette!(
-                "framework control-state dynamic capability signing seed is invalid: {err}"
-            )
-        })?,
-    );
+fn site_controller_route_listen_addr(kind: SiteKind) -> &'static str {
+    match kind {
+        SiteKind::Direct | SiteKind::Vm => "127.0.0.1",
+        SiteKind::Compose | SiteKind::Kubernetes => "0.0.0.0",
+    }
+}
 
-    Ok(Some(MaterializedFrameworkControlState {
-        plan_path,
-        receipt: FrameworkControlStateReceipt {
-            pid: 0,
-            url: crate::framework_component::control_state_service_url(listen_addr),
-        },
-        router_auth_token,
-        control_state_auth_token,
-        dynamic_caps_token_verify_key_b64,
-    }))
+fn planned_router_identity(
+    identity_seed: &str,
+    mesh_scope: &str,
+    router_identity_id: &str,
+) -> amber_mesh::MeshIdentityPublic {
+    amber_mesh::MeshIdentityPublic::from_identity(&amber_mesh::MeshIdentity::derive(
+        router_identity_id,
+        Some(mesh_scope.to_string()),
+        identity_seed,
+    ))
+}
+
+fn peer_router_ports_by_identity(
+    peer_router_identities: &BTreeMap<String, amber_mesh::MeshIdentityPublic>,
+    peer_router_mesh_addrs: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, u16>> {
+    peer_router_identities
+        .iter()
+        .map(|(site_id, identity)| {
+            let addr = peer_router_mesh_addrs.get(site_id).ok_or_else(|| {
+                miette::miette!("missing planned router mesh address for peer site `{site_id}`")
+            })?;
+            let port = addr
+                .parse::<SocketAddr>()
+                .into_diagnostic()
+                .wrap_err_with(|| format!("invalid planned router mesh address `{addr}`"))?
+                .port();
+            Ok((identity.id.clone(), port))
+        })
+        .collect()
+}
+
+fn peer_router_identities_by_id(
+    peer_router_identities: &BTreeMap<String, amber_mesh::MeshIdentityPublic>,
+) -> BTreeMap<String, amber_mesh::MeshIdentityPublic> {
+    peer_router_identities
+        .values()
+        .cloned()
+        .map(|identity| (identity.id.clone(), identity))
+        .collect()
 }
 
 pub(super) fn build_launch_bundle_manifest(
@@ -384,7 +695,7 @@ pub(super) fn site_launch_preview(plan: &SiteSupervisorPlan) -> Result<SiteLaunc
                 router_public_key_b64: preview.router_public_key_b64,
                 processes: preview.processes,
                 virtual_machines: Vec::new(),
-                inspectability_warnings: Vec::new(),
+                inspectability_warnings: preview.inspectability_warnings,
             }
         }
         SiteKind::Vm => {
@@ -516,10 +827,9 @@ pub(super) fn preview_external_slot_url(
 }
 
 pub(super) fn site_launch_commands(plan: &SiteSupervisorPlan) -> Result<Vec<LaunchCommandPreview>> {
-    let exe = env::current_exe()
-        .into_diagnostic()
-        .wrap_err("failed to resolve amber executable path")?;
-    Ok(match plan.kind {
+    let exe = super::amber_cli_executable()?;
+    let mut commands = Vec::new();
+    let site_commands = match plan.kind {
         SiteKind::Direct => {
             let mut argv = vec![
                 exe.display().to_string(),
@@ -657,7 +967,9 @@ pub(super) fn site_launch_commands(plan: &SiteSupervisorPlan) -> Result<Vec<Laun
 
             commands
         }
-    })
+    };
+    commands.extend(site_commands);
+    Ok(commands)
 }
 
 pub(super) fn observability_launch_commands(
@@ -666,9 +978,7 @@ pub(super) fn observability_launch_commands(
     let Some(plan_path) = observability.plan_path.as_ref() else {
         return Ok(Vec::new());
     };
-    let exe = env::current_exe()
-        .into_diagnostic()
-        .wrap_err("failed to resolve amber executable path")?;
+    let exe = super::amber_cli_executable()?;
     Ok(vec![LaunchCommandPreview {
         argv: vec![
             exe.display().to_string(),
@@ -788,58 +1098,6 @@ pub(super) async fn start_materialized_observability(
     Err(miette::miette!("timed out waiting for observability sink"))
 }
 
-pub(super) async fn start_materialized_framework_control_state(
-    run_root: &Path,
-    framework_control_state: Option<&MaterializedFrameworkControlState>,
-) -> Result<Option<FrameworkControlStateReceipt>> {
-    let Some(framework_control_state) = framework_control_state else {
-        return Ok(None);
-    };
-
-    let mut child = spawn_detached_child(
-        run_root,
-        &run_root
-            .join("state")
-            .join("framework-component")
-            .join("control-state.log"),
-        |cmd| {
-            cmd.arg("run-framework-control-state")
-                .arg("--plan")
-                .arg(&framework_control_state.plan_path);
-        },
-    )?;
-    let listen_addr = framework_control_state
-        .receipt
-        .url
-        .strip_prefix("http://")
-        .ok_or_else(|| {
-            miette::miette!(
-                "framework control-state receipt url `{}` is not an http:// socket address",
-                framework_control_state.receipt.url
-            )
-        })?
-        .parse::<SocketAddr>()
-        .into_diagnostic()
-        .wrap_err("invalid framework control-state listen address")?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().into_diagnostic()? {
-            return Err(miette::miette!(
-                "framework control-state service exited before becoming ready with status {status}"
-            ));
-        }
-        if wait_for_http_response(listen_addr, Duration::from_millis(250)).is_ok() {
-            let mut receipt = framework_control_state.receipt.clone();
-            receipt.pid = child.id();
-            return Ok(Some(receipt));
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    Err(miette::miette!(
-        "timed out waiting for framework control-state service"
-    ))
-}
-
 pub(super) fn prepare_site_launch(
     site: &MaterializedSite,
     runtime_env: &BTreeMap<String, String>,
@@ -949,11 +1207,9 @@ pub(crate) async fn run_run_plan_with_id(
         ],
     );
 
-    let mut framework_control_state_receipt = None;
     let mut launched_by_site = BTreeMap::<String, LaunchedSite>::new();
     let mut started_site_receipts = BTreeMap::<String, SiteReceipt>::new();
     let mut supervisor_children = BTreeMap::<String, SupervisorChild>::new();
-    let mut bridge_proxies = BTreeMap::<BridgeProxyKey, BridgeProxyHandle>::new();
     let test_wave_delay = test_wave_delay()?;
 
     let result = async {
@@ -992,7 +1248,6 @@ pub(crate) async fn run_run_plan_with_id(
                     &launched_by_site,
                     &run_root,
                     &state_root,
-                    &mut bridge_proxies,
                 )
                 .await?;
 
@@ -1010,13 +1265,6 @@ pub(crate) async fn run_run_plan_with_id(
                 sleep(delay).await;
             }
         }
-
-        framework_control_state_receipt = start_materialized_framework_control_state(
-            &run_root,
-            launch_bundle.framework_control_state.as_ref(),
-        )
-        .await?;
-
         write_commit_marker(&run_root)?;
         emit_manager_event(
             "amber.run.committed",
@@ -1032,16 +1280,7 @@ pub(crate) async fn run_run_plan_with_id(
             plan_path: launch_bundle.run_plan_path.display().to_string(),
             source_plan_path: source_plan_path.map(|path| path.display().to_string()),
             run_root: run_root.display().to_string(),
-            framework_control_state: framework_control_state_receipt.clone(),
             observability: observability_receipt.clone(),
-            bridge_proxies: bridge_proxies
-                .values()
-                .map(|proxy| BridgeProxyReceipt {
-                    export_name: proxy.export_name.clone(),
-                    pid: proxy.child.id(),
-                    listen: proxy.listen.to_string(),
-                })
-                .collect(),
             sites: launched_by_site
                 .into_iter()
                 .map(|(site_id, launched)| (site_id, launched.receipt))
@@ -1054,14 +1293,8 @@ pub(crate) async fn run_run_plan_with_id(
 
     if result.is_err() {
         let _ = write_stop_marker(&run_root);
-        for bridge in bridge_proxies.values_mut() {
-            send_sigterm(bridge.child.id());
-        }
         for supervisor in supervisor_children.values_mut() {
             send_sigterm(supervisor.child.id());
-        }
-        for bridge in bridge_proxies.values_mut() {
-            let _ = wait_for_child_exit(&mut bridge.child, PROCESS_SHUTDOWN_GRACE_PERIOD).await;
         }
         for supervisor in supervisor_children.values_mut() {
             let _ = wait_for_child_exit(&mut supervisor.child, PROCESS_SHUTDOWN_GRACE_PERIOD).await;
@@ -1098,8 +1331,15 @@ pub(crate) async fn run_run_plan_with_id(
                     context: receipt.context.clone(),
                     router_control: receipt.router_control.clone(),
                     router_mesh_addr: receipt.router_mesh_addr.clone(),
+                    compose_consumer_router_mesh_addr: receipt
+                        .compose_consumer_router_mesh_addr
+                        .clone(),
+                    kubernetes_consumer_router_mesh_addr: receipt
+                        .kubernetes_consumer_router_mesh_addr
+                        .clone(),
                     router_identity_id: receipt.router_identity_id.clone(),
                     router_public_key_b64: receipt.router_public_key_b64.clone(),
+                    site_controller_url: receipt.site_controller_url.clone(),
                     last_error: Some("coordinator cleanup after failed startup".to_string()),
                 },
             );
@@ -1107,12 +1347,6 @@ pub(crate) async fn run_run_plan_with_id(
         if let Some(pid) = observability_receipt
             .as_ref()
             .and_then(|value| value.sink_pid)
-        {
-            send_sigterm(pid);
-        }
-        if let Some(pid) = framework_control_state_receipt
-            .as_ref()
-            .map(|value| value.pid)
         {
             send_sigterm(pid);
         }
@@ -1216,10 +1450,6 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
     {
         send_sigterm(pid);
     }
-    if let Some(framework_control_state) = receipt.framework_control_state.as_ref() {
-        send_sigterm(framework_control_state.pid);
-    }
-
     if let Some(observability) = receipt.observability.as_ref()
         && let Some(pid) = observability.sink_pid
         && !wait_for_pid_exit(pid, PROCESS_SHUTDOWN_GRACE_PERIOD).await
@@ -1228,28 +1458,6 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
             "observability sink (pid {pid}) did not stop within {}s",
             PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
         ));
-    }
-    if let Some(framework_control_state) = receipt.framework_control_state.as_ref()
-        && !wait_for_pid_exit(framework_control_state.pid, PROCESS_SHUTDOWN_GRACE_PERIOD).await
-    {
-        shutdown_failures.push(format!(
-            "framework control-state service (pid {}) did not stop within {}s",
-            framework_control_state.pid,
-            PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
-        ));
-    }
-    for proxy in &receipt.bridge_proxies {
-        send_sigterm(proxy.pid);
-    }
-    for proxy in &receipt.bridge_proxies {
-        if !wait_for_pid_exit(proxy.pid, PROCESS_SHUTDOWN_GRACE_PERIOD).await {
-            shutdown_failures.push(format!(
-                "bridge proxy `{}` (pid {}) did not stop within {}s",
-                proxy.export_name,
-                proxy.pid,
-                PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
-            ));
-        }
     }
 
     if !shutdown_failures.is_empty() {

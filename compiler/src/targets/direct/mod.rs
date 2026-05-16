@@ -19,6 +19,10 @@ use crate::{
             GENERATED_ENV_SAMPLE_FILENAME, GENERATED_README_FILENAME, build_execution_guide,
         },
     },
+    run_plan::{
+        SiteDefinition, SiteKind, framework_component_controller_metadata,
+        lower_framework_component_bindings_for_single_site,
+    },
     targets::{
         common::{TargetError as MeshError, component_label},
         mesh::{
@@ -28,7 +32,7 @@ use crate::{
             },
             mesh_config::{
                 MeshAddressing, MeshConfigBuildInput, MeshConfigBuildOptions, RouterPorts,
-                build_mesh_config_plan,
+                build_mesh_config_plan, default_mesh_config_build_options,
             },
             plan::{MeshOptions, MeshPlan, build_mesh_plan, map_program_components},
             ports::placeholder_local_route_ports,
@@ -61,6 +65,13 @@ pub struct DirectReporter;
 #[derive(Clone, Debug)]
 pub struct DirectArtifact {
     pub files: BTreeMap<PathBuf, String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirectArtifactBuildOptions<'a> {
+    pub(crate) force_router: bool,
+    pub(crate) router_identity_id: &'a str,
+    pub(crate) mesh_scope: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -163,6 +174,7 @@ pub enum DirectProgramExecutionPlan {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mount_spec_b64: Option<String>,
     },
+    InternalSiteController,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -209,6 +221,31 @@ pub(crate) fn emit_direct_artifact(
     compiled: &CompiledScenario,
     force_router: bool,
 ) -> Result<DirectArtifact, MeshError> {
+    emit_direct_artifact_with_options(
+        compiled,
+        DirectArtifactBuildOptions {
+            force_router,
+            router_identity_id: ROUTER_IDENTITY_ID,
+            mesh_scope: None,
+        },
+    )
+}
+
+pub(crate) fn emit_direct_artifact_with_options(
+    compiled: &CompiledScenario,
+    options: DirectArtifactBuildOptions<'_>,
+) -> Result<DirectArtifact, MeshError> {
+    let lowered = lower_framework_component_bindings_for_single_site(
+        compiled,
+        "direct_local",
+        SiteDefinition {
+            kind: SiteKind::Direct,
+            context: None,
+            controller_site: None,
+        },
+    )
+    .map_err(|err| MeshError::new(err.to_string()))?;
+    let compiled = &lowered;
     let scenario = compiled.scenario();
     let endpoint_plan = crate::targets::program_config::build_endpoint_plan(scenario)?;
     let mesh_plan = build_mesh_plan(
@@ -235,7 +272,7 @@ pub(crate) fn emit_direct_artifact(
     let route_ports = placeholder_local_route_ports(scenario, &endpoint_plan, &mesh_plan);
     let mesh_ports_by_component = placeholder_mesh_ports(program_components);
 
-    let needs_router = mesh_plan.needs_router() || force_router;
+    let needs_router = mesh_plan.needs_router() || options.force_router;
     let router_ports = needs_router.then_some(RouterPorts {
         mesh: 0,
         control: 0,
@@ -279,11 +316,13 @@ pub(crate) fn emit_direct_artifact(
         router_ports,
         addressing: &mesh_addressing,
         options: MeshConfigBuildOptions {
-            router_identity_id: ROUTER_IDENTITY_ID,
+            router_identity_id: options.router_identity_id,
+            mesh_scope: options.mesh_scope,
             component_mesh_listen_addr: "127.0.0.1",
             router_mesh_listen_addr: "127.0.0.1",
             router_control_listen_addr: "127.0.0.1",
-            force_router,
+            force_router: options.force_router,
+            ..default_mesh_config_build_options()
         },
     })?;
 
@@ -325,7 +364,7 @@ pub(crate) fn emit_direct_artifact(
     })?;
 
     let router_plan = router_ports.map(|ports| DirectRouterPlan {
-        identity_id: ROUTER_IDENTITY_ID.to_string(),
+        identity_id: options.router_identity_id.to_string(),
         mesh_port: ports.mesh,
         control_port: 0,
         control_socket_path: DIRECT_CONTROL_SOCKET_RELATIVE_PATH.to_string(),
@@ -451,28 +490,29 @@ fn build_component_plans(
                 component.moniker.as_str()
             ))
         })?;
-        let dynamic_caps_port = mesh_config_plan
-            .component_configs
-            .get(id)
-            .and_then(|config| config.dynamic_caps_listen)
-            .map(|addr| addr.port())
-            .ok_or_else(|| {
-                MeshError::new(format!(
-                    "internal error: missing dynamic caps listen port for {}",
-                    component.moniker.as_str()
-                ))
-            })?;
         let depends_on = mesh_plan
             .strong_deps()
             .get(id)
             .map(|deps| deps.iter().map(|dep| dep.0).collect::<Vec<_>>())
             .unwrap_or_default();
         let source_dir = component_source_dir(compiled, *id, component.moniker.as_str())?;
-        let execution = resolve_direct_execution_plan(
-            direct_execution_plan(runtime_plan.execution),
-            source_dir.as_deref(),
-            component.moniker.as_str(),
-        )?;
+        let execution = if let Some(execution) = direct_internal_execution_plan(component) {
+            execution
+        } else {
+            resolve_direct_execution_plan(
+                direct_execution_plan(runtime_plan.execution),
+                source_dir.as_deref(),
+                component.moniker.as_str(),
+            )?
+        };
+        let dynamic_caps_port = match execution {
+            DirectProgramExecutionPlan::InternalSiteController => None,
+            _ => mesh_config_plan
+                .component_configs
+                .get(id)
+                .and_then(|config| config.dynamic_caps_listen)
+                .map(|addr| addr.port()),
+        };
 
         out.push(DirectComponentPlan {
             id: id.0,
@@ -502,19 +542,28 @@ fn build_component_plans(
     Ok(out)
 }
 
+fn direct_internal_execution_plan(
+    component: &amber_scenario::Component,
+) -> Option<DirectProgramExecutionPlan> {
+    framework_component_controller_metadata(component.metadata.as_ref())
+        .map(|_| DirectProgramExecutionPlan::InternalSiteController)
+}
+
 fn inject_direct_dynamic_caps_env(
     execution: DirectProgramExecutionPlan,
-    dynamic_caps_port: u16,
+    dynamic_caps_port: Option<u16>,
 ) -> DirectProgramExecutionPlan {
     match execution {
         DirectProgramExecutionPlan::Direct {
             entrypoint,
             mut env,
         } => {
-            env.insert(
-                DYNAMIC_CAPS_API_URL_ENV.to_string(),
-                format!("http://127.0.0.1:{dynamic_caps_port}"),
-            );
+            if let Some(dynamic_caps_port) = dynamic_caps_port {
+                env.insert(
+                    DYNAMIC_CAPS_API_URL_ENV.to_string(),
+                    format!("http://127.0.0.1:{dynamic_caps_port}"),
+                );
+            }
             DirectProgramExecutionPlan::Direct { entrypoint, env }
         }
         DirectProgramExecutionPlan::HelperRunner {
@@ -530,6 +579,9 @@ fn inject_direct_dynamic_caps_env(
             runtime_config,
             mount_spec_b64,
         },
+        DirectProgramExecutionPlan::InternalSiteController => {
+            DirectProgramExecutionPlan::InternalSiteController
+        }
     }
 }
 
@@ -683,6 +735,9 @@ fn resolve_direct_execution_plan(
             runtime_config,
             mount_spec_b64,
         }),
+        DirectProgramExecutionPlan::InternalSiteController => {
+            Ok(DirectProgramExecutionPlan::InternalSiteController)
+        }
     }
 }
 
@@ -1087,7 +1142,6 @@ mod tests {
     };
 
     use amber_manifest::{Manifest, ManifestRef};
-    use amber_mesh::{FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV, FRAMEWORK_COMPONENT_CCS_URL_ENV};
     use amber_resolver::Resolver;
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
     use tempfile::TempDir;
@@ -1171,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_router_passthrough_includes_framework_ccs_auth() {
+    fn direct_framework_component_is_lowered_to_an_internal_site_controller_component() {
         let dir = TempDir::new().expect("temp dir");
         let root_path = dir.path().join("root.json5");
         let admin_path = dir.path().join("admin.json5");
@@ -1200,9 +1254,6 @@ mod tests {
                 r##"
                 {{
                   manifest_version: "0.3.0",
-                  slots: {{
-                    realm: {{ kind: "component", optional: true }}
-                  }},
                   components: {{
                     admin: "{admin}"
                   }},
@@ -1236,23 +1287,13 @@ mod tests {
                 .expect("direct plan should be emitted"),
         )
         .expect("direct plan should deserialize");
-        let router = direct_plan
-            .router
-            .expect("framework.component binding should force a router");
 
         assert!(
-            router
-                .env_passthrough
-                .iter()
-                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CCS_URL_ENV),
-            "router must receive the framework CCS URL env passthrough",
-        );
-        assert!(
-            router
-                .env_passthrough
-                .iter()
-                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV),
-            "router must receive the framework CCS auth env passthrough",
+            direct_plan.components.iter().any(|component| matches!(
+                component.program.execution,
+                DirectProgramExecutionPlan::InternalSiteController
+            )),
+            "framework.component should lower to an injected internal site controller component"
         );
     }
 

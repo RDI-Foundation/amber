@@ -4,6 +4,8 @@
 mod cloud_image_support;
 #[path = "../test_support/outputs_root.rs"]
 mod outputs_root_support;
+#[path = "../test_support/port_allocator.rs"]
+mod port_allocator_support;
 #[path = "../test_support/runtime_bins.rs"]
 mod runtime_bins_support;
 #[path = "../test_support/workspace_root.rs"]
@@ -11,7 +13,10 @@ mod workspace_root_support;
 
 use std::{
     collections::BTreeSet,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -24,10 +29,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER};
+use amber_images::{
+    AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER, AMBER_SITE_CONTROLLER, DEV_IMAGE_TAGS_ENV,
+    INTERNAL_IMAGE_OVERRIDE_KEYS, ImageRef, override_reference, parse_dev_image_tag_overrides,
+};
 use cloud_image_support::default_host_arch_cloud_image_filename;
 use outputs_root_support::cli_test_outputs_root;
+use port_allocator_support::reserve_test_loopback_port;
 use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub(crate) use workspace_root_support::workspace_root;
 
 const COMMON_HTTP_APP: &str = r#"import json
@@ -126,7 +136,15 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 "#;
 
-pub(crate) const TEST_APP_IMAGE: &str = "python:3.13-alpine";
+const TEST_APP_SOURCE_IMAGE: &str = "python:3.13-alpine";
+const TEST_APP_LOCAL_IMAGE_REPOSITORY: &str = "amber-mixed-run-test-app";
+pub(crate) const KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER: &str = "main";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DockerImageMeta {
+    id: String,
+    arch: String,
+}
 
 pub(crate) fn outputs_root() -> PathBuf {
     cli_test_outputs_root(&workspace_root())
@@ -141,6 +159,36 @@ pub(crate) struct SpawnedProxy {
     child: std::process::Child,
     log_path: PathBuf,
     output_dir: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct StaleRunReceipt {
+    run_id: String,
+    #[serde(default)]
+    observability: Option<StaleObservabilityReceipt>,
+    #[serde(default)]
+    bridge_proxies: Vec<StaleBridgeProxyReceipt>,
+    sites: std::collections::BTreeMap<String, StaleSiteReceipt>,
+}
+
+#[derive(serde::Deserialize)]
+struct StaleObservabilityReceipt {
+    #[serde(default)]
+    sink_pid: Option<u32>,
+}
+
+#[derive(serde::Deserialize)]
+struct StaleBridgeProxyReceipt {
+    pid: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct StaleSiteReceipt {
+    supervisor_pid: u32,
+    #[serde(default)]
+    process_pid: Option<u32>,
+    #[serde(default)]
+    port_forward_pid: Option<u32>,
 }
 
 impl TestTempDir {
@@ -161,6 +209,7 @@ pub(crate) fn mixed_run_base_image() -> PathBuf {
 
 pub(crate) fn temp_output_dir(prefix: &str) -> TestTempDir {
     fs::create_dir_all(outputs_root()).expect("failed to create cli test outputs root");
+    cleanup_abandoned_test_runs_once();
     let temp = tempfile::Builder::new()
         .prefix(prefix)
         .tempdir_in(outputs_root())
@@ -177,9 +226,82 @@ pub(crate) fn temp_output_dir(prefix: &str) -> TestTempDir {
     }
 }
 
+fn cleanup_abandoned_test_runs_once() {
+    static CLEANUP_ONCE: OnceLock<()> = OnceLock::new();
+    CLEANUP_ONCE.get_or_init(|| {
+        for entry in fs::read_dir(outputs_root())
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", outputs_root().display()))
+        {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let storage_root = entry.path();
+            if storage_root.is_dir() {
+                cleanup_abandoned_test_runs_in_storage_root(&storage_root);
+            }
+        }
+    });
+}
+
+fn cleanup_abandoned_test_runs_in_storage_root(storage_root: &Path) {
+    let runs_dir = storage_root.join("runs");
+    let Ok(entries) = fs::read_dir(&runs_dir) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let run_root = entry.path();
+        let receipt_path = run_root.join("receipt.json");
+        if !receipt_path.is_file() {
+            continue;
+        }
+        let Ok(receipt_bytes) = fs::read(&receipt_path) else {
+            continue;
+        };
+        let Ok(receipt) = serde_json::from_slice::<StaleRunReceipt>(&receipt_bytes) else {
+            continue;
+        };
+        if stale_run_has_live_processes(&receipt) {
+            continue;
+        }
+        let _ = command_output_via_tempfiles(
+            amber_command()
+                .arg("stop")
+                .arg(&receipt.run_id)
+                .arg("--storage-root")
+                .arg(storage_root),
+            "amber stop stale test run",
+        );
+    }
+}
+
+fn stale_run_has_live_processes(receipt: &StaleRunReceipt) -> bool {
+    receipt
+        .observability
+        .as_ref()
+        .and_then(|observability| observability.sink_pid)
+        .into_iter()
+        .chain(receipt.bridge_proxies.iter().map(|proxy| proxy.pid))
+        .chain(
+            receipt
+                .sites
+                .values()
+                .flat_map(|site| {
+                    [
+                        Some(site.supervisor_pid),
+                        site.process_pid,
+                        site.port_forward_pid,
+                    ]
+                })
+                .flatten(),
+        )
+        .any(pid_is_alive)
+}
+
 pub(crate) fn pick_free_port() -> u16 {
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-    listener.local_addr().unwrap().port()
+    reserve_test_loopback_port()
 }
 
 pub(crate) fn docker_host_ip() -> String {
@@ -191,7 +313,7 @@ pub(crate) fn docker_host_ip() -> String {
             .arg("host.docker.internal:host-gateway");
     }
     let output = cmd
-        .arg(TEST_APP_IMAGE)
+        .arg(test_app_image())
         .arg("python3")
         .arg("-c")
         .arg("import socket; print(socket.gethostbyname('host.docker.internal'))")
@@ -206,22 +328,137 @@ pub(crate) fn docker_host_ip() -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-pub(crate) fn ensure_local_image(tag: &str) {
-    let inspect = Command::new("docker")
+fn docker_platform_arch() -> &'static str {
+    match env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => panic!("mixed-run tests support only aarch64 and x86_64 hosts, found {other}"),
+    }
+}
+
+fn docker_platform(expected_arch: &str) -> String {
+    format!("linux/{expected_arch}")
+}
+
+fn docker_image_meta_with_binaries(
+    docker_bin: &Path,
+    tag: &str,
+) -> Result<Option<DockerImageMeta>, String> {
+    let output = Command::new(docker_bin)
         .arg("image")
         .arg("inspect")
+        .arg("-f")
+        .arg("{{.Id}}|{{.Architecture}}")
         .arg(tag)
-        .status()
-        .unwrap_or_else(|err| panic!("failed to inspect docker image {tag}: {err}"));
-    if inspect.success() {
-        return;
+        .output()
+        .map_err(|err| format!("failed to inspect docker image {tag}: {err}"))?;
+    if !output.status.success() {
+        return Ok(None);
     }
-    let status = Command::new("docker")
+    let meta = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if meta.is_empty() {
+        return Ok(None);
+    }
+    let (id, arch) = meta.split_once('|').ok_or_else(|| {
+        format!("docker image inspect for {tag} returned malformed metadata: {meta}")
+    })?;
+    if id.is_empty() || arch.is_empty() {
+        return Err(format!(
+            "docker image inspect for {tag} returned incomplete metadata: {meta}"
+        ));
+    }
+    Ok(Some(DockerImageMeta {
+        id: id.to_string(),
+        arch: arch.to_string(),
+    }))
+}
+
+fn ensure_local_image_with_binaries(
+    docker_bin: &Path,
+    tag: &str,
+    expected_arch: &str,
+) -> Result<DockerImageMeta, String> {
+    if let Some(meta) = docker_image_meta_with_binaries(docker_bin, tag)?
+        && meta.arch == expected_arch
+    {
+        return Ok(meta);
+    }
+
+    let output = Command::new(docker_bin)
         .arg("pull")
+        .arg("--platform")
+        .arg(docker_platform(expected_arch))
         .arg(tag)
-        .status()
-        .unwrap_or_else(|err| panic!("failed to pull docker image {tag}: {err}"));
-    assert!(status.success(), "docker pull failed for {tag}");
+        .output()
+        .map_err(|err| format!("failed to pull docker image {tag}: {err}"))?;
+    if !output.status.success() {
+        return Err(format_command_output(
+            &format!("docker pull failed for {tag}"),
+            &output,
+        ));
+    }
+
+    let meta = docker_image_meta_with_binaries(docker_bin, tag)?
+        .ok_or_else(|| format!("docker image {tag} is still unavailable after pull"))?;
+    if meta.arch != expected_arch {
+        return Err(format!(
+            "docker pull resolved {tag} to linux/{} instead of {}",
+            meta.arch,
+            docker_platform(expected_arch)
+        ));
+    }
+    Ok(meta)
+}
+
+fn build_test_app_image_with_binaries(
+    docker_bin: &Path,
+    source_image: &str,
+    expected_arch: &str,
+) -> Result<String, String> {
+    let _ = ensure_local_image_with_binaries(docker_bin, source_image, expected_arch)?;
+    let local_tag = format!("{TEST_APP_LOCAL_IMAGE_REPOSITORY}:{expected_arch}");
+    let build_root = tempfile::tempdir()
+        .map_err(|err| format!("failed to create temp dir for {local_tag}: {err}"))?;
+    fs::write(
+        build_root.path().join("Dockerfile"),
+        format!("FROM {source_image}\n"),
+    )
+    .map_err(|err| {
+        format!(
+            "failed to write Dockerfile for test app image {local_tag} in {}: {err}",
+            build_root.path().display()
+        )
+    })?;
+    let output = Command::new(docker_bin)
+        .arg("build")
+        .arg("--platform")
+        .arg(docker_platform(expected_arch))
+        .arg("-t")
+        .arg(&local_tag)
+        .arg(build_root.path())
+        .output()
+        .map_err(|err| format!("failed to build docker image {local_tag}: {err}"))?;
+    if !output.status.success() {
+        return Err(format_command_output(
+            &format!("docker build failed for {local_tag} from {source_image}"),
+            &output,
+        ));
+    }
+    Ok(local_tag)
+}
+
+pub(crate) fn test_app_image() -> &'static str {
+    static IMAGE: OnceLock<String> = OnceLock::new();
+    IMAGE
+        .get_or_init(|| {
+            build_test_app_image_with_binaries(
+                Path::new("docker"),
+                TEST_APP_SOURCE_IMAGE,
+                docker_platform_arch(),
+            )
+            .unwrap_or_else(|err| panic!("{err}"))
+        })
+        .as_str()
 }
 
 pub(crate) fn docker_host_http_url(port: u16) -> String {
@@ -255,6 +492,14 @@ pub(crate) fn http_get_with_timeout(
     http_request_with_timeout("GET", port, path, None, timeout)
 }
 
+pub(crate) fn http_get_with_timeout_result(
+    port: u16,
+    path: &str,
+    timeout: Duration,
+) -> Result<(u16, String), String> {
+    http_request_with_timeout_result("GET", port, path, None, timeout)
+}
+
 pub(crate) fn http_request_with_timeout(
     method: &str,
     port: u16,
@@ -262,6 +507,16 @@ pub(crate) fn http_request_with_timeout(
     body: Option<&str>,
     timeout: Duration,
 ) -> Option<(u16, String)> {
+    http_request_with_timeout_result(method, port, path, body, timeout).ok()
+}
+
+pub(crate) fn http_request_with_timeout_result(
+    method: &str,
+    port: u16,
+    path: &str,
+    body: Option<&str>,
+    timeout: Duration,
+) -> Result<(u16, String), String> {
     let mut command = Command::new("curl");
     command
         .arg("-sS")
@@ -276,17 +531,46 @@ pub(crate) fn http_request_with_timeout(
             .arg("--data")
             .arg(body);
     }
-    let output = command
-        .arg("-o")
-        .arg("-")
-        .arg("-w")
-        .arg("\n%{http_code}")
-        .arg(format!("http://127.0.0.1:{port}{path}"))
-        .output()
-        .ok()?;
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let output = command_output_via_tempfiles(
+        command
+            .arg("-o")
+            .arg("-")
+            .arg("-w")
+            .arg("\n%{http_code}")
+            .arg(&url),
+        "curl http request",
+    );
+    if !output.status.success() {
+        return Err(format_command_output(
+            &format!(
+                "curl {method} {url} failed after {:.3}s",
+                timeout.as_secs_f64()
+            ),
+            &output,
+        ));
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let (body, status) = stdout.rsplit_once('\n')?;
-    Some((status.trim().parse().ok()?, body.trim().to_string()))
+    let Some((body, status)) = stdout.rsplit_once('\n') else {
+        return Err(format!(
+            "curl {method} {url} returned a malformed response after \
+             {:.3}s\nstdout:\n{}\nstderr:\n{}",
+            timeout.as_secs_f64(),
+            stdout,
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    };
+    let status = status.trim().parse().map_err(|err| {
+        format!(
+            "curl {method} {url} returned a malformed HTTP status `{}` after {:.3}s: \
+             {err}\nstdout:\n{}\nstderr:\n{}",
+            status.trim(),
+            timeout.as_secs_f64(),
+            stdout,
+            String::from_utf8_lossy(&output.stderr),
+        )
+    })?;
+    Ok((status, body.trim().to_string()))
 }
 
 pub(crate) fn wait_for_body(
@@ -305,12 +589,14 @@ pub(crate) fn wait_for_body(
             last_response = Some((status, body));
         }
         if let Ok(Some(status)) = proxy.child.try_wait() {
+            let diagnostics = proxy_target_diagnostics(&proxy.output_dir);
             panic!(
                 "amber proxy exited before http://127.0.0.1:{port}{path} became ready\nstatus: \
-                 {status}\noutput dir: {}\nlog ({}):\n{}",
+                 {status}\noutput dir: {}\n{diagnostics}log ({}):\n{}",
                 proxy.output_dir.display(),
                 proxy.log_path.display(),
-                fs::read_to_string(&proxy.log_path).unwrap_or_default()
+                fs::read_to_string(&proxy.log_path).unwrap_or_default(),
+                diagnostics = diagnostics,
             );
         }
         thread::sleep(Duration::from_millis(250));
@@ -318,13 +604,92 @@ pub(crate) fn wait_for_body(
     let last_response = last_response
         .map(|(status, body)| format!("last http response: {status}\n{body}\n"))
         .unwrap_or_else(|| "last http response: <none>\n".to_string());
+    let diagnostics = proxy_target_diagnostics(&proxy.output_dir);
     panic!(
-        "timed out waiting for http://127.0.0.1:{port}{path}\noutput dir: {}\n{last_response}log \
-         ({}):\n{}",
+        "timed out waiting for http://127.0.0.1:{port}{path}\noutput dir: \
+         {}\n{last_response}{diagnostics}log ({}):\n{}",
         proxy.output_dir.display(),
         proxy.log_path.display(),
-        fs::read_to_string(&proxy.log_path).unwrap_or_default()
+        fs::read_to_string(&proxy.log_path).unwrap_or_default(),
+        diagnostics = diagnostics,
     );
+}
+
+fn proxy_target_diagnostics(output_dir: &Path) -> String {
+    let Some(child_root) = output_dir.parent() else {
+        return String::new();
+    };
+    let mut files = Vec::new();
+    collect_proxy_target_diagnostic_files(child_root, &mut files);
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return String::new();
+    }
+
+    let mut diagnostics = String::from("proxy target diagnostics:\n");
+    for path in files {
+        diagnostics.push_str(&format!("----- {} -----\n", path.display()));
+        diagnostics.push_str(&read_diagnostic_file_excerpt(&path));
+        diagnostics.push('\n');
+    }
+    diagnostics
+}
+
+fn collect_proxy_target_diagnostic_files(root: &Path, files: &mut Vec<PathBuf>) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_file() {
+            if is_proxy_target_diagnostic_file(&path) {
+                files.push(path);
+            }
+            continue;
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            stack.push(entry.path());
+        }
+    }
+}
+
+fn is_proxy_target_diagnostic_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        "direct-runtime.json"
+            | "vm-runtime.json"
+            | "direct-plan.json"
+            | "vm-plan.json"
+            | "mesh-provision-plan.json"
+            | "mesh-config.json"
+            | "site.log"
+            | "supervisor.log"
+            | "manager-state.json"
+            | "site-controller-runtime-state.json"
+            | "site-controller-state.json"
+    )
+}
+
+fn read_diagnostic_file_excerpt(path: &Path) -> String {
+    const MAX_BYTES: usize = 24 * 1024;
+    let Ok(mut bytes) = fs::read(path) else {
+        return "<unreadable>\n".to_string();
+    };
+    bytes.retain(|byte| *byte != 0);
+    if bytes.len() > MAX_BYTES {
+        bytes = bytes[bytes.len() - MAX_BYTES..].to_vec();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 pub(crate) fn wait_for_path(proxy: &mut SpawnedProxy, port: u16, path: &str, timeout: Duration) {
@@ -443,14 +808,93 @@ pub(crate) fn append_debug_file(out: &mut String, label: &str, path: &Path) {
     ));
 }
 
+fn manager_state_value(state_path: &Path) -> Option<Value> {
+    fs::read_to_string(state_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+}
+
+fn append_docker_project_debug(out: &mut String, project: &str) {
+    let project_filter = format!("label=com.docker.compose.project={project}");
+    let ps_output = match Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            project_filter.as_str(),
+            "--format",
+            "{{.ID}}\t{{.Names}}\t{{.Status}}",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            out.push_str(&format!(
+                "\ndocker compose project `{project}` status query failed:\n{err}\n"
+            ));
+            return;
+        }
+    };
+
+    if !ps_output.status.success() {
+        out.push_str(&format!(
+            "\ndocker compose project `{project}` status query failed\nstdout:\n{}\nstderr:\n{}\n",
+            String::from_utf8_lossy(&ps_output.stdout),
+            String::from_utf8_lossy(&ps_output.stderr),
+        ));
+        return;
+    }
+
+    let containers = String::from_utf8_lossy(&ps_output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            Some((
+                parts.next()?.trim().to_string(),
+                parts.next()?.trim().to_string(),
+                parts.next()?.trim().to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    if containers.is_empty() {
+        out.push_str(&format!(
+            "\ndocker compose project `{project}` containers:\n<none>\n"
+        ));
+        return;
+    }
+
+    out.push_str(&format!(
+        "\ndocker compose project `{project}` containers:\n"
+    ));
+    for (_, name, status) in &containers {
+        out.push_str(&format!("{name}\t{status}\n"));
+    }
+
+    for (id, name, status) in containers {
+        let logs_output = match Command::new("docker")
+            .args(["logs", "--tail", "80", id.as_str()])
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) => {
+                out.push_str(&format!("\ndocker logs {name} ({status}) failed:\n{err}\n"));
+                continue;
+            }
+        };
+        out.push_str(&format!(
+            "\ndocker logs {name} ({status}):\nstdout:\n{}\nstderr:\n{}\n",
+            String::from_utf8_lossy(&logs_output.stdout),
+            String::from_utf8_lossy(&logs_output.stderr),
+        ));
+    }
+}
+
 pub(crate) fn site_debug_context(run_root: &Path, site_id: &str) -> String {
     let state_root = run_root.join("state").join(site_id);
+    let manager_state_path = state_root.join("manager-state.json");
     let mut out = String::new();
-    append_debug_file(
-        &mut out,
-        "manager state",
-        &state_root.join("manager-state.json"),
-    );
+    append_debug_file(&mut out, "manager state", &manager_state_path);
     append_debug_file(
         &mut out,
         "supervisor log",
@@ -462,6 +906,11 @@ pub(crate) fn site_debug_context(run_root: &Path, site_id: &str) -> String {
         &state_root.join("port-forward.log"),
     );
     append_debug_file(&mut out, "site log", &state_root.join("site.log"));
+    if let Some(project) = manager_state_value(&manager_state_path)
+        .and_then(|state| state["compose_project"].as_str().map(ToOwned::to_owned))
+    {
+        append_docker_project_debug(&mut out, &project);
+    }
     out
 }
 
@@ -566,6 +1015,7 @@ pub(crate) fn stop_child(child: &mut std::process::Child) {
 }
 
 pub(crate) fn amber_command() -> Command {
+    ensure_local_dev_image_tag_overrides();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_amber"));
     cmd.env("AMBER_RUNTIME_BIN_DIR", runtime_bin_dir());
     if let Some(kubeconfig) = env::var_os("AMBER_TEST_KIND_KUBECONFIG") {
@@ -576,6 +1026,22 @@ pub(crate) fn amber_command() -> Command {
 
 pub(crate) fn use_prebuilt_images() -> bool {
     env::var_os("AMBER_TEST_USE_PREBUILT_IMAGES").is_some()
+}
+
+fn internal_image_build_mode() -> &'static str {
+    static MODE: OnceLock<&'static str> = OnceLock::new();
+    MODE.get_or_init(|| match env::var("AMBER_TEST_INTERNAL_IMAGE_BUILD_MODE") {
+        Ok(mode) if mode == "release" => "release",
+        Ok(mode) if mode == "debug" => "debug",
+        Ok(mode) => panic!(
+            "AMBER_TEST_INTERNAL_IMAGE_BUILD_MODE must be `debug` or `release`, got `{mode}`"
+        ),
+        Err(env::VarError::NotPresent) => "debug",
+        Err(env::VarError::NotUnicode(value)) => panic!(
+            "AMBER_TEST_INTERNAL_IMAGE_BUILD_MODE must be valid UTF-8, got {:?}",
+            value
+        ),
+    })
 }
 
 pub(crate) fn image_platform_opt(tag: &str) -> Option<String> {
@@ -608,22 +1074,131 @@ pub(crate) fn ensure_docker_image(tag: &str, dockerfile: &Path) {
         return;
     }
 
-    let mut command = Command::new("docker");
-    if docker_supports_buildx() {
-        command.arg("buildx").arg("build").arg("--load");
-    } else {
-        command.env("DOCKER_BUILDKIT", "1");
-        command.arg("build");
+    if docker_image_is_fresh(tag, dockerfile) {
+        return;
     }
-    let status = command
-        .arg("-t")
-        .arg(tag)
+
+    let mut last_status = None;
+    for attempt in 1..=3 {
+        let mut command = Command::new("docker");
+        if docker_supports_buildx() {
+            command
+                .arg("buildx")
+                .arg("build")
+                .arg("--load")
+                .arg("--progress")
+                .arg("plain");
+        } else {
+            command.env("DOCKER_BUILDKIT", "1");
+            command.arg("build");
+        }
+        let status = command
+            .arg("--build-arg")
+            .arg(format!("BUILD_MODE={}", internal_image_build_mode()))
+            .arg("-t")
+            .arg(tag)
+            .arg("-f")
+            .arg(dockerfile)
+            .arg(workspace_root())
+            .status()
+            .unwrap_or_else(|err| panic!("failed to build {tag}: {err}"));
+        if status.success() {
+            return;
+        }
+        last_status = Some(status);
+        if attempt < 3 {
+            eprintln!("docker build attempt {attempt} failed for {tag}; retrying");
+            thread::sleep(Duration::from_secs(attempt * 2));
+        }
+    }
+    let status = last_status.expect("docker build should have produced a status");
+    panic!("docker build failed for {tag} after retries with status {status}");
+}
+
+fn docker_image_is_fresh(tag: &str, dockerfile: &Path) -> bool {
+    if image_platform_opt(tag).is_none() {
+        return false;
+    }
+    let Some(image_created) = docker_image_created_at(tag) else {
+        return false;
+    };
+    !source_is_newer_than_image(
+        image_created,
+        newest_internal_image_input_mtime(&workspace_root(), dockerfile),
+    )
+}
+
+fn docker_image_created_at(tag: &str) -> Option<SystemTime> {
+    let output = Command::new("docker")
+        .arg("image")
+        .arg("inspect")
         .arg("-f")
-        .arg(dockerfile)
-        .arg(workspace_root())
-        .status()
-        .unwrap_or_else(|err| panic!("failed to build {tag}: {err}"));
-    assert!(status.success(), "docker build failed for {tag}");
+        .arg("{{.Created}}")
+        .arg(tag)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let created = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let timestamp = OffsetDateTime::parse(&created, &Rfc3339).ok()?;
+    Some(UNIX_EPOCH + Duration::from_secs(timestamp.unix_timestamp() as u64))
+}
+
+fn newest_internal_image_input_mtime(
+    workspace_root: &Path,
+    dockerfile: &Path,
+) -> Option<SystemTime> {
+    [
+        workspace_root.join("Cargo.toml"),
+        workspace_root.join("Cargo.lock"),
+        workspace_root.join("rust-toolchain.toml"),
+        workspace_root.join("cli"),
+        workspace_root.join("compiler"),
+        workspace_root.join("images"),
+        workspace_root.join("runtime"),
+        dockerfile.to_path_buf(),
+    ]
+    .into_iter()
+    .filter_map(|path| newest_path_mtime(&path))
+    .max()
+}
+
+fn newest_path_mtime(path: &Path) -> Option<SystemTime> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.is_file() {
+        return metadata.modified().ok();
+    }
+    if !metadata.is_dir() {
+        return None;
+    }
+
+    let mut newest = metadata.modified().ok();
+    let entries = fs::read_dir(path).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        let child = entry.path();
+        let child_name = child
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if child_name == "target" || child_name == ".git" {
+            continue;
+        }
+        if let Some(child_mtime) = newest_path_mtime(&child) {
+            newest = match newest {
+                Some(current) if current >= child_mtime => Some(current),
+                _ => Some(child_mtime),
+            };
+        }
+    }
+    newest
+}
+
+fn source_is_newer_than_image(
+    image_created: SystemTime,
+    newest_source: Option<SystemTime>,
+) -> bool {
+    newest_source.is_some_and(|source| source > image_created)
 }
 
 pub(crate) fn docker_supports_buildx() -> bool {
@@ -637,62 +1212,241 @@ pub(crate) fn docker_supports_buildx() -> bool {
     })
 }
 
-pub(crate) fn ensure_internal_images() {
+pub(crate) fn ensure_amber_internal_images() {
     static READY: OnceLock<()> = OnceLock::new();
     READY.get_or_init(|| {
+        ensure_local_dev_image_tag_overrides();
         let root = workspace_root();
-        ensure_local_image(TEST_APP_IMAGE);
+        let images = amber_internal_image_refs();
+        ensure_docker_image(&images.router, &root.join("docker/amber-router/Dockerfile"));
         ensure_docker_image(
-            AMBER_ROUTER.reference,
-            &root.join("docker/amber-router/Dockerfile"),
-        );
-        ensure_docker_image(
-            AMBER_PROVISIONER.reference,
+            &images.provisioner,
             &root.join("docker/amber-provisioner/Dockerfile"),
         );
+        ensure_docker_image(&images.helper, &root.join("docker/amber-helper/Dockerfile"));
         ensure_docker_image(
-            AMBER_HELPER.reference,
-            &root.join("docker/amber-helper/Dockerfile"),
+            &images.site_controller,
+            &root.join("docker/amber-site-controller/Dockerfile"),
         );
     });
 }
 
+pub(crate) fn ensure_internal_images() {
+    static READY: OnceLock<()> = OnceLock::new();
+    READY.get_or_init(|| {
+        let _ = test_app_image();
+        ensure_amber_internal_images();
+    });
+}
+
+#[derive(Clone)]
+struct AmberInternalImageRefs {
+    router: String,
+    helper: String,
+    provisioner: String,
+    site_controller: String,
+}
+
+fn amber_internal_image_refs() -> AmberInternalImageRefs {
+    let overrides = parse_dev_image_tag_overrides(INTERNAL_IMAGE_OVERRIDE_KEYS)
+        .unwrap_or_else(|err| panic!("invalid {DEV_IMAGE_TAGS_ENV}: {err}"));
+    let resolve = |image: &ImageRef, key: &str| {
+        overrides
+            .get(key)
+            .map(|tag| override_reference(image, tag))
+            .unwrap_or_else(|| image.reference.to_string())
+    };
+    AmberInternalImageRefs {
+        router: resolve(&AMBER_ROUTER, "router"),
+        helper: resolve(&AMBER_HELPER, "helper"),
+        provisioner: resolve(&AMBER_PROVISIONER, "provisioner"),
+        site_controller: resolve(&AMBER_SITE_CONTROLLER, "site_controller"),
+    }
+}
+
+fn ensure_local_dev_image_tag_overrides() {
+    static READY: OnceLock<()> = OnceLock::new();
+    READY.get_or_init(|| {
+        if use_prebuilt_images()
+            || env::var_os("CI").is_some()
+            || env::var_os(DEV_IMAGE_TAGS_ENV).is_some()
+        {
+            return;
+        }
+        let mut hasher = DefaultHasher::new();
+        workspace_root().hash(&mut hasher);
+        internal_image_build_mode().hash(&mut hasher);
+        let tag = format!(
+            "dev-mixed-run-{}-{:016x}",
+            internal_image_build_mode(),
+            hasher.finish()
+        );
+        let overrides = INTERNAL_IMAGE_OVERRIDE_KEYS
+            .iter()
+            .map(|key| format!("{key}={tag}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        unsafe {
+            env::set_var(DEV_IMAGE_TAGS_ENV, overrides);
+        }
+    });
+}
+
 pub(crate) fn load_kind_image(cluster_name: &str, image: &str) {
-    let status = Command::new("kind")
+    load_kind_image_with_binaries(Path::new("kind"), Path::new("docker"), cluster_name, image)
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+fn load_kind_image_with_binaries(
+    kind_bin: &Path,
+    docker_bin: &Path,
+    cluster_name: &str,
+    image: &str,
+) -> Result<(), String> {
+    let mut direct_error = None;
+    for attempt in 1..=3 {
+        match kind_load_docker_image(kind_bin, cluster_name, image) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                direct_error = Some(err);
+                if attempt < 3 {
+                    eprintln!(
+                        "kind load docker-image attempt {attempt} failed for {image} in cluster \
+                         {cluster_name}; retrying"
+                    );
+                    thread::sleep(Duration::from_secs(attempt * 2));
+                }
+            }
+        }
+    }
+
+    let direct_error = direct_error.expect("kind image load should record a failure");
+    let archive = tempfile::Builder::new()
+        .prefix("amber-kind-image-")
+        .suffix(".tar")
+        .tempfile()
+        .map_err(|err| {
+            format!("failed to create temporary image archive for {image} in {cluster_name}: {err}")
+        })?;
+    kind_load_image_archive_with_binaries(kind_bin, docker_bin, cluster_name, image, archive)
+        .map_err(|archive_error| {
+            format!(
+                "{direct_error}
+
+kind load image-archive fallback failed for {image} in cluster {cluster_name}:
+{archive_error}"
+            )
+        })
+}
+
+fn kind_load_docker_image(kind_bin: &Path, cluster_name: &str, image: &str) -> Result<(), String> {
+    let output = Command::new(kind_bin)
         .arg("load")
         .arg("docker-image")
         .arg("--name")
         .arg(cluster_name)
         .arg(image)
-        .status()
-        .unwrap_or_else(|err| {
-            panic!("failed to load {image} into kind cluster {cluster_name}: {err}")
-        });
-    assert!(
-        status.success(),
-        "kind load docker-image failed for {image} in cluster {cluster_name}"
-    );
+        .output()
+        .map_err(|err| {
+            format!("failed to run `kind load docker-image` for {image} in {cluster_name}: {err}")
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format_command_output(
+        &format!("kind load docker-image failed for {image} in cluster {cluster_name}"),
+        &output,
+    ))
+}
+
+fn kind_load_image_archive_with_binaries(
+    kind_bin: &Path,
+    docker_bin: &Path,
+    cluster_name: &str,
+    image: &str,
+    archive: tempfile::NamedTempFile,
+) -> Result<(), String> {
+    let archive_path = archive.path().to_path_buf();
+    let docker_output = Command::new(docker_bin)
+        .arg("image")
+        .arg("save")
+        .arg("--output")
+        .arg(&archive_path)
+        .arg(image)
+        .output()
+        .map_err(|err| {
+            format!("failed to run `docker image save` for {image} in {cluster_name}: {err}")
+        })?;
+    if !docker_output.status.success() {
+        return Err(format_command_output(
+            &format!("docker image save failed for {image}"),
+            &docker_output,
+        ));
+    }
+
+    let kind = Command::new(kind_bin)
+        .arg("load")
+        .arg("image-archive")
+        .arg("--name")
+        .arg(cluster_name)
+        .arg(&archive_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to run `kind load image-archive` fallback for {image} in {cluster_name}: \
+                 {err}"
+            )
+        })?;
+    if kind.status.success() {
+        return Ok(());
+    }
+
+    Err(format_command_output(
+        &format!("kind load image-archive failed for {image} in cluster {cluster_name}"),
+        &kind,
+    ))
+}
+
+fn format_command_output(label: &str, output: &std::process::Output) -> String {
+    format!(
+        "{label} with status {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 pub(crate) fn ensure_kind_internal_images(kind_cluster: &KindCluster) {
     ensure_internal_images();
     static READY: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
     let name = kind_cluster.name.clone();
+    let images = amber_internal_image_refs();
+    let ready_key = format!(
+        "{name}|{}|{}|{}|{}|{}",
+        images.router,
+        images.provisioner,
+        images.helper,
+        images.site_controller,
+        test_app_image()
+    );
     let loaded = READY.get_or_init(|| Mutex::new(BTreeSet::new()));
     {
         let loaded = loaded.lock().expect("kind image-load guard should lock");
-        if loaded.contains(&name) {
+        if loaded.contains(&ready_key) {
             return;
         }
     }
-    load_kind_image(&name, AMBER_ROUTER.reference);
-    load_kind_image(&name, AMBER_PROVISIONER.reference);
-    load_kind_image(&name, AMBER_HELPER.reference);
-    load_kind_image(&name, TEST_APP_IMAGE);
+    load_kind_image(&name, &images.router);
+    load_kind_image(&name, &images.provisioner);
+    load_kind_image(&name, &images.helper);
+    load_kind_image(&name, &images.site_controller);
+    load_kind_image(&name, test_app_image());
     loaded
         .lock()
         .expect("kind image-load guard should lock")
-        .insert(name);
+        .insert(ready_key);
 }
 
 pub(crate) fn kill_pid(pid: u32) {
@@ -700,6 +1454,365 @@ pub(crate) fn kill_pid(pid: u32) {
     unsafe {
         let _ = libc::kill(pid as i32, libc::SIGTERM);
     }
+}
+
+pub(crate) fn framework_child_artifact_dir(
+    run_root: &Path,
+    site_id: &str,
+    child_id: u64,
+) -> PathBuf {
+    let manager_state = site_manager_state(run_root, site_id);
+    if manager_state["kind"].as_str() == Some("kubernetes") {
+        let artifact_dir =
+            framework_child_kubernetes_cache_artifact_dir(run_root, site_id, child_id);
+        materialize_kubernetes_child_artifact(&manager_state, child_id, &artifact_dir);
+        return artifact_dir;
+    }
+
+    framework_child_host_artifact_dir(run_root, site_id, child_id)
+}
+
+pub(crate) fn framework_control_state_snapshot(control_state_root: &Path) -> Value {
+    let mut live_children = Vec::new();
+    let entries = fs::read_dir(control_state_root)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", control_state_root.display()));
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(site_id) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        let manager_state = site_manager_state_from_state_root(control_state_root, &site_id);
+        if !site_hosts_local_framework_controller(control_state_root, &site_id, &manager_state) {
+            continue;
+        }
+        let state = framework_site_control_state(control_state_root, &site_id);
+        if let Some(children) = state["live_children"].as_array() {
+            live_children.extend(children.iter().cloned());
+        }
+    }
+    json!({ "live_children": live_children })
+}
+
+pub(crate) fn framework_child_is_absent(run_root: &Path, site_id: &str, child_id: u64) -> bool {
+    let manager_state = site_manager_state(run_root, site_id);
+    if manager_state["kind"].as_str() != Some("kubernetes") {
+        return !framework_child_host_child_root(run_root, site_id, child_id).exists();
+    }
+
+    if kubernetes_child_runtime_root_exists(&manager_state, child_id) {
+        return false;
+    }
+
+    let cache_root = framework_child_kubernetes_cache_child_root(run_root, site_id, child_id);
+    if cache_root.exists() {
+        fs::remove_dir_all(&cache_root).unwrap_or_else(|err| {
+            panic!(
+                "failed to clear stale kubernetes child cache {}: {err}",
+                cache_root.display()
+            )
+        });
+    }
+    true
+}
+
+fn framework_site_control_state(control_state_root: &Path, site_id: &str) -> Value {
+    let manager_state = site_manager_state_from_state_root(control_state_root, site_id);
+    let state_path = framework_site_control_state_path(control_state_root, site_id, &manager_state);
+    if manager_state["kind"].as_str() == Some("kubernetes") {
+        materialize_kubernetes_control_state(&manager_state, &state_path);
+    }
+    read_json(&state_path)
+}
+
+fn site_hosts_local_framework_controller(
+    control_state_root: &Path,
+    site_id: &str,
+    manager_state: &Value,
+) -> bool {
+    if manager_state["kind"].as_str() == Some("kubernetes") {
+        return control_state_root
+            .join(site_id)
+            .join("site-controller-plan.json")
+            .is_file();
+    }
+    framework_site_control_state_path(control_state_root, site_id, manager_state).is_file()
+}
+
+fn site_manager_state(run_root: &Path, site_id: &str) -> Value {
+    site_manager_state_from_state_root(&run_root.join("state"), site_id)
+}
+
+fn site_manager_state_from_state_root(state_root: &Path, site_id: &str) -> Value {
+    let manager_state_path = state_root.join(site_id).join("manager-state.json");
+    serde_json::from_slice(&fs::read(&manager_state_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read site manager state {}: {err}",
+            manager_state_path.display()
+        )
+    }))
+    .unwrap_or_else(|err| {
+        panic!(
+            "failed to parse site manager state {}: {err}",
+            manager_state_path.display()
+        )
+    })
+}
+
+fn framework_site_control_state_path(
+    control_state_root: &Path,
+    site_id: &str,
+    manager_state: &Value,
+) -> PathBuf {
+    if manager_state["kind"].as_str() == Some("kubernetes") {
+        return framework_kubernetes_cache_control_state_path(control_state_root, site_id);
+    }
+    control_state_root
+        .join(site_id)
+        .join("site-controller-state.json")
+}
+
+fn framework_kubernetes_cache_control_state_path(
+    control_state_root: &Path,
+    site_id: &str,
+) -> PathBuf {
+    control_state_root
+        .join(site_id)
+        .join("framework-component-kubernetes-cache")
+        .join("site-controller-state.json")
+}
+
+fn framework_child_host_child_root(run_root: &Path, site_id: &str, child_id: u64) -> PathBuf {
+    run_root
+        .join("state")
+        .join(site_id)
+        .join("framework-component")
+        .join("children")
+        .join(child_id.to_string())
+}
+
+fn framework_child_host_artifact_dir(run_root: &Path, site_id: &str, child_id: u64) -> PathBuf {
+    framework_child_host_child_root(run_root, site_id, child_id).join("artifact")
+}
+
+fn framework_child_kubernetes_cache_child_root(
+    run_root: &Path,
+    site_id: &str,
+    child_id: u64,
+) -> PathBuf {
+    run_root
+        .join("state")
+        .join(site_id)
+        .join("framework-component-kubernetes-cache")
+        .join("children")
+        .join(child_id.to_string())
+}
+
+fn framework_child_kubernetes_cache_artifact_dir(
+    run_root: &Path,
+    site_id: &str,
+    child_id: u64,
+) -> PathBuf {
+    framework_child_kubernetes_cache_child_root(run_root, site_id, child_id).join("artifact")
+}
+
+fn kubernetes_child_runtime_root_exists(manager_state: &Value, child_id: u64) -> bool {
+    let namespace = manager_state["kubernetes_namespace"]
+        .as_str()
+        .unwrap_or_else(|| panic!("kubernetes manager state is missing kubernetes_namespace"));
+    let pod = kubernetes_site_controller_pod_name(manager_state, namespace);
+    let remote_child_root = format!("/amber/site/state/framework-component/children/{child_id}");
+    let output = kubectl_for_manager_state(manager_state)
+        .arg("-n")
+        .arg(namespace)
+        .arg("exec")
+        .arg(&pod)
+        .arg("-c")
+        .arg(KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER)
+        .arg("--")
+        .arg("sh")
+        .arg("-lc")
+        .arg(format!("test -d {remote_child_root}"))
+        .output()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to probe kubernetes child runtime root {remote_child_root} in {pod}: {err}"
+            )
+        });
+    match output.status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        _ => {
+            panic!(
+                "failed to probe kubernetes child runtime root {remote_child_root} in {pod}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        }
+    }
+}
+
+fn materialize_kubernetes_child_artifact(
+    manager_state: &Value,
+    child_id: u64,
+    artifact_dir: &Path,
+) {
+    if artifact_dir.is_dir() {
+        return;
+    }
+    let namespace = manager_state["kubernetes_namespace"]
+        .as_str()
+        .unwrap_or_else(|| panic!("kubernetes manager state is missing kubernetes_namespace"));
+    let pod = kubernetes_site_controller_pod_name(manager_state, namespace);
+    let remote_artifact_dir =
+        format!("/amber/site/state/framework-component/children/{child_id}/artifact");
+    let parent = artifact_dir.parent().unwrap_or_else(|| {
+        panic!(
+            "artifact dir {} should have a parent",
+            artifact_dir.display()
+        )
+    });
+    fs::create_dir_all(parent).unwrap_or_else(|err| {
+        panic!(
+            "failed to create framework child parent {}: {err}",
+            parent.display()
+        )
+    });
+    let target = parent.join(format!("artifact-kubernetes-copy-{child_id}"));
+    if target.exists() {
+        fs::remove_dir_all(&target).unwrap_or_else(|err| {
+            panic!(
+                "failed to clear previous kubernetes child artifact copy {}: {err}",
+                target.display()
+            )
+        });
+    }
+    let mut command = kubectl_for_manager_state(manager_state);
+    let status = command
+        .arg("-n")
+        .arg(namespace)
+        .arg("cp")
+        .arg("-c")
+        .arg(KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER)
+        .arg(format!("{pod}:{remote_artifact_dir}"))
+        .arg(&target)
+        .status()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to copy kubernetes child artifact {remote_artifact_dir} from {pod}: {err}"
+            )
+        });
+    if !status.success() {
+        panic!(
+            "kubectl cp failed for kubernetes child artifact {remote_artifact_dir} from {pod} \
+             with status {status}"
+        );
+    }
+    fs::rename(&target, artifact_dir).unwrap_or_else(|err| {
+        panic!(
+            "failed to move kubernetes child artifact copy {} into {}: {err}",
+            target.display(),
+            artifact_dir.display()
+        )
+    });
+}
+
+fn materialize_kubernetes_control_state(manager_state: &Value, state_path: &Path) {
+    let namespace = manager_state["kubernetes_namespace"]
+        .as_str()
+        .unwrap_or_else(|| panic!("kubernetes manager state is missing kubernetes_namespace"));
+    let pod = kubernetes_site_controller_pod_name(manager_state, namespace);
+    let parent = state_path.parent().unwrap_or_else(|| {
+        panic!(
+            "framework control state path {} should have a parent",
+            state_path.display()
+        )
+    });
+    fs::create_dir_all(parent).unwrap_or_else(|err| {
+        panic!(
+            "failed to create kubernetes control state cache parent {}: {err}",
+            parent.display()
+        )
+    });
+    let target = parent.join("site-controller-state-kubernetes-copy.json");
+    let output = kubectl_for_manager_state(manager_state)
+        .arg("-n")
+        .arg(namespace)
+        .arg("exec")
+        .arg(&pod)
+        .arg("-c")
+        .arg(KUBERNETES_SITE_CONTROLLER_MAIN_CONTAINER)
+        .arg("--")
+        .arg("cat")
+        .arg("/amber/site/state/site-controller-state.json")
+        .output()
+        .unwrap_or_else(|err| {
+            panic!("failed to read kubernetes control state from {pod} in {namespace}: {err}")
+        });
+    if !output.status.success() {
+        panic!(
+            "failed to read kubernetes control state from {pod} in {namespace}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::write(&target, &output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "failed to write temporary kubernetes control state cache {}: {err}",
+            target.display()
+        )
+    });
+    fs::rename(&target, state_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to move kubernetes control state cache {} into {}: {err}",
+            target.display(),
+            state_path.display()
+        )
+    });
+}
+
+pub(crate) fn kubernetes_site_controller_pod_name(
+    manager_state: &Value,
+    namespace: &str,
+) -> String {
+    let mut command = kubectl_for_manager_state(manager_state);
+    let output = command
+        .arg("-n")
+        .arg(namespace)
+        .arg("get")
+        .arg("pods")
+        .arg("-l")
+        .arg("amber.io/component=amber-site-controller")
+        .arg("-o")
+        .arg("jsonpath={.items[0].metadata.name}")
+        .output()
+        .unwrap_or_else(|err| {
+            panic!("failed to query kubernetes site-controller pod in {namespace}: {err}")
+        });
+    if !output.status.success() {
+        panic!(
+            "failed to query kubernetes site-controller pod in {namespace}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let pod = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if pod.is_empty() {
+        panic!("kubernetes site-controller pod is missing in namespace {namespace}");
+    }
+    pod
+}
+
+pub(crate) fn kubectl_for_manager_state(manager_state: &Value) -> Command {
+    let mut command = Command::new("kubectl");
+    if let Some(kubeconfig) = env::var_os("AMBER_TEST_KIND_KUBECONFIG") {
+        command.env("KUBECONFIG", kubeconfig);
+    }
+    if let Some(context) = manager_state["context"].as_str() {
+        command.arg("--context").arg(context);
+    }
+    command
 }
 
 pub(crate) fn pid_is_alive(pid: u32) -> bool {
@@ -767,14 +1880,15 @@ impl RunHandle {
         if self.stopped {
             return;
         }
-        let output = amber_command()
-            .arg("stop")
-            .arg(&self.run_id)
-            .arg("--storage-root")
-            .arg(&self.storage_root)
-            .envs(self.command_env.iter().map(|(key, value)| (key, value)))
-            .output()
-            .expect("failed to run amber stop");
+        let output = command_output_via_tempfiles(
+            amber_command()
+                .arg("stop")
+                .arg(&self.run_id)
+                .arg("--storage-root")
+                .arg(&self.storage_root)
+                .envs(self.command_env.iter().map(|(key, value)| (key, value))),
+            "amber stop",
+        );
         assert!(
             output.status.success(),
             "amber stop failed\nstdout:\n{}\nstderr:\n{}",
@@ -790,14 +1904,44 @@ impl Drop for RunHandle {
         if self.stopped {
             return;
         }
-        let _ = amber_command()
-            .arg("stop")
-            .arg(&self.run_id)
-            .arg("--storage-root")
-            .arg(&self.storage_root)
-            .envs(self.command_env.iter().map(|(key, value)| (key, value)))
-            .output();
+        let _ = command_output_via_tempfiles(
+            amber_command()
+                .arg("stop")
+                .arg(&self.run_id)
+                .arg("--storage-root")
+                .arg(&self.storage_root)
+                .envs(self.command_env.iter().map(|(key, value)| (key, value))),
+            "amber stop",
+        );
         self.stopped = true;
+    }
+}
+
+pub(crate) fn command_output_via_tempfiles(
+    command: &mut Command,
+    label: &str,
+) -> std::process::Output {
+    let stdout_file = tempfile::NamedTempFile::new()
+        .unwrap_or_else(|err| panic!("failed to create stdout temp file for {label}: {err}"));
+    let stderr_file = tempfile::NamedTempFile::new()
+        .unwrap_or_else(|err| panic!("failed to create stderr temp file for {label}: {err}"));
+    let status = command
+        .stdout(Stdio::from(stdout_file.reopen().unwrap_or_else(|err| {
+            panic!("failed to reopen stdout temp file for {label}: {err}")
+        })))
+        .stderr(Stdio::from(stderr_file.reopen().unwrap_or_else(|err| {
+            panic!("failed to reopen stderr temp file for {label}: {err}")
+        })))
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run {label}: {err}"));
+    let stdout = fs::read(stdout_file.path())
+        .unwrap_or_else(|err| panic!("failed to read stdout temp file for {label}: {err}"));
+    let stderr = fs::read(stderr_file.path())
+        .unwrap_or_else(|err| panic!("failed to read stderr temp file for {label}: {err}"));
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
     }
 }
 
@@ -831,17 +1975,18 @@ pub(crate) fn run_manifest_with_args_and_env(
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> RunHandle {
-    let output = amber_command()
-        .arg("run")
-        .arg(manifest)
-        .arg("--placement")
-        .arg(placement)
-        .arg("--storage-root")
-        .arg(storage_root)
-        .args(extra_args)
-        .envs(extra_env.iter().copied())
-        .output()
-        .expect("failed to run amber run");
+    let output = command_output_via_tempfiles(
+        amber_command()
+            .arg("run")
+            .arg(manifest)
+            .arg("--placement")
+            .arg(placement)
+            .arg("--storage-root")
+            .arg(storage_root)
+            .args(extra_args)
+            .envs(extra_env.iter().copied()),
+        "amber run",
+    );
     assert!(
         output.status.success(),
         "amber run failed\nstdout:\n{}\nstderr:\n{}{}",
@@ -921,7 +2066,7 @@ pub(crate) fn run_manifest_expect_failure_with_env(
         .arg(storage_root)
         .args(extra_args)
         .envs(extra_env.iter().copied());
-    let output = cmd.output().expect("failed to run amber run");
+    let output = command_output_via_tempfiles(&mut cmd, "amber run");
     assert!(
         !output.status.success(),
         "amber run unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
@@ -941,21 +2086,22 @@ pub(crate) fn dry_run_manifest(
     bundle_root: &Path,
     extra_args: &[&str],
 ) -> std::process::Output {
-    amber_command()
-        .arg("run")
-        .arg("-Z")
-        .arg("unstable-options")
-        .arg(manifest)
-        .arg("--placement")
-        .arg(placement)
-        .arg("--storage-root")
-        .arg(storage_root)
-        .args(extra_args)
-        .arg("--dry-run")
-        .arg("--emit-launch-bundle")
-        .arg(bundle_root)
-        .output()
-        .expect("failed to run amber run --dry-run")
+    command_output_via_tempfiles(
+        amber_command()
+            .arg("run")
+            .arg("-Z")
+            .arg("unstable-options")
+            .arg(manifest)
+            .arg("--placement")
+            .arg(placement)
+            .arg("--storage-root")
+            .arg(storage_root)
+            .args(extra_args)
+            .arg("--dry-run")
+            .arg("--emit-launch-bundle")
+            .arg(bundle_root),
+        "amber run --dry-run",
+    )
 }
 
 pub(crate) fn spawn_run_manifest_with_env(
@@ -1065,7 +2211,7 @@ pub(crate) fn write_image_component(
             "manifest_version": "0.3.0",
             "slots": upstreams.iter().map(|(alias, _)| ((*alias).to_string(), json!({"kind": "http"}))).collect::<serde_json::Map<_, _>>(),
             "program": {
-                "image": TEST_APP_IMAGE,
+                "image": test_app_image(),
                 "entrypoint": ["python3", "-u", "-c", { "file": "./app.py" }],
                 "env": env,
                 "network": {
@@ -1355,6 +2501,8 @@ pub(crate) fn serve_host_http_request(stream: &mut TcpStream) {
 pub(crate) struct KindClusterGuard {
     name: String,
     kubeconfig: PathBuf,
+    previous_cluster_name: Option<OsString>,
+    previous_kubeconfig: Option<OsString>,
 }
 
 impl KindClusterGuard {
@@ -1387,9 +2535,17 @@ impl KindClusterGuard {
                 .status();
             panic!("kind create cluster failed with status {status}");
         }
+        let previous_cluster_name = env::var_os("AMBER_TEST_KIND_CLUSTER_NAME");
+        let previous_kubeconfig = env::var_os("AMBER_TEST_KIND_KUBECONFIG");
+        unsafe {
+            env::set_var("AMBER_TEST_KIND_CLUSTER_NAME", &name);
+            env::set_var("AMBER_TEST_KIND_KUBECONFIG", kubeconfig);
+        }
         Self {
             name,
             kubeconfig: kubeconfig.to_path_buf(),
+            previous_cluster_name,
+            previous_kubeconfig,
         }
     }
 }
@@ -1404,6 +2560,16 @@ impl Drop for KindClusterGuard {
             .arg("--kubeconfig")
             .arg(&self.kubeconfig)
             .status();
+        unsafe {
+            match &self.previous_cluster_name {
+                Some(value) => env::set_var("AMBER_TEST_KIND_CLUSTER_NAME", value),
+                None => env::remove_var("AMBER_TEST_KIND_CLUSTER_NAME"),
+            }
+            match &self.previous_kubeconfig {
+                Some(value) => env::set_var("AMBER_TEST_KIND_KUBECONFIG", value),
+                None => env::remove_var("AMBER_TEST_KIND_KUBECONFIG"),
+            }
+        }
     }
 }
 
@@ -1645,9 +2811,11 @@ pub(crate) fn write_single_site_vm_fixture(root: &Path) -> ScenarioFixture {
             "schema": "amber.run.placement",
             "version": 1,
             "sites": {
-                "vm_local": { "kind": "vm" }
+                "direct_controller": { "kind": "direct" },
+                "vm_local": { "kind": "vm", "controller_site": "direct_controller" }
             },
             "defaults": {
+                "path": "direct_controller",
                 "vm": "vm_local"
             }
         }),
@@ -2008,4 +3176,568 @@ pub(crate) fn namespace_exists(namespace: &str, kubeconfig: &Path, context: &str
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    #[test]
+    fn command_output_via_tempfiles_does_not_wait_for_background_stdout_writer() {
+        let started = Instant::now();
+        let output = command_output_via_tempfiles(
+            Command::new("sh").arg("-c").arg("(sleep 2) & printf done"),
+            "background stdout writer",
+        );
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "done");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "capturing to temp files should wait for the command, not background writers"
+        );
+    }
+
+    #[test]
+    fn source_is_newer_than_image_detects_newer_sources() {
+        let image_created = UNIX_EPOCH + Duration::from_secs(10);
+        let newest_source = Some(UNIX_EPOCH + Duration::from_secs(11));
+        assert!(source_is_newer_than_image(image_created, newest_source));
+    }
+
+    #[test]
+    fn source_is_newer_than_image_ignores_older_or_missing_sources() {
+        let image_created = UNIX_EPOCH + Duration::from_secs(10);
+        assert!(!source_is_newer_than_image(
+            image_created,
+            Some(UNIX_EPOCH + Duration::from_secs(9))
+        ));
+        assert!(!source_is_newer_than_image(image_created, None));
+    }
+
+    #[test]
+    fn framework_child_artifact_dir_uses_dedicated_kubernetes_cache() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let manager_state_path = temp
+            .path()
+            .join("state")
+            .join("kind_local")
+            .join("manager-state.json");
+        fs::create_dir_all(manager_state_path.parent().expect("manager state parent"))
+            .expect("manager state dir should create");
+        fs::write(
+            &manager_state_path,
+            serde_json::to_vec(&json!({
+                "kind": "kubernetes",
+                "kubernetes_namespace": "amber-test",
+            }))
+            .expect("manager state should serialize"),
+        )
+        .expect("manager state should write");
+
+        let cache_dir = framework_child_kubernetes_cache_artifact_dir(temp.path(), "kind_local", 7);
+        fs::create_dir_all(&cache_dir).expect("kubernetes cache dir should exist");
+
+        let artifact_dir = framework_child_artifact_dir(temp.path(), "kind_local", 7);
+        assert_eq!(artifact_dir, cache_dir);
+        assert!(
+            !artifact_dir.starts_with(
+                temp.path()
+                    .join("state")
+                    .join("kind_local")
+                    .join("framework-component")
+                    .join("children")
+            ),
+            "kubernetes child artifact inspection should not reuse the authoritative host state \
+             path"
+        );
+    }
+
+    #[test]
+    fn framework_control_state_path_uses_dedicated_kubernetes_cache() {
+        let state_root = Path::new("/tmp/amber-run/state");
+        let manager_state = json!({
+            "kind": "kubernetes",
+            "kubernetes_namespace": "amber-test",
+        });
+
+        let state_path =
+            framework_site_control_state_path(state_root, "kind_local", &manager_state);
+        assert_eq!(
+            state_path,
+            framework_kubernetes_cache_control_state_path(state_root, "kind_local")
+        );
+        assert!(
+            !state_path.ends_with("site-controller-state.json")
+                || state_path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "framework-component-kubernetes-cache"),
+            "kubernetes framework control state should use the dedicated cache path, got {}",
+            state_path.display()
+        );
+    }
+
+    #[test]
+    fn framework_control_state_snapshot_skips_sites_without_local_controller() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let state_root = temp.path().join("state");
+        let direct_root = state_root.join("direct_local");
+        let vm_root = state_root.join("vm_local");
+        fs::create_dir_all(&direct_root).expect("direct state root should create");
+        fs::create_dir_all(&vm_root).expect("vm state root should create");
+        write_json(
+            &direct_root.join("manager-state.json"),
+            &json!({
+                "kind": "direct",
+                "site_id": "direct_local",
+            }),
+        );
+        write_json(
+            &direct_root.join("site-controller-state.json"),
+            &json!({
+                "live_children": [
+                    {
+                        "name": "local-child",
+                        "state": "live",
+                        "child_id": 7,
+                    }
+                ],
+            }),
+        );
+        write_json(
+            &vm_root.join("manager-state.json"),
+            &json!({
+                "kind": "vm",
+                "site_id": "vm_local",
+            }),
+        );
+
+        let snapshot = framework_control_state_snapshot(&state_root);
+
+        assert_eq!(snapshot["live_children"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["live_children"][0]["name"], "local-child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kind_load_image_archive_uses_real_archive_path() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let kind = temp.path().join("kind");
+        let log_path = temp.path().join("commands.log");
+
+        fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nset -eu\nprintf 'docker %s\\n' \"$*\" >> '{}'\nif [ \"$1\" = image ] \
+                 && [ \"$2\" = inspect ] && [ \"$3\" = -f ] && [ \"$4\" = \
+                 '{{{{.Id}}}}|{{{{.Architecture}}}}' ] && [ \"$5\" = 'test:image' ]; then\n  exit \
+                 1\nfi\nif [ \"$1\" = image ] && [ \"$2\" = save ] && [ \"$3\" = --output ]; \
+                 then\n  printf 'archive' > \"$4\"\n  exit 0\nfi\necho \"unexpected docker \
+                 invocation: $*\" >&2\nexit 1\n",
+                log_path.display()
+            ),
+        )
+        .expect("docker stub should write");
+        fs::write(
+            &kind,
+            format!(
+                "#!/bin/sh\nset -eu\nprintf 'kind %s\\n' \"$*\" >> '{}'\narchive=\"${{5:-}}\"\nif \
+                 [ \"$1\" = load ] && [ \"$2\" = image-archive ] && [ \"$3\" = --name ] && [ \
+                 \"$5\" != '-' ] && [ -f \"$archive\" ]; then\n  exit 0\nfi\necho \"unexpected \
+                 kind invocation: $*\" >&2\nexit 1\n",
+                log_path.display()
+            ),
+        )
+        .expect("kind stub should write");
+        for path in [&docker, &kind] {
+            let mut permissions = fs::metadata(path)
+                .expect("stub metadata should read")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("stub should chmod");
+        }
+
+        let archive = tempfile::Builder::new()
+            .prefix("kind-archive-")
+            .suffix(".tar")
+            .tempfile_in(temp.path())
+            .expect("temp archive should create");
+        kind_load_image_archive_with_binaries(
+            &kind,
+            &docker,
+            "test-cluster",
+            "test:image",
+            archive,
+        )
+        .expect("kind image-archive fallback should use a real archive path");
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        assert!(
+            log.lines()
+                .any(|line| line.contains("docker image save --output ")),
+            "docker should save to a concrete archive path:\n{log}"
+        );
+        assert!(
+            log.lines().any(|line| {
+                line.starts_with("kind load image-archive --name test-cluster ")
+                    && !line.ends_with(" -")
+            }),
+            "kind should receive the archive filename, not stdin:\n{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kind_load_image_archive_saves_the_requested_image_tag() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let kind = temp.path().join("kind");
+        let log_path = temp.path().join("commands.log");
+
+        fs::write(
+            &docker,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf 'docker %s
+' "$*" >> '{}'
+if [ "$1" = image ] && [ "$2" = save ] && [ "$3" = --output ] && [ "$5" = 'test:image' ]; then
+  printf 'archive' > "$4"
+  exit 0
+fi
+echo "unexpected docker invocation: $*" >&2
+exit 1
+"#,
+                log_path.display()
+            ),
+        )
+        .expect("docker stub should write");
+        fs::write(
+            &kind,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf 'kind %s
+' "$*" >> '{}'
+archive="${{5:-}}"
+if [ "$1" = load ] && [ "$2" = image-archive ] && [ "$3" = --name ] && [ -f "$archive" ]; then
+  exit 0
+fi
+echo "unexpected kind invocation: $*" >&2
+exit 1
+"#,
+                log_path.display()
+            ),
+        )
+        .expect("kind stub should write");
+        for path in [&docker, &kind] {
+            let mut permissions = fs::metadata(path)
+                .expect("stub metadata should read")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("stub should chmod");
+        }
+
+        let archive = tempfile::Builder::new()
+            .prefix("kind-archive-")
+            .suffix(".tar")
+            .tempfile_in(temp.path())
+            .expect("temp archive should create");
+        kind_load_image_archive_with_binaries(
+            &kind,
+            &docker,
+            "test-cluster",
+            "test:image",
+            archive,
+        )
+        .expect("kind image-archive fallback should save the requested image tag");
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        assert!(
+            log.lines().any(|line| {
+                line.contains("docker image save --output ") && line.ends_with(" test:image")
+            }),
+            "docker save should export the requested image tag:
+{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_kind_image_retries_direct_load_before_single_archive_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let kind = temp.path().join("kind");
+        let log_path = temp.path().join("commands.log");
+
+        fs::write(
+            &docker,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf 'docker %s
+' "$*" >> '{}'
+if [ "$1" = image ] && [ "$2" = save ] && [ "$3" = --output ] && [ "$5" = 'test:image' ]; then
+  printf 'archive' > "$4"
+  exit 0
+fi
+echo "unexpected docker invocation: $*" >&2
+exit 1
+"#,
+                log_path.display()
+            ),
+        )
+        .expect("docker stub should write");
+        fs::write(
+            &kind,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf 'kind %s
+' "$*" >> '{}'
+archive="${{5:-}}"
+if [ "$1" = load ] && [ "$2" = docker-image ]; then
+  exit 1
+fi
+if [ "$1" = load ] && [ "$2" = image-archive ] && [ "$3" = --name ] && [ -f "$archive" ]; then
+  exit 0
+fi
+echo "unexpected kind invocation: $*" >&2
+exit 1
+"#,
+                log_path.display()
+            ),
+        )
+        .expect("kind stub should write");
+        for path in [&docker, &kind] {
+            let mut permissions = fs::metadata(path)
+                .expect("stub metadata should read")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("stub should chmod");
+        }
+
+        load_kind_image_with_binaries(&kind, &docker, "test-cluster", "test:image")
+            .expect("archive fallback should run once after direct load retries are exhausted");
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        let direct_count = log
+            .lines()
+            .filter(|line| line == &"kind load docker-image --name test-cluster test:image")
+            .count();
+        let archive_count = log
+            .lines()
+            .filter(|line| line.starts_with("kind load image-archive --name test-cluster "))
+            .count();
+        let save_count = log
+            .lines()
+            .filter(|line| {
+                line.contains("docker image save --output ") && line.ends_with(" test:image")
+            })
+            .count();
+        assert_eq!(
+            direct_count, 3,
+            "kind load docker-image should retry exactly three times before falling back:
+{log}"
+        );
+        assert_eq!(
+            archive_count, 1,
+            "kind image-archive fallback should run once after retries are exhausted:
+{log}"
+        );
+        assert_eq!(
+            save_count, 1,
+            "docker image save should run once for the single archive fallback:
+{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_local_image_pulls_expected_platform_when_missing() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let log_path = temp.path().join("commands.log");
+        let state_path = temp.path().join("inspect-state");
+
+        fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nset -eu\nlog_path='{}'\nstate_path='{}'\nprintf 'docker %s\\n' \"$*\" \
+                 >> \"$log_path\"\nif [ \"$1\" = image ] && [ \"$2\" = inspect ] && [ \"$3\" = -f \
+                 ] && [ \"$4\" = '{{{{.Id}}}}|{{{{.Architecture}}}}' ] && [ \"$5\" = \
+                 'python:3.13-alpine' ]; then\n  if [ ! -f \"$state_path\" ]; then\n    exit 1\n  \
+                 fi\n  printf 'sha256:test|arm64\\n'\n  exit 0\nfi\nif [ \"$1\" = pull ] && [ \
+                 \"$2\" = --platform ] && [ \"$3\" = 'linux/arm64' ] && [ \"$4\" = \
+                 'python:3.13-alpine' ]; then\n  printf pulled > \"$state_path\"\n  exit \
+                 0\nfi\necho \"unexpected docker invocation: $*\" >&2\nexit 1\n",
+                log_path.display(),
+                state_path.display(),
+            ),
+        )
+        .expect("docker stub should write");
+        let mut permissions = fs::metadata(&docker)
+            .expect("stub metadata should read")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&docker, permissions).expect("stub should chmod");
+
+        let meta = ensure_local_image_with_binaries(&docker, "python:3.13-alpine", "arm64")
+            .expect("missing image should be pulled for the expected platform");
+        assert_eq!(
+            meta,
+            DockerImageMeta {
+                id: "sha256:test".to_string(),
+                arch: "arm64".to_string(),
+            }
+        );
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        assert!(
+            log.lines()
+                .any(|line| line == "docker pull --platform linux/arm64 python:3.13-alpine"),
+            "docker pull should request the expected platform:\n{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_local_image_repulls_expected_platform_when_local_arch_is_wrong() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let log_path = temp.path().join("commands.log");
+        let state_path = temp.path().join("inspect-state");
+
+        fs::write(
+            &docker,
+            format!(
+                r#"#!/bin/sh
+set -eu
+log_path='{}'
+state_path='{}'
+printf 'docker %s
+' "$*" >> "$log_path"
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = -f ] && [ "$4" = '{{{{.Id}}}}|{{{{.Architecture}}}}' ] && [ "$5" = 'python:3.13-alpine' ]; then
+  if [ -f "$state_path" ]; then
+    printf 'sha256:test|arm64
+'
+  else
+    printf 'sha256:stale|amd64
+'
+  fi
+  exit 0
+fi
+if [ "$1" = pull ] && [ "$2" = --platform ] && [ "$3" = 'linux/arm64' ] && [ "$4" = 'python:3.13-alpine' ]; then
+  printf pulled > "$state_path"
+  exit 0
+fi
+echo "unexpected docker invocation: $*" >&2
+exit 1
+"#,
+                log_path.display(),
+                state_path.display(),
+            ),
+        )
+        .expect("docker stub should write");
+        let mut permissions = fs::metadata(&docker)
+            .expect("stub metadata should read")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&docker, permissions).expect("stub should chmod");
+
+        let meta = ensure_local_image_with_binaries(&docker, "python:3.13-alpine", "arm64")
+            .expect("wrong-arch image should be repulled for the expected platform");
+        assert_eq!(
+            meta,
+            DockerImageMeta {
+                id: "sha256:test".to_string(),
+                arch: "arm64".to_string(),
+            }
+        );
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        assert!(
+            log.lines()
+                .any(|line| line == "docker pull --platform linux/arm64 python:3.13-alpine"),
+            "wrong-arch local images should be repulled for the expected platform:
+{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_app_image_builds_a_local_wrapper_image() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let docker = temp.path().join("docker");
+        let log_path = temp.path().join("commands.log");
+        let state_path = temp.path().join("inspect-state");
+        let dockerfile_copy = temp.path().join("Dockerfile");
+
+        fs::write(
+            &docker,
+            format!(
+                r#"#!/bin/sh
+set -eu
+log_path='{}'
+state_path='{}'
+dockerfile_copy='{}'
+printf 'docker %s
+' "$*" >> "$log_path"
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = -f ] && [ "$4" = '{{{{.Id}}}}|{{{{.Architecture}}}}' ] && [ "$5" = 'python:3.13-alpine' ]; then
+  if [ ! -f "$state_path" ]; then
+    exit 1
+  fi
+  printf 'sha256:test|arm64
+'
+  exit 0
+fi
+if [ "$1" = pull ] && [ "$2" = --platform ] && [ "$3" = 'linux/arm64' ] && [ "$4" = 'python:3.13-alpine' ]; then
+  printf pulled > "$state_path"
+  exit 0
+fi
+if [ "$1" = build ] && [ "$2" = --platform ] && [ "$3" = 'linux/arm64' ] && [ "$4" = -t ] && [ "$5" = 'amber-mixed-run-test-app:arm64' ]; then
+  cp "$6/Dockerfile" "$dockerfile_copy"
+  exit 0
+fi
+echo "unexpected docker invocation: $*" >&2
+exit 1
+"#,
+                log_path.display(),
+                state_path.display(),
+                dockerfile_copy.display(),
+            ),
+        )
+        .expect("docker stub should write");
+        let mut permissions = fs::metadata(&docker)
+            .expect("stub metadata should read")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&docker, permissions).expect("stub should chmod");
+
+        let local_tag = build_test_app_image_with_binaries(&docker, "python:3.13-alpine", "arm64")
+            .expect("test app image should build a local wrapper image");
+        assert_eq!(local_tag, "amber-mixed-run-test-app:arm64");
+
+        let log = fs::read_to_string(&log_path).expect("commands log should read");
+        assert!(
+            log.lines().any(|line| {
+                line == "docker build --platform linux/arm64 -t amber-mixed-run-test-app:arm64"
+                    || line.starts_with(
+                        "docker build --platform linux/arm64 -t amber-mixed-run-test-app:arm64 ",
+                    )
+            }),
+            "test app image should be built as a local wrapper image:
+{log}"
+        );
+        assert_eq!(
+            fs::read_to_string(&dockerfile_copy).expect("copied Dockerfile should read"),
+            "FROM python:3.13-alpine
+",
+            "test app image wrapper should inherit from the upstream python base image",
+        );
+    }
 }

@@ -351,7 +351,7 @@ Supported `from` sources (current):
 * `slots.<name>`: mount a storage slot as a directory. The referenced slot must exist and have
   `kind: "storage"`.
 * `framework.docker`: requires `experimental_features: ["docker"]`. In Docker Compose output, this
-  injects a Docker socket mount backed by the framework docker gateway.
+  injects a Docker socket mount backed by the router-owned framework docker gateway.
 * `framework.kvm`: requires `experimental_features: ["kvm"]`. In Docker Compose output, adds a
   `/dev/kvm` device mapping to the container for hardware-accelerated virtualization (QEMU/KVM).
   Also adds the `kvm` group to the container via `group_add`, using the `AMBER_KVM_GID` environment
@@ -359,9 +359,11 @@ Supported `from` sources (current):
   `stat -c %g /dev/kvm`). The generated `env.example` includes this variable. Other
   targets (e.g. Kubernetes) do not yet support this capability.
 
-Reserved (not implemented yet):
+Reserved (not implemented for mounts):
 
-* `framework.<capability>` other than `framework.docker` and `framework.kvm`
+* `framework.component` exists only as a binding source; it cannot be mounted.
+* `framework.<capability>` other than `framework.component`, `framework.docker`, and
+  `framework.kvm`
 
 Mount value formatting:
 
@@ -567,9 +569,9 @@ config_schema: {
 
 ### Capability declaration shape
 
-Both slots and provides share:
+Slots, resources, and provides use capability declarations:
 
-* `kind`: `"mcp" | "llm" | "http" | "docker" | "a2a" | "storage"`
+* `kind`: `"mcp" | "llm" | "http" | "component" | "docker" | "a2a" | "storage" | "kvm"`
 * `profile` (optional): string qualifier (often used for `"mcp"`)
 
 Example:
@@ -689,6 +691,9 @@ Notes:
 * This crate enforces that each provide declares an `endpoint` and that it refers to a declared endpoint name.
 * `provides` cannot declare `kind: "storage"`. Storage is routed through `slots` and `bindings`,
   then consumed via `program.mounts`.
+* `provides` cannot declare framework-owned kinds: `"component"`, `"docker"`, or `"kvm"`.
+  Those capability sources are created only by `framework.component`, `framework.docker`, and
+  `framework.kvm`.
 * To forward a child capability, use `exports` pointing at `#child.<name>`.
 
 ### `exports`
@@ -804,6 +809,7 @@ Framework capabilities are a fixed compiler-known list.
 
 Current framework capabilities:
 
+* `component` (`framework.component`) — framework-provided dynamic child component management.
 * `docker` (`framework.docker`) — requires `experimental_features: ["docker"]` in the same
   manifest.
 * `kvm` (`framework.kvm`) — requires `experimental_features: ["kvm"]`. Docker Compose only. Adds a `/dev/kvm` device mapping to the container.

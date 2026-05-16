@@ -102,6 +102,50 @@ fn top_level_help_groups_authoring_and_runtime_workflows() {
 }
 
 #[test]
+fn scenario_ir_input_rejects_framework_owned_provide_kinds() {
+    for kind in ["component", "docker", "kvm"] {
+        let temp = tempfile::tempdir().expect("tempdir should exist");
+        let path = temp.path().join(format!("{kind}.json"));
+        let ir = serde_json::json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": amber_scenario::SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [],
+                    "digest": amber_manifest::ManifestDigest::new([0u8; 32]).to_string(),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {
+                        "api": {
+                            "kind": kind,
+                            "endpoint": "api"
+                        }
+                    }
+                }
+            ],
+            "bindings": [],
+            "exports": []
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&ir).expect("IR should serialize"),
+        )
+        .expect("IR should be written");
+
+        let err = load_compiled_scenario_ir(&path)
+            .expect_err("framework-owned provide kind should be rejected");
+        let rendered = err.to_string();
+        assert!(rendered.contains("framework-owned"), "{rendered}");
+        assert!(rendered.contains(kind), "{rendered}");
+    }
+}
+
+#[test]
 fn attached_run_overview_stays_focused_on_identity_and_exports() {
     let mut output = Vec::new();
     print_run_session_overview(
@@ -222,6 +266,76 @@ fn proxy_telemetry_keeps_router_info_without_verbose_output() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn direct_runtime_only_isolates_non_controller_components() {
+    let controller = DirectComponentPlan {
+        id: 1,
+        moniker: amber_compiler::run_plan::FrameworkComponentControllerMoniker::for_site(
+            "direct_local",
+        )
+        .into_string(),
+        log_name: "controller".to_string(),
+        source_dir: None,
+        depends_on: Vec::new(),
+        sidecar: amber_compiler::reporter::direct::DirectSidecarPlan {
+            log_name: "controller-sidecar".to_string(),
+            mesh_port: 0,
+            mesh_config_path: "mesh/components/controller/mesh-config.json".to_string(),
+            mesh_identity_path: "mesh/components/controller/mesh-identity.json".to_string(),
+            env_passthrough: Vec::new(),
+        },
+        program: amber_compiler::reporter::direct::DirectProgramPlan {
+            log_name: "controller-program".to_string(),
+            work_dir: "work/components/controller".to_string(),
+            storage_mounts: Vec::new(),
+            execution: DirectProgramExecutionPlan::InternalSiteController,
+        },
+    };
+    let app = DirectComponentPlan {
+        id: 2,
+        moniker: "/app".to_string(),
+        log_name: "app".to_string(),
+        source_dir: Some("/workspace/scenarios/app".to_string()),
+        depends_on: Vec::new(),
+        sidecar: amber_compiler::reporter::direct::DirectSidecarPlan {
+            log_name: "app-sidecar".to_string(),
+            mesh_port: 0,
+            mesh_config_path: "mesh/components/app/mesh-config.json".to_string(),
+            mesh_identity_path: "mesh/components/app/mesh-identity.json".to_string(),
+            env_passthrough: Vec::new(),
+        },
+        program: amber_compiler::reporter::direct::DirectProgramPlan {
+            log_name: "app-program".to_string(),
+            work_dir: "work/components/app".to_string(),
+            storage_mounts: Vec::new(),
+            execution: DirectProgramExecutionPlan::Direct {
+                entrypoint: vec!["/bin/true".to_string()],
+                env: BTreeMap::new(),
+            },
+        },
+    };
+
+    assert_eq!(
+        direct_component_sidecar_network(&controller),
+        ProcessNetwork::Host
+    );
+    assert!(!direct_component_uses_isolated_network(&controller));
+    assert!(!direct_component_program_joins_sidecar(&controller));
+    assert_eq!(direct_program_network_override(&controller), "host");
+
+    assert_eq!(
+        direct_component_sidecar_network(&app),
+        ProcessNetwork::Isolated
+    );
+    assert!(direct_component_uses_isolated_network(&app));
+    assert!(direct_component_program_joins_sidecar(&app));
+    assert_eq!(
+        direct_program_network_override(&app),
+        "join_component_sidecar"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn component_program_read_only_mounts_resolve_parent_escape_paths() {
     let component = DirectComponentPlan {
         id: 3,
@@ -310,6 +424,7 @@ fn build_runtime_template_context_uses_runtime_slot_ports() {
         dynamic_caps_port_by_component: BTreeMap::new(),
         component_mesh_port_by_id: BTreeMap::new(),
         router_mesh_port: None,
+        ready: false,
     };
 
     let context =
@@ -888,6 +1003,142 @@ async fn cleanup_direct_runtime_removes_partial_startup_artifacts() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cleanup_direct_runtime_terminates_wrapper_descendants() {
+    let plan_root = tempfile::tempdir().expect("temp dir should be created");
+    let runtime_dir = tempfile::Builder::new()
+        .prefix("amber-direct-test-")
+        .tempdir()
+        .expect("runtime dir should be created");
+    let runtime_root = runtime_dir.path().to_path_buf();
+    let runtime_state_path = direct_runtime_state_path(plan_root.path());
+    fs::create_dir_all(runtime_state_path.parent().expect("state parent"))
+        .expect("state parent should be created");
+    fs::write(&runtime_state_path, "{}").expect("state file should be written");
+
+    let child_pid_path = runtime_root.join("child.pid");
+    // Use a real wrapper process so the test records the long-lived descendant PID rather than
+    // relying on shell job-control or `setsid` utility behavior.
+    let child = TokioCommand::new("python3")
+        .arg("-c")
+        .arg(
+            r#"
+import pathlib
+import subprocess
+import sys
+
+pid_path = pathlib.Path(sys.argv[1])
+child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+pid_path.write_text(f"{child.pid}\n", encoding="utf-8")
+child.wait()
+"#,
+        )
+        .arg(&child_pid_path)
+        .spawn()
+        .expect("wrapper should spawn");
+    let mut children = vec![ManagedChild {
+        name: "wrapper-with-descendant".to_string(),
+        wrapper: Some(child),
+        #[cfg(target_os = "linux")]
+        wrapper_pid: 0,
+        #[cfg(target_os = "linux")]
+        managed_pid: 0,
+    }];
+    #[cfg(target_os = "linux")]
+    {
+        let pid = children[0]
+            .wrapper
+            .as_ref()
+            .and_then(tokio::process::Child::id)
+            .expect("child pid should be available");
+        children[0].wrapper_pid = pid;
+        children[0].managed_pid = pid;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let child_pid = loop {
+        if Instant::now() >= deadline {
+            let contents = fs::read_to_string(&child_pid_path).unwrap_or_default();
+            panic!(
+                "descendant pid should be recorded before cleanup starts; last contents: {:?}",
+                contents,
+            );
+        }
+        match fs::read_to_string(&child_pid_path) {
+            Ok(contents) => {
+                let trimmed = contents.trim();
+                if let Ok(pid) = trimmed.parse::<u32>() {
+                    break pid;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("descendant pid file should be readable: {err}"),
+        }
+        sleep(Duration::from_millis(25)).await;
+    };
+    let wrapper_pid = children[0]
+        .wrapper
+        .as_ref()
+        .and_then(tokio::process::Child::id)
+        .expect("wrapper pid should be available");
+    let tree_deadline = Instant::now() + Duration::from_secs(5);
+    while descendant_parent_pid(child_pid) != Some(wrapper_pid) && Instant::now() < tree_deadline {
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        descendant_parent_pid(child_pid),
+        Some(wrapper_pid),
+        "descendant should appear in the process table under its wrapper before cleanup"
+    );
+
+    cleanup_direct_runtime(
+        &mut children,
+        Vec::new(),
+        &runtime_state_path,
+        None,
+        Some(runtime_dir),
+    )
+    .await;
+
+    let stopped = !crate::unix_process::pid_is_alive(child_pid);
+    let survivor = if stopped {
+        None
+    } else {
+        Some(
+            std::process::Command::new("ps")
+                .args(["-o", "pid=,ppid=,pgid=,stat=,command=", "-p"])
+                .arg(child_pid.to_string())
+                .output()
+                .ok()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .filter(|line| !line.is_empty())
+                .unwrap_or_else(|| "<survivor ps unavailable>".to_string()),
+        )
+    };
+    if !stopped {
+        let _ = unsafe { libc::kill(child_pid as i32, libc::SIGKILL) };
+    }
+    assert!(
+        stopped,
+        "cleanup should terminate descendants that outlive their wrapper; surviving process: {}",
+        survivor.unwrap_or_default()
+    );
+}
+
+#[cfg(unix)]
+fn descendant_parent_pid(pid: u32) -> Option<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p"])
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
 #[test]
 fn write_direct_runtime_state_preserves_projected_router_mesh_port() {
     let plan_root = tempfile::tempdir().expect("temp dir should be created");
@@ -1061,43 +1312,6 @@ fn rewrite_peer_addr_for_slirp_gateway_rewrites_loopback_only() {
     assert_eq!(
         rewrite_peer_addr_for_slirp_gateway("not-a-socket"),
         "not-a-socket"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn rewrite_loopback_url_for_slirp_gateway_rewrites_loopback_only() {
-    assert_eq!(
-        rewrite_loopback_url_for_slirp_gateway("http://127.0.0.1:23000/base?x=1"),
-        "http://10.0.2.2:23000/base?x=1"
-    );
-    assert_eq!(
-        rewrite_loopback_url_for_slirp_gateway("http://localhost:24000"),
-        "http://10.0.2.2:24000/"
-    );
-    assert_eq!(
-        rewrite_loopback_url_for_slirp_gateway("http://192.168.1.10:25000/path"),
-        "http://192.168.1.10:25000/path"
-    );
-    assert_eq!(
-        rewrite_loopback_url_for_slirp_gateway("not-a-url"),
-        "not-a-url"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn rewrite_sidecar_env_passthrough_for_slirp_rewrites_only_dynamic_caps_control_url() {
-    assert_eq!(
-        rewrite_sidecar_env_passthrough_for_slirp(
-            amber_mesh::DYNAMIC_CAPS_CONTROL_URL_ENV,
-            "http://127.0.0.1:25000/v1/control-state"
-        ),
-        "http://10.0.2.2:25000/v1/control-state"
-    );
-    assert_eq!(
-        rewrite_sidecar_env_passthrough_for_slirp("UNRELATED_ENV", "http://127.0.0.1:25000"),
-        "http://127.0.0.1:25000"
     );
 }
 

@@ -1,5 +1,6 @@
 use super::{planner::*, state::*, *};
 
+#[cfg(test)]
 pub(crate) fn authorize_capability_instance<'a>(
     state: &'a FrameworkControlState,
     cap_instance_id: &str,
@@ -15,6 +16,35 @@ pub(crate) fn authorize_capability_instance<'a>(
     Ok(record)
 }
 
+pub(crate) fn authorize_capability_route<'a>(
+    state: &'a FrameworkControlState,
+    route_id: &str,
+    peer_id: &str,
+) -> std::result::Result<&'a CapabilityInstanceRecord, ProtocolErrorResponse> {
+    let mut route_records = state
+        .capability_instances
+        .values()
+        .filter(|record| record.route_id == route_id);
+    let Some(first_record) = route_records.next() else {
+        return Err(protocol_error(
+            ProtocolErrorCode::Unauthorized,
+            "unknown framework capability instance",
+        ));
+    };
+    if first_record.recipient_peer_id == peer_id {
+        return Ok(first_record);
+    }
+    route_records
+        .find(|record| record.recipient_peer_id == peer_id)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::Unauthorized,
+                "framework capability instance is not bound to the authenticated mesh peer",
+            )
+        })
+}
+
+#[cfg(test)]
 pub(super) fn capability_instance_record<'a>(
     state: &'a FrameworkControlState,
     cap_instance_id: &str,
@@ -404,7 +434,6 @@ pub(super) struct ResolvedTemplateBinding {
 
 #[derive(Clone)]
 pub(super) struct SyntheticSourceRecord {
-    pub(super) slot_name: String,
     pub(super) actual_source: BindingFrom,
     pub(super) source_child_id: Option<u64>,
     pub(super) weak: bool,

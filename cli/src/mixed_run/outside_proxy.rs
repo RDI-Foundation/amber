@@ -344,22 +344,13 @@ pub(super) async fn stop_site_from_receipt(
         SiteKind::Compose => {
             if let Some(project_name) = site.compose_project.as_deref() {
                 let launch_env = read_compose_launch_env(run_root, site_id)?;
-                let status = compose_command(Some(project_name), Path::new(&site.artifact_dir))
-                    .envs(launch_env)
-                    .arg("down")
-                    .arg("-v")
-                    .arg("--remove-orphans")
-                    .status()
-                    .into_diagnostic()
-                    .wrap_err_with(|| {
-                        format!("failed to stop orphaned compose site `{project_name}`")
-                    })?;
-                if !status.success() {
-                    return Err(miette::miette!(
-                        "orphaned compose site `{project_name}` failed to stop with status \
-                         {status}"
-                    ));
-                }
+                stop_compose_site_with_docker(
+                    Path::new("docker"),
+                    project_name,
+                    Path::new(&site.artifact_dir),
+                    &launch_env,
+                    Duration::from_secs(30),
+                )?;
             }
         }
         SiteKind::Kubernetes => {
@@ -367,27 +358,87 @@ pub(super) async fn stop_site_from_receipt(
                 send_sigterm(pid);
             }
             if let Some(namespace) = site.kubernetes_namespace.as_deref() {
-                let status = kubectl_command(site.context.as_deref())
-                    .arg("delete")
-                    .arg("namespace")
-                    .arg(namespace)
-                    .arg("--ignore-not-found")
-                    .status()
-                    .into_diagnostic()
-                    .wrap_err_with(|| {
-                        format!("failed to stop orphaned kubernetes site `{namespace}`")
-                    })?;
-                if !status.success() {
-                    return Err(miette::miette!(
-                        "orphaned kubernetes site `{namespace}` failed to stop with status \
-                         {status}"
-                    ));
-                }
+                stop_kubernetes_namespace(
+                    site.context.as_deref(),
+                    namespace,
+                    KUBERNETES_NAMESPACE_DELETE_TIMEOUT,
+                )
+                .wrap_err_with(|| {
+                    format!("failed to stop orphaned kubernetes site `{namespace}`")
+                })?;
             }
         }
     }
     cleanup_dynamic_site_children(&run_root.join("state").join(site_id), site.kind)?;
     Ok(())
+}
+
+fn stop_compose_site_with_docker(
+    docker_bin: &Path,
+    project_name: &str,
+    artifact_dir: &Path,
+    launch_env: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<()> {
+    let status = compose_command_with_docker_bin(docker_bin, Some(project_name), artifact_dir)
+        .envs(launch_env)
+        .arg("down")
+        .arg("-v")
+        .arg("--remove-orphans")
+        .status()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to stop orphaned compose site `{project_name}`"))?;
+    if !status.success() {
+        return Err(miette::miette!(
+            "orphaned compose site `{project_name}` failed to stop with status {status}"
+        ));
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = compose_command_with_docker_bin(docker_bin, Some(project_name), artifact_dir)
+            .envs(launch_env)
+            .arg("ps")
+            .arg("-q")
+            .output()
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("failed to verify orphaned compose site `{project_name}` is stopped")
+            })?;
+        if !output.status.success() {
+            return Err(miette::miette!(
+                "failed to verify orphaned compose site `{project_name}` is \
+                 stopped\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ));
+        }
+        if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "timed out waiting for orphaned compose site `{project_name}` to fully stop"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn compose_command_with_docker_bin(
+    docker_bin: &Path,
+    project_name: Option<&str>,
+    artifact_dir: &Path,
+) -> Command {
+    let mut cmd = Command::new(docker_bin);
+    cmd.arg("compose")
+        .arg("-f")
+        .arg(artifact_dir.join("compose.yaml"));
+    if let Some(project_name) = project_name {
+        cmd.arg("-p").arg(project_name);
+    }
+    cmd.current_dir(artifact_dir);
+    cmd
 }
 
 pub(super) fn resolve_proxy_run_root(
@@ -640,4 +691,65 @@ pub(super) async fn wait_for_socket_listener(addr: SocketAddr) -> Result<()> {
         sleep(Duration::from_millis(100)).await;
     }
     Err(miette::miette!("timed out waiting for listener {}", addr))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    #[test]
+    fn stop_compose_site_waits_for_ps_to_empty_after_down_returns() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let artifact_dir = temp.path().join("artifact");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        fs::write(artifact_dir.join("compose.yaml"), "services: {}\n").expect("compose file");
+
+        let docker = temp.path().join("docker");
+        let log_path = temp.path().join("docker.log");
+        let count_path = temp.path().join("ps-count");
+        fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nset -eu\nlog_path='{}'\ncount_path='{}'\nprintf '%s\\n' \"$*\" >> \
+                 \"$log_path\"\nif [ \"${{1:-}}\" = compose ] && [ \"${{6:-}}\" = down ]; \
+                 then\nexit 0\nfi\nif [ \"${{1:-}}\" = compose ] && [ \"${{6:-}}\" = ps ] && [ \
+                 \"${{7:-}}\" = -q ]; then\ncount=0\nif [ -f \"$count_path\" ]; then\ncount=$(cat \
+                 \"$count_path\")\nfi\ncount=$((count + 1))\nprintf '%s' \"$count\" > \
+                 \"$count_path\"\nif [ \"$count\" -lt 3 ]; then\nprintf \
+                 'container-id\\n'\nfi\nexit 0\nfi\necho \"unexpected docker invocation: $*\" \
+                 >&2\nexit 1\n",
+                log_path.display(),
+                count_path.display(),
+            ),
+        )
+        .expect("docker stub");
+        let mut perms = fs::metadata(&docker)
+            .expect("docker metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&docker, perms).expect("docker chmod");
+
+        stop_compose_site_with_docker(
+            &docker,
+            "amber-test-project",
+            &artifact_dir,
+            &BTreeMap::new(),
+            Duration::from_secs(1),
+        )
+        .expect("compose stop should wait for project removal");
+
+        let log = fs::read_to_string(&log_path).expect("docker log");
+        let ps_polls = log.lines().filter(|line| line.contains(" ps -q")).count();
+        assert!(
+            log.lines()
+                .any(|line| line.contains(" down -v --remove-orphans")),
+            "expected compose down invocation in log:\n{log}"
+        );
+        assert!(
+            ps_polls >= 3,
+            "expected repeated compose ps polling after down, got {ps_polls} polls:\n{log}"
+        );
+    }
 }

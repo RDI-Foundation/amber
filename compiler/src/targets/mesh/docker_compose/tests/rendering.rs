@@ -125,6 +125,79 @@ fn compose_storage_volume_names_include_identity_hash() {
 }
 
 #[test]
+fn compose_sidecars_expose_control_socket_volume() {
+    let program = lower_test_program(
+        0,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["sh", "-lc", "sleep infinity"],
+            "env": {}
+        }),
+    );
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        metadata: None,
+        child_templates: BTreeMap::new(),
+        children: Vec::new(),
+    };
+    let artifact = render_compose(&compile_output(Scenario {
+        manifest_catalog: BTreeMap::new(),
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    }))
+    .expect("compose render ok");
+    let compose = parse_compose(&artifact);
+    let sidecar_name = compose
+        .services
+        .keys()
+        .find_map(|name| {
+            let name = name.as_str();
+            name.ends_with("-net").then_some(name)
+        })
+        .expect("sidecar service");
+    let sidecar = service(&compose, sidecar_name);
+    assert_eq!(
+        env_value(sidecar, "AMBER_ROUTER_CONTROL_SOCKET_PATH").as_deref(),
+        Some("/amber/control/router-control.sock")
+    );
+    assert!(
+        sidecar
+            .volumes
+            .iter()
+            .any(|mount| mount.ends_with(":/amber/control")),
+        "sidecar should mount a writable control socket volume: {:?}",
+        sidecar.volumes
+    );
+    let control_init_name = format!("{sidecar_name}-control-init");
+    assert_depends_on(
+        sidecar,
+        &control_init_name,
+        "service_completed_successfully",
+    );
+    let control_init_service = service(&compose, &control_init_name);
+    assert_eq!(control_init_service.user.as_deref(), Some("0:0"));
+    assert!(
+        control_init_service
+            .volumes
+            .iter()
+            .any(|mount| mount.ends_with(":/amber/control")),
+        "sidecar control init should mount the sidecar control volume: {:?}",
+        control_init_service.volumes
+    );
+}
+
+#[test]
 fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
     let program = lower_test_program(
         0,
@@ -275,12 +348,27 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
         "{yaml}"
     );
     assert!(
+        sidecar
+            .extra_hosts
+            .iter()
+            .any(|entry| entry == super::HOST_GATEWAY_ENTRY),
+        "{yaml}"
+    );
+    assert!(
         !sidecar.networks.contains_key(super::BOUNDARY_NETWORK_NAME),
         "{yaml}"
     );
     assert_eq!(
         egress_init.network_mode.as_deref(),
         Some("service:c0-component-net"),
+        "{yaml}"
+    );
+    assert_eq!(
+        egress_init.command.as_ref(),
+        Some(&vec![
+            "install-network-guard".to_string(),
+            "23000".to_string()
+        ]),
         "{yaml}"
     );
     assert_eq!(egress_init.user.as_deref(), Some("0:0"), "{yaml}");
@@ -500,31 +588,17 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         "framework routing should not emit a bespoke docker gateway service"
     );
 
-    let (gateway_name, gateway) = injected_docker_gateway_service(&compose);
-    let expected_network_mode = format!("service:{gateway_name}-net");
-    assert_eq!(
-        gateway.network_mode.as_deref(),
-        Some(expected_network_mode.as_str()),
+    let (gateway_name, gateway) = injected_docker_gateway_sidecar(&compose);
+    assert_eq!(gateway.network_mode.as_deref(), None);
+    assert_eq!(gateway.user.as_deref(), Some("0:0"));
+    assert!(
+        gateway
+            .volumes
+            .iter()
+            .any(|volume| volume.ends_with(super::DOCKER_GATEWAY_CONTAINER_SOCK)),
+        "{yaml}"
     );
     assert_internal_service_rootfs_hardened(gateway, yaml.as_ref());
-
-    let gateway_config = env_value(gateway, super::DOCKER_GATEWAY_CONFIG_ENV)
-        .expect("gateway config env should be present");
-    let gateway_config_json: Value =
-        serde_json::from_str(&gateway_config).expect("gateway config should parse");
-    let callers = gateway_config_json["callers"]
-        .as_array()
-        .expect("callers should be an array");
-    assert_eq!(callers.len(), 1);
-    assert_eq!(callers[0]["host"], "127.0.0.1");
-    let gateway_component = callers[0]["component"]
-        .as_str()
-        .expect("gateway caller component should be a string");
-    assert!(
-        gateway_component.starts_with("/__amber_internal_framework_docker_gateway"),
-        "unexpected injected gateway component moniker: {gateway_component}"
-    );
-    assert_eq!(callers[0]["compose_service"], gateway_name);
 
     let program_service = service(&compose, "c0-component");
     assert_depends_on(program_service, gateway_name, "service_started");
@@ -532,6 +606,125 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         env_value(program_service, "DOCKER_HOST").as_deref(),
         Some("tcp://127.0.0.1:20000"),
     );
+}
+
+#[test]
+fn docker_compose_shared_framework_docker_gateway_preserves_consumer_identities() {
+    let slot_docker: SlotDecl = serde_json::from_value(json!({ "kind": "docker" })).unwrap();
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        metadata: None,
+        child_templates: BTreeMap::new(),
+        children: vec![ComponentId(1), ComponentId(2)],
+    };
+    let child = |id: usize, name: &str| Component {
+        id: ComponentId(id),
+        parent: Some(ComponentId(0)),
+        moniker: moniker(&format!("/{name}")),
+        digest: digest(id as u8),
+        config: None,
+        config_schema: None,
+        program: Some(lower_test_program(
+            id,
+            json!({
+                "image": "alpine:3.20",
+                "entrypoint": ["sh", "-lc", "sleep infinity"],
+                "env": {
+                    "DOCKER_HOST": "${slots.docker.url}",
+                },
+            }),
+        )),
+        slots: BTreeMap::from([("docker".to_string(), slot_docker.clone())]),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        metadata: None,
+        child_templates: BTreeMap::new(),
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
+        root: ComponentId(0),
+        components: vec![Some(root), Some(child(1, "alpha")), Some(child(2, "beta"))],
+        bindings: vec![
+            BindingEdge {
+                from: BindingFrom::Framework(amber_scenario::FrameworkRef {
+                    authority: ComponentId(0),
+                    capability: FrameworkCapabilityName::try_from("docker").unwrap(),
+                }),
+                to: SlotRef {
+                    component: ComponentId(1),
+                    name: "docker".to_string(),
+                },
+                weak: false,
+            },
+            BindingEdge {
+                from: BindingFrom::Framework(amber_scenario::FrameworkRef {
+                    authority: ComponentId(0),
+                    capability: FrameworkCapabilityName::try_from("docker").unwrap(),
+                }),
+                to: SlotRef {
+                    component: ComponentId(2),
+                    name: "docker".to_string(),
+                },
+                weak: false,
+            },
+        ],
+        exports: Vec::new(),
+    };
+
+    let output = compile_output_with_docker_feature(scenario);
+    let yaml = render_compose(&output).expect("compose render should succeed");
+    let compose = parse_compose(&yaml);
+    let plan = provision_plan(&compose);
+    let (gateway_name, _gateway) = injected_docker_gateway_sidecar(&compose);
+    let gateway_target = target_for_service(&plan, gateway_name);
+    let gateway_inbound = gateway_target
+        .config
+        .inbound
+        .iter()
+        .find(|route| {
+            route.capability == super::framework_docker_injection::FRAMEWORK_DOCKER_GATEWAY_PROVIDE
+        })
+        .expect("gateway inbound docker route");
+    assert_eq!(gateway_inbound.protocol, MeshProtocol::Tcp);
+    match &gateway_inbound.target {
+        amber_mesh::InboundTarget::DockerGateway {
+            docker_sock,
+            compose_project_env,
+        } => {
+            assert_eq!(docker_sock, Path::new(super::DOCKER_GATEWAY_CONTAINER_SOCK));
+            assert_eq!(compose_project_env, super::COMPOSE_PROJECT_NAME_ENV);
+        }
+        other => panic!("unexpected docker gateway target: {other:?}"),
+    }
+    assert_eq!(gateway_inbound.allowed_issuers.len(), 2);
+
+    for service_name in ["c1-alpha", "c2-beta"] {
+        let program_service = service(&compose, service_name);
+        assert_depends_on(program_service, gateway_name, "service_started");
+        assert_eq!(
+            env_value(program_service, "DOCKER_HOST").as_deref(),
+            Some("tcp://127.0.0.1:20000"),
+        );
+        let target = target_for_service(&plan, &format!("{service_name}-net"));
+        let outbound = target
+            .config
+            .outbound
+            .iter()
+            .find(|route| route.slot == "docker")
+            .expect("consumer outbound docker route");
+        assert_eq!(outbound.protocol, MeshProtocol::Tcp);
+    }
 }
 
 #[test]
@@ -586,12 +779,9 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
         "framework routing should not emit a bespoke docker gateway service"
     );
 
-    let (gateway_name, gateway) = injected_docker_gateway_service(&compose);
-    let expected_network_mode = format!("service:{gateway_name}-net");
-    assert_eq!(
-        gateway.network_mode.as_deref(),
-        Some(expected_network_mode.as_str()),
-    );
+    let (gateway_name, gateway) = injected_docker_gateway_sidecar(&compose);
+    assert_eq!(gateway.network_mode.as_deref(), None);
+    assert_internal_service_rootfs_hardened(gateway, yaml.as_ref());
 
     let program_service = service(&compose, "c0-component");
     let entrypoint = program_service
@@ -1221,6 +1411,13 @@ fn compose_emits_export_metadata_and_labels() {
     );
     let control_init_service = service(&compose, "amber-router-control-init");
     assert_eq!(control_init_service.user.as_deref(), Some("0:0"));
+    assert!(
+        control_init_service
+            .command
+            .as_ref()
+            .is_some_and(|command| command.iter().any(|arg| arg.contains("chmod 0770"))),
+        "router control dir should be group-accessible to the injected site controller"
+    );
     assert!(
         control_init_service
             .volumes

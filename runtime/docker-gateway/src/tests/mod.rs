@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
-    net::{IpAddr, Ipv4Addr, SocketAddrV4},
+    env,
+    net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -11,7 +12,7 @@ use hyper::client::conn::http1 as client_http1;
 use tempfile::TempDir;
 use tokio::{
     io::AsyncReadExt,
-    net::{TcpSocket, TcpStream, UnixListener},
+    net::{TcpListener, TcpStream, UnixListener},
     task::JoinHandle,
     time::timeout,
 };
@@ -234,23 +235,14 @@ struct GatewayHarness {
 }
 
 impl GatewayHarness {
-    async fn start(callers: Vec<CallerConfig>) -> Self {
+    async fn start(peer_id: impl Into<String>) -> Self {
         let docker = MockDocker::start().await;
-        let addr = reserve_loopback_socket_addr();
-        let config = DockerGatewayConfig {
-            listen: addr,
-            docker_sock: docker.socket_path.clone(),
-            compose_project: TEST_PROJECT.to_string(),
-            callers,
-        };
-
-        let task = tokio::spawn(async move {
-            if let Err(err) = run(config).await {
-                panic!("gateway run failed: {err}");
-            }
-        });
-
-        wait_until_gateway_listens(addr, &task).await;
+        let (addr, task) = start_gateway_listener(
+            docker.socket_path.clone(),
+            TEST_PROJECT.to_string(),
+            peer_id.into(),
+        )
+        .await;
         Self { addr, docker, task }
     }
 
@@ -291,11 +283,10 @@ struct GatewayClient {
 }
 
 impl GatewayClient {
-    async fn connect_from_socket(socket: TcpSocket, addr: SocketAddr) -> Self {
-        let stream = socket
-            .connect(addr)
+    async fn connect(addr: SocketAddr) -> Self {
+        let stream = TcpStream::connect(addr)
             .await
-            .unwrap_or_else(|err| panic!("connect from bound local source socket failed: {err}"));
+            .unwrap_or_else(|err| panic!("connect to gateway failed: {err}"));
         let io = TokioIo::new(stream);
         let (sender, conn) = client_http1::handshake(io)
             .await
@@ -398,35 +389,33 @@ impl Drop for GatewayClient {
     }
 }
 
-fn reserve_bound_loopback_socket() -> (TcpSocket, u16) {
-    let socket = TcpSocket::new_v4().expect("create v4 tcp socket");
-    socket
-        .bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
-        .expect("bind loopback tcp socket");
-    let local_port = socket.local_addr().expect("socket local addr").port();
-    (socket, local_port)
-}
-
-fn reserve_loopback_socket_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .expect("bind temporary loopback listener");
-    let addr = listener.local_addr().expect("local addr");
-    drop(listener);
-    addr
-}
-
-async fn wait_until_gateway_listens(addr: SocketAddr, task: &JoinHandle<()>) {
-    for _ in 0..400 {
-        if TcpStream::connect(addr).await.is_ok() {
-            return;
+async fn start_gateway_listener(
+    docker_sock: PathBuf,
+    compose_project: String,
+    peer_id: String,
+) -> (SocketAddr, JoinHandle<()>) {
+    let runtime = DockerGatewayRuntime::new(DockerGatewayConfig {
+        docker_sock,
+        compose_project,
+    })
+    .expect("valid gateway config");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind gateway test listener");
+    let addr = listener.local_addr().expect("gateway listener addr");
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept gateway test client");
+            let runtime = runtime.clone();
+            let peer_id = peer_id.clone();
+            tokio::spawn(async move {
+                if let Err(err) = runtime.serve_connection(stream, peer_id).await {
+                    eprintln!("gateway test connection failed: {err}");
+                }
+            });
         }
-        assert!(
-            !task.is_finished(),
-            "gateway task exited before listener was ready"
-        );
-        tokio::task::yield_now().await;
-    }
-    panic!("gateway listener did not come up at {addr}");
+    });
+    (addr, task)
 }
 
 async fn send_gateway_request(
@@ -439,22 +428,6 @@ async fn send_gateway_request(
     let stream = TcpStream::connect(addr)
         .await
         .unwrap_or_else(|err| panic!("connect to gateway failed: {err}"));
-    send_gateway_request_on_stream(stream, method, target, headers, body).await
-}
-
-async fn send_gateway_request_from_socket(
-    socket: TcpSocket,
-    source_port: u16,
-    addr: SocketAddr,
-    method: Method,
-    target: &str,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) -> GatewayResponse {
-    let stream = socket
-        .connect(addr)
-        .await
-        .unwrap_or_else(|err| panic!("connect from local source port {source_port} failed: {err}"));
     send_gateway_request_on_stream(stream, method, target, headers, body).await
 }
 
@@ -501,15 +474,6 @@ async fn send_gateway_request_on_stream(
     GatewayResponse { status, body }
 }
 
-fn default_caller() -> CallerConfig {
-    CallerConfig {
-        host: "127.0.0.1".to_string(),
-        port: None,
-        component: TEST_COMPONENT.to_string(),
-        compose_service: TEST_COMPONENT.to_string(),
-    }
-}
-
 fn container_labels(component: &str, project: &str) -> serde_json::Value {
     serde_json::json!({
         "Config": {
@@ -535,8 +499,7 @@ fn decode_filters(req: &CapturedRequest) -> serde_json::Value {
         .path_and_query
         .split_once('?')
         .expect("request should include query");
-    let query_map: HashMap<String, String> =
-        serde_urlencoded::from_str(query).expect("query should decode");
+    let query_map: HashMap<String, String> = parse_query_pairs(query).into_iter().collect();
     let filters = query_map.get("filters").expect("filters query param");
     serde_json::from_str(filters).expect("filters should be valid json")
 }

@@ -1,13 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
-    env,
-    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 
-use base64::Engine as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
@@ -28,19 +25,16 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_with::{DefaultOnNull, serde_as};
 use thiserror::Error;
 use tokio::{
-    net::{TcpListener, UnixStream},
-    sync::RwLock,
-    time::{sleep, timeout},
+    io::{AsyncRead, AsyncWrite},
+    net::UnixStream,
+    time::timeout,
 };
 
-const CONFIG_B64_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_B64";
-const CONFIG_JSON_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_JSON";
 const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
 #[cfg(test)]
 const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
 const AMBER_COMPONENT_LABEL: &str = "amber.component";
 const AMBER_PROJECT_LABEL: &str = "amber.project";
-const CALLER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
 const EXEC_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const EXEC_CACHE_MAX_ENTRIES: u64 = 8_192;
@@ -49,55 +43,28 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProxyBody = BoxBody<Bytes, BoxError>;
 type GatewayResult<T> = Result<T, Box<Response<ProxyBody>>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShutdownReason {
-    Interrupt,
-    Terminated,
-}
-
 #[derive(Debug, Error)]
 pub enum DockerGatewayError {
-    #[error("missing docker gateway config (set {CONFIG_B64_ENV} or {CONFIG_JSON_ENV})")]
-    MissingConfig,
     #[error("invalid docker gateway config: {0}")]
     InvalidConfig(String),
-    #[error("failed to bind {addr}: {source}")]
-    BindFailed {
-        addr: SocketAddr,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct DockerGatewayConfig {
-    pub listen: SocketAddr,
     pub docker_sock: PathBuf,
     pub compose_project: String,
-    pub callers: Vec<CallerConfig>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct CallerConfig {
-    pub host: String,
-    #[serde(default)]
-    pub port: Option<u16>,
-    pub component: String,
-    pub compose_service: String,
 }
 
 #[derive(Clone)]
 struct ConnState {
     state: Arc<State>,
-    peer: SocketAddr,
-    identity: Option<CallerIdentity>,
+    identity: CallerIdentity,
 }
 
 struct State {
     cfg: Arc<DockerGatewayConfig>,
     client: Client<UnixConnector, ProxyBody>,
     exec_map: Cache<String, String>,
-    callers_by_ip: RwLock<HashMap<IpAddr, Vec<ResolvedCaller>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,12 +76,6 @@ struct OwnerMeta {
 #[derive(Clone, Debug)]
 struct CallerIdentity {
     component: String,
-}
-
-#[derive(Clone, Debug)]
-struct ResolvedCaller {
-    component: String,
-    port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,60 +240,55 @@ struct NetworkingConfigRequest {
 }
 
 impl DockerGatewayConfig {
-    pub fn from_env() -> Result<Self, DockerGatewayError> {
-        if let Ok(b64) = env::var(CONFIG_B64_ENV) {
-            if b64.trim().is_empty() {
-                return Err(DockerGatewayError::MissingConfig);
-            }
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(b64.as_bytes())
-                .map_err(|err| DockerGatewayError::InvalidConfig(err.to_string()))?;
-            let parsed = serde_json::from_slice(&decoded)
-                .map_err(|err| DockerGatewayError::InvalidConfig(err.to_string()))?;
-            return Self::validate(parsed);
-        }
-
-        if let Ok(raw) = env::var(CONFIG_JSON_ENV) {
-            if raw.trim().is_empty() {
-                return Err(DockerGatewayError::MissingConfig);
-            }
-            let parsed = serde_json::from_str(&raw)
-                .map_err(|err| DockerGatewayError::InvalidConfig(err.to_string()))?;
-            return Self::validate(parsed);
-        }
-
-        Err(DockerGatewayError::MissingConfig)
-    }
-
-    fn validate(config: Self) -> Result<Self, DockerGatewayError> {
+    pub fn validate(config: Self) -> Result<Self, DockerGatewayError> {
         if config.compose_project.trim().is_empty() {
             return Err(DockerGatewayError::InvalidConfig(
                 "compose_project must not be empty".to_string(),
             ));
         }
-        if config.callers.is_empty() {
-            return Err(DockerGatewayError::InvalidConfig(
-                "callers must not be empty".to_string(),
-            ));
-        }
-        for caller in &config.callers {
-            if caller.host.trim().is_empty() {
-                return Err(DockerGatewayError::InvalidConfig(
-                    "caller host must not be empty".to_string(),
-                ));
-            }
-            if caller.component.trim().is_empty() {
-                return Err(DockerGatewayError::InvalidConfig(
-                    "caller component must not be empty".to_string(),
-                ));
-            }
-            if caller.compose_service.trim().is_empty() {
-                return Err(DockerGatewayError::InvalidConfig(
-                    "caller compose_service must not be empty".to_string(),
-                ));
-            }
-        }
         Ok(config)
+    }
+}
+
+#[derive(Clone)]
+pub struct DockerGatewayRuntime {
+    state: Arc<State>,
+}
+
+impl DockerGatewayRuntime {
+    pub fn new(config: DockerGatewayConfig) -> Result<Self, DockerGatewayError> {
+        Ok(Self {
+            state: Arc::new(State::new(DockerGatewayConfig::validate(config)?)),
+        })
+    }
+
+    pub async fn serve_connection<S>(&self, stream: S, peer_id: String) -> Result<(), BoxError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let conn_state = Arc::new(ConnState {
+            state: self.state.clone(),
+            identity: CallerIdentity { component: peer_id },
+        });
+        let svc = service_fn(move |req: Request<Incoming>| {
+            let conn_state = conn_state.clone();
+            async move {
+                let req = req.map(box_body_from_incoming);
+                Ok::<_, std::convert::Infallible>(handle(req, conn_state).await)
+            }
+        });
+
+        http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .serve_connection(TokioIo::new(stream), svc)
+            .with_upgrades()
+            .await
+            .map_err(|err| -> BoxError { Box::new(err) })
+    }
+
+    pub async fn cleanup_created_resources(&self) {
+        self.state.cleanup_created_resources().await;
     }
 }
 
@@ -347,67 +303,7 @@ impl State {
                 .time_to_live(EXEC_CACHE_TTL)
                 .max_capacity(EXEC_CACHE_MAX_ENTRIES)
                 .build(),
-            callers_by_ip: RwLock::new(HashMap::new()),
         }
-    }
-
-    async fn refresh_callers(&self) {
-        let mut callers_by_ip: HashMap<IpAddr, Vec<ResolvedCaller>> = HashMap::new();
-
-        for caller in &self.cfg.callers {
-            match tokio::net::lookup_host((caller.host.as_str(), 0)).await {
-                Ok(addrs) => {
-                    let mut saw_address = false;
-                    for addr in addrs {
-                        saw_address = true;
-                        callers_by_ip
-                            .entry(addr.ip())
-                            .or_default()
-                            .push(ResolvedCaller {
-                                component: caller.component.clone(),
-                                port: caller.port,
-                            });
-                    }
-
-                    if !saw_address {
-                        tracing::warn!(
-                            "docker gateway caller resolution returned no addresses for host {}",
-                            caller.host
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "docker gateway caller resolution failed for host {}: {err}",
-                        caller.host
-                    );
-                }
-            }
-        }
-
-        *self.callers_by_ip.write().await = callers_by_ip;
-    }
-
-    async fn resolve_identity(&self, peer: SocketAddr) -> Option<CallerIdentity> {
-        let callers = self.callers_by_ip.read().await;
-        let matches = callers.get(&peer.ip())?;
-
-        let mut identity: Option<&str> = None;
-        for entry in matches {
-            if entry.port.is_some_and(|port| port != peer.port()) {
-                continue;
-            }
-
-            match identity {
-                None => identity = Some(entry.component.as_str()),
-                Some(component) if component == entry.component.as_str() => {}
-                Some(_) => return None,
-            }
-        }
-
-        identity.map(|component| CallerIdentity {
-            component: component.to_string(),
-        })
     }
 
     async fn cleanup_created_resources(&self) {
@@ -499,108 +395,8 @@ impl State {
     }
 }
 
-async fn resolve_connection_identity(state: &State, peer: SocketAddr) -> Option<CallerIdentity> {
-    if let Some(identity) = state.resolve_identity(peer).await {
-        return Some(identity);
-    }
-    // Newly started compose networks can make caller hostnames resolvable a moment after startup.
-    // Refresh once on a miss so first requests do not fail with a transient unauthorized error.
-    state.refresh_callers().await;
-    state.resolve_identity(peer).await
-}
-
-pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> {
-    let state = Arc::new(State::new(config));
-    state.refresh_callers().await;
-
-    let refresh_state = state.clone();
-    let refresh_task = tokio::spawn(async move {
-        loop {
-            sleep(CALLER_REFRESH_INTERVAL).await;
-            refresh_state.refresh_callers().await;
-        }
-    });
-
-    let listener = TcpListener::bind(state.cfg.listen)
-        .await
-        .map_err(|source| DockerGatewayError::BindFailed {
-            addr: state.cfg.listen,
-            source,
-        })?;
-
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-
-    loop {
-        tokio::select! {
-            reason = &mut shutdown => {
-                refresh_task.abort();
-                match reason {
-                    ShutdownReason::Interrupt => {
-                        state.cleanup_created_resources().await;
-                    }
-                    ShutdownReason::Terminated => {
-                        // `docker compose down` sends SIGTERM and also performs its own teardown.
-                        // Skipping gateway cleanup avoids duplicate deletes and "No such container" races.
-                        tracing::warn!(
-                            "docker gateway received SIGTERM; skipping shutdown cleanup to avoid \
-                             teardown races"
-                        );
-                    }
-                }
-                return Ok(());
-            }
-            accepted = listener.accept() => {
-                let (stream, peer) = match accepted {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!("docker gateway accept failed: {err}");
-                        continue;
-                    }
-                };
-
-                let conn_state = Arc::new(ConnState {
-                    state: state.clone(),
-                    peer,
-                    identity: resolve_connection_identity(state.as_ref(), peer).await,
-                });
-
-                let io = TokioIo::new(stream);
-                let svc = service_fn(move |req: Request<Incoming>| {
-                    let conn_state = conn_state.clone();
-                    async move {
-                        let req = req.map(box_body_from_incoming);
-                        Ok::<_, std::convert::Infallible>(handle(req, conn_state).await)
-                    }
-                });
-
-                tokio::spawn(async move {
-                    if let Err(err) = http1::Builder::new()
-                        .preserve_header_case(true)
-                        .title_case_headers(true)
-                        .serve_connection(io, svc)
-                        .with_upgrades()
-                        .await
-                    {
-                        tracing::warn!("docker gateway connection failed: {err}");
-                    }
-                });
-            }
-        }
-    }
-}
-
 async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<ProxyBody> {
-    let id = match conn.identity.clone() {
-        Some(identity) => identity,
-        None => {
-            return docker_error(
-                StatusCode::UNAUTHORIZED,
-                format!("unauthorized peer {}", conn.peer),
-            );
-        }
-    };
-
+    let id = conn.identity.clone();
     let (ver_opt, segs) = split_version_and_segments(req.uri().path());
     let version_prefix = ver_opt.unwrap_or_else(|| "".to_string());
 
@@ -629,7 +425,7 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
         let is_pull = req
             .uri()
             .query()
-            .and_then(|q| serde_urlencoded::from_str::<Vec<(String, String)>>(q).ok())
+            .map(parse_query_pairs)
             .map(|params| {
                 params.iter().any(|(k, _)| k == "fromImage")
                     && !params.iter().any(|(k, _)| k == "fromSrc")
@@ -916,34 +712,7 @@ fn build_label_filter_query(required_labels: &[String], include_all: bool) -> St
     }
     query_pairs.push(("filters".to_string(), encoded_filters));
 
-    serde_urlencoded::to_string(query_pairs)
-        .expect("serializing static label query params should succeed")
-}
-
-async fn shutdown_signal() -> ShutdownReason {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        match signal(SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => ShutdownReason::Interrupt,
-                    _ = sigterm.recv() => ShutdownReason::Terminated,
-                }
-            }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                ShutdownReason::Interrupt
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        return ShutdownReason::Interrupt;
-    }
+    encode_query_pairs(&query_pairs)
 }
 
 async fn forward(mut req: Request<ProxyBody>, state: Arc<State>) -> Response<ProxyBody> {
@@ -1520,15 +1289,24 @@ fn ensure_host(req: &mut Request<ProxyBody>) {
     }
 }
 
+fn parse_query_pairs(query: &str) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect()
+}
+
+fn encode_query_pairs(pairs: &[(String, String)]) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in pairs {
+        serializer.append_pair(key, value);
+    }
+    serializer.finish()
+}
+
 fn add_label_filters_to_uri(uri: &Uri, required: &[String]) -> GatewayResult<Uri> {
     let path = uri.path().to_string();
     let mut pairs: Vec<(String, String)> = match uri.query() {
-        Some(query) => serde_urlencoded::from_str(query).map_err(|err| {
-            boxed_response(docker_error(
-                StatusCode::BAD_REQUEST,
-                format!("invalid query parameters: {err}"),
-            ))
-        })?,
+        Some(query) => parse_query_pairs(query),
         None => Vec::new(),
     };
 
@@ -1570,12 +1348,7 @@ fn add_label_filters_to_uri(uri: &Uri, required: &[String]) -> GatewayResult<Uri
         pairs.push(("filters".to_string(), new_filters));
     }
 
-    let new_query = serde_urlencoded::to_string(&pairs).map_err(|err| {
-        boxed_response(docker_error(
-            StatusCode::BAD_REQUEST,
-            format!("query parameter serialization error: {err}"),
-        ))
-    })?;
+    let new_query = encode_query_pairs(&pairs);
 
     let path_and_query = if new_query.is_empty() {
         path

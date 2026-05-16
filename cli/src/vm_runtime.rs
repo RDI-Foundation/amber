@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     hash::{Hash as _, Hasher as _},
     io::{Seek as _, SeekFrom, Write as _},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitStatus, Stdio},
 };
@@ -54,10 +54,7 @@ mod state;
 use self::{artifacts::*, preview::*, state::*};
 pub(crate) use self::{
     preview::build_vm_site_launch_preview,
-    state::{
-        ensure_control_socket_link, vm_current_control_socket_path,
-        vm_endpoint_forward_ready_timeout, write_vm_runtime_state,
-    },
+    state::{vm_current_control_socket_path, vm_endpoint_forward_ready_timeout},
 };
 
 const VM_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
@@ -800,13 +797,13 @@ fn resolve_vm_runtime_host_path(raw_path: &str, source_dir: Option<&str>) -> Res
 }
 
 pub(crate) fn vm_uses_tcg_accel() -> bool {
-    matches!(detect_qemu_accel(), QemuAccel::Tcg)
+    amber_site_controller::vm_uses_tcg_accel()
 }
 
 fn detect_qemu_accel() -> QemuAccel {
     #[cfg(target_os = "macos")]
     {
-        if env::var_os("AMBER_VM_FORCE_TCG").is_some() {
+        if vm_uses_tcg_accel() {
             QemuAccel::Tcg
         } else {
             QemuAccel::Hvf
@@ -815,12 +812,10 @@ fn detect_qemu_accel() -> QemuAccel {
 
     #[cfg(target_os = "linux")]
     {
-        if env::var_os("AMBER_VM_FORCE_TCG").is_some() {
+        if vm_uses_tcg_accel() {
             QemuAccel::Tcg
-        } else if Path::new("/dev/kvm").exists() {
-            QemuAccel::Kvm
         } else {
-            QemuAccel::Tcg
+            QemuAccel::Kvm
         }
     }
 

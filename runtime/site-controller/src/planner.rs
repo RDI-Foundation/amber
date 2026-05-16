@@ -1,4 +1,16 @@
 use super::{api::*, state::*, *};
+use crate::runtime_api::SharedSiteControllerRuntime;
+
+#[derive(Clone, Debug)]
+pub(crate) struct LocalChildRuntimeSpec {
+    pub(crate) component_ids: Vec<usize>,
+    pub(crate) assigned_components: Vec<String>,
+    pub(crate) child_artifact_files: BTreeMap<String, String>,
+    pub(crate) site_artifact_files: BTreeMap<String, String>,
+    pub(crate) controller_routes: Vec<amber_mesh::InboundRoute>,
+    pub(crate) proxy_exports: BTreeMap<String, DynamicProxyExportRecord>,
+    pub(crate) direct_inputs: Vec<DynamicInputDirectRecord>,
+}
 
 pub(super) async fn prepare_child_record(
     state: &mut FrameworkControlState,
@@ -57,6 +69,19 @@ pub(super) async fn prepare_child_record(
         BTreeMap::from([(wrapper_url.to_string(), wrapper_manifest)]),
     )
     .await?;
+    let compiled = amber_compiler::run_plan::lower_framework_component_bindings_for_placement(
+        &compiled,
+        &placement_file_from_state(state),
+    )
+    .map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "failed to lower framework.component bindings in dynamic child `{}`: {err}",
+                request.name
+            ),
+        )
+    })?;
     let (fragment, outputs) = extract_live_child_fragment(
         state,
         &compiled,
@@ -76,7 +101,6 @@ pub(super) async fn prepare_child_record(
         fragment: Some(fragment),
         input_bindings: child_input_binding_records(&live_scenario, &resolved_bindings),
         assignments: BTreeMap::new(),
-        site_plans: Vec::new(),
         overlay_ids: Vec::new(),
         overlays: Vec::new(),
         outputs,
@@ -130,14 +154,6 @@ pub(super) fn rebuild_live_child_runtime_metadata(
     child.overlays = dynamic_overlay_records(&planned.incident_links, fragment);
     let mut live_assignments = existing_assignments.clone();
     live_assignments.extend(child.assignments.clone());
-    child.site_plans = dynamic_site_plans(
-        &planned.site_plans,
-        &child.assignments,
-        fragment,
-        &child.outputs,
-        &child.overlays,
-        &dynamic_input_route_records(&live_assignments, fragment, &child.input_bindings),
-    )?;
     child.overlay_ids = child
         .overlays
         .iter()
@@ -1031,23 +1047,11 @@ pub(super) fn build_wrapper_manifest(
             synthetic_sources.insert(
                 synthetic_name.clone(),
                 SyntheticSourceRecord {
-                    slot_name: binding.slot_name.clone(),
                     actual_source,
                     source_child_id,
                     weak: source.weak,
                 },
             );
-
-            if let BindingFrom::Framework(framework) = &source.from {
-                bindings.push(raw_binding(
-                    &format!("#{child_name}"),
-                    binding.slot_name.clone(),
-                    "framework",
-                    framework.capability.to_string(),
-                    source.weak,
-                )?);
-                continue;
-            }
 
             slots.insert(
                 synthetic_name.clone(),
@@ -1154,12 +1158,12 @@ pub(super) fn wrapper_manifest_url(authority_realm_id: usize, child_id: u64) -> 
 }
 
 pub(super) fn allocate_child_id(state: &mut FrameworkControlState) -> u64 {
-    state.next_child_id += 1;
+    state.next_child_id += state.id_stride.max(1);
     state.next_child_id
 }
 
 pub(super) fn allocate_tx_id(state: &mut FrameworkControlState) -> u64 {
-    state.next_tx_id += 1;
+    state.next_tx_id += state.id_stride.max(1);
     state.next_tx_id
 }
 
@@ -1300,14 +1304,194 @@ pub(super) fn remove_child_record(
     Ok(())
 }
 
-pub(super) fn dynamic_site_plans(
-    desired_site_plans: &BTreeMap<String, amber_compiler::run_plan::RunSitePlan>,
+struct LocalChildRuntimeSpecInputs<'a> {
+    state: &'a FrameworkControlState,
+    outputs: &'a BTreeMap<String, OutputHandleRecord>,
+    overlays: &'a [DynamicOverlayRecord],
+    direct_inputs: &'a [DynamicInputDirectRecord],
+}
+
+fn parse_mesh_provision_plan_artifact(
+    artifact_files: &BTreeMap<String, String>,
+) -> std::result::Result<Option<amber_mesh::MeshProvisionPlan>, ProtocolErrorResponse> {
+    if let Some(raw) = artifact_files.get("mesh-provision-plan.json") {
+        return serde_json::from_str(raw).map(Some).map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("mesh-provision-plan.json is not a valid mesh provision plan: {err}"),
+            )
+        });
+    }
+
+    if let Some(raw) = artifact_files.get("compose.yaml") {
+        let document: serde_yaml::Value = serde_yaml::from_str(raw).map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("compose.yaml is not valid YAML: {err}"),
+            )
+        })?;
+        let content = document
+            .as_mapping()
+            .and_then(|root| root.get(serde_yaml::Value::String("configs".to_string())))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|configs| {
+                configs.get(serde_yaml::Value::String(
+                    "amber-mesh-provision-plan".to_string(),
+                ))
+            })
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|config| config.get(serde_yaml::Value::String("content".to_string())))
+            .and_then(serde_yaml::Value::as_str)
+            .ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    "compose.yaml is missing configs.amber-mesh-provision-plan.content",
+                )
+            })?;
+        return serde_json::from_str(content).map(Some).map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("compose.yaml has an invalid embedded mesh provision plan: {err}"),
+            )
+        });
+    }
+
+    if let Some(raw) = artifact_files.get("01-configmaps/amber-mesh-provision.yaml") {
+        let document: serde_yaml::Value = serde_yaml::from_str(raw).map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("01-configmaps/amber-mesh-provision.yaml is not valid YAML: {err}"),
+            )
+        })?;
+        let content = document
+            .as_mapping()
+            .and_then(|root| root.get(serde_yaml::Value::String("data".to_string())))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|data| data.get(serde_yaml::Value::String("mesh-plan.json".to_string())))
+            .and_then(serde_yaml::Value::as_str)
+            .ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    "01-configmaps/amber-mesh-provision.yaml is missing data.mesh-plan.json",
+                )
+            })?;
+        return serde_json::from_str(content).map(Some).map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "01-configmaps/amber-mesh-provision.yaml has an invalid embedded mesh \
+                     provision plan: {err}"
+                ),
+            )
+        });
+    }
+
+    Ok(None)
+}
+
+fn framework_controller_route_grants_for_child(
+    state: &FrameworkControlState,
+    site_id: &str,
+    child_moniker_set: &BTreeSet<&str>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut grants = BTreeMap::<String, BTreeSet<String>>::new();
+    for record in state.capability_instances.values() {
+        if record.controller_site_id != site_id {
+            continue;
+        }
+        if record.capability == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME {
+            continue;
+        }
+        if !child_moniker_set.contains(record.recipient_component_moniker.as_str()) {
+            continue;
+        }
+        grants
+            .entry(record.route_id.clone())
+            .or_default()
+            .insert(record.recipient_peer_id.clone());
+    }
+    grants
+}
+
+fn controller_routes_for_child(
+    state: &FrameworkControlState,
+    site_id: &str,
+    desired_site_plan: &amber_compiler::run_plan::RunSitePlan,
+    child_moniker_set: &BTreeSet<&str>,
+) -> std::result::Result<Vec<amber_mesh::InboundRoute>, ProtocolErrorResponse> {
+    let grants = framework_controller_route_grants_for_child(state, site_id, child_moniker_set);
+    let Some(mesh_plan) = parse_mesh_provision_plan_artifact(&desired_site_plan.artifact_files)?
+    else {
+        if grants.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "site `{site_id}` has dynamic framework.component grants but no mesh provision \
+                 plan artifact"
+            ),
+        ));
+    };
+
+    let mut routes = Vec::new();
+    for target in mesh_plan.targets {
+        if !matches!(target.kind, amber_mesh::MeshProvisionTargetKind::Component) {
+            continue;
+        }
+        if !target.config.inbound.iter().any(|route| {
+            route.capability == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+        }) {
+            continue;
+        }
+        for mut route in target.config.inbound {
+            if route.capability == amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME
+            {
+                route
+                    .allowed_issuers
+                    .retain(|issuer| child_moniker_set.contains(issuer.as_str()));
+                if !route.allowed_issuers.is_empty() {
+                    routes.push(route);
+                }
+                continue;
+            }
+            let Some(allowed_issuers) = grants.get(&route.route_id) else {
+                continue;
+            };
+            route.allowed_issuers = allowed_issuers.iter().cloned().collect();
+            routes.push(route);
+        }
+    }
+
+    let planned_route_ids = routes
+        .iter()
+        .map(|route| route.route_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let missing = grants
+        .keys()
+        .filter(|route_id| !planned_route_ids.contains(route_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "site `{site_id}` mesh plan is missing dynamic framework.component controller \
+                 routes: {}",
+                missing.join(", ")
+            ),
+        ));
+    }
+    Ok(routes)
+}
+
+fn build_local_child_runtime_spec_from_site_plan(
+    site_id: &str,
+    desired_site_plan: &amber_compiler::run_plan::RunSitePlan,
     assignments: &BTreeMap<String, String>,
     fragment: &LiveScenarioFragment,
-    outputs: &BTreeMap<String, OutputHandleRecord>,
-    overlays: &[DynamicOverlayRecord],
-    routed_inputs: &[DynamicInputRouteRecord],
-) -> std::result::Result<Vec<DynamicSitePlanRecord>, ProtocolErrorResponse> {
+    inputs: LocalChildRuntimeSpecInputs<'_>,
+) -> std::result::Result<LocalChildRuntimeSpec, ProtocolErrorResponse> {
     let child_moniker_set = fragment
         .components
         .iter()
@@ -1318,145 +1502,293 @@ pub(super) fn dynamic_site_plans(
         .iter()
         .map(|component| (component.id, component.moniker.as_str()))
         .collect::<BTreeMap<_, _>>();
-    let mut site_plans = Vec::new();
-    for (site_id, desired_site_plan) in desired_site_plans {
-        let component_ids = desired_site_plan
-            .scenario_ir
-            .components
-            .iter()
-            .filter(|component| child_moniker_set.contains(component.moniker.as_str()))
-            .map(|component| component.id)
-            .collect::<Vec<_>>();
-        if component_ids.is_empty() {
-            continue;
-        }
-        let assigned_components = desired_site_plan
-            .assigned_components
-            .iter()
-            .filter(|moniker| {
-                fragment
-                    .components
-                    .iter()
-                    .any(|component| component.moniker == **moniker)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut proxy_exports = BTreeMap::new();
-        for (name, output) in outputs {
-            let Some((component_id, component_moniker, provide_name)) =
-                output.sources.iter().find_map(|source| {
-                    let BindingFromIr::Component { component, provide } = &source.from else {
-                        return None;
-                    };
-                    let moniker = child_monikers.get(component)?;
-                    (assignments.get(*moniker)? == site_id).then_some((
-                        *component,
-                        *moniker,
-                        provide.as_str(),
-                    ))
-                })
-            else {
-                continue;
-            };
-            let protocol = match output.decl.kind.transport() {
-                CapabilityTransport::Http => "http",
-                CapabilityTransport::NonNetwork => continue,
-                _ => continue,
-            };
-            let export =
-                dynamic_proxy_export_record(fragment, component_id, provide_name, protocol)
-                    .ok_or_else(|| {
-                        protocol_error(
-                            ProtocolErrorCode::ControlStateUnavailable,
-                            &format!(
-                                "dynamic export `{name}` on component `{component_moniker}` could \
-                                 not be resolved to a concrete network endpoint"
-                            ),
-                        )
-                    })?;
-            proxy_exports.insert(name.clone(), export);
-        }
-        for overlay in overlays {
-            let DynamicOverlayAction::ExportPeer { link } = &overlay.action else {
-                continue;
-            };
-            if link.provider_site != *site_id
-                || !child_moniker_set.contains(link.provider_component.as_str())
-            {
-                continue;
-            }
-            if proxy_exports.contains_key(&link.export_name) {
-                continue;
-            }
-            let component = fragment
+    let component_ids = desired_site_plan
+        .scenario_ir
+        .components
+        .iter()
+        .filter(|component| child_moniker_set.contains(component.moniker.as_str()))
+        .map(|component| component.id)
+        .collect::<Vec<_>>();
+    if component_ids.is_empty() {
+        return Err(protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("site `{site_id}` has no child-owned components in the desired site plan"),
+        ));
+    }
+    let assigned_components = desired_site_plan
+        .assigned_components
+        .iter()
+        .filter(|moniker| {
+            fragment
                 .components
                 .iter()
-                .find(|component| component.moniker == link.provider_component)
-                .ok_or_else(|| {
-                    protocol_error(
-                        ProtocolErrorCode::ControlStateUnavailable,
-                        &format!(
-                            "dynamic export provider `{}` is missing from the live child fragment",
-                            link.provider_component
-                        ),
-                    )
-                })?;
-            let export = dynamic_proxy_export_record(
-                fragment,
-                component.id,
-                &link.provide,
-                &link.protocol.to_string(),
-            )
+                .any(|component| component.moniker == **moniker)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut proxy_exports = BTreeMap::new();
+    for (name, output) in inputs.outputs {
+        let Some((component_id, component_moniker, provide_name)) =
+            output.sources.iter().find_map(|source| {
+                let BindingFromIr::Component { component, provide } = &source.from else {
+                    return None;
+                };
+                let moniker = child_monikers.get(component)?;
+                (assignments.get(*moniker)? == site_id).then_some((
+                    *component,
+                    *moniker,
+                    provide.as_str(),
+                ))
+            })
+        else {
+            continue;
+        };
+        let protocol = match output.decl.kind.transport() {
+            CapabilityTransport::Http => "http",
+            CapabilityTransport::NonNetwork => continue,
+            _ => continue,
+        };
+        let export = dynamic_proxy_export_record(fragment, component_id, provide_name, protocol)
             .ok_or_else(|| {
                 protocol_error(
                     ProtocolErrorCode::ControlStateUnavailable,
                     &format!(
-                        "dynamic export `{}` on component `{}` could not be resolved to a \
-                         concrete network endpoint",
-                        link.export_name, link.provider_component
+                        "dynamic export `{name}` on component `{component_moniker}` could not be \
+                         resolved to a concrete network endpoint"
                     ),
                 )
             })?;
-            proxy_exports.insert(link.export_name.clone(), export);
+        proxy_exports.insert(name.clone(), export);
+    }
+    for overlay in inputs.overlays {
+        let DynamicOverlayAction::ExportPeer { link } = &overlay.action else {
+            continue;
+        };
+        if link.provider_site != site_id
+            || !child_moniker_set.contains(link.provider_component.as_str())
+        {
+            continue;
         }
-        let artifact_files = if desired_site_plan.site.kind == SiteKind::Kubernetes {
-            project_kubernetes_dynamic_child_artifact_files(
-                &desired_site_plan.artifact_files,
-                &component_ids,
-            )
-            .map_err(|err| {
+        if proxy_exports.contains_key(&link.export_name) {
+            continue;
+        }
+        let component = fragment
+            .components
+            .iter()
+            .find(|component| component.moniker == link.provider_component)
+            .ok_or_else(|| {
                 protocol_error(
                     ProtocolErrorCode::ControlStateUnavailable,
                     &format!(
-                        "failed to project kubernetes child artifact for site `{site_id}`: {err}"
+                        "dynamic export provider `{}` is missing from the live child fragment",
+                        link.provider_component
                     ),
                 )
-            })?
-        } else {
-            desired_site_plan.artifact_files.clone()
-        };
-        site_plans.push(DynamicSitePlanRecord {
-            site_id: site_id.clone(),
-            kind: desired_site_plan.site.kind,
-            router_identity_id: desired_site_plan.router_identity_id.clone(),
-            component_ids,
-            assigned_components,
-            artifact_files,
-            desired_artifact_files: desired_site_plan.artifact_files.clone(),
-            proxy_exports,
-            routed_inputs: routed_inputs
-                .iter()
-                .filter(|input| input.component == child_monikers[&fragment.root_component_id])
-                .filter(|input| {
-                    assignments
-                        .get(input.component.as_str())
-                        .is_some_and(|assigned_site| assigned_site == site_id)
-                })
-                .cloned()
-                .collect(),
-        });
+            })?;
+        let export = dynamic_proxy_export_record(
+            fragment,
+            component.id,
+            &link.provide,
+            &link.protocol.to_string(),
+        )
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "dynamic export `{}` on component `{}` could not be resolved to a concrete \
+                     network endpoint",
+                    link.export_name, link.provider_component
+                ),
+            )
+        })?;
+        proxy_exports.insert(link.export_name.clone(), export);
     }
-    Ok(site_plans)
+    let child_artifact_files = if desired_site_plan.site.kind == SiteKind::Kubernetes {
+        project_kubernetes_dynamic_child_artifact_files(
+            &desired_site_plan.artifact_files,
+            &component_ids,
+        )
+        .map_err(|err| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!("failed to project kubernetes child artifact for site `{site_id}`: {err}"),
+            )
+        })?
+    } else {
+        desired_site_plan.artifact_files.clone()
+    };
+    Ok(LocalChildRuntimeSpec {
+        component_ids,
+        assigned_components,
+        child_artifact_files,
+        site_artifact_files: desired_site_plan.artifact_files.clone(),
+        controller_routes: controller_routes_for_child(
+            inputs.state,
+            site_id,
+            desired_site_plan,
+            &child_moniker_set,
+        )?,
+        proxy_exports,
+        direct_inputs: inputs
+            .direct_inputs
+            .iter()
+            .filter(|input| input.component == child_monikers[&fragment.root_component_id])
+            .filter(|input| {
+                assignments
+                    .get(input.component.as_str())
+                    .is_some_and(|assigned_site| assigned_site == site_id)
+            })
+            .cloned()
+            .collect(),
+    })
+}
+
+pub(super) fn child_runtime_site_ids(
+    child: &LiveChildRecord,
+) -> std::result::Result<Vec<String>, ProtocolErrorResponse> {
+    let fragment = child.fragment.as_ref().ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "dynamic child `{}` is missing the authoritative fragment required for placement",
+                child.name
+            ),
+        )
+    })?;
+    let site_ids = fragment
+        .components
+        .iter()
+        .filter_map(|component| child.assignments.get(component.moniker.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if site_ids.is_empty() {
+        return Err(protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "dynamic child `{}` has no site assignment for any fragment component",
+                child.name
+            ),
+        ));
+    }
+    Ok(site_ids.into_iter().collect())
+}
+
+pub(super) fn child_runtime_site_id(
+    child: &LiveChildRecord,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    let site_ids = child_runtime_site_ids(child)?;
+    match site_ids.len() {
+        1 => Ok(site_ids
+            .into_iter()
+            .next()
+            .expect("single child site id should be present")),
+        _ => Err(protocol_error(
+            ProtocolErrorCode::PlacementUnsatisfied,
+            &format!(
+                "dynamic child `{}` spans multiple sites ({}) but site controllers only create \
+                 children within a single site",
+                child.name,
+                site_ids.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        )),
+    }
+}
+
+pub(super) fn live_assignment_map_with_child(
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
+) -> BTreeMap<String, String> {
+    let mut assignments = live_assignment_map(state);
+    assignments.extend(child.assignments.clone());
+    assignments
+}
+
+pub(super) fn build_local_child_runtime_spec(
+    state: &FrameworkControlState,
+    child: &LiveChildRecord,
+    site_id: &str,
+) -> std::result::Result<LocalChildRuntimeSpec, ProtocolErrorResponse> {
+    let fragment = child.fragment.as_ref().ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "dynamic child `{}` is missing the authoritative fragment required for runtime \
+                 preparation",
+                child.name
+            ),
+        )
+    })?;
+    let scenario = scenario_with_fragment(&live_scenario_ir(state)?, fragment)?;
+    let live_assignments = live_assignment_map_with_child(state, child);
+    let desired_site_plan = build_site_plan_subset(
+        &scenario,
+        &placement_file_from_state(state),
+        &run_plan_activation_from_state(state),
+        &live_assignments,
+        &BTreeSet::from([site_id.to_string()]),
+    )
+    .map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "failed to build desired site plan for local child `{}` on site `{site_id}`: {err}",
+                child.name
+            ),
+        )
+    })?
+    .remove(site_id)
+    .ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "desired site plan for local child `{}` is missing site `{site_id}`",
+                child.name
+            ),
+        )
+    })?;
+    build_local_child_runtime_spec_from_site_plan(
+        site_id,
+        &desired_site_plan,
+        &live_assignments,
+        fragment,
+        LocalChildRuntimeSpecInputs {
+            state,
+            outputs: &child.outputs,
+            overlays: &child.overlays,
+            direct_inputs: &dynamic_input_direct_records(
+                &live_assignments,
+                fragment,
+                &child.input_bindings,
+            ),
+        },
+    )
+}
+
+pub(super) fn build_desired_site_artifact_files(
+    state: &FrameworkControlState,
+    site_id: &str,
+) -> std::result::Result<BTreeMap<String, String>, ProtocolErrorResponse> {
+    build_site_plan_subset(
+        &decode_live_scenario(state)?,
+        &placement_file_from_state(state),
+        &run_plan_activation_from_state(state),
+        &live_assignment_map(state),
+        &BTreeSet::from([site_id.to_string()]),
+    )
+    .map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("failed to build desired site artifacts for site `{site_id}`: {err}"),
+        )
+    })?
+    .remove(site_id)
+    .map(|site_plan| site_plan.artifact_files)
+    .ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("desired site artifact snapshot is missing site `{site_id}`"),
+        )
+    })
 }
 
 pub(super) fn child_input_binding_records(
@@ -1486,11 +1818,11 @@ pub(super) fn child_input_binding_records(
         .collect()
 }
 
-pub(super) fn dynamic_input_route_records(
+pub(super) fn dynamic_input_direct_records(
     assignments: &BTreeMap<String, String>,
     fragment: &LiveScenarioFragment,
     input_bindings: &[ChildInputBindingRecord],
-) -> Vec<DynamicInputRouteRecord> {
+) -> Vec<DynamicInputDirectRecord> {
     let Some(root_component) = fragment
         .components
         .iter()
@@ -1525,7 +1857,7 @@ pub(super) fn dynamic_input_route_records(
                 CapabilityTransport::NonNetwork => return None,
                 _ => return None,
             };
-            (provider_site == child_site).then(|| DynamicInputRouteRecord {
+            (provider_site == child_site).then(|| DynamicInputDirectRecord {
                 component: root_component.moniker.clone(),
                 slot: binding.slot.clone(),
                 provider_component: provider_component.clone(),
@@ -1653,6 +1985,54 @@ pub(super) fn create_child_response(child: &LiveChildRecord) -> CreateChildRespo
     }
 }
 
+fn merge_framework_controller_component_ir(
+    existing: &mut ComponentIr,
+    fragment_controller: &ComponentIr,
+    id_map: &BTreeMap<usize, usize>,
+) -> std::result::Result<(), ProtocolErrorResponse> {
+    let mut fragment_metadata = amber_compiler::run_plan::framework_component_controller_metadata(
+        fragment_controller.metadata.as_ref(),
+    )
+    .ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            "dynamic child fragment controller is missing its framework metadata",
+        )
+    })?;
+    let mut existing_metadata = amber_compiler::run_plan::framework_component_controller_metadata(
+        existing.metadata.as_ref(),
+    )
+    .ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            "live framework.component controller is missing its framework metadata",
+        )
+    })?;
+    for grant in fragment_metadata.grants.values_mut() {
+        if let Some(remapped) = id_map.get(&grant.authority_realm_id) {
+            grant.authority_realm_id = *remapped;
+        }
+    }
+    for (slot, decl) in &fragment_controller.slots {
+        existing
+            .slots
+            .entry(slot.clone())
+            .or_insert_with(|| decl.clone());
+    }
+    for (provide, decl) in &fragment_controller.provides {
+        existing
+            .provides
+            .entry(provide.clone())
+            .or_insert_with(|| decl.clone());
+    }
+    existing_metadata.grants.extend(fragment_metadata.grants);
+    existing.metadata = Some(
+        serde_json::to_value(existing_metadata)
+            .expect("framework controller metadata should serialize"),
+    );
+    Ok(())
+}
+
 pub(super) fn extract_live_child_fragment(
     state: &mut FrameworkControlState,
     compiled: &CompiledScenario,
@@ -1678,20 +2058,73 @@ pub(super) fn extract_live_child_fragment(
             )
         })?
         .0;
+    let existing_controllers_by_site = state
+        .base_scenario
+        .components
+        .iter()
+        .filter_map(|component| {
+            amber_compiler::run_plan::framework_component_controller_metadata(
+                component.metadata.as_ref(),
+            )
+            .map(|metadata| (metadata.execution_site, component.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut id_map = BTreeMap::new();
+    let mut reused_controller_component_ids = BTreeSet::new();
+    let mut reused_controller_fragments = BTreeMap::<usize, Vec<ComponentIr>>::new();
     for component in &compiled.scenario_ir().components {
         if component.id == wrapper_root {
             continue;
         }
+        if let Some(metadata) = amber_compiler::run_plan::framework_component_controller_metadata(
+            component.metadata.as_ref(),
+        ) && let Some(existing_controller) =
+            existing_controllers_by_site.get(&metadata.execution_site)
+        {
+            id_map.insert(component.id, existing_controller.id);
+            reused_controller_component_ids.insert(component.id);
+            reused_controller_fragments
+                .entry(existing_controller.id)
+                .or_default()
+                .push(component.clone());
+            continue;
+        }
         id_map.insert(component.id, state.next_component_id);
         state.next_component_id += 1;
+    }
+    let mut controller_replacements = BTreeMap::<usize, ComponentIr>::new();
+    for (existing_controller_id, fragments) in reused_controller_fragments {
+        let existing_controller = state
+            .base_scenario
+            .components
+            .iter()
+            .find(|component| component.id == existing_controller_id)
+            .cloned()
+            .ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "live framework.component controller {} disappeared while preparing a \
+                         dynamic child fragment",
+                        existing_controller_id
+                    ),
+                )
+            })?;
+        let replacement = controller_replacements
+            .entry(existing_controller_id)
+            .or_insert(existing_controller);
+        for fragment_controller in &fragments {
+            merge_framework_controller_component_ir(replacement, fragment_controller, &id_map)?;
+        }
     }
 
     let mut components = compiled
         .scenario_ir()
         .components
         .iter()
-        .filter(|component| component.id != wrapper_root)
+        .filter(|component| {
+            component.id != wrapper_root && !reused_controller_component_ids.contains(&component.id)
+        })
         .map(|component| {
             let mut component = component.clone();
             component.id = *id_map
@@ -1720,6 +2153,7 @@ pub(super) fn extract_live_child_fragment(
             component
         })
         .collect::<Vec<_>>();
+    components.extend(controller_replacements.into_values());
     components.sort_by(|left, right| left.id.cmp(&right.id));
 
     let mut bindings = Vec::new();
@@ -1764,25 +2198,6 @@ pub(super) fn extract_live_child_fragment(
                         &format!("missing synthetic source mapping for `{}`", slot.slot),
                     )
                 })?;
-                rewritten.from = BindingFromIr::from(&synthetic.actual_source);
-                rewritten.weak = synthetic.weak;
-                synthetic.source_child_id
-            }
-            BindingFromIr::Framework {
-                authority_realm, ..
-            } if *authority_realm == wrapper_root => {
-                let Some(synthetic) = synthetic_sources.values().find(|source| {
-                    source.slot_name == binding.to.slot
-                        && matches!(source.actual_source, BindingFrom::Framework(_))
-                }) else {
-                    return Err(protocol_error(
-                        ProtocolErrorCode::ControlStateUnavailable,
-                        &format!(
-                            "missing framework synthetic source mapping for slot `{}`",
-                            binding.to.slot
-                        ),
-                    ));
-                };
                 rewritten.from = BindingFromIr::from(&synthetic.actual_source);
                 rewritten.weak = synthetic.weak;
                 synthetic.source_child_id
@@ -1934,6 +2349,17 @@ pub(super) fn collect_capability_instances(
         .iter()
         .map(|component| (component.id, component.moniker.clone()))
         .collect::<BTreeMap<_, _>>();
+    let mut controller_metadata_by_id = state
+        .base_scenario
+        .components
+        .iter()
+        .filter_map(|component| {
+            amber_compiler::run_plan::framework_component_controller_metadata(
+                component.metadata.as_ref(),
+            )
+            .map(|metadata| (component.id, metadata))
+        })
+        .collect::<BTreeMap<_, _>>();
     for child in &active_children {
         let Some(fragment) = child.fragment.as_ref() else {
             continue;
@@ -1944,6 +2370,12 @@ pub(super) fn collect_capability_instances(
                 .iter()
                 .map(|component| (component.id, component.moniker.clone())),
         );
+        controller_metadata_by_id.extend(fragment.components.iter().filter_map(|component| {
+            amber_compiler::run_plan::framework_component_controller_metadata(
+                component.metadata.as_ref(),
+            )
+            .map(|metadata| (component.id, metadata))
+        }));
     }
 
     let mut site_by_moniker = state.placement.assignments.clone();
@@ -1958,6 +2390,7 @@ pub(super) fn collect_capability_instances(
             binding,
             &moniker_by_id,
             &site_by_moniker,
+            &controller_metadata_by_id,
             state.generation,
         )?;
     }
@@ -1971,6 +2404,7 @@ pub(super) fn collect_capability_instances(
                 &binding.binding,
                 &moniker_by_id,
                 &site_by_moniker,
+                &controller_metadata_by_id,
                 state.generation,
             )?;
         }
@@ -1978,73 +2412,142 @@ pub(super) fn collect_capability_instances(
     Ok(records)
 }
 
+fn framework_capability_recipient_peer_id(
+    recipient_component_moniker: &str,
+    recipient_site_id: &str,
+    controller_site_id: &str,
+) -> String {
+    if recipient_site_id == controller_site_id {
+        recipient_component_moniker.to_string()
+    } else {
+        format!("/site/{controller_site_id}/router")
+    }
+}
+
 pub(super) fn collect_capability_instance_from_binding(
     records: &mut BTreeMap<String, CapabilityInstanceRecord>,
     binding: &BindingIr,
     moniker_by_id: &BTreeMap<usize, String>,
     site_by_moniker: &BTreeMap<String, String>,
+    controller_metadata_by_id: &BTreeMap<
+        usize,
+        amber_compiler::run_plan::FrameworkComponentControllerMetadata,
+    >,
     generation: u64,
 ) -> Result<()> {
-    let BindingFromIr::Framework {
-        authority_realm,
-        capability,
-    } = &binding.from
-    else {
-        return Ok(());
-    };
-    if capability != "component" {
-        return Ok(());
-    }
-
-    let authority_realm_moniker = moniker_by_id.get(authority_realm).cloned().ok_or_else(|| {
-        miette::miette!(
-            "framework.component authority realm id {authority_realm} is missing from the \
-             authoritative live graph"
-        )
-    })?;
     let recipient_component_moniker = moniker_by_id
         .get(&binding.to.component)
         .cloned()
         .ok_or_else(|| {
             miette::miette!(
-                "framework.component recipient component id {} is missing from the authoritative \
-                 live graph",
-                binding.to.component
-            )
+                    "framework.component recipient component id {} is missing from the \
+                     authoritative                  live graph",
+                    binding.to.component
+                )
         })?;
     let recipient_site_id = site_by_moniker
         .get(&recipient_component_moniker)
         .cloned()
         .ok_or_else(|| {
             miette::miette!(
-                "framework.component recipient `{recipient_component_moniker}` is missing a site \
-                 assignment in the authoritative live graph"
-            )
+                    "framework.component recipient `{recipient_component_moniker}` is missing a \
+                     site                  assignment in the authoritative live graph"
+                )
         })?;
-    let cap_instance_id = framework_cap_instance_id(
-        authority_realm_moniker.as_str(),
-        recipient_component_moniker.as_str(),
-        &binding.to.component.to_string(),
-        &binding.to.slot,
-        capability,
-    );
-    records.insert(
-        cap_instance_id.clone(),
-        CapabilityInstanceRecord {
-            cap_instance_id: cap_instance_id.clone(),
-            route_id: cap_instance_id,
-            authority_realm_id: *authority_realm,
-            authority_realm_moniker,
-            recipient_component_id: binding.to.component,
-            recipient_component_moniker: recipient_component_moniker.clone(),
-            recipient_peer_id: recipient_component_moniker,
-            recipient_site_id,
-            capability: capability.clone(),
-            slot: binding.to.slot.clone(),
-            generation,
-        },
-    );
-    Ok(())
+
+    match &binding.from {
+        BindingFromIr::Framework { capability, .. } => {
+            if capability != "component" {
+                return Ok(());
+            }
+            Err(miette::miette!(
+                "framework.component binding {}.{} must be lowered before capability refresh",
+                recipient_component_moniker,
+                binding.to.slot,
+            ))
+        }
+        BindingFromIr::Component { component, provide } => {
+            let Some(metadata) = controller_metadata_by_id.get(component) else {
+                return Ok(());
+            };
+            let provider_moniker = moniker_by_id.get(component).cloned().ok_or_else(|| {
+                miette::miette!(
+                        "framework.component controller component id {component} is missing from                          the                      authoritative live graph"
+                    )
+            })?;
+            let route_id = amber_mesh::component_route_id(
+                provider_moniker.as_str(),
+                provide,
+                amber_mesh::MeshProtocol::Http,
+            );
+            if let Some(grant) = metadata.grants.get(provide) {
+                let cap_instance_id = framework_cap_instance_id(
+                    grant.authority_realm_moniker.as_str(),
+                    recipient_component_moniker.as_str(),
+                    &binding.to.component.to_string(),
+                    &binding.to.slot,
+                    "component",
+                );
+                records.insert(
+                    cap_instance_id.clone(),
+                    CapabilityInstanceRecord {
+                        cap_instance_id,
+                        route_id,
+                        authority_realm_id: grant.authority_realm_id,
+                        authority_realm_moniker: grant.authority_realm_moniker.clone(),
+                        recipient_component_id: binding.to.component,
+                        recipient_component_moniker: recipient_component_moniker.clone(),
+                        recipient_peer_id: framework_capability_recipient_peer_id(
+                            recipient_component_moniker.as_str(),
+                            recipient_site_id.as_str(),
+                            metadata.execution_site.as_str(),
+                        ),
+                        recipient_site_id,
+                        controller_site_id: metadata.execution_site.clone(),
+                        managed_site_id: grant.managed_site.clone(),
+                        capability: "component".to_string(),
+                        slot: binding.to.slot.clone(),
+                        generation,
+                    },
+                );
+                return Ok(());
+            }
+            if provide != amber_mesh::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME {
+                return Ok(());
+            }
+            let cap_instance_id = framework_cap_instance_id(
+                provider_moniker.as_str(),
+                recipient_component_moniker.as_str(),
+                &binding.to.component.to_string(),
+                &binding.to.slot,
+                provide,
+            );
+            records.insert(
+                cap_instance_id.clone(),
+                CapabilityInstanceRecord {
+                    cap_instance_id,
+                    route_id,
+                    authority_realm_id: *component,
+                    authority_realm_moniker: provider_moniker,
+                    recipient_component_id: binding.to.component,
+                    recipient_component_moniker: recipient_component_moniker.clone(),
+                    recipient_peer_id: framework_capability_recipient_peer_id(
+                        recipient_component_moniker.as_str(),
+                        recipient_site_id.as_str(),
+                        metadata.execution_site.as_str(),
+                    ),
+                    recipient_site_id,
+                    controller_site_id: metadata.execution_site.clone(),
+                    managed_site_id: String::new(),
+                    capability: provide.clone(),
+                    slot: binding.to.slot.clone(),
+                    generation,
+                },
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 pub(super) fn template_mode(template: &ChildTemplate) -> TemplateMode {
@@ -3047,18 +3550,21 @@ pub(super) struct ControlStateApp {
     pub(super) run_root: PathBuf,
     pub(super) state_root: PathBuf,
     pub(super) mesh_scope: Arc<str>,
-    pub(super) control_state_auth_token: Arc<str>,
+    pub(super) controller_plan: Arc<SiteControllerPlan>,
     pub(super) authority_locks: Arc<Mutex<BTreeMap<usize, Arc<Mutex<()>>>>>,
-    pub(super) bridge_proxies: Arc<Mutex<BTreeMap<BridgeProxyKey, BridgeProxyHandle>>>,
+    pub(super) runtime: SharedSiteControllerRuntime,
 }
 
 #[derive(Clone)]
-pub(super) struct CcsApp {
-    pub(super) client: ReqwestClient,
+pub(super) struct SiteControllerApp {
+    pub(super) control: ControlStateApp,
+    pub(super) ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone)]
+pub(super) struct LocalDynamicCapabilityOriginApp {
     pub(super) site_state_root: PathBuf,
-    pub(super) control_state_url: Arc<str>,
-    pub(super) router_auth_token: Arc<str>,
-    pub(super) control_state_auth_token: Arc<str>,
+    pub(super) runtime: SharedSiteControllerRuntime,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -3082,7 +3588,13 @@ pub(super) struct SiteManagerStateView {
     #[serde(default)]
     pub(super) router_mesh_addr: Option<String>,
     #[serde(default)]
+    pub(super) compose_consumer_router_mesh_addr: Option<String>,
+    #[serde(default)]
+    pub(super) kubernetes_consumer_router_mesh_addr: Option<String>,
+    #[serde(default)]
     pub(super) router_identity_id: Option<String>,
     #[serde(default)]
     pub(super) router_public_key_b64: Option<String>,
+    #[serde(default)]
+    pub(super) site_controller_url: Option<String>,
 }

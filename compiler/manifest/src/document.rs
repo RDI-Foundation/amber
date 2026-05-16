@@ -213,7 +213,10 @@ fn labels_for_manifest_error(
         ManifestError::MissingProvideEndpoint { name } => {
             labels_for_missing_provide_endpoint(spans, name)
         }
-        ManifestError::UnsupportedProvideKind { name, .. } => labels_for_provide_kind(spans, name),
+        ManifestError::UnsupportedProvideKind { name, .. }
+        | ManifestError::FrameworkOwnedProvideKind { name, .. } => {
+            labels_for_provide_kind(spans, name)
+        }
         ManifestError::UnsupportedResourceKind { name, .. } => {
             labels_for_resource_decl(spans, name, "unsupported resource kind here")
         }

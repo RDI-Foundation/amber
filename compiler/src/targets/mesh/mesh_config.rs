@@ -1,42 +1,54 @@
 use std::collections::{BTreeSet, HashMap};
 
-use amber_manifest::NetworkProtocol;
+use amber_manifest::{CapabilityKind, NetworkProtocol};
 use amber_mesh::{
-    DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV, DYNAMIC_CAPS_CONTROL_URL_ENV,
-    DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV, FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV,
-    FRAMEWORK_COMPONENT_CCS_URL_ENV, InboundRoute, InboundTarget, MeshConfigTemplate,
-    MeshIdentityTemplate, MeshPeerTemplate, MeshProtocol, OutboundRoute, component_route_id,
-    framework_cap_instance_id, http_route_plugins_for_capability_kind, router_export_route_id,
-    router_external_route_id, telemetry::SCENARIO_RUN_ID_ENV,
+    InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate, MeshPeerTemplate,
+    MeshProtocol, OutboundRoute, component_route_id, http_route_plugins_for_capability_kind,
+    router_export_route_id, router_external_route_id, telemetry::SCENARIO_RUN_ID_ENV,
 };
 use amber_scenario::{ComponentId, Scenario};
 use base64::Engine as _;
 use sha2::Digest as _;
 
 use super::{
-    plan::{MeshError, MeshPlan, component_label},
+    plan::{EndpointInfo, MeshError, MeshPlan, component_label},
     ports::LocalRoutePorts,
 };
-use crate::runtime_interface::collect_external_slots;
+use crate::{
+    run_plan::{
+        FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE, framework_component_controller_metadata,
+    },
+    runtime_interface::collect_external_slots,
+};
 
 pub(crate) const DEFAULT_ROUTER_ID: &str = "/router";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MeshConfigBuildOptions<'a> {
     pub(crate) router_identity_id: &'a str,
+    pub(crate) mesh_scope: Option<&'a str>,
     pub(crate) component_mesh_listen_addr: &'a str,
     pub(crate) router_mesh_listen_addr: &'a str,
     pub(crate) router_control_listen_addr: &'a str,
     pub(crate) force_router: bool,
+    pub(crate) docker_gateway: Option<DockerGatewayMeshConfig<'a>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DockerGatewayMeshConfig<'a> {
+    pub(crate) docker_sock: &'a str,
+    pub(crate) compose_project_env: &'a str,
 }
 
 pub(crate) fn default_mesh_config_build_options() -> MeshConfigBuildOptions<'static> {
     MeshConfigBuildOptions {
         router_identity_id: DEFAULT_ROUTER_ID,
+        mesh_scope: None,
         component_mesh_listen_addr: "0.0.0.0",
         router_mesh_listen_addr: "0.0.0.0",
         router_control_listen_addr: "0.0.0.0",
         force_router: false,
+        docker_gateway: None,
     }
 }
 
@@ -143,7 +155,10 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         return Err(MeshError::new("router ports missing"));
     }
 
-    let mesh_scope = scenario_mesh_scope(scenario)?;
+    let mesh_scope = match options.mesh_scope {
+        Some(mesh_scope) => mesh_scope.to_string(),
+        None => scenario_mesh_scope(scenario)?,
+    };
 
     let mut identities_by_component: HashMap<ComponentId, MeshIdentityTemplate> = HashMap::new();
     for &id in mesh_plan.program_components() {
@@ -162,6 +177,10 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
     } else {
         None
     };
+
+    let local_controller_component = mesh_plan.program_components().iter().copied().find(|id| {
+        framework_component_controller_metadata(scenario.component(*id).metadata.as_ref()).is_some()
+    });
 
     let mut consumers_by_provider: HashMap<(ComponentId, String), BTreeSet<ComponentId>> =
         HashMap::new();
@@ -188,18 +207,6 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
     let mut component_configs: HashMap<ComponentId, MeshConfigTemplate> = HashMap::new();
     let mut component_sidecar_env_passthrough = Vec::new();
     push_env_passthrough_once(&mut component_sidecar_env_passthrough, SCENARIO_RUN_ID_ENV);
-    push_env_passthrough_once(
-        &mut component_sidecar_env_passthrough,
-        DYNAMIC_CAPS_CONTROL_URL_ENV,
-    );
-    push_env_passthrough_once(
-        &mut component_sidecar_env_passthrough,
-        DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV,
-    );
-    push_env_passthrough_once(
-        &mut component_sidecar_env_passthrough,
-        DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV,
-    );
     for &id in mesh_plan.program_components() {
         let identity = identities_by_component
             .get(&id)
@@ -214,10 +221,34 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
 
         let mut inbound = Vec::new();
         for (provide_name, provide_decl) in &scenario.component(id).provides {
-            let endpoint = mesh_plan
-                .component_bindings()
-                .find(|binding| binding.provider == id && binding.provide == *provide_name)
-                .map(|b| b.endpoint.clone())
+            let endpoint = (Some(id) == local_controller_component
+                && provide_name == FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE)
+                .then(|| {
+                    provide_decl.endpoint.as_deref().and_then(|endpoint_name| {
+                        scenario
+                            .component(id)
+                            .program
+                            .as_ref()
+                            .and_then(|program| program.network())
+                            .and_then(|network| {
+                                network
+                                    .endpoints
+                                    .iter()
+                                    .find(|endpoint| endpoint.name == endpoint_name)
+                            })
+                            .map(|endpoint| EndpointInfo {
+                                port: endpoint.port,
+                                protocol: endpoint.protocol,
+                            })
+                    })
+                })
+                .flatten()
+                .or_else(|| {
+                    mesh_plan
+                        .component_bindings()
+                        .find(|binding| binding.provider == id && binding.provide == *provide_name)
+                        .map(|b| b.endpoint.clone())
+                })
                 .or_else(|| {
                     mesh_plan
                         .exports()
@@ -228,6 +259,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             let Some(endpoint) = endpoint else {
                 continue;
             };
+            let capability_kind = provide_decl.decl.kind.as_str();
             let protocol = mesh_protocol(endpoint.protocol)?;
 
             let mut issuers: BTreeSet<String> = BTreeSet::new();
@@ -239,6 +271,24 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                         .id
                         .clone();
                     issuers.insert(consumer_id);
+                }
+            }
+            if Some(id) == local_controller_component
+                && provide_name == FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE
+            {
+                for consumer in mesh_plan.program_components().iter().copied() {
+                    if consumer == id {
+                        continue;
+                    }
+                    let consumer_id = identities_by_component
+                        .get(&consumer)
+                        .expect("consumer identity missing")
+                        .id
+                        .clone();
+                    issuers.insert(consumer_id);
+                }
+                if let Some(router_identity) = router_identity.as_ref() {
+                    issuers.insert(router_identity.id.clone());
                 }
             }
             let route_backs_live_http_authority =
@@ -253,6 +303,24 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 continue;
             }
 
+            let target = if capability_kind == CapabilityKind::Docker.as_str() {
+                let docker_gateway = input.options.docker_gateway.ok_or_else(|| {
+                    MeshError::new(format!(
+                        "mesh config for {}.{} requires docker gateway runtime configuration",
+                        component_label(scenario, id),
+                        provide_name
+                    ))
+                })?;
+                InboundTarget::DockerGateway {
+                    docker_sock: docker_gateway.docker_sock.into(),
+                    compose_project_env: docker_gateway.compose_project_env.to_string(),
+                }
+            } else {
+                InboundTarget::Local {
+                    port: endpoint.port,
+                }
+            };
+
             inbound.push(InboundRoute {
                 route_id: component_route_id(&identity.id, provide_name, protocol),
                 capability: provide_name.clone(),
@@ -263,9 +331,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                     Some(provide_decl.decl.kind.as_str()),
                     protocol,
                 ),
-                target: InboundTarget::Local {
-                    port: endpoint.port,
-                },
+                target,
                 allowed_issuers: issuers.into_iter().collect(),
             });
         }
@@ -288,12 +354,12 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 .expect("provider identity missing")
                 .id
                 .clone();
-            let protocol = mesh_protocol(binding.endpoint.protocol)?;
             let provide_decl = scenario
                 .component(binding.provider)
                 .provides
                 .get(&binding.provide)
                 .expect("binding provide should exist");
+            let protocol = mesh_protocol(binding.endpoint.protocol)?;
             outbound.push(OutboundRoute {
                 route_id: component_route_id(&peer_id, &binding.provide, protocol),
                 rewrite_route_id: None,
@@ -350,59 +416,65 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             });
         }
 
-        for binding in mesh_plan.framework_bindings() {
-            if binding.consumer != id || binding.capability.as_str() != "component" {
-                continue;
-            }
-            let listen_port = route_ports.framework_binding_port(binding).ok_or_else(|| {
+        if let Some(binding) = mesh_plan
+            .framework_bindings()
+            .find(|binding| binding.consumer == id && binding.capability.as_str() == "component")
+        {
+            return Err(MeshError::new(format!(
+                "framework.component binding {}.{} must be lowered before mesh config generation",
+                component_label(scenario, id),
+                binding.slot,
+            )));
+        }
+
+        if let Some(controller_id) = local_controller_component
+            && controller_id != id
+        {
+            let listen_port = route_ports.controller_internal_port(id).ok_or_else(|| {
                 MeshError::new(format!(
-                    "route port missing for {}.{}",
-                    component_label(scenario, id),
-                    binding.slot
+                    "site controller control route port missing for {}",
+                    component_label(scenario, id)
                 ))
             })?;
-            let router_identity = router_identity.as_ref().ok_or_else(|| {
-                MeshError::new("framework.component bindings require router identity")
-            })?;
-            let router_addr = addressing.mesh_addr_for_router()?;
-            let slot_decl = scenario
-                .component(binding.consumer)
-                .slots
-                .get(binding.slot.as_str())
-                .expect("framework binding target slot should exist");
-            let authority_moniker = scenario.component(binding.authority_realm).moniker.as_str();
-            let consumer_moniker = scenario.component(binding.consumer).moniker.as_str();
-            let route_id = framework_cap_instance_id(
-                authority_moniker,
-                consumer_moniker,
-                &binding.consumer.0.to_string(),
-                &binding.slot,
-                binding.capability.as_str(),
-            );
+            let peer_addr = addressing.mesh_addr_for_component(controller_id)?;
+            let peer_id = identities_by_component
+                .get(&controller_id)
+                .expect("controller identity missing")
+                .id
+                .clone();
             outbound.push(OutboundRoute {
-                route_id,
+                route_id: component_route_id(
+                    &peer_id,
+                    FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE,
+                    MeshProtocol::Http,
+                ),
                 rewrite_route_id: None,
-                slot: binding.slot.clone(),
-                capability_kind: Some(slot_decl.decl.kind.to_string()),
-                capability_profile: slot_decl.decl.profile.clone(),
+                slot: FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE.to_string(),
+                capability_kind: None,
+                capability_profile: None,
                 listen_port,
                 listen_addr: None,
                 protocol: MeshProtocol::Http,
                 http_plugins: Vec::new(),
-                peer_addr: router_addr,
-                peer_id: router_identity.id.clone(),
-                capability: binding.capability.to_string(),
+                peer_addr,
+                peer_id,
+                capability: FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE.to_string(),
             });
         }
 
         let mesh_listen = format!("{}:{mesh_port}", options.component_mesh_listen_addr)
             .parse()
             .expect("mesh listen");
-        let dynamic_caps_listen = route_ports.dynamic_caps_port(id).map(|port| {
-            format!("{}:{port}", options.component_mesh_listen_addr)
-                .parse()
-                .expect("dynamic caps listen")
-        });
+        let dynamic_caps_listen =
+            if local_controller_component.is_some() && Some(id) != local_controller_component {
+                route_ports.dynamic_caps_port(id).map(|port| {
+                    format!("{}:{port}", options.component_mesh_listen_addr)
+                        .parse()
+                        .expect("dynamic caps listen")
+                })
+            } else {
+                None
+            };
         let config_peers = required_peers(&identity.id, &inbound, &outbound);
 
         let config = MeshConfigTemplate {
@@ -470,12 +542,12 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 .expect("export provider identity missing")
                 .id
                 .clone();
-            let protocol = mesh_protocol(export.endpoint.protocol)?;
             let provide_decl = scenario
                 .component(export.provider)
                 .provides
                 .get(&export.provide)
                 .expect("export provide should exist");
+            let protocol = mesh_protocol(export.endpoint.protocol)?;
             let provider_route_id = component_route_id(&peer_id, &export.provide, protocol);
             inbound.push(InboundRoute {
                 route_id: router_export_route_id(&export.name, protocol),
@@ -491,52 +563,6 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                     capability: export.provide.clone(),
                 },
                 allowed_issuers: vec![router_identity.id.clone()],
-            });
-        }
-
-        let framework_bindings = mesh_plan
-            .framework_bindings()
-            .filter(|binding| binding.capability.as_str() == "component")
-            .collect::<Vec<_>>();
-        if !framework_bindings.is_empty() {
-            push_env_passthrough_once(&mut router_env_passthrough, FRAMEWORK_COMPONENT_CCS_URL_ENV);
-            push_env_passthrough_once(
-                &mut router_env_passthrough,
-                FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV,
-            );
-        }
-        for binding in framework_bindings {
-            let slot_decl = scenario
-                .component(binding.consumer)
-                .slots
-                .get(binding.slot.as_str())
-                .expect("framework binding target slot should exist");
-            let consumer_id = identities_by_component
-                .get(&binding.consumer)
-                .expect("framework binding consumer identity missing")
-                .id
-                .clone();
-            let authority_moniker = scenario.component(binding.authority_realm).moniker.as_str();
-            let consumer_moniker = scenario.component(binding.consumer).moniker.as_str();
-            let route_id = framework_cap_instance_id(
-                authority_moniker,
-                consumer_moniker,
-                &binding.consumer.0.to_string(),
-                &binding.slot,
-                binding.capability.as_str(),
-            );
-            inbound.push(InboundRoute {
-                route_id,
-                capability: binding.capability.to_string(),
-                capability_kind: Some(slot_decl.decl.kind.to_string()),
-                capability_profile: slot_decl.decl.profile.clone(),
-                protocol: MeshProtocol::Http,
-                http_plugins: Vec::new(),
-                target: InboundTarget::External {
-                    url_env: FRAMEWORK_COMPONENT_CCS_URL_ENV.to_string(),
-                    optional: false,
-                },
-                allowed_issuers: vec![consumer_id],
             });
         }
 
@@ -647,7 +673,7 @@ mod tests {
         sync::Arc,
     };
 
-    use amber_manifest::{ManifestDigest, ProvideDecl, SlotDecl};
+    use amber_manifest::{FrameworkCapabilityName, ManifestDigest, ProvideDecl, SlotDecl};
     use amber_scenario::{Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport};
     use serde_json::json;
 
@@ -656,6 +682,7 @@ mod tests {
         mesh::{
             plan::{
                 EndpointInfo, MeshPlan, ResolvedBinding, ResolvedComponentBinding, ResolvedExport,
+                ResolvedFrameworkBinding,
             },
             ports::allocate_local_route_ports,
         },
@@ -841,6 +868,182 @@ mod tests {
         assert!(
             unused_route.is_none(),
             "unused local routes must stay closed to the router and should not be emitted",
+        );
+    }
+
+    #[test]
+    fn build_mesh_config_plan_opens_controller_internal_route_to_local_sidecars_and_router() {
+        let consumer = component(
+            0,
+            "/consumer",
+            json!({
+                "image": "consumer",
+                "entrypoint": ["consumer"],
+            }),
+        );
+        let controller_moniker =
+            crate::run_plan::FrameworkComponentControllerMoniker::for_site("site-a").into_string();
+        let mut controller = component(
+            1,
+            controller_moniker.as_str(),
+            json!({
+                "image": "controller",
+                "entrypoint": ["controller"],
+                "network": {
+                    "endpoints": [
+                        { "name": "framework_component", "port": 8080, "protocol": "http" }
+                    ]
+                }
+            }),
+        );
+        controller.metadata = Some(
+            serde_json::to_value(crate::run_plan::FrameworkComponentControllerMetadata {
+                kind: "amber.framework_component.controller".to_string(),
+                execution_site: "site-a".to_string(),
+                grants: BTreeMap::new(),
+            })
+            .expect("controller metadata"),
+        );
+        controller.provides.insert(
+            FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE.to_string(),
+            serde_json::from_value::<ProvideDecl>(json!({
+                "kind": "component",
+                "endpoint": "framework_component",
+            }))
+            .expect("internal provide decl"),
+        );
+
+        let scenario = Scenario {
+            root: ComponentId(0),
+            components: vec![Some(consumer), Some(controller)],
+            bindings: Vec::new(),
+            exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
+        };
+        let mesh_plan = MeshPlan::new(
+            vec![ComponentId(0), ComponentId(1)],
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+        );
+        let endpoint_plan = build_endpoint_plan(&scenario).expect("endpoint plan");
+        let route_ports = allocate_local_route_ports(&scenario, &endpoint_plan, &mesh_plan)
+            .expect("local route ports");
+        let mesh_ports_by_component =
+            HashMap::from([(ComponentId(0), 23000), (ComponentId(1), 23001)]);
+
+        let plan = build_mesh_config_plan(MeshConfigBuildInput {
+            scenario: &scenario,
+            mesh_plan: &mesh_plan,
+            route_ports: &route_ports,
+            mesh_ports_by_component: &mesh_ports_by_component,
+            router_ports: Some(RouterPorts {
+                mesh: 24000,
+                control: 24100,
+            }),
+            addressing: &StaticAddressing,
+            options: MeshConfigBuildOptions {
+                force_router: true,
+                router_identity_id: "/site/test/router",
+                ..default_mesh_config_build_options()
+            },
+        })
+        .expect("mesh config plan");
+
+        let controller_config = plan
+            .component_configs
+            .get(&ComponentId(1))
+            .expect("controller config");
+        let internal_route = controller_config
+            .inbound
+            .iter()
+            .find(|route| route.capability == FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE)
+            .expect("controller internal inbound route");
+        assert_eq!(
+            internal_route.allowed_issuers,
+            vec!["/consumer".to_string(), "/site/test/router".to_string()],
+            "controller internal routing must admit local component sidecars and the site router",
+        );
+        assert!(
+            controller_config.dynamic_caps_listen.is_none(),
+            "synthetic controller sidecars should not expose the ordinary dynamic caps listener",
+        );
+
+        let consumer_config = plan
+            .component_configs
+            .get(&ComponentId(0))
+            .expect("consumer config");
+        assert!(
+            consumer_config.dynamic_caps_listen.is_some(),
+            "ordinary components should still expose the dynamic caps listener",
+        );
+    }
+
+    #[test]
+    fn build_mesh_config_plan_rejects_unlowered_framework_component_bindings() {
+        let mut consumer = component(
+            0,
+            "/consumer",
+            json!({
+                "image": "consumer",
+                "entrypoint": ["consumer"],
+            }),
+        );
+        consumer.slots.insert(
+            "realm".to_string(),
+            serde_json::from_value::<SlotDecl>(json!({
+                "kind": "component",
+            }))
+            .expect("slot decl"),
+        );
+
+        let scenario = Scenario {
+            root: ComponentId(0),
+            components: vec![Some(consumer)],
+            bindings: Vec::new(),
+            exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
+        };
+
+        let mesh_plan = MeshPlan::new(
+            vec![ComponentId(0)],
+            vec![ResolvedBinding::Framework(ResolvedFrameworkBinding {
+                consumer: ComponentId(0),
+                slot: "realm".to_string(),
+                authority_realm: ComponentId(0),
+                capability: FrameworkCapabilityName::try_from("component")
+                    .expect("framework capability"),
+            })],
+            Vec::new(),
+            HashMap::new(),
+        );
+
+        let endpoint_plan = build_endpoint_plan(&scenario).expect("endpoint plan");
+        let route_ports = allocate_local_route_ports(&scenario, &endpoint_plan, &mesh_plan)
+            .expect("local route ports");
+        let mesh_ports_by_component = HashMap::from([(ComponentId(0), 23000)]);
+
+        let err = build_mesh_config_plan(MeshConfigBuildInput {
+            scenario: &scenario,
+            mesh_plan: &mesh_plan,
+            route_ports: &route_ports,
+            mesh_ports_by_component: &mesh_ports_by_component,
+            router_ports: Some(RouterPorts {
+                mesh: 24000,
+                control: 24100,
+            }),
+            addressing: &StaticAddressing,
+            options: MeshConfigBuildOptions {
+                router_identity_id: "/site/test/router",
+                ..default_mesh_config_build_options()
+            },
+        })
+        .expect_err("framework.component routes must be lowered before mesh config generation");
+
+        assert!(
+            err.to_string()
+                .contains("must be lowered before mesh config generation"),
+            "unexpected mesh config error: {err}"
         );
     }
 }

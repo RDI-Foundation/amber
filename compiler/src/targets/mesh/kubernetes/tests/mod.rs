@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -58,6 +59,114 @@ fn render_artifact(output: &crate::CompileOutput) -> super::KubernetesArtifact {
     KubernetesReporter
         .emit(&compiled_scenario(output))
         .expect("render kubernetes output")
+}
+
+fn compile_framework_component_output(root_path: &Path) -> crate::CompileOutput {
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let url = Url::from_file_path(root_path).expect("file url");
+    rt.block_on(compiler.compile(ManifestRef::from_url(url), opts))
+        .expect("compile scenario")
+}
+
+#[test]
+fn lowered_framework_component_controller_uses_real_internal_image_in_kubernetes_artifacts() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let admin_path = dir.path().join("admin.json5");
+    fs::write(
+        &root_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          slots: { external: { kind: "http" } },
+          components: { admin: "./admin.json5" },
+          bindings: [
+            { to: "#admin.ctl", from: "framework.component" },
+            { to: "#admin.external", from: "self.external", weak: true }
+          ]
+        }
+        "##,
+    )
+    .expect("write root manifest");
+    fs::write(
+        &admin_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "sleep 3600"]
+          },
+          slots: {
+            ctl: { kind: "component" },
+            external: { kind: "http" }
+          }
+        }
+        "#,
+    )
+    .expect("write admin manifest");
+
+    let output = compile_framework_component_output(&root_path);
+    let artifact = render_artifact(&output);
+    let deployment = artifact
+        .files
+        .get(&PathBuf::from("03-deployments/amber-site-controller.yaml"))
+        .expect("site controller deployment");
+    let service = artifact
+        .files
+        .get(&PathBuf::from("04-services/amber-site-controller.yaml"))
+        .expect("site controller service");
+    let netpol = artifact
+        .files
+        .get(&PathBuf::from(
+            "05-networkpolicies/amber-site-controller-netpol.yaml",
+        ))
+        .expect("site controller network policy");
+    let site_controller_image = internal_images().site_controller;
+
+    assert!(
+        deployment.contains(&site_controller_image),
+        "synthetic controller deployment should use the real site-controller image: {deployment}"
+    );
+    assert!(
+        !deployment.contains("__amber_internal/site-controller"),
+        "kubernetes artifacts must not leak the internal site-controller placeholder image: \
+         {deployment}"
+    );
+    assert!(
+        service.contains("name: amber-site-controller"),
+        "the lowered controller should render an ordinary service for the controller workload: \
+         {service}"
+    );
+    let netpol_doc: serde_yaml::Value =
+        serde_yaml::from_str(netpol).expect("parse site controller network policy");
+    let egress = netpol_doc["spec"]["egress"]
+        .as_sequence()
+        .expect("site controller network policy should have egress rules");
+    let has_router_control_egress = egress.iter().any(|rule| {
+        let to_router = rule["to"].as_sequence().is_some_and(|peers| {
+            peers.iter().any(|peer| {
+                peer["podSelector"]["matchLabels"]["amber.io/component"].as_str()
+                    == Some("amber-router")
+            })
+        });
+        let has_control_port = rule["ports"].as_sequence().is_some_and(|ports| {
+            ports.iter().any(|port| {
+                port["protocol"].as_str() == Some("TCP") && port["port"].as_u64() == Some(24100)
+            })
+        });
+        to_router && has_control_port
+    });
+    assert!(
+        has_router_control_egress,
+        "site controller must be able to reach the local router control port without opening a \
+         broader egress surface: {netpol}"
+    );
 }
 
 fn parse_rendered_env(content: &str) -> std::collections::BTreeMap<String, String> {
@@ -295,10 +404,22 @@ fn write_kubernetes_smoke_fixture(root: &Path) -> PathBuf {
       "\
         mkdir content\n\
         cd content\n\
-        wget '${slots.server.url}/runtime_secret.txt'\n\
-        wget '${slots.server.url}/runtime_config.txt'\n\
-        wget '${slots.server.url}/static_secret.txt'\n\
-        wget '${slots.server.url}/static_config.txt'\n\
+        fetch() {\n\
+          path=\"$1\"\n\
+          attempts=0\n\
+          until wget -O \"$path\" '${slots.server.url}/'\"$path\"; do\n\
+            rm -f \"$path\"\n\
+            attempts=$((attempts + 1))\n\
+            if [ \"$attempts\" -ge 60 ]; then\n\
+              exit 1\n\
+            fi\n\
+            sleep 1\n\
+          done\n\
+        }\n\
+        fetch runtime_secret.txt\n\
+        fetch runtime_config.txt\n\
+        fetch static_secret.txt\n\
+        fetch static_config.txt\n\
         httpd -f -p 8080\n\
       ",
     ],
@@ -907,6 +1028,63 @@ fn kubectl_logs(namespace: &str, pod: &str, kubeconfig: &Path) -> String {
     match output {
         Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
         Err(err) => format!("failed to run kubectl logs: {err}"),
+    }
+}
+
+fn wait_for_pod_http(
+    namespace: &str,
+    pod: &str,
+    container: &str,
+    url: &str,
+    kubeconfig: &Path,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    let mut last_status = String::new();
+    let mut last_stdout = String::new();
+    let mut last_stderr = String::new();
+
+    loop {
+        let output = kubectl_cmd(kubeconfig)
+            .arg("exec")
+            .arg("-n")
+            .arg(namespace)
+            .arg(pod)
+            .arg("-c")
+            .arg(container)
+            .arg("--")
+            .arg("wget")
+            .arg("-q")
+            .arg("-O")
+            .arg("-")
+            .arg(url)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                return String::from_utf8_lossy(&output.stdout).trim().to_string();
+            }
+            Ok(output) => {
+                last_status = output.status.to_string();
+                last_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                last_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            }
+            Err(err) => {
+                last_status = format!("failed to run kubectl exec: {err}");
+                last_stdout.clear();
+                last_stderr.clear();
+            }
+        }
+
+        if Instant::now() >= deadline {
+            let pod_logs = kubectl_logs(namespace, pod, kubeconfig);
+            panic!(
+                "pod HTTP endpoint {url} did not become ready in container {container}\nlast \
+                 status: {last_status}\nlast stdout:\n{last_stdout}\nlast \
+                 stderr:\n{last_stderr}\npod logs:\n{pod_logs}"
+            );
+        }
+
+        thread::sleep(Duration::from_secs(1));
     }
 }
 

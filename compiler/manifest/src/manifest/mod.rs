@@ -309,6 +309,31 @@ fn validate_resource_decls(resources: &BTreeMap<ResourceName, ResourceDecl>) -> 
     Ok(())
 }
 
+fn framework_owned_provide_kind_help(kind: CapabilityKind) -> String {
+    match kind {
+        CapabilityKind::Kvm => "`kvm` access is created by `framework.kvm`. Use `program.mounts` \
+                                with `from: \"framework.kvm\"` instead of declaring a `provides` \
+                                entry."
+            .to_string(),
+        CapabilityKind::Component | CapabilityKind::Docker => {
+            let framework_capability = kind.as_str();
+            format!(
+                "`{kind}` capabilities are created by `framework.{framework_capability}`. Declare \
+                 a `slots.<name>: {{ kind: \"{kind}\" }}` consumer slot and bind it from \
+                 `framework.{framework_capability}` instead of declaring a `provides` entry."
+            )
+        }
+        _ => "`provides` cannot declare this framework-owned capability kind.".to_string(),
+    }
+}
+
+fn is_framework_owned_provide_kind(kind: CapabilityKind) -> bool {
+    matches!(
+        kind,
+        CapabilityKind::Component | CapabilityKind::Docker | CapabilityKind::Kvm
+    )
+}
+
 fn validate_environment_extends(
     environments: &BTreeMap<String, EnvironmentDecl>,
 ) -> Result<(), Error> {
@@ -728,6 +753,14 @@ fn validate_endpoints(
     }
 
     for (provide_name, provide) in provides {
+        if is_framework_owned_provide_kind(provide.decl.kind) {
+            return Err(Error::FrameworkOwnedProvideKind {
+                name: provide_name.to_string(),
+                kind: provide.decl.kind,
+                help: framework_owned_provide_kind_help(provide.decl.kind),
+            });
+        }
+
         if provide.decl.kind == CapabilityKind::Storage {
             return Err(Error::UnsupportedProvideKind {
                 name: provide_name.to_string(),

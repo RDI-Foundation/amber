@@ -105,7 +105,74 @@ pub(crate) fn component_program_spec(
                 network: ProcessNetwork::Host,
             })
         }
+        DirectProgramExecutionPlan::InternalSiteController => {
+            let (program, args) =
+                split_entrypoint(&internal_site_controller_entrypoint(runtime_root)?)?;
+            Ok(ProcessSpec {
+                name: component.program.log_name.clone(),
+                program,
+                args,
+                env: BTreeMap::new(),
+                work_dir,
+                sandbox: ProcessSandbox::Unsandboxed,
+                drop_all_caps: true,
+                #[cfg(target_os = "linux")]
+                read_only_mounts: Vec::new(),
+                writable_dirs,
+                bind_dirs: Vec::new(),
+                bind_mounts,
+                hidden_paths: Vec::new(),
+                network: ProcessNetwork::Host,
+            })
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn direct_component_uses_isolated_network(component: &DirectComponentPlan) -> bool {
+    !matches!(
+        component.program.execution,
+        DirectProgramExecutionPlan::InternalSiteController
+    )
+}
+
+pub(crate) fn direct_component_sidecar_network(component: &DirectComponentPlan) -> ProcessNetwork {
+    #[cfg(target_os = "linux")]
+    {
+        if direct_component_uses_isolated_network(component) {
+            ProcessNetwork::Isolated
+        } else {
+            ProcessNetwork::Host
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = component;
+        ProcessNetwork::Host
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn direct_component_program_joins_sidecar(component: &DirectComponentPlan) -> bool {
+    direct_component_uses_isolated_network(component)
+}
+
+fn internal_site_controller_plan_path(runtime_root: &Path) -> PathBuf {
+    let site_state_root = runtime_root.parent().unwrap_or(runtime_root);
+    mixed_run::site_controller_plan_path(site_state_root)
+}
+
+fn internal_site_controller_entrypoint(runtime_root: &Path) -> Result<Vec<String>> {
+    let command = mixed_run::site_controller_command()?;
+    let mut argv = vec![command.executable.display().to_string()];
+    argv.extend(command.prefix_args.iter().map(|arg| (*arg).to_string()));
+    argv.push("--plan".to_string());
+    argv.push(
+        internal_site_controller_plan_path(runtime_root)
+            .display()
+            .to_string(),
+    );
+    Ok(argv)
 }
 
 pub(crate) fn build_direct_site_launch_preview(
@@ -120,27 +187,64 @@ pub(crate) fn build_direct_site_launch_preview(
         direct_plan,
         mesh_plan,
     } = load_direct_runtime_inputs(&plan_path)?;
-    let runtime_state = materialize_direct_runtime(
+    let mut inspectability_warnings = Vec::new();
+    let runtime_state = match materialize_direct_runtime(
         &plan_root,
         runtime_root,
         &direct_plan,
         &mesh_plan,
         router_mesh_port,
         true,
-    )?;
-    #[cfg(target_os = "linux")]
-    configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
-    #[cfg(not(target_os = "linux"))]
-    configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
+    ) {
+        Ok(runtime_state) => {
+            #[cfg(target_os = "linux")]
+            configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
+            #[cfg(not(target_os = "linux"))]
+            configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
+            runtime_state
+        }
+        Err(err) if missing_existing_peer_identity(&err) => {
+            // Dry-run preview can still show the local process shape before peer-site routers
+            // exist; the missing identities only block full mesh config materialization.
+            inspectability_warnings.push(format!(
+                "preview is missing one or more peer-site router identities, so mesh configs \
+                 remain unresolved until those sites are running: {err}"
+            ));
+            let (preview_peer_identities, preview_peer_ports) =
+                preview_placeholder_peer_mesh_state(&mesh_plan);
+            materialize_direct_runtime_with_existing(
+                &plan_root,
+                runtime_root,
+                &direct_plan,
+                &mesh_plan,
+                router_mesh_port,
+                DirectExistingMeshState {
+                    reuse_existing: false,
+                    peer_ports_by_id: &preview_peer_ports,
+                    peer_identities_by_id: &preview_peer_identities,
+                },
+            )?
+        }
+        Err(err) => return Err(err),
+    };
 
     let router_binary = resolve_runtime_binary("amber-router")?;
     let mut processes = Vec::new();
     let mut router_public_key_b64 = None;
     if let Some(router) = direct_plan.router.as_ref() {
-        let router_config = read_mesh_config_public(&runtime_root.join(&router.mesh_config_path))?;
-        router_public_key_b64 = Some(
-            base64::engine::general_purpose::STANDARD.encode(router_config.identity.public_key),
-        );
+        let router_config_path = runtime_root.join(&router.mesh_config_path);
+        match read_mesh_config_public(&router_config_path) {
+            Ok(router_config) => {
+                router_public_key_b64 = Some(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(router_config.identity.public_key),
+                );
+            }
+            Err(err) => inspectability_warnings.push(format!(
+                "failed to inspect direct router mesh config {}: {err}",
+                router_config_path.display()
+            )),
+        }
         let paths = DirectControlSocketPaths {
             artifact_link: resolve_direct_artifact_path(&plan_root, &router.control_socket_path),
             current_link: direct_current_control_socket_path(&plan_root),
@@ -228,9 +332,6 @@ pub(crate) fn build_direct_site_launch_preview(
         );
         for passthrough in &component.sidecar.env_passthrough {
             if let Ok(value) = env::var(passthrough) {
-                #[cfg(target_os = "linux")]
-                let value =
-                    rewrite_sidecar_env_passthrough_for_slirp(passthrough.as_str(), value.as_str());
                 env.insert(passthrough.clone(), value);
             }
         }
@@ -252,16 +353,7 @@ pub(crate) fn build_direct_site_launch_preview(
                 bind_dirs: Vec::new(),
                 bind_mounts: Vec::new(),
                 hidden_paths: Vec::new(),
-                network: {
-                    #[cfg(target_os = "linux")]
-                    {
-                        ProcessNetwork::Isolated
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        ProcessNetwork::Host
-                    }
-                },
+                network: direct_component_sidecar_network(component),
             },
             "sidecar",
             Some(component.moniker.as_str()),
@@ -283,18 +375,24 @@ pub(crate) fn build_direct_site_launch_preview(
             &direct_plan.runtime_addresses,
             &runtime_state,
         )?;
-        spec.hidden_paths.push(runtime_root.join("mesh"));
+        if !matches!(
+            component.program.execution,
+            DirectProgramExecutionPlan::InternalSiteController
+        ) {
+            spec.hidden_paths.push(runtime_root.join("mesh"));
+        }
         let resolved_process = match &component.program.execution {
             DirectProgramExecutionPlan::Direct { .. } => None,
             DirectProgramExecutionPlan::HelperRunner { .. } => {
                 Some(direct_resolved_process_preview(&spec.env)?)
             }
+            DirectProgramExecutionPlan::InternalSiteController => None,
         };
         processes.push(direct_process_preview(
             spec,
             "program",
             Some(component.moniker.as_str()),
-            Some(direct_program_network_override()),
+            Some(direct_program_network_override(component)),
             resolved_process,
         ));
     }
@@ -302,7 +400,54 @@ pub(crate) fn build_direct_site_launch_preview(
     Ok(DirectSiteLaunchPreview {
         router_public_key_b64,
         processes,
+        inspectability_warnings,
     })
+}
+
+pub(crate) fn missing_existing_peer_identity(err: &miette::Report) -> bool {
+    err.to_string()
+        .contains("mesh provision plan requires existing peer identity")
+}
+
+pub(crate) fn preview_placeholder_peer_mesh_state(
+    mesh_plan: &MeshProvisionPlan,
+) -> (BTreeMap<String, MeshIdentityPublic>, BTreeMap<String, u16>) {
+    let target_ids = mesh_plan
+        .targets
+        .iter()
+        .map(|target| target.config.identity.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mesh_scope = mesh_plan
+        .targets
+        .first()
+        .and_then(|target| target.config.identity.mesh_scope.clone());
+    let peer_ids = mesh_plan
+        .targets
+        .iter()
+        .flat_map(|target| target.config.peers.iter())
+        .filter(|peer| !target_ids.contains(peer.id.as_str()))
+        .map(|peer| peer.id.clone())
+        .collect::<BTreeSet<_>>();
+    let peer_identities = peer_ids
+        .iter()
+        .map(|peer| {
+            let identity = MeshIdentity::generate(peer.clone(), mesh_scope.clone());
+            (
+                peer.clone(),
+                MeshIdentityPublic {
+                    id: identity.id,
+                    public_key: identity.public_key,
+                    mesh_scope: identity.mesh_scope,
+                },
+            )
+        })
+        .collect();
+    let peer_ports = peer_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, peer_id)| (peer_id, 39_000 + index as u16))
+        .collect();
+    (peer_identities, peer_ports)
 }
 
 pub(crate) fn load_direct_runtime_inputs(plan_path: &Path) -> Result<DirectRuntimeInputs> {
@@ -409,13 +554,18 @@ pub(crate) fn direct_process_network_label(network: ProcessNetwork) -> String {
     }
 }
 
-pub(crate) fn direct_program_network_override() -> &'static str {
+pub(crate) fn direct_program_network_override(component: &DirectComponentPlan) -> &'static str {
     #[cfg(target_os = "linux")]
     {
-        "join_component_sidecar"
+        if direct_component_program_joins_sidecar(component) {
+            "join_component_sidecar"
+        } else {
+            "host"
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = component;
         "host"
     }
 }
@@ -525,13 +675,10 @@ pub(crate) async fn wait_for_component_local_targets(
     if ports.is_empty() {
         return Ok(());
     }
-    let sidecar_pid = sidecar_pid.ok_or_else(|| {
-        miette::miette!(
-            "missing sidecar pid while waiting for component {} local targets",
-            component.moniker
-        )
-    })?;
-    let namespace_join = prepare_linux_namespace_join(sidecar_pid)?;
+    let namespace_join = sidecar_pid
+        .map(prepare_linux_namespace_join)
+        .transpose()?
+        .flatten();
     let amber_cli = env::current_exe()
         .into_diagnostic()
         .wrap_err("failed to locate current amber binary for direct local probe")?;
@@ -809,6 +956,7 @@ pub(crate) fn component_execution_program_path(
             }
             Ok(None)
         }
+        DirectProgramExecutionPlan::InternalSiteController => Ok(None),
     }
 }
 
@@ -1042,9 +1190,9 @@ pub(crate) async fn spawn_managed_process(
         ProcessSandbox::Sandboxed => sandbox.wrap_command(&spec)?,
         ProcessSandbox::Unsandboxed => {
             #[cfg(target_os = "linux")]
-            if !matches!(spec.network, ProcessNetwork::Host) {
+            if matches!(spec.network, ProcessNetwork::Isolated) {
                 return Err(miette::miette!(
-                    "unsandboxed direct processes must use host networking"
+                    "unsandboxed direct processes cannot create isolated networking"
                 ));
             }
             (spec.program.clone(), spec.args.clone())
@@ -1053,15 +1201,9 @@ pub(crate) async fn spawn_managed_process(
     #[cfg(target_os = "linux")]
     let mut args = args;
     #[cfg(target_os = "linux")]
-    let namespace_join = if matches!(spec.sandbox, ProcessSandbox::Sandboxed)
-        && matches!(sandbox, DirectSandbox::Bubblewrap { .. })
-    {
-        match spec.network {
-            ProcessNetwork::Join(pid) => prepare_linux_namespace_join(pid)?,
-            _ => None,
-        }
-    } else {
-        None
+    let namespace_join = match spec.network {
+        ProcessNetwork::Join(pid) => prepare_linux_namespace_join(pid)?,
+        _ => None,
     };
     #[cfg(target_os = "linux")]
     let pid_capture = if matches!(spec.sandbox, ProcessSandbox::Sandboxed)

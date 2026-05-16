@@ -26,8 +26,8 @@ RUN case "${TARGETARCH}" in \
 
 FROM base-builder AS builder
 
-# Prefetch Rust dependencies for better Docker layer caching.
 COPY Cargo.toml Cargo.lock ./
+COPY README.md ./
 COPY cli/Cargo.toml cli/
 COPY compiler/config/Cargo.toml compiler/config/
 COPY compiler/Cargo.toml compiler/
@@ -38,21 +38,32 @@ COPY compiler/json5/Cargo.toml compiler/json5/
 COPY compiler/manifest/Cargo.toml compiler/manifest/
 COPY runtime/mesh/Cargo.toml runtime/mesh/
 COPY runtime/proxy/Cargo.toml runtime/proxy/
-COPY runtime/provisioner/Cargo.toml runtime/provisioner/
 COPY runtime/router/Cargo.toml runtime/router/
+COPY runtime/site-controller/Cargo.toml runtime/site-controller/
 COPY compiler/resolver/Cargo.toml compiler/resolver/
 COPY compiler/scenario/Cargo.toml compiler/scenario/
 COPY compiler/template/Cargo.toml compiler/template/
+COPY runtime/provisioner/Cargo.toml runtime/provisioner/
 COPY runtime/scenario-runner/Cargo.toml runtime/scenario-runner/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    mkdir -p cli/src compiler/config/src compiler/src runtime/docker-gateway/src runtime/helper/src images/src compiler/json5/src compiler/manifest/src runtime/mesh/src runtime/proxy/src runtime/provisioner/src runtime/router/src compiler/resolver/src compiler/scenario/src compiler/template/src runtime/scenario-runner/src && \
-    touch cli/src/main.rs compiler/config/src/lib.rs compiler/src/lib.rs runtime/docker-gateway/src/main.rs runtime/helper/src/main.rs images/src/lib.rs compiler/json5/src/lib.rs compiler/manifest/src/lib.rs runtime/mesh/src/lib.rs runtime/proxy/src/lib.rs runtime/provisioner/src/main.rs runtime/router/src/main.rs compiler/resolver/src/lib.rs compiler/scenario/src/lib.rs compiler/template/src/lib.rs runtime/scenario-runner/src/lib.rs && \
+    mkdir -p cli/src compiler/config/src compiler/src runtime/docker-gateway/src runtime/helper/src images/src compiler/json5/src compiler/manifest/src runtime/mesh/src runtime/proxy/src runtime/provisioner/src runtime/router/src runtime/scenario-runner/src runtime/site-controller/src runtime/site-controller/src/bin compiler/resolver/src compiler/scenario/src compiler/template/src && \
+    touch cli/src/main.rs compiler/config/src/lib.rs compiler/src/lib.rs runtime/docker-gateway/src/lib.rs runtime/helper/src/main.rs images/src/lib.rs compiler/json5/src/lib.rs compiler/manifest/src/lib.rs runtime/mesh/src/lib.rs runtime/proxy/src/lib.rs runtime/provisioner/src/main.rs runtime/router/src/main.rs runtime/scenario-runner/src/lib.rs runtime/site-controller/src/lib.rs runtime/site-controller/src/bin/amber-site-controller.rs compiler/resolver/src/lib.rs compiler/scenario/src/lib.rs compiler/template/src/lib.rs && \
     cargo fetch --locked
 
+COPY cli ./cli
+COPY compiler ./compiler
+COPY examples ./examples
+COPY images ./images
 COPY runtime/docker-gateway ./runtime/docker-gateway
+COPY runtime/helper ./runtime/helper
+COPY runtime/mesh ./runtime/mesh
+COPY runtime/proxy ./runtime/proxy
+COPY runtime/router ./runtime/router
 COPY runtime/scenario-runner ./runtime/scenario-runner
+COPY runtime/site-controller ./runtime/site-controller
+COPY docker/images.json docker/images.json
 
 ARG BUILD_MODE=release
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
@@ -60,16 +71,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     target=$(cat /tmp/rust-target) && \
     if [ "$BUILD_MODE" = "release" ]; then \
-      cargo build --locked --release -p amber-docker-gateway --target "${target}"; \
+      cargo build --locked --release -p amber-cli -p amber-site-controller --target "${target}"; \
       build_dir=release; \
     else \
-      cargo build --locked -p amber-docker-gateway --target "${target}"; \
+      cargo build --locked -p amber-cli -p amber-site-controller --target "${target}"; \
       build_dir=debug; \
     fi && \
-    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-docker-gateway /out/amber-docker-gateway
+    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber /out/amber && \
+    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-site-controller /out/amber-site-controller
 
-FROM gcr.io/distroless/static-debian13 AS runtime
+FROM docker:28-cli AS runtime
 
-COPY --from=builder /out/amber-docker-gateway /amber-docker-gateway
+RUN apk add --no-cache kubectl
 
-ENTRYPOINT ["/amber-docker-gateway"]
+COPY --from=builder /out/amber /usr/local/bin/amber
+COPY --from=builder /out/amber-site-controller /usr/local/bin/amber-site-controller
+
+ENTRYPOINT ["/usr/local/bin/amber-site-controller"]

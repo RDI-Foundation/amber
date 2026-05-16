@@ -1,6 +1,9 @@
+#[path = "test_support/port_allocator.rs"]
+mod port_allocator_support;
+
 use std::{
     env, fs,
-    net::{SocketAddr, TcpListener},
+    net::SocketAddr,
     path::Path,
     process::{Command, Stdio},
     thread,
@@ -8,11 +11,11 @@ use std::{
 };
 
 use amber_mesh::{MeshConfig, MeshIdentity, TransportConfig, encode_config_b64};
+use port_allocator_support::reserve_test_loopback_port;
 use serde_json::Value;
 
 fn pick_free_port() -> u16 {
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-    listener.local_addr().unwrap().port()
+    reserve_test_loopback_port()
 }
 
 fn workspace_root() -> std::path::PathBuf {

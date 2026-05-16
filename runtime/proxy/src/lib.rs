@@ -1736,6 +1736,13 @@ fn control_status(code: u16, body: &str) -> Result<(), ControlUpdateError> {
     })
 }
 
+fn control_delete_status(code: u16, body: &str) -> Result<(), ControlUpdateError> {
+    if (200..300).contains(&code) || code == 404 {
+        return Ok(());
+    }
+    control_status(code, body)
+}
+
 async fn send_control_put_json(
     endpoint: &ControlEndpoint,
     path: &str,
@@ -1775,7 +1782,7 @@ async fn send_control_delete_json(
     );
     let response = send_control_request(endpoint, &request).await?;
     let (code, body) = parse_http_response(&response).ok_or(ControlUpdateError::Retryable)?;
-    control_status(code, body)
+    control_delete_status(code, body)
 }
 
 fn parse_http_response(response: &str) -> Option<(u16, &str)> {
@@ -1986,11 +1993,42 @@ where
     .map_err(|_| ControlUpdateError::Retryable)?
     .map_err(|_| ControlUpdateError::Retryable)?;
     let mut buf = Vec::new();
-    tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, stream.read_to_end(&mut buf))
-        .await
-        .map_err(|_| ControlUpdateError::Retryable)?
-        .map_err(|_| ControlUpdateError::Retryable)?;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| ControlUpdateError::Retryable)?
+            .map_err(|_| ControlUpdateError::Retryable)?;
+        if read == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..read]);
+        if let Some(response_len) = http_response_length(&buf)
+            && buf.len() >= response_len
+        {
+            break;
+        }
+    }
     Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+fn http_response_length(buf: &[u8]) -> Option<usize> {
+    let header_end = find_header_end(buf)?;
+    let header = std::str::from_utf8(&buf[..header_end]).ok()?;
+    let content_length = header.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    })?;
+    Some(header_end + content_length)
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
 }
 
 fn mesh_protocol_from_metadata(protocol: &str) -> Result<MeshProtocol> {

@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    env,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -207,14 +206,21 @@ pub struct MeshConfigTemplate {
 pub const MESH_PROVISION_PLAN_VERSION: &str = "2";
 pub const MESH_CONFIG_FILENAME: &str = "mesh-config.json";
 pub const MESH_IDENTITY_FILENAME: &str = "mesh-identity.json";
-pub const FRAMEWORK_COMPONENT_CCS_URL_ENV: &str = "AMBER_FRAMEWORK_COMPONENT_CCS_URL";
-pub const FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV: &str = "AMBER_FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN";
+pub const FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME: &str =
+    dynamic_caps::FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME;
 pub const DYNAMIC_CAPS_API_URL_ENV: &str = dynamic_caps::DYNAMIC_CAPS_API_URL_ENV;
-pub const DYNAMIC_CAPS_CONTROL_URL_ENV: &str = dynamic_caps::DYNAMIC_CAPS_CONTROL_URL_ENV;
-pub const DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV: &str =
-    dynamic_caps::DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV;
-pub const DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV: &str =
-    dynamic_caps::DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV;
+
+fn stable_temp_socket_root() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp")
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir()
+    }
+}
 
 pub fn stable_temp_socket_path(namespace: &str, kind: &str, path: &Path) -> PathBuf {
     let mut hasher = sha2::Sha256::new();
@@ -229,7 +235,7 @@ pub fn stable_temp_socket_path(namespace: &str, kind: &str, path: &Path) -> Path
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    env::temp_dir()
+    stable_temp_socket_root()
         .join(namespace)
         .join(format!("{kind}-{suffix}.sock"))
 }
@@ -321,6 +327,10 @@ pub struct OutboundRoute {
 pub enum InboundTarget {
     Local {
         port: u16,
+    },
+    DockerGateway {
+        docker_sock: PathBuf,
+        compose_project_env: String,
     },
     External {
         url_env: String,
@@ -608,6 +618,8 @@ mod key_serde_64 {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
     use super::*;
 
     #[test]
@@ -644,9 +656,51 @@ mod tests {
         );
         assert_eq!(
             path,
-            env::temp_dir()
+            Path::new("/tmp")
                 .join("amber-direct-control")
                 .join("current-9308da51951bac96.sock",)
+        );
+    }
+
+    #[test]
+    fn source_does_not_contain_literal_nul_bytes() {
+        let source = include_bytes!("lib.rs");
+        assert!(
+            !source.contains(&0),
+            "use escaped \\0 sequences instead of literal NUL bytes in Rust source",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_temp_socket_path_ignores_tmpdir_env() {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("env lock should not be poisoned");
+        let original = env::var_os("TMPDIR");
+        unsafe {
+            env::set_var("TMPDIR", "/var/folders/custom-process-temp");
+        }
+
+        let path = stable_temp_socket_path(
+            "amber-direct-control",
+            "current",
+            Path::new("/tmp/amber/example/sites/direct_local/artifact"),
+        );
+
+        match original {
+            Some(value) => unsafe { env::set_var("TMPDIR", value) },
+            None => unsafe { env::remove_var("TMPDIR") },
+        }
+
+        assert_eq!(
+            path,
+            Path::new("/tmp")
+                .join("amber-direct-control")
+                .join("current-9308da51951bac96.sock"),
+            "stable temp socket paths must not vary with per-process TMPDIR values",
         );
     }
 }

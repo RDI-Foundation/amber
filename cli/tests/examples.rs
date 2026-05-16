@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Mutex, OnceLock},
 };
 
 #[path = "../src/example_catalog.rs"]
@@ -12,6 +13,7 @@ mod runtime_bins_support;
 
 #[test]
 fn examples_check_deny_warnings() {
+    let _guard = example_command_lock();
     let examples_dir = examples_dir();
     let examples = collect_examples();
     for example in &examples {
@@ -93,6 +95,7 @@ fn examples_check_deny_warnings() {
 
 #[test]
 fn examples_compile_from_ir_matches_manifest_outputs() {
+    let _guard = example_command_lock();
     let amber = env!("CARGO_BIN_EXE_amber");
     let outputs_root = workspace_root().join("target").join("cli-test-outputs");
     fs::create_dir_all(&outputs_root).expect("failed to create outputs root");
@@ -145,6 +148,13 @@ fn examples_compile_from_ir_matches_manifest_outputs() {
             ExampleBackend::CheckOnly => unreachable!("check-only examples are skipped above"),
         }
     }
+}
+
+fn example_command_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("example command lock should not be poisoned")
 }
 
 fn workspace_root() -> PathBuf {

@@ -3,6 +3,7 @@ name = "amber-router"
 edition = "2024"
 
 [dependencies]
+amber-docker-gateway = { workspace = true }
 amber-mesh = { workspace = true }
 aho-corasick = "1.1.3"
 base64 = { workspace = true }

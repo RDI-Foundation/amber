@@ -1,11 +1,7 @@
 use std::fmt;
 
-use base64::{
-    Engine as _,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
-use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -16,9 +12,9 @@ pub const DYNAMIC_CAPS_REF_HOST: &str = "ref";
 pub const DYNAMIC_CAPS_REF_VERSION: u32 = 1;
 
 pub const DYNAMIC_CAPS_API_URL_ENV: &str = "AMBER_DYNAMIC_CAPS_API_URL";
-pub const DYNAMIC_CAPS_CONTROL_URL_ENV: &str = "AMBER_DYNAMIC_CAPS_CONTROL_URL";
-pub const DYNAMIC_CAPS_CONTROL_AUTH_TOKEN_ENV: &str = "AMBER_DYNAMIC_CAPS_CONTROL_AUTH_TOKEN";
-pub const DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64_ENV: &str = "AMBER_DYNAMIC_CAPS_TOKEN_VERIFY_KEY_B64";
+pub const FRAMEWORK_COMPONENT_CONTROLLER_INTERNAL_PROVIDE_NAME: &str =
+    "__amber_internal_site_controller";
+const DYNAMIC_CAPABILITY_REF_SIGNATURE_DOMAIN: &[u8] = b"amber.dynamic-capability-ref.v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -246,58 +242,11 @@ pub struct GrantSnapshotIr {
 pub struct DynamicCapabilityRefClaims {
     pub version: u32,
     pub run_id: String,
+    pub issuer_id: String,
     pub grant_id: String,
     pub holder_component_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descriptor_hint: Option<String>,
-}
-
-pub fn generate_dynamic_capability_signing_seed() -> [u8; 32] {
-    SigningKey::generate(&mut OsRng).to_bytes()
-}
-
-pub fn signing_key_from_seed(seed: [u8; 32]) -> SigningKey {
-    SigningKey::from_bytes(&seed)
-}
-
-pub fn signing_key_from_seed_b64(raw: &str) -> Result<SigningKey, DynamicCapabilityRefError> {
-    let decoded = STANDARD.decode(raw.as_bytes()).map_err(|err| {
-        DynamicCapabilityRefError::InvalidToken(format!(
-            "failed to decode dynamic capability signing seed: {err}"
-        ))
-    })?;
-    let seed: [u8; 32] = decoded.as_slice().try_into().map_err(|_| {
-        DynamicCapabilityRefError::InvalidToken(
-            "dynamic capability signing seed must be exactly 32 bytes".to_string(),
-        )
-    })?;
-    Ok(signing_key_from_seed(seed))
-}
-
-pub fn signing_seed_b64(signing_key: &SigningKey) -> String {
-    STANDARD.encode(signing_key.to_bytes())
-}
-
-pub fn verify_key_b64(signing_key: &SigningKey) -> String {
-    STANDARD.encode(signing_key.verifying_key().to_bytes())
-}
-
-pub fn verify_key_from_b64(raw: &str) -> Result<VerifyingKey, DynamicCapabilityRefError> {
-    let decoded = STANDARD.decode(raw.as_bytes()).map_err(|err| {
-        DynamicCapabilityRefError::InvalidToken(format!(
-            "failed to decode dynamic capability verify key: {err}"
-        ))
-    })?;
-    let bytes: [u8; 32] = decoded.as_slice().try_into().map_err(|_| {
-        DynamicCapabilityRefError::InvalidToken(
-            "dynamic capability verify key must be exactly 32 bytes".to_string(),
-        )
-    })?;
-    VerifyingKey::from_bytes(&bytes).map_err(|err| {
-        DynamicCapabilityRefError::InvalidToken(format!(
-            "dynamic capability verify key is malformed: {err}"
-        ))
-    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -405,11 +354,7 @@ pub fn encode_dynamic_capability_ref(
     claims: DynamicCapabilityRefClaims,
     signing_key: &SigningKey,
 ) -> Result<String, DynamicCapabilityRefError> {
-    let payload = serde_json::to_vec(&claims).map_err(|err| {
-        DynamicCapabilityRefError::InvalidToken(format!(
-            "failed to encode dynamic capability ref claims: {err}"
-        ))
-    })?;
+    let payload = dynamic_capability_ref_signature_payload(&claims)?;
     let signature = signing_key.sign(&payload);
     let token = DynamicCapabilityRefToken {
         claims,
@@ -511,14 +456,25 @@ pub fn verify_dynamic_capability_ref(
     parsed: &ParsedDynamicCapabilityRef,
     verify_key: &VerifyingKey,
 ) -> Result<(), DynamicCapabilityRefError> {
-    let claims_bytes = serde_json::to_vec(&parsed.claims).map_err(|err| {
-        DynamicCapabilityRefError::InvalidToken(format!(
-            "failed to re-encode dynamic capability ref claims: {err}"
-        ))
-    })?;
+    let claims_bytes = dynamic_capability_ref_signature_payload(&parsed.claims)?;
     verify_key
         .verify(&claims_bytes, &parsed.signature)
         .map_err(|_| DynamicCapabilityRefError::InvalidSignature)
+}
+
+fn dynamic_capability_ref_signature_payload(
+    claims: &DynamicCapabilityRefClaims,
+) -> Result<Vec<u8>, DynamicCapabilityRefError> {
+    let claims_json = serde_json::to_vec(claims).map_err(|err| {
+        DynamicCapabilityRefError::InvalidToken(format!(
+            "failed to encode dynamic capability ref claims: {err}"
+        ))
+    })?;
+    let mut payload =
+        Vec::with_capacity(DYNAMIC_CAPABILITY_REF_SIGNATURE_DOMAIN.len() + claims_json.len());
+    payload.extend_from_slice(DYNAMIC_CAPABILITY_REF_SIGNATURE_DOMAIN);
+    payload.extend_from_slice(&claims_json);
+    Ok(payload)
 }
 
 pub fn build_dynamic_capability_ref_url(
@@ -552,6 +508,8 @@ pub fn build_dynamic_capability_ref_url(
 
 #[cfg(test)]
 mod tests {
+    use rand_core::OsRng;
+
     use super::*;
     use crate::HttpRoutePlugin;
 
@@ -581,6 +539,7 @@ mod tests {
         DynamicCapabilityRefClaims {
             version: DYNAMIC_CAPS_REF_VERSION,
             run_id: "run-123".to_string(),
+            issuer_id: "/controller".to_string(),
             grant_id: "g_abc".to_string(),
             holder_component_id: "components./worker".to_string(),
             descriptor_hint: Some("worker.http".to_string()),
@@ -589,7 +548,7 @@ mod tests {
 
     #[test]
     fn dynamic_capability_ref_round_trip_preserves_claims_and_suffix() {
-        let signing_key = signing_key_from_seed(generate_dynamic_capability_signing_seed());
+        let signing_key = SigningKey::generate(&mut OsRng);
         let raw = build_dynamic_capability_ref_url(
             test_claims(),
             &signing_key,
@@ -609,7 +568,7 @@ mod tests {
 
     #[test]
     fn dynamic_capability_ref_rejects_signature_tampering() {
-        let signing_key = signing_key_from_seed(generate_dynamic_capability_signing_seed());
+        let signing_key = SigningKey::generate(&mut OsRng);
         let raw = build_dynamic_capability_ref_url(test_claims(), &signing_key, "/", None, None)
             .expect("dynamic ref should build");
         let mut parsed = Url::parse(&raw).expect("dynamic ref url should parse");
@@ -628,14 +587,6 @@ mod tests {
         let err = decode_dynamic_capability_ref(parsed.as_str(), &signing_key.verifying_key())
             .expect_err("tampered ref should be rejected");
         assert!(matches!(err, DynamicCapabilityRefError::InvalidSignature));
-    }
-
-    #[test]
-    fn verify_key_b64_round_trip_preserves_key_material() {
-        let signing_key = signing_key_from_seed(generate_dynamic_capability_signing_seed());
-        let encoded = verify_key_b64(&signing_key);
-        let decoded = verify_key_from_b64(&encoded).expect("verify key should decode");
-        assert_eq!(decoded.to_bytes(), signing_key.verifying_key().to_bytes());
     }
 
     #[test]

@@ -16,12 +16,14 @@ members = [
   "runtime/provisioner",
   "runtime/router",
   "runtime/scenario-runner",
+  "runtime/site-controller",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 amber-compiler = { path = "compiler" }
 amber-config = { path = "compiler/config" }
+amber-docker-gateway = { path = "runtime/docker-gateway" }
 amber-images = { path = "images" }
 amber-json5 = { path = "compiler/json5" }
 amber-manifest = { path = "compiler/manifest" }
@@ -31,6 +33,7 @@ amber-resolver = { path = "compiler/resolver" }
 amber-router = { path = "runtime/router" }
 amber-scenario = { path = "compiler/scenario" }
 amber-scenario-runner = { path = "runtime/scenario-runner" }
+amber-site-controller = { path = "runtime/site-controller" }
 amber-template = { path = "compiler/template" }
 base64 = "0.22.1"
 futures = "0.3.31"

@@ -186,6 +186,14 @@ pub(crate) fn hashed_temp_socket_path(namespace: &str, kind: &str, path: &Path) 
     amber_mesh::stable_temp_socket_path(namespace, kind, path)
 }
 
+fn vm_component_control_socket_path(work_dir: &Path, component_id: usize) -> PathBuf {
+    hashed_temp_socket_path(
+        "amber-vm-control",
+        &format!("sidecar-{component_id}"),
+        work_dir,
+    )
+}
+
 pub(crate) fn assign_vm_runtime_ports(
     runtime_root: &Path,
     vm_plan: &VmPlan,
@@ -220,11 +228,19 @@ pub(crate) fn assign_vm_runtime_ports_with_existing(
         }
         mesh_port_by_peer_id.insert(peer_id.clone(), *port);
     }
+    if let Some(port) = fixed_router_mesh_port
+        && !reserved.insert(port)
+    {
+        return Err(miette::miette!(
+            "router mesh port {} conflicts with an existing vm runtime port",
+            port
+        ));
+    }
 
     for component in &vm_plan.components {
         let path = runtime_root.join(&component.mesh_config_path);
         let mut config = read_mesh_config_public(&path)?;
-        let mesh_port = allocate_runtime_port(&mut reserved, None)?;
+        let mesh_port = allocate_runtime_port(&mut reserved)?;
         if mesh_port_by_peer_id
             .insert(config.identity.id.clone(), mesh_port)
             .is_some()
@@ -239,7 +255,7 @@ pub(crate) fn assign_vm_runtime_ports_with_existing(
         let mut route_guest_host_pairs = BTreeMap::<String, Vec<(u16, u16)>>::new();
         for route in &mut config.outbound {
             let guest_port = route.listen_port;
-            let host_port = allocate_runtime_port(&mut reserved, None)?;
+            let host_port = allocate_runtime_port(&mut reserved)?;
             route.listen_port = host_port;
             route_guest_host_pairs
                 .entry(route.slot.clone())
@@ -281,7 +297,7 @@ pub(crate) fn assign_vm_runtime_ports_with_existing(
                 let host_port = if let Some(existing) = endpoint_forwards.get(&guest_port) {
                     *existing
                 } else {
-                    let host_port = allocate_runtime_port(&mut reserved, None)?;
+                    let host_port = allocate_runtime_port(&mut reserved)?;
                     endpoint_forwards.insert(guest_port, host_port);
                     host_port
                 };
@@ -316,7 +332,10 @@ pub(crate) fn assign_vm_runtime_ports_with_existing(
     let mut router_config = if let Some(router) = vm_plan.router.as_ref() {
         let path = runtime_root.join(&router.mesh_config_path);
         let mut config = read_mesh_config_public(&path)?;
-        let mesh_port = allocate_runtime_port(&mut reserved, fixed_router_mesh_port)?;
+        let mesh_port = match fixed_router_mesh_port {
+            Some(port) => port,
+            None => allocate_runtime_port(&mut reserved)?,
+        };
         if let Some(existing) = mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port)
             && existing != mesh_port
         {
@@ -357,21 +376,9 @@ pub(crate) fn assign_vm_runtime_ports_with_existing(
     })
 }
 
-pub(crate) fn allocate_runtime_port(
-    reserved: &mut BTreeSet<u16>,
-    preferred: Option<u16>,
-) -> Result<u16> {
-    if let Some(preferred) = preferred {
-        if reserved.insert(preferred) {
-            return Ok(preferred);
-        }
-        return Err(miette::miette!(
-            "runtime port {} was requested twice in one vm runtime",
-            preferred
-        ));
-    }
+pub(crate) fn allocate_runtime_port(reserved: &mut BTreeSet<u16>) -> Result<u16> {
     for _ in 0..256 {
-        let port = pick_free_port()?;
+        let port = amber_site_controller::reserve_loopback_port()?;
         if reserved.insert(port) {
             return Ok(port);
         }
@@ -379,12 +386,6 @@ pub(crate) fn allocate_runtime_port(
     Err(miette::miette!(
         "ran out of ports while allocating vm runtime ports"
     ))
-}
-
-pub(crate) fn pick_free_port() -> Result<u16> {
-    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-        .into_diagnostic()?;
-    Ok(listener.local_addr().into_diagnostic()?.port())
 }
 
 pub(crate) fn rewrite_mesh_peer_addrs(
@@ -611,6 +612,33 @@ pub(crate) async fn spawn_component_sidecar(
                 work_dir.display()
             )
         })?;
+    let control_socket_path = vm_component_control_socket_path(&work_dir, component.id);
+    let control_socket_dir = control_socket_path
+        .parent()
+        .ok_or_else(|| miette::miette!("invalid vm sidecar control socket path"))?
+        .to_path_buf();
+    fs::create_dir_all(&control_socket_dir)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create vm sidecar control directory {}",
+                control_socket_dir.display()
+            )
+        })?;
+    if control_socket_path.exists() {
+        fs::remove_file(&control_socket_path)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to remove stale vm sidecar control socket {}",
+                    control_socket_path.display()
+                )
+            })?;
+    }
+    env_map.insert(
+        "AMBER_ROUTER_CONTROL_SOCKET_PATH".to_string(),
+        control_socket_path.display().to_string(),
+    );
     spawn_command(
         format!("{}-sidecar", component.log_name),
         vec![router_binary.to_string()],
@@ -1003,5 +1031,38 @@ mod tests {
             persisted.component_mesh_port_by_id,
             replacement.component_mesh_port_by_id
         );
+    }
+
+    #[test]
+    fn vm_component_control_socket_path_stays_short_on_long_work_dirs() {
+        let work_dir = Path::new(
+            "/Users/example/Developer/amber/target/cli-test-outputs/\
+             linux-vm-framework_component-very-long/state/runs/run-123/state/vm_local/runtime/\
+             work/sidecars/c2-web",
+        );
+        let socket = vm_component_control_socket_path(work_dir, 2);
+        let rendered = socket.as_os_str().to_string_lossy();
+
+        assert!(
+            rendered.len() < 104,
+            "vm sidecar control socket path must fit within unix socket limits: {rendered}",
+        );
+    }
+
+    #[test]
+    fn allocate_runtime_port_avoids_shared_loopback_reservations() {
+        let reserved_port =
+            amber_site_controller::reserve_loopback_port().expect("shared loopback port");
+        let mut reserved = BTreeSet::new();
+
+        for _ in 0..32 {
+            let port = allocate_runtime_port(&mut reserved)
+                .expect("vm runtime port allocation should succeed");
+            assert_ne!(
+                port, reserved_port,
+                "vm runtime should not reuse loopback ports already reserved by mixed-run \
+                 infrastructure",
+            );
+        }
     }
 }

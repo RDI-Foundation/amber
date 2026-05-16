@@ -1484,10 +1484,24 @@ fn ensure_leaf_schema_supported(schema: &Map<String, Value>) -> Result<()> {
 }
 
 pub fn canonical_json(v: &Value) -> Value {
-    let canonical_bytes =
-        serde_jcs::to_vec(v).expect("serializing config schema to canonical JSON should succeed");
-    serde_json::from_slice(&canonical_bytes)
-        .expect("canonical JSON bytes should deserialize back into JSON value")
+    match v {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| canonical_json_key_order(left, right));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), canonical_json(value)))
+                    .collect(),
+            )
+        }
+        _ => v.clone(),
+    }
+}
+
+fn canonical_json_key_order(left: &str, right: &str) -> std::cmp::Ordering {
+    left.encode_utf16().cmp(right.encode_utf16())
 }
 
 // Produce a minimized schema that only includes explicitly allowed leaf paths.
