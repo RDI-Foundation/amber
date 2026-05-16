@@ -1,0 +1,12 @@
+Error: manifest::invalid_config_schema
+
+  × check failed
+  ╰─▶ invalid config definition at properties.token.type: 42 is not valid
+      under any of the schemas listed in the 'anyOf' keyword
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/config_schema_invalid_type_keyword.json5:7:15]
+ 6 │       token: {
+ 7 │         type: 42,
+   ·               ─┬
+   ·                ╰── invalid config definition here
+ 8 │       },
+   ╰────

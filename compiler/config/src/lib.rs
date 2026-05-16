@@ -1,6 +1,7 @@
 mod env;
 mod error;
 mod node;
+mod profile;
 mod schema;
 mod template;
 
@@ -10,6 +11,7 @@ pub use env::{
 };
 pub use error::{ConfigError, Result};
 pub use node::{ConfigNode, RootConfigTemplate, compose_config_template};
+pub use profile::{ConfigSchemaProfileError, validate_config_schema_profile};
 pub use schema::{
     SchemaLeaf, SchemaLookup, SchemaPresence, SchemaWalkResult, apply_schema_defaults,
     apply_schema_defaults_to_node, canonical_json, collect_leaf_paths, collect_schema_leaves,

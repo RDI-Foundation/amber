@@ -1,0 +1,12 @@
+Error: manifest::invalid_config_schema
+
+  × check failed
+  ╰─▶ invalid config definition at patternProperties: unsupported
+      config_schema keyword `patternProperties`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/config_schema_unsupported_keyword.json5:5:5]
+ 4 │     type: "object",
+ 5 │     patternProperties: {
+   ·     ────────┬────────
+   ·             ╰── invalid config definition here
+ 6 │       ".*": { type: "string" },
+   ╰────

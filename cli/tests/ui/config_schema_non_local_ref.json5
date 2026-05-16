@@ -1,0 +1,12 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    $defs: {
+      token: { $anchor: "token", type: "string" },
+    },
+    properties: {
+      token: { $ref: "#token" },
+    },
+  },
+}

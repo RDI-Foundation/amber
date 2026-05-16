@@ -78,7 +78,7 @@ fn manifest_builder_rejects_invalid_config_schema() {
         .build()
         .unwrap_err();
 
-    assert!(matches!(err, Error::InvalidConfigSchema(_)));
+    assert!(matches!(err, Error::InvalidConfigSchema { .. }));
 }
 
 #[test]

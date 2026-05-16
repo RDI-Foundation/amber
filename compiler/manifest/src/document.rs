@@ -2,6 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use amber_json5::spans::span_for_object_key;
 use miette::{Diagnostic, LabeledSpan, NamedSource, SourceCode, SourceSpan};
 use thiserror::Error;
 use url::Url;
@@ -255,10 +256,9 @@ fn labels_for_manifest_error(
         ManifestError::UnsupportedMountSource { mount } => {
             labels_for_mount_source(spans, mount, "reserved mount source")
         }
-        ManifestError::InvalidConfigSchema(_) => vec![primary(
-            span_or_default(spans.config_schema),
-            Some("invalid config definition here".to_string()),
-        )],
+        ManifestError::InvalidConfigSchema { pointer, key, .. } => {
+            labels_for_config_schema_error(source, spans, pointer.as_deref(), key.as_deref())
+        }
         ManifestError::UnknownEnvironmentExtends { name, .. } => {
             labels_for_unknown_environment_extends(spans, name)
         }
@@ -438,6 +438,45 @@ fn labels_for_mount_path(spans: &ManifestSpans, path: &str, label: &str) -> Vec<
         |mount| mount.path_value.as_deref() == Some(path),
         |mount| mount.path,
     )
+}
+
+fn labels_for_config_schema_error(
+    source: &str,
+    spans: &ManifestSpans,
+    pointer: Option<&str>,
+    key: Option<&str>,
+) -> Vec<LabeledSpan> {
+    let Some(schema_span) = spans.config_schema else {
+        return vec![primary(
+            span_or_default(None),
+            Some("invalid config definition here".to_string()),
+        )];
+    };
+
+    let span = match (pointer, key) {
+        (Some(pointer), Some(key)) => crate::span_for_json_pointer(source, schema_span, pointer)
+            .and_then(|object| span_for_object_key(source, object, key))
+            .or_else(|| {
+                crate::span_for_json_pointer(source, schema_span, &json_pointer_child(pointer, key))
+            }),
+        (Some(pointer), None) => crate::span_for_json_pointer(source, schema_span, pointer),
+        (None, _) => None,
+    }
+    .unwrap_or(schema_span);
+
+    vec![primary(
+        span,
+        Some("invalid config definition here".to_string()),
+    )]
+}
+
+fn json_pointer_child(pointer: &str, key: &str) -> String {
+    let key = key.replace('~', "~0").replace('/', "~1");
+    if pointer.is_empty() {
+        format!("/{key}")
+    } else {
+        format!("{pointer}/{key}")
+    }
 }
 
 fn labels_for_mount_source(spans: &ManifestSpans, source: &str, label: &str) -> Vec<LabeledSpan> {
@@ -930,6 +969,32 @@ mod tests {
         let offset = source.find("\"#b\"").unwrap();
         assert_eq!(label.offset(), offset);
         assert_eq!(label.len(), "\"#b\"".len());
+    }
+
+    #[test]
+    fn invalid_config_schema_property_name_points_to_key() {
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              agent_HF_TOKEN: { type: "string", secret: true },
+            },
+          },
+        }
+        "#;
+
+        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+        assert!(matches!(err.kind, crate::Error::InvalidConfigSchema { .. }));
+
+        let labels: Vec<_> = err.labels().unwrap().collect();
+        assert_eq!(labels.len(), 1);
+
+        let label = &labels[0];
+        let offset = source.find("agent_HF_TOKEN").unwrap();
+        assert_eq!(label.offset(), offset);
+        assert_eq!(label.len(), "agent_HF_TOKEN".len());
     }
 
     #[test]

@@ -18,7 +18,6 @@ use serde_with::{
 };
 
 use crate::{
-    config_schema_profile,
     error::Error,
     interpolation::{
         InlineStringSpec, InterpolatedString, InterpolationSource, ProgramEntrypoint,
@@ -825,8 +824,23 @@ pub struct ConfigSchema(pub Value);
 
 impl ConfigSchema {
     pub(crate) fn validate_value(value: &Value) -> Result<(), Error> {
-        jsonschema::validator_for(value).map_err(|e| Error::InvalidConfigSchema(e.to_string()))?;
-        config_schema_profile::validate(value).map_err(Error::InvalidConfigSchema)?;
+        amber_config::validate_config_schema_profile(value).map_err(|e| {
+            Error::InvalidConfigSchema {
+                path: e.path,
+                message: e.message,
+                pointer: e.pointer,
+                key: e.key,
+            }
+        })?;
+        jsonschema::validator_for(value).map_err(|e| {
+            let e = amber_config::ConfigSchemaProfileError::from_json_schema_validation(&e);
+            Error::InvalidConfigSchema {
+                path: e.path,
+                message: e.message,
+                pointer: e.pointer,
+                key: e.key,
+            }
+        })?;
         Ok(())
     }
 
@@ -850,7 +864,9 @@ impl<'de> Deserialize<'de> for ConfigSchema {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        ConfigSchema::new(value).map_err(serde::de::Error::custom)
+        // Raw manifests validate config_schema after deserialization so diagnostics can use
+        // manifest-level source spans instead of pointing at the whole field.
+        Ok(ConfigSchema(value))
     }
 }
 

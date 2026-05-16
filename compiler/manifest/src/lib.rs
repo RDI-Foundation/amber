@@ -1,6 +1,5 @@
 #![allow(unused_assignments)]
 
-mod config_schema_profile;
 mod document;
 pub mod framework;
 pub mod lint;
